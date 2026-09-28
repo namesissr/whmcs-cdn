@@ -1,0 +1,14 @@
+[Unit]
+Description=Pasargad CDN edge agent
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/pcdn-agent
+Restart=always
+RestartSec=5
+Environment=PCDN_CONFIG=/etc/pcdn/agent.conf
+
+[Install]
+WantedBy=multi-user.target

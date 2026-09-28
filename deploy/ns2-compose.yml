@@ -1,0 +1,21 @@
+# Secondary nameserver (ns2) on a separate server.
+# The controller writes every zone to it through the API (no zone transfer needed).
+#   PDNS_API_KEY=<same key as the controller> docker compose -f ns2-compose.yml up -d
+# Then firewall port 8081 so only the controller's IP can reach it, and add
+# http://THIS_SERVER_IP:8081 to PDNS_API_URL in the controller's .env.
+services:
+  pdns:
+    image: powerdns/pdns-auth-49:latest
+    restart: unless-stopped
+    environment:
+      PDNS_AUTH_API_KEY: ${PDNS_API_KEY}
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "8081:8081"
+    volumes:
+      - pdns-data:/var/lib/powerdns
+      - ../dns/pdns.conf:/etc/powerdns/pdns.d/pcdn.conf:ro
+
+volumes:
+  pdns-data:

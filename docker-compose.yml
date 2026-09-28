@@ -1,0 +1,55 @@
+# Pasargad CDN — control plane (controller API + PowerDNS ns1 + Postgres + Caddy TLS)
+# Usage: cp .env.example .env && edit && docker compose up -d --build
+
+services:
+  controller:
+    build: ./controller
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn
+    volumes:
+      - controller-data:/data
+    depends_on:
+      - db
+      - pdns
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pcdn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: pcdn
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  pdns:
+    image: powerdns/pdns-auth-49:latest
+    restart: unless-stopped
+    environment:
+      PDNS_AUTH_API_KEY: ${PDNS_API_KEY}
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - pdns-data:/var/lib/powerdns
+      - ./dns/pdns.conf:/etc/powerdns/pdns.d/pcdn.conf:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    command: caddy reverse-proxy --from ${CONTROLLER_DOMAIN} --to controller:8000
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+    depends_on:
+      - controller
+
+volumes:
+  controller-data:
+  db-data:
+  pdns-data:
+  caddy-data:

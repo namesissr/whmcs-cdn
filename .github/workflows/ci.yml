@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  controller:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: controller
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  edge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q nginx python3-pytest && sudo systemctl stop nginx
+      # nginx -t binds :80, so this needs root
+      - run: sudo python3 -m pytest -q -p no:cacheprovider edge/tests
+      - run: bash -n edge/install.sh
+
+  whmcs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: find whmcs -name '*.php' -print0 | xargs -0 -n1 php -l
