@@ -158,7 +158,8 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/p
 # روی سرور ns2 (پوشه‌های dns/ و deploy/ این مخزن را کپی کنید):
 cd /opt/pcdn/deploy && PDNS_API_KEY=<همان کلید کنترلر> docker compose -f ns2-compose.yml up -d
 # فایروال: پورت 8081 فقط برای IP کنترلر باز باشد
-ufw allow 53 && ufw allow from <CONTROLLER_IP> to any port 8081 proto tcp
+ufw allow 53
+sudo ./ns2-firewall.sh <CONTROLLER_IP>   # ufw روی پورت‌های Docker اثر ندارد
 ```
 
 سپس در `.env` کنترلر آدرس API سرور ns2 را اضافه کنید و `docker compose up -d` را دوباره اجرا کنید:
