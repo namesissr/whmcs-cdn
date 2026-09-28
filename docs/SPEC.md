@@ -326,3 +326,22 @@ Max 20 000 items and 2 000 events per request.
   "v" verdict}` where verdict is `ok` or `<action>:<source>:<rule>`
 (e.g. `block:waf:942100`, `challenge:ddos:auto`, `block:ratelimit:login`,
 `log:firewall:r3`). The agent derives security counters and events from `v`.
+
+---------------------------------------------------------------------------
+## 6. Platform-wide (WHMCS admin panel)
+
+- `GET /api/v1/overview` →
+```json
+{"sites": {"total": 12, "by_status": {"active": 9, "pending_ns": 2, "suspended": 1}},
+ "edges": {"total": 3, "enabled": 3, "online": 2, "with_errors": 0},
+ "month": {"start": "2026-09-01T00:00:00Z", "bytes": 0, "requests": 0, "security": {"waf": 0}},
+ "top_sites": [{"domain": "example.com", "bytes": 0, "requests": 0}],
+ "nameservers": ["ns1.pasargadmizban.com", "ns2.pasargadmizban.com"]}
+```
+- `GET /api/v1/events?limit=100&source=waf` → like §4 events, newest first, across all sites, each with `"domain"`.
+- Existing: `GET /api/v1/sites` (domain, status, external_id), `GET /api/v1/usage?month=YYYY-MM`,
+  `GET/POST /api/v1/edges`, `PATCH /api/v1/edges/{id}?enabled=true|false`,
+  `POST /api/v1/edges/{id}/rotate-token`, `DELETE /api/v1/edges/{id}`, `GET /api/v1/ping`.
+  Edge object: `{id, name, ipv4, ipv6, region ("home"|"global"), enabled, last_seen_at, applied_version, last_error}`;
+  create/rotate responses include `"token"` exactly once. An edge is "online" when last_seen_at is
+  within EDGE_OFFLINE_SECONDS (default 180 s).

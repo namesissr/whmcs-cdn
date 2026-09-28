@@ -301,3 +301,51 @@ def prune_events(db: Session, keep: int = 1000):
                            .order_by(SecurityEvent.id.desc()).offset(keep).limit(1))
         if cutoff is not None:
             db.execute(delete(SecurityEvent).where(SecurityEvent.site_id == site_id, SecurityEvent.id <= cutoff))
+
+
+# ------------------------------------------------------------------ platform-wide (admin panel)
+
+@router.get("/overview")
+def overview(db: Session = Depends(get_db)):
+    """One call for the WHMCS admin dashboard: site/edge counts, month totals, top sites."""
+    from .models import Edge
+    from .services import month_start, online_edges
+
+    start = month_start()
+    by_status = Counter()
+    for s in db.scalars(select(Site)):
+        by_status[s.effective_status] += 1
+    usage = Counter()
+    requests = Counter()
+    security = Counter()
+    for row in db.scalars(select(UsageHourly).where(UsageHourly.hour >= start)):
+        usage[row.site_id] += row.bytes
+        requests[row.site_id] += row.requests
+        for k, v in _loads(row.details).get("security", {}).items():
+            security[k] += int(v)
+    domains = dict(db.execute(select(Site.id, Site.domain)).all())
+    online = {e.id for e in online_edges(db)}
+    edges = list(db.scalars(select(Edge).order_by(Edge.id)))
+    return {
+        "sites": {"total": sum(by_status.values()), "by_status": dict(by_status)},
+        "edges": {"total": len(edges), "enabled": sum(1 for e in edges if e.enabled), "online": len(online),
+                  "with_errors": sum(1 for e in edges if e.last_error)},
+        "month": {"start": start.isoformat() + "Z", "bytes": sum(usage.values()), "requests": sum(requests.values()),
+                  "security": dict(security)},
+        "top_sites": [{"domain": domains.get(sid, "?"), "bytes": b, "requests": requests[sid]}
+                      for sid, b in usage.most_common(10)],
+        "nameservers": settings.nameservers,
+    }
+
+
+@router.get("/events")
+def all_events(limit: int = 100, source: str | None = None, db: Session = Depends(get_db)):
+    """Newest security events across every site (admin panel)."""
+    limit = max(1, min(limit, 1000))
+    q = select(SecurityEvent, Site.domain).join(Site, Site.id == SecurityEvent.site_id)
+    if source:
+        q = q.where(SecurityEvent.source == source)
+    rows = db.execute(q.order_by(SecurityEvent.ts.desc(), SecurityEvent.id.desc()).limit(limit)).all()
+    return [{"domain": d, "t": e.ts.isoformat() + "Z", "ip": e.ip, "country": e.country, "method": e.method,
+             "host": e.host, "path": e.path, "action": e.action, "source": e.source, "rule": e.rule,
+             "user_agent": e.user_agent} for e, d in rows]
