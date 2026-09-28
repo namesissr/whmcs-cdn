@@ -97,10 +97,21 @@ def site_to_dict(db: Session, site: Site) -> dict:
             "error": site.ssl_error,
         },
         "dnssec": site.dnssec_enabled,
+        # customers whitelist these at their origin and use them for real-IP config
+        "edge_ips": edge_ips(db),
         "usage_month": {**usage, "gb": round(usage["bytes"] / 1024**3, 3)},
         "records": [record_to_dict(r) for r in site.records],
         "created_at": site.created_at.isoformat() + "Z",
     }
+
+
+def edge_ips(db: Session) -> list[str]:
+    ips = []
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
+        ips.append(e.ipv4)
+        if e.ipv6:
+            ips.append(e.ipv6)
+    return ips
 
 
 def cert_names(pem: str) -> list[str]:

@@ -401,6 +401,10 @@ function pasargadcdn_ClientArea(array $params)
             'pcdnApiUrl' => $base . '/api.php',
             'pcdnCssUrl' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
             'pcdnJsUrl' => $base . '/assets/app.js?v=' . $ver('assets/app.js'),
+            // Loaded in this order (all deferred); app.js boots last.
+            'pcdnScripts' => array_map(function ($f) use ($base, $ver) {
+                return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
+            }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'app.js']),
             // Safe inside <script type="application/json">: no raw < > & ' "
             'pcdnBoot' => json_encode($boot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
                 | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_PARTIAL_OUTPUT_ON_ERROR),

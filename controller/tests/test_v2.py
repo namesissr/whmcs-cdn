@@ -106,6 +106,7 @@ def test_pools_records_and_edge_config(client):
     client.put(f"{S}/config/waf", json={"mode": "block"})
     client.patch(f"{S}/settings", json={"dev_mode": True, "force_https": True})
     token = add_edge(client)
+    assert client.get(S).json()["edge_ips"] == ["5.160.1.10"]
     cfg = edge_get(client, token, "/edge/v1/config").json()["sites"][0]
     hosts = {h["name"]: h["origin"] for h in cfg["hosts"]}
     assert hosts["api.example.com"] == {"pool": "main"}

@@ -43,6 +43,8 @@ that section with 403 and the edge config treats it as disabled.
 
 Read all: `GET /api/v1/sites/{domain}` → includes `"config": {<section>: ...}`
 for every section below.
+The site object also carries `"edge_ips": ["5.160.1.10", ...]` — public IPs of all enabled
+edges (for the customer's origin firewall allow-list and real-IP configuration).
 Read one: `GET /api/v1/sites/{domain}/config/{section}`.
 Replace one: `PUT /api/v1/sites/{domain}/config/{section}` with the full section
 body; response = the stored (normalised) section. Sections:
