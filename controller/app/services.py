@@ -59,6 +59,17 @@ def usage_totals(db: Session, site_id: int, start: datetime, end: datetime | Non
     return {"bytes": int(b), "requests": int(r), "cache_hits": int(h)}
 
 
+def refresh_quota(db: Session, site: Site) -> bool:
+    """Recompute over_quota for this month; returns True when it changed. Caller commits."""
+    over = False
+    if site.bandwidth_limit_gb > 0:
+        used = usage_totals(db, site.id, month_start())["bytes"]
+        over = used >= site.bandwidth_limit_gb * 1024**3
+    changed = over != site.over_quota
+    site.over_quota = over
+    return changed
+
+
 def site_to_dict(db: Session, site: Site) -> dict:
     usage = usage_totals(db, site.id, month_start())
     config = sections.all_config(site)

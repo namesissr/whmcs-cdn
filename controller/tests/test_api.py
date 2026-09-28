@@ -178,3 +178,17 @@ def test_cname_origin_resolution(client):
     hosts = edge_get(client, token, "/edge/v1/config").json()["sites"][0]["hosts"]
     assert hosts == [{"name": "shop.example.com", "origin": {"address": "shops.myshopify.com", "port": None}},
                      {"name": "v6.example.com", "origin": {"address": "[2a01:4f8::1]", "port": None}}]
+
+
+def test_plan_change_applies_quota_immediately(client):
+    client.post("/api/v1/sites", json={"domain": "example.com", "origin_ip": "93.184.216.34",
+                                       "plan": {"bandwidth_limit_gb": 1}})
+    token = add_edge(client)
+    hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+    client.post("/edge/v1/usage", headers={"Authorization": f"Bearer {token}"},
+                json={"items": [{"host": "example.com", "hour": hour, "bytes": 2 * 1024**3, "requests": 1}]})
+    # lowering/keeping the cap below usage cuts at once; raising it reconnects at once
+    assert client.patch("/api/v1/sites/example.com/plan", json={"bandwidth_limit_gb": 1}).json()["status"] \
+        == "over_quota"
+    assert client.patch("/api/v1/sites/example.com/plan", json={"bandwidth_limit_gb": 3}).json()["status"] \
+        == "pending_ns"

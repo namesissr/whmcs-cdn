@@ -11,7 +11,7 @@ from .config import settings
 from .db import SessionLocal
 from .models import Purge, Site, State, UsageHourly, utcnow
 from .routes_v2 import prune_events
-from .services import month_start, online_edges, sync_all_dns, sync_site_dns, usage_totals
+from .services import online_edges, refresh_quota, sync_all_dns, sync_site_dns
 
 log = logging.getLogger("pcdn.scheduler")
 
@@ -84,15 +84,9 @@ def job_ssl(db):
 
 
 def job_quota(db):
-    start = month_start()
     for site in db.scalars(select(Site)):
-        over = False
-        if site.bandwidth_limit_gb > 0:
-            used = usage_totals(db, site.id, start)["bytes"]
-            over = used >= site.bandwidth_limit_gb * 1024**3
-        if over != site.over_quota:
-            site.over_quota = over
-            log.info("%s over_quota=%s", site.domain, over)
+        if refresh_quota(db, site):
+            log.info("%s over_quota=%s", site.domain, site.over_quota)
     db.commit()
 
 

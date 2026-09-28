@@ -15,6 +15,7 @@ from .config import settings
 from .db import get_db
 from .models import Edge, Record, Site, UsageHourly, utcnow
 from .services import (
+    refresh_quota,
     month_start,
     queue_purge,
     record_to_dict,
@@ -181,6 +182,8 @@ def read_site(domain: str, db: Session = Depends(get_db)):
 def update_plan(domain: str, plan: Plan, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     apply_plan(site, plan)
+    # a raised/lowered bandwidth limit takes effect now, not on the next scheduler tick
+    refresh_quota(db, site)
     db.commit()
     return site_to_dict(db, site)
 
