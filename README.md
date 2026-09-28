@@ -304,35 +304,61 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 ## GeoDNS (ترافیک ایران از نودهای داخل)
 
 به‌طور پیش‌فرض، همه نودهای سالم به‌صورت تصادفی در پاسخ DNS قرار می‌گیرند. با GeoDNS:
-- کاربران ایران فقط نودهای `home` را می‌گیرند.
-- بقیه کاربران نودهای `global` را می‌گیرند.
+- کاربران ایران فقط نودهای `home` را می‌گیرند و بقیه کاربران فقط نودهای `global` را.
 - اگر همه نودهای یک گروه از کار بیفتند، گروه دیگر خودکار جایگزین می‌شود.
 
-این رفتار روی PowerDNS 4.9 واقعی تست شده است.
+**چطور کار می‌کند:**
+- **هر دو نیم‌سرور همیشه یک جواب می‌دهند.** اینکه کدام گروه آنلاین است را کنترلر از گزارش نودها (هر ۲۰ ثانیه) تعیین می‌کند. این تصمیم به بررسی سلامتِ خود نیم‌سرورها سپرده نمی‌شود، چون مثلاً ns2 در خارج ممکن است به نودهای ایران دسترسی نداشته باشد و کاربران ایرانی را به خارج بفرستد. بررسی سلامت PowerDNS (`EDGE_PROBE`) فقط بین نودهای همان گروه انتخاب می‌کند.
+- **IPv6:** اگر نودهای ایران IPv6 نداشته باشند، کاربر ایرانی رکورد AAAA خالی می‌گیرد و با IPv4 به نود ایران وصل می‌شود؛ دیگر IPv6 نود خارج به او داده نمی‌شود.
+- **کشور کاربر:** اگر resolver زیرشبکه کاربر را بفرستد (EDNS Client Subnet، مثل Google 8.8.8.8 و resolverهای ISPهای ایران)، کشور از روی زیرشبکه کاربر تعیین می‌شود؛ وگرنه از روی IP خود resolver. Cloudflare (1.1.1.1) زیرشبکه کاربر را نمی‌فرستد و سرورهایش خارج از ایران است، پس کاربرانش به گروه `GEO_NO_ECS_POOL` (پیش‌فرض `home`) فرستاده می‌شوند.
+- **دیتابیس کشورها:** `deploy/geoip-update.sh` دیتابیس DB-IP Lite را با ثبت‌های رسمی RIPE NCC ترکیب می‌کند. DB-IP حدود ۵٪ از رنج‌های ثبت‌شده برای ایران را در کشورهای دیگر نشان می‌دهد (مثلاً IPهای ایرانی که در آلمان announce شده‌اند). با این ترکیب، این رنج‌ها هم ایران شناخته می‌شوند. برای اصلاح دستی یک رنج، فایل `dns/geo/overrides.txt` را بسازید (نمونه: `dns/geo/overrides.txt.example`).
 
-روی سرور کنترل‌پنل (و روی ns2، اگر جداست):
+**روی سرور کنترل‌پنل (ns1):**
 
-1. دیتابیس رایگان کشورها (DB-IP Lite، مجوز CC BY 4.0) را دانلود کنید:
+1. دیتابیس کشورها را بسازید (فقط python3 لازم است؛ حدود ۲۰ ثانیه و ۱۰۰ مگابایت رم):
    ```bash
-   cd /opt/pcdn && sudo deploy/geoip-update.sh --no-restart
+   cd /opt/pcdn && sudo git pull && sudo deploy/geoip-update.sh --no-restart
    ```
 2. به `.env` این دو خط را اضافه کنید:
    ```
    COMPOSE_FILE=docker-compose.yml:deploy/geoip.override.yml
    GEOIP_ENABLED=true
    ```
-3. سرویس‌ها را بالا بیاورید و همه زون‌ها را دوباره بنویسید:
+3. سرویس‌ها را بالا بیاورید. کنترلر با تغییر تنظیمات GeoDNS همه زون‌ها را خودش دوباره می‌نویسد؛ `dns-sync` این کار را فوری انجام می‌دهد:
    ```bash
-   sudo docker compose up -d
+   sudo docker compose up -d --build
    sudo docker compose exec controller python -m app.manage dns-sync
    ```
-4. برای به‌روزرسانی ماهانه دیتابیس، کران اضافه کنید:
+4. برای به‌روزرسانی هفتگی دیتابیس، کران اضافه کنید:
    ```bash
-   echo '0 4 3 * * root /opt/pcdn/deploy/geoip-update.sh >> /var/log/pcdn-geoip.log 2>&1' | sudo tee /etc/cron.d/pcdn-geoip
+   echo '0 4 * * 1 root /opt/pcdn/deploy/geoip-update.sh >> /var/log/pcdn-geoip.log 2>&1' | sudo tee /etc/cron.d/pcdn-geoip
    ```
-5. **روی ns2:** مرحله ۱ را در همان مسیر اجرا کنید، سپس با `-f ns2-compose.yml -f ns2-geoip.override.yml` بالا بیاورید. هر دو نیم‌سرور باید پاسخ یکسان بدهند.
 
-اگر `download.db-ip.com` از سرور در دسترس نبود، فایل `dbip-country-lite-YYYY-MM.mmdb.gz` را از جای دیگری دانلود کنید. آن را از حالت فشرده خارج کنید و با نام `dns/geo/country.mmdb` روی سرور بگذارید.
+**روی ns2 (اگر جداست)** دقیقاً همین دیتابیس لازم است. اگر ns2 آن را نداشته باشد، همه کاربرانی که resolverشان از ns2 می‌پرسد اشتباه هدایت می‌شوند:
+```bash
+cd /opt/pcdn && sudo git pull && sudo deploy/geoip-update.sh --no-restart
+cd deploy && sudo PDNS_API_KEY=... docker compose -f ns2-compose.yml -f ns2-geoip.override.yml up -d
+echo '0 4 * * 1 root /opt/pcdn/deploy/geoip-update.sh >> /var/log/pcdn-geoip.log 2>&1' | sudo tee /etc/cron.d/pcdn-geoip
+```
+
+**بررسی (روی سرور کنترل‌پنل):**
+```bash
+sudo docker compose exec controller python -m app.manage geo-check
+# با IP یک کاربر مشخص (مثلاً IP گوشی‌تان از سایت‌هایی مثل ipinfo.io):
+sudo docker compose exec controller python -m app.manage geo-check --ip 5.120.10.1
+```
+این دستور از هر نیم‌سرور می‌پرسد که یک کاربر ایرانی و یک کاربر خارجی کدام گروه را می‌گیرند. اگر یکی از نیم‌سرورها دیتابیس کشورها را نداشته باشد یا جواب نیم‌سرورها با هم فرق کند، خطا می‌دهد. کنترلر همین آزمون را هر ۱۰ دقیقه خودکار اجرا می‌کند و در صورت خطا هشدار می‌فرستد. نتیجه در `/healthz/deep` هم دیده می‌شود.
+
+هر زون یک رکورد تشخیصی `_pcdn-geo` دارد که تصمیم GeoDNS را برای همان کسی که می‌پرسد نشان می‌دهد:
+```bash
+dig +short TXT _pcdn-geo.example.com                   # از سیستم خود کاربر
+dig +short TXT _pcdn-geo.example.com @NS2_IP +subnet=5.120.10.0/24
+# "ip=5.120.10.0 ecs=yes resolver=... country=ir pool=home"
+```
+
+> **هنگام تست دقت کنید:** اگر VPN یا پروکسی روشن باشد، کاربر از کشور سرور VPN دیده می‌شود و درست است که به نود خارج برود. resolverها جواب را تا `PROXIED_TTL` (پیش‌فرض ۶۰ ثانیه) کش می‌کنند.
+
+اگر `download.db-ip.com` یا `ftp.ripe.net` از سرور در دسترس نبود، `DBIP_URL_BASE` و `RIPE_URL` را به یک آینه (یا `file:///...`) بدهید. اگر فقط فایل RIPE در دسترس نباشد، اسکریپت با هشدار از DB-IP تنها استفاده می‌کند.
 
 ## مرجع API
 

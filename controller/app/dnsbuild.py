@@ -1,5 +1,6 @@
 """Turns a site's records + the live edge list into PowerDNS rrsets."""
 
+import ipaddress
 from collections import defaultdict
 
 from .config import settings
@@ -20,23 +21,97 @@ def _lua_list(ips: list[str]) -> str:
     return "{" + ",".join(f"'{ip}'" for ip in ips) + "}"
 
 
-def lua_expression(home: list[str], global_: list[str]) -> str:
-    """Build the LUA snippet that answers with healthy edges.
+# bump when the generated records change so the scheduler rewrites every zone once
+BUILD_VERSION = "2"
+SELECTORS = ("random", "all", "hashed", "first", "pickclosest")
+# TXT record answering "which pool would this resolver/visitor get, and why" (see README)
+DIAG_LABEL = "_pcdn-geo"
 
-    ifurlup() probes EDGE_HEALTH_URL on every candidate IP and returns the first
-    set that has at least one healthy address, so the second set is a fallback.
+
+def _selector() -> str:
+    sel = (settings.lua_selector or "random").strip().lower()
+    return sel if sel in SELECTORS else "random"
+
+
+def _cidrs(values: list[str]) -> list[str]:
+    out = []
+    for v in values:
+        try:
+            out.append(str(ipaddress.ip_network(v.strip(), strict=False)))
+        except ValueError:
+            continue
+    return out
+
+
+def _countries() -> list[str]:
+    return [c.lower() for c in settings.geo_home_countries if len(c) == 2 and c.isalpha()] or ["ir"]
+
+
+def home_test() -> str:
+    """LUA statements that set `c` (country code) and `home` (true: serve the home pool).
+
+    countryCode() looks up the visitor's subnet when the resolver sends one (EDNS Client
+    Subnet), else the resolver's own address. Resolvers known to never send it (Cloudflare)
+    and addresses missing from the database follow GEO_NO_ECS_POOL / GEO_UNKNOWN_POOL.
     """
-    url = settings.health_url
-    opts = f"{{selector='{settings.lua_selector}', backupSelector='all'}}"
-    if settings.geoip_enabled and home and global_:
-        cc = settings.geo_home_country
-        return (
-            f";if country('{cc}') then "
-            f"return ifurlup('{url}', {{{_lua_list(home)},{_lua_list(global_)}}}, {opts}) "
-            f"else return ifurlup('{url}', {{{_lua_list(global_)},{_lua_list(home)}}}, {opts}) end"
-        )
-    all_ips = home + global_
-    return f"ifurlup('{url}', {{{_lua_list(all_ips)}}}, {opts})"
+    cond = " or ".join(f"c=='{c}'" for c in _countries())
+    lua = f"local c=countryCode() local home=({cond})"
+    if settings.geo_unknown_pool in ("home", "global"):
+        val = "true" if settings.geo_unknown_pool == "home" else "false"
+        lua += f" if c=='--' or c=='' then home={val} end"
+    resolvers = _cidrs(settings.geo_no_ecs_resolvers)
+    if settings.geo_no_ecs_pool in ("home", "global") and resolvers:
+        val = "true" if settings.geo_no_ecs_pool == "home" else "false"
+        lua += f" if ecswho==nil and netmask({_lua_list(resolvers)}) then home={val} end"
+    return lua
+
+
+def _pick(ips: list[str]) -> str:
+    """LUA expression choosing among the edges of one pool."""
+    if not ips:
+        return "{}"  # e.g. AAAA when the pool has no IPv6 edge: the visitor uses IPv4
+    lst = _lua_list(ips)
+    sel = _selector()
+    if settings.edge_probe:
+        # PowerDNS probes the pool's edges itself; if none looks healthy from this
+        # nameserver it still answers with the whole pool (never with the other pool)
+        return f"ifurlup('{settings.health_url}', {{{lst}}}, {{selector='{sel}', backupSelector='all'}})"
+    return {"all": lst, "hashed": f"pickhashed({lst})", "first": f"'{ips[0]}'",
+            "pickclosest": f"pickclosest({lst})"}.get(sel, f"pickrandom({lst})")
+
+
+def geo_split(home_alive: bool, global_alive: bool) -> bool:
+    return settings.geoip_enabled and home_alive and global_alive
+
+
+def lua_expression(home: list[str], global_: list[str],
+                   home_alive: bool | None = None, global_alive: bool | None = None) -> str:
+    """Build the LUA snippet that answers with the visitor's pool of online edges.
+
+    home/global_: the online edges of one address family. *_alive: whether the pool has
+    any online edge at all (from IPv4, so an AAAA query of an IPv4-only home pool gets no
+    answer instead of the foreign IPv6 edges). Which pool is alive comes from the
+    controller, so every nameserver gives the same answer.
+    """
+    home_alive = bool(home) if home_alive is None else home_alive
+    global_alive = bool(global_) if global_alive is None else global_alive
+    if geo_split(home_alive, global_alive):
+        return f";{home_test()} if home then return {_pick(home)} else return {_pick(global_)} end"
+    return f";return {_pick(home + global_)}"
+
+
+def diag_expression(home_alive: bool, global_alive: bool) -> str:
+    """TXT answer describing the GeoDNS decision for the asking resolver/visitor."""
+    if settings.geoip_enabled:
+        head = home_test()
+        pool = "(home and 'home' or 'global')"
+        if not (home_alive and global_alive):
+            pool = "'home-only'" if home_alive else "'global-only'"  # the other pool is offline
+    else:
+        head = "local c=countryCode()"
+        pool = "'all'"  # GEOIP_ENABLED=false: every online edge
+    return (f";{head} return 'ip='..bestwho:toString()..' ecs='..(ecswho and 'yes' or 'no')"
+            f"..' resolver='..who:toString()..' country='..c..' pool='..{pool}")
 
 
 def edge_pools(edges: list[Edge], family: int) -> tuple[list[str], list[str]]:
@@ -104,11 +179,16 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
         add(name, "LUA", min(ttl, settings.proxied_ttl),
             f"{rtype} \"ifportup({int(port)}, {_lua_list(ips)}, {{selector='all', backupSelector='all'}})\"")
 
+    home_alive, global_alive = bool(v4_home), bool(v4_global)
     for name in proxied_names:
         # The customer sees their record; resolvers see our edges.
-        add(name, "LUA", settings.proxied_ttl, "A \"" + lua_expression(v4_home, v4_global) + "\"")
+        add(name, "LUA", settings.proxied_ttl,
+            "A \"" + lua_expression(v4_home, v4_global, home_alive, global_alive) + "\"")
         if have_v6:
-            add(name, "LUA", settings.proxied_ttl, "AAAA \"" + lua_expression(v6_home, v6_global) + "\"")
+            add(name, "LUA", settings.proxied_ttl,
+                "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive) + "\"")
+    if proxied_names:
+        add(f"{DIAG_LABEL}.{domain}", "LUA", 5, "TXT \"" + diag_expression(home_alive, global_alive) + "\"")
 
     return list(grouped.values())
 

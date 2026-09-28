@@ -34,10 +34,36 @@ class Settings:
     default_ttl: int = field(default_factory=lambda: int(os.getenv("DEFAULT_TTL", "300")))
     proxied_ttl: int = field(default_factory=lambda: int(os.getenv("PROXIED_TTL", "60")))
 
-    # GeoIP: requires the PowerDNS geoip backend + MaxMind DB (see README).
+    # GeoIP: requires the PowerDNS geoip backend + country DB on EVERY nameserver (see README).
     geoip_enabled: bool = field(default_factory=lambda: _bool("GEOIP_ENABLED", False))
-    geo_home_country: str = field(default_factory=lambda: os.getenv("GEO_HOME_COUNTRY", "IR"))
+    # comma separated ISO codes served by "home" edges
+    geo_home_countries: list[str] = field(
+        default_factory=lambda: [c.upper() for c in _raw_list("GEO_HOME_COUNTRY") or ["IR"]])
+    # Resolvers that never send the visitor's subnet (EDNS Client Subnet), so their own
+    # (foreign) location would decide: Cloudflare 1.1.1.1 by default. home | global | geo
+    geo_no_ecs_pool: str = field(default_factory=lambda: (os.getenv("GEO_NO_ECS_POOL") or "home").strip().lower())
+    geo_no_ecs_resolvers: list[str] = field(default_factory=lambda: _raw_list("GEO_NO_ECS_RESOLVERS") or [
+        # Cloudflare (1.1.1.1 / 1.0.0.1 egress) - https://www.cloudflare.com/ips/
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+        "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+        "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+        "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+        "2a06:98c0::/29", "2c0f:f248::/32",
+    ])
+    # visitors whose country is unknown to the database: home | global
+    geo_unknown_pool: str = field(default_factory=lambda: (os.getenv("GEO_UNKNOWN_POOL") or "home").strip().lower())
+    # periodic check that every nameserver geolocates a home and a foreign subnet correctly
+    geo_check_enabled: bool = field(default_factory=lambda: _bool("GEO_CHECK", True))
+    geo_check_home_subnet: str = field(default_factory=lambda: os.getenv("GEO_CHECK_HOME_SUBNET") or "2.176.0.0/24")
+    geo_check_foreign_subnet: str = field(
+        default_factory=lambda: os.getenv("GEO_CHECK_FOREIGN_SUBNET") or "8.8.8.0/24")
+    # DNS addresses of the nameservers for that check; default: the hosts in PDNS_API_URL, port 53
+    pdns_dns_addrs: list[str] = field(default_factory=lambda: _raw_list("PDNS_DNS_ADDRS"))
+    # Which edge answers inside the chosen pool. Moving a visitor between the home and
+    # global pools only follows the controller's view of the edges (agent heartbeats), so
+    # ns1 and ns2 always agree; EDGE_PROBE adds PowerDNS's own checks inside the pool.
     lua_selector: str = field(default_factory=lambda: os.getenv("LUA_SELECTOR", "random"))
+    edge_probe: bool = field(default_factory=lambda: _bool("EDGE_PROBE", True))
     health_url: str = field(default_factory=lambda: os.getenv("EDGE_HEALTH_URL", "http://health.pcdn/__pcdn/health"))
 
     acme_email: str = field(default_factory=lambda: os.getenv("ACME_EMAIL", ""))

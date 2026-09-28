@@ -225,6 +225,43 @@ def cmd_alerts_test(a):
         sys.exit(1)
 
 
+def cmd_geo_check(a):
+    from . import geocheck
+
+    with _db() as db:
+        report = geocheck.check(db, a.domain, a.ip or [])
+        if not a.domain and not a.ip:
+            geocheck.save_report(db, report)
+        off = geocheck.geo_off_warning(db)
+    if a.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(f"GEOIP_ENABLED={settings_geo()}  zone: {report.get('domain') or '-'}")
+        if report.get("skipped"):
+            print(f"skipped: {report['skipped']}")
+        for srv in report["servers"]:
+            print(f"\n{srv['server']}: {'OK' if srv['ok'] else 'PROBLEM'}")
+            for kind, d in srv["answers"].items():
+                if "error" in d:
+                    print(f"  {kind:>8}: ERROR {d['error']}")
+                else:
+                    print(f"  {kind:>8}: visitor {d.get('ip', '?'):<16} country={d.get('country', '?'):<3} "
+                          f"-> pool={d.get('pool', '?')}")
+        if off:
+            print(f"\nWARNING: {off}")
+        for p in report["problems"]:
+            print(f"PROBLEM: {p}")
+        if not report["problems"] and not off and report["servers"]:
+            print("\nall nameservers route home and foreign visitors correctly")
+    sys.exit(1 if report["problems"] or off else 0)
+
+
+def settings_geo() -> str:
+    from .config import settings
+
+    return str(settings.geoip_enabled).lower()
+
+
 def cmd_health(a):
     from .routes_ops import deep_health
 
@@ -288,6 +325,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("dns-sync", help="rewrite every zone in PowerDNS").set_defaults(fn=cmd_dns_sync)
     sub.add_parser("alerts-test", help="send a test alert").set_defaults(fn=cmd_alerts_test)
     sub.add_parser("health", help="deep health report").set_defaults(fn=cmd_health)
+    s = sub.add_parser("geo-check", help="ask every nameserver which edges home/foreign visitors get")
+    s.add_argument("domain", nargs="?", help="zone to test (default: the first site with proxied records)")
+    s.add_argument("--ip", action="append", help="also test a visitor IP or subnet, e.g. 5.120.10.1 (repeatable)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_geo_check)
     return p
 
 

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import delete, or_, select
 
-from . import alerts, nscheck, ssl
+from . import alerts, dnsbuild, geocheck, nscheck, ssl
 from .config import settings
 from .db import SessionLocal
 from .leader import instance_id, make_elector
@@ -60,11 +60,19 @@ def note_resume(db, now: datetime | None = None):
         db.commit()
 
 
+def dns_signature() -> str:
+    return ";".join([dnsbuild.BUILD_VERSION, str(settings.geoip_enabled), ",".join(settings.geo_home_countries),
+                     settings.geo_no_ecs_pool, ",".join(settings.geo_no_ecs_resolvers), settings.geo_unknown_pool,
+                     settings.lua_selector, str(settings.edge_probe), settings.health_url])
+
+
 def job_edges(db):
     """Resync every zone when the set of healthy edges changes, or after a failed DNS write."""
     if not edge_reports_trusted(db):
         return
-    current = ",".join(f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}" for e in online_edges(db))
+    # the DNS settings and the record format are part of the state: changing GEOIP_ENABLED,
+    # GEO_* or upgrading the controller rewrites every zone on the next tick
+    current = ",".join(f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}" for e in online_edges(db)) + "|" + dns_signature()
     dirty = db.get(State, DNS_DIRTY_KEY) is not None
     if current == _state(db, "online_edges") and not dirty:
         return
@@ -217,7 +225,34 @@ def job_backup(db, now: datetime | None = None, force: bool = False):
                          + (" (در فضای ابری هم بارگذاری شد)" if result.get("uploaded") else ""))
 
 
-JOBS = [job_edges, job_alerts, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
+GEO_CHECK_INTERVAL = timedelta(minutes=10)
+
+
+def job_geo(db, now: datetime | None = None, force: bool = False):
+    """Every 10 minutes: does every nameserver route home and foreign visitors correctly?"""
+    now = now or utcnow()
+    last = geocheck.last_report(db)
+    if not force and last and now - datetime.fromisoformat(last["at"]) < GEO_CHECK_INTERVAL:
+        return
+    active = {}
+    off = geocheck.geo_off_warning(db)
+    if off:
+        active["geo:off"] = ("GeoDNS خاموش است",
+                             "نود ایران و نود خارج هر دو آنلاین هستند ولی GEOIP_ENABLED=true در .env کنترلر "
+                             "تنظیم نشده؛ پس هر بازدیدکننده به‌صورت تصادفی به یکی از نودهای داخل یا خارج "
+                             "فرستاده می‌شود.\n" + off, "critical")
+    if settings.geo_check_enabled and settings.pdns_enabled:
+        db.rollback()
+        report = geocheck.check(db)
+        geocheck.save_report(db, report)
+        if settings.geoip_enabled and report["problems"]:
+            active["geo:check"] = ("مسیریابی کشوری (GeoDNS) درست کار نمی‌کند",
+                                   "آزمون خودکار GeoDNS روی نیم‌سرورها خطا داد:\n- "
+                                   + "\n- ".join(report["problems"][:10]), "critical")
+    alerts.sync("geo:", active, lambda c: "مسیریابی کشوری (GeoDNS) دوباره درست کار می‌کند.")
+
+
+JOBS = [job_edges, job_alerts, job_geo, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
 
 
 def run_once():

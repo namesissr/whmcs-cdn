@@ -75,6 +75,25 @@ def deep_health() -> tuple[dict, int]:
                 warnings.append(f"PowerDNS server #{i + 1} is unreachable")
         body["pdns"] = servers
 
+    # GeoDNS --------------------------------------------------------------------
+    from . import geocheck
+
+    db = SessionLocal()
+    try:
+        off = geocheck.geo_off_warning(db)
+        geo = geocheck.last_report(db)
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        off, geo = None, None
+    finally:
+        db.close()
+    body["geodns"] = {"enabled": settings.geoip_enabled, "last_check": geo and geo.get("at"),
+                      "problems": (geo or {}).get("problems", []) if settings.geoip_enabled else []}
+    if off:
+        warnings.append(off)
+    for p in body["geodns"]["problems"]:
+        warnings.append(f"GeoDNS: {p}")
+
     # scheduler / leader election ---------------------------------------------
     sched = scheduler.current
     if not settings.scheduler_enabled:
