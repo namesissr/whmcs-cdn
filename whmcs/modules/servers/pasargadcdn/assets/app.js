@@ -16,6 +16,8 @@
 
   var boot = {};
   try { boot = JSON.parse(document.getElementById('pcdn-boot').textContent || '{}'); } catch (e) { /* shown below */ }
+  // Blend into the host theme (light/dark, surfaces, brand colour, font) before anything renders.
+  if (P.theme) P.theme.init(root, boot.theme);
   P.CFG.api = root.getAttribute('data-api') || '';
   P.CFG.csrf = root.getAttribute('data-csrf') || '';
   P.CFG.serviceId = boot.serviceId || 0;

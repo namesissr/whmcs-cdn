@@ -9,7 +9,9 @@
   var h = P.h, s = P.s, append = P.append, clear = P.clear, icon = P.icon, ltr = P.ltr, num = P.num;
   function A() { return P.app; }
 
-  var COLORS = { requests: '#2563eb', hits: '#0d9488', bytes: '#7c3aed', s2: '#16a34a', s3: '#2563eb', s4: '#d97706', s5: '#dc2626' };
+  // Series colours are theme tokens (app.css), applied through style attributes so they follow light/dark.
+  var COLORS = { requests: 'var(--pc-c-req)', hits: 'var(--pc-c-hit)', bytes: 'var(--pc-c-bytes)', s2: 'var(--pc-c-2xx)', s3: 'var(--pc-c-3xx)',
+    s4: 'var(--pc-c-4xx)', s5: 'var(--pc-c-5xx)' };
 
   // ------------------------------------------------------------------ charts
 
@@ -27,12 +29,12 @@
     var gid = P.uid('pcdn-sg-');
     var svg = s('svg', { viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', class: 'pcdn-spark', role: 'img', 'aria-label': 'روند درخواست‌ها در ۲۴ ساعت گذشته', focusable: 'false' });
     var grad = s('linearGradient', { id: gid, x1: 0, y1: 0, x2: 0, y2: 1 });
-    grad.appendChild(s('stop', { offset: '0', 'stop-color': COLORS.requests, 'stop-opacity': '.28' }));
-    grad.appendChild(s('stop', { offset: '1', 'stop-color': COLORS.requests, 'stop-opacity': '0' }));
+    grad.appendChild(s('stop', { offset: '0', style: 'stop-color:' + COLORS.requests + ';stop-opacity:.28' }));
+    grad.appendChild(s('stop', { offset: '1', style: 'stop-color:' + COLORS.requests + ';stop-opacity:0' }));
     var defs = s('defs'); defs.appendChild(grad); svg.appendChild(defs);
     if (n) {
-      svg.appendChild(s('path', { d: line + ' L' + W + ' ' + H + ' L0 ' + H + ' Z', fill: 'url(#' + gid + ')' }));
-      svg.appendChild(s('path', { d: line, fill: 'none', stroke: COLORS.requests, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round' }));
+      svg.appendChild(s('path', { d: line + ' L' + W + ' ' + H + ' L0 ' + H + ' Z', style: 'fill:url(#' + gid + ');stroke:none' }));
+      svg.appendChild(s('path', { d: line, style: 'fill:none;stroke:' + COLORS.requests, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round' }));
     }
     return h('div', { className: 'pcdn-spark-wrap' }, svg);
   }
@@ -74,7 +76,7 @@
       var x = xAt(best);
       cross.setAttribute('x1', x); cross.setAttribute('x2', x); cross.setAttribute('visibility', 'visible');
       while (dots.firstChild) dots.removeChild(dots.firstChild);
-      (dotsAt ? dotsAt(best) : []).forEach(function (d) { dots.appendChild(s('circle', { cx: x, cy: d[0], r: 4, fill: '#fff', stroke: d[1], 'stroke-width': 2 })); });
+      (dotsAt ? dotsAt(best) : []).forEach(function (d) { dots.appendChild(s('circle', { cx: x, cy: d[0], r: 4, style: 'fill:var(--pc-surface);stroke:' + d[1], 'stroke-width': 2 })); });
       dots.setAttribute('visibility', 'visible');
       clear(tip);
       append(tip, rowsAt(best));
@@ -106,12 +108,12 @@
     series.forEach(function (sr) {
       var gid = P.uid('pcdn-g-');
       var g = s('linearGradient', { id: gid, x1: 0, y1: 0, x2: 0, y2: 1 });
-      g.appendChild(s('stop', { offset: '0', 'stop-color': sr.color, 'stop-opacity': '.22' }));
-      g.appendChild(s('stop', { offset: '1', 'stop-color': sr.color, 'stop-opacity': '0.02' }));
+      g.appendChild(s('stop', { offset: '0', style: 'stop-color:' + sr.color + ';stop-opacity:.22' }));
+      g.appendChild(s('stop', { offset: '1', style: 'stop-color:' + sr.color + ';stop-opacity:.02' }));
       defs.appendChild(g);
       var d = sr.values.map(function (v, i2) { return (i2 ? 'L' : 'M') + xAt(i2).toFixed(1) + ' ' + f.y(v).toFixed(1); }).join(' ');
-      f.svg.appendChild(s('path', { d: d + ' L' + xAt(f.n - 1).toFixed(1) + ' ' + (f.T + f.ph) + ' L' + xAt(0).toFixed(1) + ' ' + (f.T + f.ph) + ' Z', fill: 'url(#' + gid + ')' }));
-      f.svg.appendChild(s('path', { d: d, fill: 'none', stroke: sr.color, 'stroke-width': 2.2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+      f.svg.appendChild(s('path', { d: d + ' L' + xAt(f.n - 1).toFixed(1) + ' ' + (f.T + f.ph) + ' L' + xAt(0).toFixed(1) + ' ' + (f.T + f.ph) + ' Z', style: 'fill:url(#' + gid + ');stroke:none' }));
+      f.svg.appendChild(s('path', { d: d, style: 'fill:none;stroke:' + sr.color, 'stroke-width': 2.2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
     });
     hover(f, xAt, function (i2) {
       return [h('div', { className: 'pcdn-tip-title', text: labels[i2] })].concat(series.map(function (sr) { return tipRow(sr.color, sr.name, fmt(sr.values[i2])); }));
@@ -129,7 +131,7 @@
       var y = f.y(v), x = xAt(i) - bw / 2, bh = f.T + f.ph - y;
       if (bh <= 0) return;
       var r = Math.min(4, bw / 2, bh);
-      f.svg.appendChild(s('path', { fill: color, class: 'pcdn-bar', d: 'M' + x + ' ' + (y + bh) + 'V' + (y + r) + 'Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y +
+      f.svg.appendChild(s('path', { style: 'fill:' + color + ';stroke:none', class: 'pcdn-bar', d: 'M' + x + ' ' + (y + bh) + 'V' + (y + r) + 'Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y +
         'H' + (x + bw - r) + 'Q' + (x + bw) + ' ' + y + ' ' + (x + bw) + ' ' + (y + r) + 'V' + (y + bh) + 'Z' }));
     });
     hover(f, xAt, function (i) { return [h('div', { className: 'pcdn-tip-title', text: labels[i] }), tipRow(color, name, fmt(values[i]))]; });
@@ -141,12 +143,12 @@
     var R = 52, C = 2 * Math.PI * R, off = 0;
     var svg = s('svg', { viewBox: '0 0 140 140', class: 'pcdn-donut', role: 'img', focusable: 'false',
       'aria-label': parts.map(function (p) { return p.label + ': ' + P.pct(p.value, total); }).join('، ') });
-    svg.appendChild(s('circle', { cx: 70, cy: 70, r: R, fill: 'none', stroke: 'var(--pc-track)', 'stroke-width': 18 }));
+    svg.appendChild(s('circle', { cx: 70, cy: 70, r: R, style: 'fill:none;stroke:var(--pc-track)', 'stroke-width': 18 }));
     parts.forEach(function (p) {
       var v = Number(p.value) || 0;
       if (!total || !v) return;
       var len = Math.max(0.5, C * v / total - (parts.length > 1 ? 1.5 : 0));
-      svg.appendChild(s('circle', { cx: 70, cy: 70, r: R, fill: 'none', stroke: p.color, 'stroke-width': 18, 'stroke-dasharray': len + ' ' + (C - len),
+      svg.appendChild(s('circle', { cx: 70, cy: 70, r: R, style: 'fill:none;stroke:' + p.color, 'stroke-width': 18, 'stroke-dasharray': len + ' ' + (C - len),
         'stroke-dashoffset': -off, transform: 'rotate(-90 70 70)' }));
       off += C * v / total;
     });

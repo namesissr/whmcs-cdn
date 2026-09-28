@@ -265,10 +265,11 @@
   var layer = null, toasts = null;
   function getLayer() {
     if (!layer) {
-      layer = h('div', { className: 'pcdn pcdn-layer', dir: 'rtl', lang: 'fa' });
+      layer = h('div', { id: 'pcdn-layer', className: 'pcdn pcdn-layer', dir: 'rtl', lang: 'fa' });
       toasts = h('div', { className: 'pcdn-toasts', role: 'status', 'aria-live': 'polite' });
       layer.appendChild(toasts);
       document.body.appendChild(layer);
+      theme.attach(layer);
     }
     return layer;
   }
@@ -712,6 +713,313 @@
     }));
   }
 
+  // ------------------------------------------------------------------ theme: blend into the host page
+  //
+  // The app has no page background of its own. PCDN.theme reads the host page around #pcdn-app —
+  // background (colour or gradient), text colour, primary colour and font — decides light/dark and
+  // derives the neutral + brand tokens from it (set inline on the app root and the overlay layer),
+  // so our cards look like the host theme's own cards. Mode: data-theme="auto|light|dark" on
+  // #pcdn-app (templates/clientarea.tpl) or boot.theme; default "auto". It re-checks when the host
+  // toggles a class/style/data-theme on <html>/<body>, on prefers-color-scheme changes and on load.
+
+  var theme = (function () {
+    var WHITE = [255, 255, 255, 1], BLACK = [0, 0, 0, 1], INK = [11, 18, 32, 1];
+    var PERSIAN = /vazir|iran\s?sans|iransans|yekan|shabnam|sahel|samim|tanha|dana|peyda|estedad|kalameh|morabba|irancell|parastoo|nahid|gandom/i;
+    var targets = [], rootEl = null, mode = 'auto', applied = {}, attr = null, last = '', timer = null, cvs = null, watching = false;
+
+    function parse(str) {
+      str = String(str || '').trim();
+      if (!str || str === 'transparent' || str === 'none') return null;
+      var m = str.match(/^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i);
+      if (m) return [+m[1], +m[2], +m[3], m[4] === undefined ? 1 : m[4].slice(-1) === '%' ? parseFloat(m[4]) / 100 : +m[4]];
+      m = str.match(/^#([0-9a-f]{3,8})$/i);
+      if (m) {
+        var x = m[1];
+        if (x.length < 6) x = x.split('').map(function (c) { return c + c; }).join('');
+        return [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2, 4), 16), parseInt(x.slice(4, 6), 16), x.length === 8 ? parseInt(x.slice(6, 8), 16) / 255 : 1];
+      }
+      try { // oklch(), color(srgb …), hsl(), names: let a canvas normalise it
+        cvs = cvs || document.createElement('canvas');
+        cvs.width = cvs.height = 1;
+        var cx = cvs.getContext('2d');
+        if (!cx) return null;
+        cx.fillStyle = '#010203'; cx.fillStyle = str;
+        if (cx.fillStyle === '#010203') return null;
+        cx.clearRect(0, 0, 1, 1); cx.fillRect(0, 0, 1, 1);
+        var d = cx.getImageData(0, 0, 1, 1).data;
+        return [d[0], d[1], d[2], d[3] / 255];
+      } catch (e) { return null; }
+    }
+    function lin(v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+    function lum(c) { return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]); }
+    function contrast(a, b) { var x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+    function mix(a, b, t) { return [0, 1, 2].map(function (i) { return a[i] + (b[i] - a[i]) * t; }).concat([1]); }
+    function over(top, bot) {
+      var a = top[3] + bot[3] * (1 - top[3]);
+      if (!a) return [0, 0, 0, 0];
+      return [0, 1, 2].map(function (i) { return (top[i] * top[3] + bot[i] * bot[3] * (1 - top[3])) / a; }).concat([a]);
+    }
+    function hex(c) { return '#' + c.slice(0, 3).map(function (v) { var s2 = Math.max(0, Math.min(255, Math.round(v))).toString(16); return s2.length < 2 ? '0' + s2 : s2; }).join(''); }
+    function rgba(c, a) { return 'rgba(' + c.slice(0, 3).map(Math.round).join(', ') + ', ' + a + ')'; }
+    function chroma(c) { return Math.max(c[0], c[1], c[2]) - Math.min(c[0], c[1], c[2]); }
+    /** Worst contrast of fg against a list of backgrounds. */
+    function worst(fg, bgs) { return Math.min.apply(null, bgs.map(function (b) { return contrast(fg, b); })); }
+    /** Move fg toward `to` until it reaches `ratio` against every bg. */
+    function ensure(fg, bgs, ratio, to) {
+      for (var i = 0; i < 25 && worst(fg, bgs) < ratio; i++) fg = mix(fg, to, 0.08);
+      return fg;
+    }
+
+    /** Average colour of a CSS gradient (computed background-image), or null. */
+    function gradient(img) {
+      if (!img || img === 'none' || img.indexOf('gradient') < 0) return null;
+      var list = img.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}\b|(?:color|oklch|oklab|lab|lch|hsla?)\([^)]*\)/gi) || [];
+      var acc = [0, 0, 0], w = 0, n = 0;
+      list.forEach(function (x) { var c = parse(x); if (c) { n++; if (c[3] > 0) { acc[0] += c[0] * c[3]; acc[1] += c[1] * c[3]; acc[2] += c[2] * c[3]; w += c[3]; } } });
+      return w ? [acc[0] / w, acc[1] / w, acc[2] / w, Math.min(1, w / n)] : null;
+    }
+    /** Painted background of one element (gradient over colour), or null. */
+    function paintOf(el) {
+      var cs = window.getComputedStyle(el), c = parse(cs.backgroundColor), g = gradient(cs.backgroundImage);
+      if (c && c[3] < 0.02) c = null;
+      return g && c ? over(g, c) : g || c;
+    }
+    /** First (composited) non-transparent background from `el` upwards. */
+    function hostBg(el) {
+      var layers = [];
+      for (; el && el.nodeType === 1; el = el.parentElement) {
+        var p = paintOf(el);
+        if (p) { layers.push(p); if (p[3] >= 0.98) break; }
+      }
+      if (!layers.length) return null;
+      var res = layers[layers.length - 1][3] >= 0.98 ? layers.pop() : WHITE;
+      while (layers.length) res = over(layers.pop(), res);
+      return res.slice(0, 3).concat([1]);
+    }
+    function inApp(el) { return !!(el.closest && el.closest('#pcdn-app, #pcdn-layer')); }
+    /** The host's primary colour: a real .btn-primary (what users see, incl. custom.css), the Bootstrap vars, or a hidden probe. */
+    function hostBrand(host) {
+      function ok(c) { return c && c[3] > 0.5 && chroma(c) >= 24 ? c.slice(0, 3).concat([1]) : null; }
+      var list = document.querySelectorAll('.btn-primary'), c = null, i;
+      for (i = 0; i < list.length && i < 20 && !c; i++) if (!inApp(list[i])) c = ok(paintOf(list[i]));
+      if (c) return c;
+      var st = [window.getComputedStyle(document.documentElement), document.body ? window.getComputedStyle(document.body) : null];
+      ['--bs-primary', '--primary'].forEach(function (v) { st.forEach(function (x) { if (!c && x) c = ok(parse(x.getPropertyValue(v))); }); });
+      if (c) return c;
+      try {
+        var probe = document.createElement('button');
+        probe.type = 'button'; probe.className = 'btn btn-primary'; probe.tabIndex = -1;
+        probe.setAttribute('aria-hidden', 'true');
+        probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;left:-9999px;top:0';
+        probe.textContent = 'x';
+        (host || document.body).appendChild(probe);
+        c = ok(paintOf(probe));
+        probe.parentNode.removeChild(probe);
+      } catch (e) { c = null; }
+      return c;
+    }
+    /** A host card colour (.card / .panel outside the app) when it clearly is one. */
+    function hostCard(bg, dark) {
+      var list = document.querySelectorAll('.card, .panel'), i, c;
+      for (i = 0; i < list.length && i < 30; i++) {
+        if (inApp(list[i]) || list[i].contains(rootEl)) continue;
+        c = paintOf(list[i]);
+        if (!c || c[3] < 0.98) continue;
+        var L = lum(c);
+        if (dark ? (L < 0.2 && L >= lum(bg) && contrast(c, bg) < 1.8) : (L > 0.75 && contrast(c, bg) < 1.35)) return c.slice(0, 3).concat([1]);
+        return null;
+      }
+      return null;
+    }
+
+    function derive(bg, fg, dark, brandC, card) {
+      var v = {}, surface, s2, text;
+      if (dark) {
+        surface = card && lum(card) > lum(bg) + 0.002 ? card : mix(bg, WHITE, 0.055);
+        text = fg && lum(fg) > 0.55 && contrast(fg, surface) >= 7 ? fg : [231, 235, 242, 1];
+        s2 = mix(surface, WHITE, 0.03);
+        v.elevated = mix(surface, WHITE, 0.03);
+        v.hover = mix(surface, text, 0.06);
+        v.fill = mix(surface, text, 0.07);
+        v['fill-2'] = mix(surface, text, 0.09);
+        v['row-hover'] = mix(surface, text, 0.03);
+        v['seg-bg'] = mix(surface, BLACK, 0.28);
+        v.border = mix(bg, text, 0.14);
+        v['border-strong'] = mix(bg, text, 0.24);
+        v['border-hover'] = mix(bg, text, 0.34);
+        v['input-bg'] = mix(surface, BLACK, 0.14);
+        v['switch-off'] = mix(surface, text, 0.3);
+        v.knob = mix(text, WHITE, 0.3);
+        v.track = mix(surface, text, 0.12);
+        v.handle = v['border-strong'];
+        v['skel-a'] = mix(surface, text, 0.07);
+        v['skel-b'] = mix(surface, text, 0.12);
+        v.grid = mix(surface, text, 0.09);
+        v.baseline = mix(surface, text, 0.2);
+        v.cross = mix(surface, text, 0.4);
+        v['tip-bg'] = mix(bg, WHITE, 0.13);
+        v['tip-border'] = v['border-strong'];
+        v['code-bg'] = mix(bg, BLACK, 0.35);
+        v['code-head'] = mix(v['code-bg'], WHITE, 0.05);
+        v['code-border'] = v.border;
+        v['code-line'] = mix(v['code-bg'], WHITE, 0.16);
+        v['inv-bg'] = mix(bg, WHITE, 0.13);
+        v['inv-bg-2'] = mix(bg, WHITE, 0.09);
+        v['inv-edge'] = v['border-strong'];
+      } else {
+        surface = card || (lum(bg) > 0.97 ? bg : mix(bg, WHITE, 0.65));
+        text = fg && lum(fg) < 0.2 && contrast(fg, surface) >= 7 ? fg : [15, 23, 42, 1];
+        var base = mix(surface, bg, 0.45);
+        s2 = mix(base, text, 0.018);
+        v.elevated = surface;
+        v.hover = mix(base, text, 0.04);
+        v.fill = mix(base, text, 0.045);
+        v['fill-2'] = mix(base, text, 0.06);
+        v['row-hover'] = mix(surface, text, 0.015);
+        v['seg-bg'] = mix(base, text, 0.09);
+        v.border = mix(base, text, 0.11);
+        v['border-strong'] = mix(surface, text, 0.2);
+        v['border-hover'] = mix(surface, text, 0.32);
+        v['input-bg'] = surface;
+        v['switch-off'] = mix(surface, text, 0.27);
+        v.track = mix(base, text, 0.08);
+        v.handle = mix(surface, text, 0.16);
+        v['skel-a'] = mix(surface, text, 0.07);
+        v['skel-b'] = mix(surface, text, 0.035);
+        v.grid = mix(surface, text, 0.07);
+        v.baseline = mix(surface, text, 0.18);
+        v.cross = mix(surface, text, 0.4);
+      }
+      v.surface = surface;
+      v['surface-2'] = s2;
+      v.text = ensure(text, [surface, s2, v.fill, v.hover], 7, dark ? WHITE : BLACK);
+      v['input-disabled'] = v.fill;
+      var backs = [surface, s2, v.fill, v['fill-2'], v.hover, v.elevated];
+      v['text-2'] = ensure(mix(v.text, surface, 0.16), backs, 7, dark ? WHITE : BLACK);
+      v.muted = ensure(mix(v.text, surface, 0.4), backs, 4.6, dark ? WHITE : BLACK);
+      v.faint = ensure(mix(v.text, surface, 0.52), [surface, v['input-bg']], 3.2, dark ? WHITE : BLACK);
+      v.axis = v.muted;
+      if (dark) {
+        v['tip-fg'] = v.text;
+        v['tip-label'] = ensure(v['text-2'], [v['tip-bg']], 7, WHITE);
+        v['tip-muted'] = ensure(v.muted, [v['tip-bg']], 4.6, WHITE);
+      }
+
+      // brand
+      var b = brandC || [29, 95, 214, 1];
+      if (dark && contrast(b, surface) < 2) b = ensure(b, [surface], 2, WHITE);
+      var on = WHITE;
+      if (contrast(WHITE, b) < 4.5) {
+        var d0 = b, k = 0;
+        while (contrast(WHITE, d0) < 4.5 && k < 4) { d0 = mix(d0, BLACK, 0.06); k++; }
+        if (contrast(WHITE, d0) >= 4.5) b = d0; else on = ensure(INK, [b], 4.5, BLACK);
+      }
+      v.brand = b;
+      v['on-brand'] = on;
+      v['brand-hover'] = on === WHITE ? mix(b, BLACK, 0.14) : mix(b, WHITE, 0.16);
+      v['brand-lite'] = mix(b, WHITE, 0.18);
+      v['brand-deep'] = mix(b, BLACK, 0.22);
+      v['brand-50'] = mix(surface, b, dark ? 0.16 : 0.08);
+      v['brand-100'] = mix(surface, b, dark ? 0.32 : 0.2);
+      var lb = [surface, s2, v['brand-50'], v.hover, v.elevated];
+      v.link = ensure(b, lb, 4.6, dark ? WHITE : BLACK);
+      v['brand-600'] = ensure(mix(v.link, dark ? WHITE : BLACK, 0.12), lb, 4.6, dark ? WHITE : BLACK);
+      v['info-strong'] = ensure(mix(b, dark ? WHITE : BLACK, 0.45), [v['brand-50'], surface], 6, dark ? WHITE : BLACK);
+      v['hero-end'] = mix(surface, b, dark ? 0.12 : 0.07);
+      v['guide-a'] = mix(surface, b, dark ? 0.04 : 0.015);
+      v['guide-b'] = mix(surface, b, dark ? 0.09 : 0.05);
+      v['upgrade-end'] = mix(surface, [139, 92, 246, 1], dark ? 0.12 : 0.05);
+      v.ring = '0 0 0 3px ' + rgba(dark ? v.link : b, dark ? 0.45 : 0.32);
+      v['brand-glow'] = dark ? 'rgba(0, 0, 0, .35)' : rgba(b, 0.28);
+      v.page = bg;
+      var out = {};
+      Object.keys(v).forEach(function (key) { out['--pc-' + key] = Array.isArray(v[key]) ? hex(v[key]) : v[key]; });
+      return out;
+    }
+
+    function detect() {
+      if (!rootEl) return;
+      var host = rootEl.parentElement || document.body;
+      var bg = hostBg(host), fgRaw = parse(window.getComputedStyle(host).color);
+      var fg = fgRaw && fgRaw[3] > 0.3 ? fgRaw.slice(0, 3).concat([1]) : null;
+      var brandC = hostBrand(host), dark, forced = mode === 'light' || mode === 'dark';
+      if (forced) {
+        dark = mode === 'dark';
+        bg = dark ? [17, 24, 39, 1] : [243, 245, 249, 1];
+        fg = null;
+      } else {
+        var fgL = fg ? lum(fg) : null, bgL = bg ? lum(bg) : null;
+        if (fgL !== null && fgL > 0.5) dark = true;          // light text: dark theme whatever the walk found
+        else if (fgL !== null && fgL < 0.1) dark = false;    // dark text: light theme
+        else dark = bgL !== null && bgL < 0.18;
+        if (dark && (bgL === null || bgL > 0.12)) {          // signals disagree / gradient we could not read: synthesise
+          var hue = brandC || [30, 41, 90, 1];
+          bg = mix([17, 24, 39, 1], hue, 0.12);
+        }
+        if (!dark && (bgL === null || bgL < 0.35)) bg = [248, 250, 252, 1];
+      }
+      var card = forced ? null : hostCard(bg, dark);
+      var vars = derive(bg, fg, dark, brandC, card);
+      var ff = window.getComputedStyle(host).fontFamily || '';
+      if (PERSIAN.test(ff)) vars['--pc-font'] = ff + ", 'PCDN Vazirmatn', Tahoma, sans-serif";
+      var key = JSON.stringify(vars) + dark + forced;
+      if (key === last) return;
+      last = key;
+      applied = vars;
+      attr = dark ? 'dark' : 'light';
+      targets.forEach(paint);
+      rootEl.classList.toggle('pcdn-framed', forced);
+    }
+    function paint(el) {
+      var old = el.getAttribute('data-pcdn-vars');
+      if (old) old.split(' ').forEach(function (k) { if (!(k in applied)) el.style.removeProperty(k); });
+      Object.keys(applied).forEach(function (k) { el.style.setProperty(k, applied[k]); });
+      el.setAttribute('data-pcdn-vars', Object.keys(applied).join(' '));
+      if (attr) el.setAttribute('data-pcdn-theme', attr);
+    }
+    function schedule() { clearTimeout(timer); timer = setTimeout(detect, 120); }
+    function hostSig() {
+      return [document.documentElement, document.body].map(function (el) {
+        return el ? ['class', 'style', 'data-theme', 'data-bs-theme', 'data-mode', 'data-color-scheme'].map(function (a) {
+          var x = el.getAttribute(a) || '';
+          return a === 'class' ? x.split(/\s+/).filter(function (c) { return c.indexOf('pcdn-') !== 0; }).join(' ') : x;
+        }).join('|') : '';
+      }).join('#');
+    }
+    function watch() {
+      if (watching) return;
+      watching = true;
+      var sig = hostSig();
+      if (window.MutationObserver) {
+        var mo = new window.MutationObserver(function () { var s2 = hostSig(); if (s2 !== sig) { sig = s2; schedule(); } });
+        var opts = { attributes: true, attributeFilter: ['class', 'style', 'data-theme', 'data-bs-theme', 'data-mode', 'data-color-scheme'] };
+        mo.observe(document.documentElement, opts);
+        if (document.body) mo.observe(document.body, opts);
+      }
+      if (window.matchMedia) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        if (mq.addEventListener) mq.addEventListener('change', schedule); else if (mq.addListener) mq.addListener(schedule);
+      }
+      if (document.readyState !== 'complete') window.addEventListener('load', schedule);
+    }
+    return {
+      /** Start theming `root`; `pref` = "auto" | "light" | "dark" (data-theme on the root wins). */
+      init: function (root, pref) {
+        rootEl = root;
+        var m = String(root.getAttribute('data-theme') || pref || 'auto').toLowerCase();
+        mode = m === 'light' || m === 'dark' ? m : 'auto';
+        if (targets.indexOf(root) < 0) targets.push(root);
+        try { detect(); } catch (e) { root.setAttribute('data-pcdn-theme', 'light'); }
+        watch();
+      },
+      /** Give another .pcdn element (the overlay layer) the same palette. */
+      attach: function (el) { if (targets.indexOf(el) < 0) { targets.push(el); if (attr) paint(el); } },
+      refresh: detect,
+      current: function () { return { theme: attr, mode: mode, vars: applied }; },
+      _util: { parse: parse, lum: lum, contrast: contrast, mix: mix, hex: hex }
+    };
+  })();
+
   // ------------------------------------------------------------------ export
 
   var K = {
@@ -722,7 +1030,7 @@
     copyable: copyable, badge: badge, alertBox: alertBox, card: card, collapsible: collapsible, empty: empty, skeleton: skeleton, meter: meter,
     beginForm: beginForm, endForm: endForm, pathOf: pathOf, reg: reg, placeErrors: placeErrors, clearErrors: clearErrors,
     field: field, toggle: toggle, switchInput: switchInput, select: select, input: input, duration: duration, tags: tags,
-    choice: choice, checks: checks, textarea: textarea, segmented: segmented, getLayer: getLayer
+    choice: choice, checks: checks, textarea: textarea, segmented: segmented, getLayer: getLayer, theme: theme
   };
   Object.keys(K).forEach(function (k) { P[k] = K[k]; });
 })();
