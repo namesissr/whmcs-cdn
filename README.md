@@ -302,16 +302,36 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 
 ## GeoDNS (ترافیک ایران از نودهای داخل)
 
-به‌طور پیش‌فرض، همه نودهای سالم به‌صورت تصادفی در پاسخ DNS قرار می‌گیرند. برای اینکه کاربران ایرانی به نودهای `home` و بقیه به نودهای `global` هدایت شوند، این مراحل را انجام دهید:
+به‌طور پیش‌فرض، همه نودهای سالم به‌صورت تصادفی در پاسخ DNS قرار می‌گیرند. با GeoDNS:
+- کاربران ایران فقط نودهای `home` را می‌گیرند.
+- بقیه کاربران نودهای `global` را می‌گیرند.
+- اگر همه نودهای یک گروه از کار بیفتند، گروه دیگر خودکار جایگزین می‌شود.
 
-1. دیتابیس رایگان [GeoLite2-City](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) را دانلود کنید و در کانتینر PowerDNS در مسیر `/etc/powerdns/GeoLite2-City.mmdb` قرار دهید. برای این کار یک volume اضافه کنید.
-2. یک فایل `/etc/powerdns/geo-zones.yaml` با محتوای `domains: []` بسازید.
-3. سه خط `launch+=geoip`، `geoip-database-files` و `geoip-zones-file` را در `dns/pdns.conf` از حالت توضیح خارج کنید.
-4. در `.env` مقدار `GEOIP_ENABLED=true` را تنظیم کنید. در صورت تمایل `LUA_SELECTOR=pickclosest` را هم بگذارید.
+این رفتار روی PowerDNS 4.9 واقعی تست شده است.
 
-بعد از این تغییرات، پاسخ DNS برای کاربران ایران ابتدا نودهای `home` است. اگر همه نودهای `home` از دسترس خارج شوند، نودهای `global` جایگزین می‌شوند. برای بقیه کاربران برعکس است.
+روی سرور کنترل‌پنل (و روی ns2، اگر جداست):
 
----
+1. دیتابیس رایگان کشورها (DB-IP Lite، مجوز CC BY 4.0) را دانلود کنید:
+   ```bash
+   cd /opt/pcdn && sudo deploy/geoip-update.sh --no-restart
+   ```
+2. به `.env` این دو خط را اضافه کنید:
+   ```
+   COMPOSE_FILE=docker-compose.yml:deploy/geoip.override.yml
+   GEOIP_ENABLED=true
+   ```
+3. سرویس‌ها را بالا بیاورید و همه زون‌ها را دوباره بنویسید:
+   ```bash
+   sudo docker compose up -d
+   sudo docker compose exec controller python -m app.manage dns-sync
+   ```
+4. برای به‌روزرسانی ماهانه دیتابیس، کران اضافه کنید:
+   ```bash
+   echo '0 4 3 * * root /opt/pcdn/deploy/geoip-update.sh >> /var/log/pcdn-geoip.log 2>&1' | sudo tee /etc/cron.d/pcdn-geoip
+   ```
+5. **روی ns2:** مرحله ۱ را در همان مسیر اجرا کنید، سپس با `-f ns2-compose.yml -f ns2-geoip.override.yml` بالا بیاورید. هر دو نیم‌سرور باید پاسخ یکسان بدهند.
+
+اگر `download.db-ip.com` از سرور در دسترس نبود، فایل `dbip-country-lite-YYYY-MM.mmdb.gz` را از جای دیگری دانلود کنید. آن را از حالت فشرده خارج کنید و با نام `dns/geo/country.mmdb` روی سرور بگذارید.
 
 ## مرجع API
 

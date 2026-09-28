@@ -1,0 +1,8 @@
+# Same GeoDNS setup for a standalone ns2 (both nameservers must answer the same way):
+#   cd /opt/pcdn/deploy && sudo ./geoip-update.sh --no-restart
+#   sudo PDNS_API_KEY=... docker compose -f ns2-compose.yml -f ns2-geoip.override.yml up -d
+services:
+  pdns:
+    volumes:
+      - ../dns/geoip.conf:/etc/powerdns/pdns.d/geoip.conf:ro
+      - ../dns/geo:/etc/powerdns/geo:ro
