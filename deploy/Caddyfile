@@ -8,10 +8,15 @@
 	encode gzip
 
 	reverse_proxy {
+		# static fallback: used whenever the dynamic lookup below fails or is slow
+		# (e.g. right after `docker compose up`, before Docker's DNS knows the containers)
+		to controller:8000
 		dynamic a {
 			name controller
 			port 8000
 			refresh 5s
+			resolvers 127.0.0.11
+			dial_timeout 2s
 		}
 		lb_policy round_robin
 		lb_try_duration 10s
