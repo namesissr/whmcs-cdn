@@ -1,0 +1,104 @@
+# Server B (standby) in the two-server HA setup — docs/OPERATIONS.md, section "HA".
+# Runs: ns2 (PowerDNS), a PostgreSQL hot standby that streams from server A, a second
+# controller and Caddy. Replaces deploy/ns2-compose.yml on B.
+#
+#   cd /opt/pcdn && cp <A's .env> .env   # same ADMIN_API_KEY, DATA_ENCRYPTION_KEY, PDNS_API_KEY, POSTGRES_PASSWORD
+#   edit .env: PRIVATE_IP (B), DATABASE_URL (both hosts), PDNS_API_URL, INSTANCE_NAME=server-b
+#   initialise the standby once (pg_basebackup, see the doc), then:
+#   docker compose -p pcdn -f deploy/ha-standby-compose.yml --env-file .env up -d --build
+#
+# While A is primary, B's controller writes to A's database (libpq picks the writable host
+# from DATABASE_URL) and follows A's scheduler (advisory lock). After `pg_promote()` on B,
+# B's controller reconnects to the local database and takes over the scheduler by itself.
+
+x-controller: &controller
+  build: ../controller
+  image: pcdn-controller:local
+  restart: unless-stopped
+  env_file: ../.env
+  environment:
+    # must list both servers, e.g.
+    # postgresql+psycopg://pcdn:PW@/pcdn?host=10.0.0.1:5432&host=db:5432&target_session_attrs=read-write&connect_timeout=5
+    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL with both database hosts}
+    BACKUP_DIR: /data/backups
+    BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+
+services:
+  controller:
+    <<: *controller
+    volumes:
+      - controller-data:/data
+      - pdns-data:/pdns-data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - db
+      - pdns
+
+  tools:
+    <<: *controller
+    profiles: ["tools"]
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL with both database hosts}
+      BACKUP_DIR: /data/backups
+      BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+      SCHEDULER_ENABLED: "false"
+    volumes:
+      - controller-data:/data
+      - pdns-data:/pdns-data
+    command: ["python", "-m", "app.manage", "--help"]
+
+  # hot standby: the data directory is created by pg_basebackup -R (standby.signal +
+  # primary_conninfo), so this container starts as a read-only replica of server A.
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pcdn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: pcdn
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's private address}:5432:5432"
+    command: ["postgres", "-c", "hot_standby=on", "-c", "wal_level=replica", "-c", "max_wal_senders=10",
+              "-c", "max_replication_slots=10", "-c", "wal_keep_size=1GB"]
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  # ns2 — same as deploy/ns2-compose.yml (A's controller writes to it through port 8081)
+  pdns:
+    image: powerdns/pdns-auth-49:latest
+    restart: unless-stopped
+    environment:
+      PDNS_AUTH_API_KEY: ${PDNS_API_KEY}
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "${PRIVATE_IP:?set PRIVATE_IP}:8081:8081"
+    volumes:
+      - pdns-data:/var/lib/powerdns
+      - ../dns/pdns.conf:/etc/powerdns/pdns.d/pcdn.conf:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      CONTROLLER_DOMAIN: ${CONTROLLER_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - controller
+
+volumes:
+  controller-data:
+  db-data:
+  pdns-data:
+  caddy-data:

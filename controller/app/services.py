@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from . import pdns, sections
 from .config import settings
-from .models import Edge, Purge, Site, UsageHourly, utcnow
+from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
 
 log = logging.getLogger("pcdn")
@@ -22,8 +22,15 @@ def online_edges(db: Session) -> list[Edge]:
     ))
 
 
-def sync_site_dns(db: Session, site: Site) -> str | None:
-    """Push the zone to PowerDNS. Returns an error string on failure."""
+DNS_DIRTY_KEY = "dns_dirty"
+
+
+def sync_site_dns(db: Session, site: Site, server_errors: dict[int, str] | None = None) -> str | None:
+    """Push the zone to PowerDNS. Returns an error string on failure.
+
+    A failure marks DNS as dirty so the scheduler re-syncs every zone once the
+    PowerDNS server is reachable again (see scheduler.job_edges).
+    """
     if not settings.pdns_enabled:
         return None
     try:
@@ -31,13 +38,26 @@ def sync_site_dns(db: Session, site: Site) -> str | None:
         return None
     except Exception as e:  # noqa: BLE001 - never break the API because DNS is down
         log.exception("DNS sync failed for %s", site.domain)
+        if server_errors is not None:
+            server_errors.update(getattr(e, "servers", None) or {-1: str(e)})
+        mark_dns_dirty(db)
         return str(e)
 
 
-def sync_all_dns(db: Session) -> int:
+def mark_dns_dirty(db: Session):
+    try:
+        if db.get(State, DNS_DIRTY_KEY) is None:
+            db.add(State(key=DNS_DIRTY_KEY, value=utcnow().isoformat()))
+        db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("could not flag DNS for resync")
+        db.rollback()
+
+
+def sync_all_dns(db: Session, server_errors: dict[int, str] | None = None) -> int:
     failed = 0
-    for site in db.scalars(select(Site)):
-        if sync_site_dns(db, site):
+    for site in list(db.scalars(select(Site))):
+        if sync_site_dns(db, site, server_errors):
             failed += 1
     return failed
 

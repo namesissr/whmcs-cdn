@@ -6,17 +6,38 @@ on:
 
 jobs:
   controller:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: controller
+    # migrations, leader election and pg_dump/pg_restore are also tested against a real PostgreSQL
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pcdn
+          POSTGRES_PASSWORD: pcdn
+          POSTGRES_DB: pcdn
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pcdn" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PCDN_TEST_PG_URL: postgresql+psycopg://pcdn:pcdn@127.0.0.1:5432/pcdn
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: PostgreSQL 16 client (pg_dump / pg_restore for the backup tests)
+        run: |
+          if ! pg_dump --version | grep -q " 16\."; then
+            sudo apt-get update -q && sudo apt-get install -y -q postgresql-client-16
+          fi
+          pg_dump --version
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q
+      - run: python -m pyflakes app tests migrations
+      - run: python -m pytest -q -rs
 
   edge:
     runs-on: ubuntu-24.04

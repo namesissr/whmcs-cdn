@@ -18,7 +18,10 @@ PROTECTED_PREFIXES = ("_acme-challenge.",)
 
 
 class PdnsError(RuntimeError):
-    pass
+    def __init__(self, message: str, servers: dict[int, str] | None = None):
+        super().__init__(message)
+        # index in PDNS_API_URL -> error, for per-server alerts
+        self.servers = servers or {}
 
 
 class PdnsClient:
@@ -119,14 +122,14 @@ class PdnsCluster:
         self.clients = clients
 
     def _each(self, fn):
-        errors = []
-        for c in self.clients:
+        errors = {}
+        for i, c in enumerate(self.clients):
             try:
                 fn(c)
             except Exception as e:  # noqa: BLE001
-                errors.append(f"{c.base}: {e}")
+                errors[i] = f"{c.base}: {e}"
         if errors:
-            raise PdnsError("; ".join(errors))
+            raise PdnsError("; ".join(errors.values()), errors)
 
     def sync_zone(self, site, edges):
         self._each(lambda c: c.sync_zone(site, edges))
@@ -188,6 +191,17 @@ class PdnsCluster:
         # prefer SHA-256 digests (digest type 2)
         ds = [d for d in k.get("ds", []) if d.split()[2:3] == ["2"]] or k.get("ds", [])
         return {"enabled": True, "ds": ds, "dnskey": k.get("dnskey")}
+
+
+def ping(c: PdnsClient, timeout: float = 5) -> str | None:
+    """None when the server's API answers, else a short error (never contains the API key)."""
+    try:
+        r = c.http.get(c.base, timeout=timeout)
+    except httpx.HTTPError as e:
+        return f"{type(e).__name__}: {e}"[:300]
+    if r.status_code != 200:
+        return f"HTTP {r.status_code}"
+    return None
 
 
 _client: PdnsCluster | None = None

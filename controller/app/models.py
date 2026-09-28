@@ -14,6 +14,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from . import crypto
 from .db import Base
 
 
@@ -46,14 +47,16 @@ class Site(Base):
     # customer settings: JSON document of sections (see sections.SECTIONS / SPEC §2)
     config: Mapped[str] = mapped_column(Text, default="{}")
     blocked_ips: Mapped[str] = mapped_column(Text, default="[]")
-    # HMAC key the edges use for challenge clearance cookies
-    secret: Mapped[str] = mapped_column(String(64), default=lambda: secrets.token_hex(32))
+    # HMAC key the edges use for challenge clearance cookies. Stored encrypted when
+    # DATA_ENCRYPTION_KEY is set (see crypto.py); use the `secret` property.
+    secret_stored: Mapped[str] = mapped_column("secret", Text, default=lambda: crypto.encrypt(secrets.token_hex(32)))
     dnssec_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # ssl
     ssl_status: Mapped[str] = mapped_column(String(10), default="none")  # none|pending|active|failed
     ssl_cert: Mapped[str | None] = mapped_column(Text, nullable=True)
-    ssl_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # PEM private key, encrypted at rest when DATA_ENCRYPTION_KEY is set; use the `ssl_key` property
+    ssl_key_stored: Mapped[str | None] = mapped_column("ssl_key", Text, nullable=True)
     ssl_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ssl_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     ssl_source: Mapped[str | None] = mapped_column(String(12), nullable=True)  # letsencrypt | custom
@@ -64,6 +67,22 @@ class Site(Base):
     records: Mapped[list["Record"]] = relationship(
         back_populates="site", cascade="all, delete-orphan", order_by="Record.id"
     )
+
+    @property
+    def ssl_key(self) -> str | None:
+        return crypto.decrypt(self.ssl_key_stored)
+
+    @ssl_key.setter
+    def ssl_key(self, value: str | None):
+        self.ssl_key_stored = crypto.encrypt(value)
+
+    @property
+    def secret(self) -> str:
+        return crypto.decrypt(self.secret_stored)
+
+    @secret.setter
+    def secret(self, value: str):
+        self.secret_stored = crypto.encrypt(value)
 
     @property
     def blocked_ip_list(self) -> list[str]:

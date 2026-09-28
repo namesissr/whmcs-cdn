@@ -1,18 +1,53 @@
 # Pasargad CDN — control plane (controller API + PowerDNS ns1 + Postgres + Caddy TLS)
 # Usage: cp .env.example .env && edit && docker compose up -d --build
+#
+# More than one controller (same server):  docker compose up -d --scale controller=2
+#   only one of them runs the background jobs (leader election in PostgreSQL),
+#   Caddy balances the API across all of them. Two-server HA: docs/OPERATIONS.md.
+# Restore / maintenance commands:   docker compose --profile tools run --rm --no-deps tools python -m app.manage --help
+
+x-controller: &controller
+  build: ./controller
+  image: pcdn-controller:local
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn}
+    BACKUP_DIR: /data/backups
+    BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+  depends_on:
+    - db
+    - pdns
 
 services:
   controller:
-    build: ./controller
-    restart: unless-stopped
-    env_file: .env
+    <<: *controller
+    volumes:
+      - controller-data:/data            # acme.sh home, backups (shared by every replica)
+      - pdns-data:/pdns-data:ro          # PowerDNS sqlite DB (zones + DNSSEC keys), read for backups
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # one-off maintenance container: same image, PowerDNS volume writable (restore).
+  #   docker compose --profile tools run --rm --no-deps tools python -m app.manage restore ... --yes
+  tools:
+    <<: *controller
+    profiles: ["tools"]
+    restart: "no"
     environment:
-      DATABASE_URL: postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn}
+      BACKUP_DIR: /data/backups
+      BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+      SCHEDULER_ENABLED: "false"
     volumes:
       - controller-data:/data
-    depends_on:
-      - db
-      - pdns
+      - pdns-data:/pdns-data
+    # an archive from elsewhere:  ... run --rm -v /root/pcdn-backup-X.tar.gz.enc:/restore/b.enc:ro tools ...
+    command: ["python", "-m", "app.manage", "--help"]
 
   db:
     image: postgres:16-alpine
@@ -39,11 +74,13 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
-    command: caddy reverse-proxy --from ${CONTROLLER_DOMAIN} --to controller:8000
+    environment:
+      CONTROLLER_DOMAIN: ${CONTROLLER_DOMAIN}
     ports:
       - "80:80"
       - "443:443"
     volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
     depends_on:
       - controller

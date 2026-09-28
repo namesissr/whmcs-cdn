@@ -24,9 +24,14 @@ class FakePdns:
 
     def __init__(self):
         self.zones: dict[str, dict] = {}
+        self.down = False  # simulate an unreachable server
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.split("/api/v1/servers/localhost", 1)[1]
+        if self.down:
+            raise httpx.ConnectError("connection refused")
+        if path == "" and request.method == "GET":
+            return httpx.Response(200, json={"id": "localhost", "type": "Server"})
         if path == "/zones" and request.method == "POST":
             body = json.loads(request.content)
             self.zones[body["name"]] = {"name": body["name"], "rrsets": body["rrsets"]}
@@ -93,8 +98,57 @@ def fake_pdns():
 
 @pytest.fixture()
 def client(fake_pdns):
+    from app import routes_ops
+
+    routes_ops._cache["body"] = None  # /healthz/deep caches its answer for a few seconds
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     with TestClient(app) as c:
         c.headers["Authorization"] = "Bearer test-admin-key"
         yield c
+
+
+# ---------------------------------------------------------------- PostgreSQL (optional)
+#
+# Tests marked with the `pg_url` fixture run against a real PostgreSQL server when
+# PCDN_TEST_PG_URL is set (CI sets it; locally e.g.
+# PCDN_TEST_PG_URL=postgresql+psycopg://pcdn:pcdn@127.0.0.1:5432/postgres). Every test gets
+# a fresh database that is dropped afterwards; the role needs CREATEDB.
+
+PG_URL = os.environ.get("PCDN_TEST_PG_URL", "")
+
+
+@pytest.fixture()
+def pg_url():
+    if not PG_URL:
+        pytest.skip("PCDN_TEST_PG_URL not set")
+    import uuid
+
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+
+    name = "pcdn_t_" + uuid.uuid4().hex[:10]
+    admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+    with admin.connect() as c:
+        c.execute(text(f'CREATE DATABASE "{name}"'))
+    url = make_url(PG_URL).set(database=name).render_as_string(hide_password=False)
+    yield url
+    with admin.connect() as c:
+        c.execute(text(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :n AND pid <> pg_backend_pid()"
+        ), {"n": name})
+        c.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+    admin.dispose()
+
+
+@pytest.fixture()
+def alert_settings(monkeypatch):
+    """Reset alert channel settings (tests opt into the channels they need)."""
+    from app import alerts
+    from app.config import settings
+
+    for k, v in {"telegram_bot_token": "", "telegram_chat_ids": [], "smtp_host": "", "alert_emails": [],
+                 "telegram_api_url": "https://api.telegram.org", "alert_reminder_hours": 6.0}.items():
+        monkeypatch.setattr(settings, k, v)
+    monkeypatch.setattr(alerts, "telegram_transport", None)
+    return settings
