@@ -26,6 +26,17 @@
   var SID = String(boot.serviceId || '0');
   // Overage billing: included traffic (WHMCS soft limit) vs the controller hard cap.
   var BILL = boot.billing && Number(boot.billing.included_gb) > 0 ? boot.billing : null;
+  // Prepaid wallet: cap = plan + blocks bought this month from the client's credit balance.
+  var WALLET = boot.wallet && typeof boot.wallet === 'object' && Number(boot.wallet.plan_gb) > 0 ? boot.wallet : null;
+  var ADDFUNDS_URL = ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
+  function money(v) {
+    v = Number(v) || 0;
+    return (v >= 100 ? num(Math.round(v)) : num(Math.round(v * 100) / 100)) + (WALLET && WALLET.currency ? ' ' + WALLET.currency : '');
+  }
+  function addFundsBtn(kind) {
+    return h('a', { className: 'pcdn-btn pcdn-btn-' + (kind || 'primary') + ' pcdn-addfunds', href: ADDFUNDS_URL, 'data-ro-ok': '1' },
+      icon('wallet'), h('span', { text: ADMIN ? 'افزودن اعتبار (پروفایل مشتری)' : 'شارژ کیف پول' }));
+  }
 
   var S = {
     site: boot.site || null,
@@ -331,6 +342,11 @@
     var banner = null, adminBar = ADMIN ? adminBanner() : null;
     if (!S.active) banner = P.alertBox('warning', [h('strong', { text: 'این سرویس فعال نیست. ' }), 'اطلاعات فقط قابل مشاهده است و امکان تغییر تنظیمات وجود ندارد.'], { icon: 'lock' });
     else if (S.site.status === 'suspended') banner = P.alertBox('danger', 'این سرویس در CDN معلق است و بازدیدکنندگان صفحه تعلیق را می‌بینند.');
+    else if (S.site.status === 'over_quota' && WALLET) banner = P.alertBox('danger', [
+      h('strong', { text: 'سرویس قطع است: ترافیک این ماه تمام شده ' + (WALLET.limit_reached ? 'و سقف خرید خودکار این ماه پر شده است. ' : 'و اعتبار کیف پول برای خرید بسته بعدی کافی نیست. ') }),
+      WALLET.limit_reached ? 'برای ادامه تا پایان ماه، پلن را ارتقا دهید یا با پشتیبانی تماس بگیرید. '
+        : (WALLET.needed != null ? 'با شارژ دست‌کم ' + money(WALLET.needed) + ' یک بسته ' + num(WALLET.block_gb) + ' گیگابایتی خودکار خریده می‌شود و سایت ظرف چند ثانیه دوباره وصل می‌شود. ' : ''),
+      h('div', { className: 'pcdn-banner-actions' }, WALLET.limit_reached ? h('a', { href: UPGRADE_URL, className: 'pcdn-btn pcdn-btn-primary', 'data-ro-ok': '1', text: 'ارتقای پلن' }) : addFundsBtn())], { icon: 'ban' });
     else if (S.site.status === 'over_quota') banner = P.alertBox('danger', [h('strong', { text: 'ترافیک ماهانه تمام شده است. ' }), 'برای ادامه سرویس‌دهی، پلن را ارتقا دهید. ',
       h('a', { href: UPGRADE_URL, className: 'pcdn-link', text: 'ارتقای پلن' })]);
     append(mainEl, [adminBar, banner, pageHead(p, id)]);
@@ -594,18 +610,22 @@
 
     // KPIs
     var cap = Number(plan.bandwidth_limit_gb) || 0, usedGb = (Number(u.bytes) || 0) / 1073741824;
-    var limit = BILL ? Number(BILL.included_gb) : cap;
+    var limit = WALLET ? Number(WALLET.cap_gb) : BILL ? Number(BILL.included_gb) : cap;
     var ratio = limit > 0 ? usedGb / limit : 0;
     var trafficSub = limit > 0 ? 'از ' + num(limit) + ' گیگابایت (' + P.pct(usedGb, limit) + ')' : 'بدون محدودیت ترافیک';
+    if (WALLET && Number(WALLET.bought_gb) > 0) trafficSub = 'از ' + num(limit) + ' گیگابایت (' + num(WALLET.plan_gb) + ' پلن + ' + num(WALLET.bought_gb) + ' خریداری‌شده)';
     if (BILL && usedGb > limit) trafficSub = num(Math.ceil((usedGb - limit) * 10) / 10) + ' گیگابایت بیش از ترافیک پلن (با هزینه ترافیک اضافه)';
     var threatVal = h('span', null, P.skeleton(1, 'is-inline'));
     var reqs = Number(u.requests) || 0, hits = Number(u.cache_hits) || 0;
     out.push(h('div', { className: 'pcdn-kpis' },
       kpi('activity', 'brand', 'ترافیک این ماه', P.bytes(u.bytes), trafficSub,
-        limit > 0 ? P.meter(Math.min(ratio, 1), BILL ? (ratio >= 1 ? 'warning' : 'brand') : ratio >= 0.95 ? 'danger' : ratio >= 0.8 ? 'warning' : 'brand') : null, { id: 'traffic' }),
+        limit > 0 ? P.meter(Math.min(ratio, 1), WALLET ? (S.site.status === 'over_quota' ? 'danger' : Number(WALLET.more_gb) > 0 ? 'brand' : ratio >= 0.9 ? 'warning' : 'brand')
+          : BILL ? (ratio >= 1 ? 'warning' : 'brand') : ratio >= 0.95 ? 'danger' : ratio >= 0.8 ? 'warning' : 'brand') : null, { id: 'traffic' }),
       kpi('chart', 'violet', 'درخواست‌های این ماه', num(reqs), 'حدود ' + P.short(reqs) + ' درخواست', null, { id: 'requests' }),
       kpi('zap', 'success', 'نرخ کش', P.pct(hits, reqs), 'پاسخ مستقیم از سرورهای CDN', reqs ? P.meter(hits / reqs, 'success') : null, { id: 'cache' }),
       kpi('shieldCheck', 'danger', 'تهدیدهای متوقف‌شده', threatVal, 'در ۲۴ ساعت گذشته', goLink('events', 'مشاهده رویدادها'), { id: 'threats' })));
+
+    if (WALLET) out.push(walletCard(usedGb));
 
     // quick actions + security summary
     out.push(h('div', { className: 'pcdn-grid-2' }, quickActions(), h('div', { className: 'pcdn-stack' }, securitySummary(), planSummary())));
@@ -714,13 +734,35 @@
     return c;
   }
 
+  function walletCard(usedGb) {
+    var w = WALLET, cut = S.site.status === 'over_quota';
+    var c = P.card({ title: 'کیف پول و ترافیک', icon: 'wallet', id: 'wallet', tone: cut ? 'danger' : 'brand', actions: addFundsBtn(cut ? 'primary' : 'ghost') });
+    var proj;
+    if (w.limit_reached) proj = P.alertBox('warning', 'سقف خرید خودکار ترافیک این ماه پر شده است؛ پس از اتمام ترافیک فعلی، سرویس تا ماه بعد قطع می‌شود مگر اینکه پلن را ارتقا دهید.');
+    else if (w.block_price == null) proj = P.alertBox('info', 'خرید ترافیک اضافه برای این سرویس هنوز قیمت‌گذاری نشده است. با پشتیبانی تماس بگیرید.');
+    else if (Number(w.more_gb) > 0) proj = P.alertBox('success', 'با اعتبار فعلی، پس از اتمام ترافیک تا حدود ' + num(w.more_gb) + ' گیگابایت دیگر ادامه می‌یابد (تا حدود ' + num(Number(w.cap_gb) + Number(w.more_gb)) + ' گیگابایت در این ماه).');
+    else proj = P.alertBox(cut ? 'danger' : 'warning', (cut ? 'سرویس قطع است. ' : 'با اعتبار فعلی، پس از اتمام ' + num(w.cap_gb) + ' گیگابایت سرویس قطع می‌شود. ') +
+      'برای خرید بسته بعدی دست‌کم ' + money(w.needed) + ' شارژ کنید.');
+    append(c.body, [
+      h('dl', { className: 'pcdn-dl' },
+        h('div', { 'data-w': 'credit' }, h('dt', { text: 'اعتبار کیف پول' }), h('dd', { className: Number(w.credit) > 0 ? '' : 'pcdn-text-danger', text: money(w.credit) })),
+        h('div', null, h('dt', { text: 'ترافیک پلن' }), h('dd', { text: num(w.plan_gb) + ' گیگابایت' })),
+        h('div', { 'data-w': 'bought' }, h('dt', { text: 'خریداری‌شده این ماه' }), h('dd', { text: num(w.bought_gb) + ' گیگابایت' })),
+        h('div', null, h('dt', { text: 'مصرف / سقف فعلی' }), h('dd', { text: P.num1(usedGb) + ' از ' + num(w.cap_gb) + ' گیگابایت' })),
+        h('div', null, h('dt', { text: 'بسته ترافیک' }), h('dd', { text: num(w.block_gb) + ' گیگابایت' + (w.block_price != null ? ' — ' + money(w.block_price) : '') }))),
+      h('div', { 'data-w': 'projection' }, proj),
+      h('p', { className: 'pcdn-muted pcdn-small', text: 'پس از اتمام ترافیک پلن، بسته‌ها خودکار از اعتبار کیف پول خریده می‌شوند و فاکتورشان با همان اعتبار پرداخت می‌شود. اگر اعتبار کافی نباشد سرویس قطع و پس از شارژ کیف پول ظرف چند ثانیه دوباره وصل می‌شود. ترافیک پلن ابتدای هر ماه از نو شروع می‌شود.' })
+    ]);
+    return c;
+  }
+
   function planSummary() {
     var plan = S.site.plan || {}, f = features();
     var c = P.card({ title: 'پلن شما', icon: 'star', id: 'plan', actions: h('a', { className: 'pcdn-btn pcdn-btn-sm pcdn-btn-ghost', href: UPGRADE_URL, 'data-ro-ok': '1' }, icon('sparkles'), h('span', { text: 'ارتقا' })) });
     function feat(on, label) { return h('span', { className: 'pcdn-feat' + (on ? ' is-on' : '') }, icon(on ? 'check' : 'lock'), h('span', { text: label })); }
     append(c.body, [
       h('dl', { className: 'pcdn-dl' },
-        h('div', null, h('dt', { text: 'ترافیک ماهانه' }), h('dd', { text: BILL ? num(BILL.included_gb) + ' گیگابایت' : plan.bandwidth_limit_gb ? num(plan.bandwidth_limit_gb) + ' گیگابایت' : 'نامحدود' })),
+        h('div', null, h('dt', { text: 'ترافیک ماهانه' }), h('dd', { text: WALLET ? num(WALLET.plan_gb) + ' گیگابایت + بسته‌های پیش‌پرداخت' : BILL ? num(BILL.included_gb) + ' گیگابایت' : plan.bandwidth_limit_gb ? num(plan.bandwidth_limit_gb) + ' گیگابایت' : 'نامحدود' })),
         BILL ? h('div', { 'data-billing': '1' }, h('dt', { text: 'ترافیک اضافه' }), h('dd', { text: (Number(BILL.price_per_gb) > 0 ? 'هر گیگابایت ' + num(BILL.price_per_gb) + (BILL.currency ? ' ' + BILL.currency : '') : 'طبق تعرفه') +
           (plan.bandwidth_limit_gb ? ' — حداکثر تا ' + num(plan.bandwidth_limit_gb) + ' گیگابایت' : '') })) : null,
         h('div', null, h('dt', { text: 'رکوردهای DNS' }), h('dd', { text: num((S.site.records || []).length) + ' از ' + num(plan.max_records) })),

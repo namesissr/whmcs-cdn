@@ -163,6 +163,17 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 .pcdn-page > .pcdn-form { display: flex; flex-direction: column; gap: var(--pc-gap); }
 .pcdn-stack { display: flex; flex-direction: column; gap: var(--pc-gap); }
 .pcdn-main > .pcdn-alert { margin-bottom: 14px; }
+/* prepaid wallet */
+.pcdn .pcdn-text-danger { color: var(--pc-danger); }
+.pcdn [data-card="wallet"] .pcdn-alert { margin: 12px 0 8px; }
+.pcdn [data-card="wallet"] .pcdn-dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.pcdn [data-card="wallet"] .pcdn-dl > div { flex-direction: column; justify-content: flex-start; gap: 2px; padding: 8px 12px; border: 1px solid var(--pc-border); border-radius: 10px; background: var(--pc-surface-2); }
+.pcdn [data-card="wallet"] .pcdn-dl > div:last-child { border-bottom: 1px solid var(--pc-border); }
+.pcdn [data-card="wallet"] .pcdn-dl dt { font-size: 12.5px; }
+.pcdn [data-card="wallet"] .pcdn-dl dd { text-align: right; font-size: 15px; }
+.pcdn [data-card="wallet"] > .pcdn-card-body > p { font-size: 12.5px; line-height: 1.8; }
+.pcdn .pcdn-banner-actions { margin-top: 8px; }
+.pcdn .pcdn-addfunds { white-space: nowrap; }
 /* admin mode («مدیریت کامل» from the WHMCS admin addon) */
 .pcdn .pcdn-admin-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 14px; padding: 9px 12px; border-radius: 10px;
   background: #1e293b; color: #e2e8f0; font-size: 13px; line-height: 1.7; }

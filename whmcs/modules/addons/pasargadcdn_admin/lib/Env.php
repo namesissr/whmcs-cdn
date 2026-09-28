@@ -21,6 +21,9 @@ final class Env
 {
     const MODULE = 'pasargadcdn_admin';
     const KV_TABLE = 'mod_pasargadcdn_settings';
+    const TOPUPS = 'mod_pasargadcdn_topups';
+    const NOTICES = 'mod_pasargadcdn_notices';
+    const USAGE = 'mod_pasargadcdn_usage';
     const DEAD_STATUSES = ['Terminated', 'Cancelled', 'Fraud'];
     const DEFAULT_NS = ['ns1.pasargadmizban.com', 'ns2.pasargadmizban.com'];
 
@@ -31,6 +34,9 @@ final class Env
     public static function reset(): void
     {
         self::$memo = array_intersect_key(self::$memo, ['loaded' => 1, 'api_factory' => 1]);
+        if (function_exists('pasargadcdn_addon_settings')) {
+            \pasargadcdn_addon_settings(true);
+        }
     }
 
     // ------------------------------------------------------------------ server module
@@ -163,6 +169,50 @@ final class Env
             });
         }
         self::$memo['kv'] = true;
+        if (!$schema->hasTable(self::TOPUPS)) {
+            $schema->create(self::TOPUPS, function ($t) {
+                $t->increments('id');
+                $t->integer('service_id');
+                $t->integer('userid');
+                $t->char('month', 7);
+                $t->integer('seq');
+                $t->integer('blocks')->default(1);
+                $t->integer('gb');
+                $t->decimal('amount', 16, 2)->default(0);
+                $t->integer('currency')->default(0);
+                $t->integer('invoice_id')->nullable();
+                $t->string('status', 16)->default('pending');
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+                // one row per purchase slot: two concurrent runs can never buy the same slot twice
+                $t->unique(['service_id', 'month', 'seq'], 'mod_pcdn_topups_slot');
+                $t->index(['month', 'status'], 'mod_pcdn_topups_month');
+                $t->index('invoice_id', 'mod_pcdn_topups_invoice');
+            });
+        }
+        if (!$schema->hasTable(self::NOTICES)) {
+            $schema->create(self::NOTICES, function ($t) {
+                $t->increments('id');
+                $t->integer('service_id');
+                $t->char('month', 7);
+                $t->string('kind', 16);
+                $t->dateTime('created_at')->nullable();
+                $t->unique(['service_id', 'month', 'kind'], 'mod_pcdn_notices_once');
+            });
+        }
+        if (!$schema->hasTable(self::USAGE)) {
+            $schema->create(self::USAGE, function ($t) {
+                // last observed month usage of services near their cap (rate-aware purchase margin)
+                $t->integer('service_id')->primary();
+                $t->char('month', 7);
+                $t->decimal('gb', 14, 3)->default(0);
+                $t->integer('observed_at')->default(0);
+                $t->decimal('rate', 18, 9)->default(0);
+            });
+        }
+        self::$memo['tbl:' . self::USAGE] = true;
+        self::$memo['tbl:' . self::TOPUPS] = true;
+        self::$memo['tbl:' . self::NOTICES] = true;
     }
 
     // ------------------------------------------------------------------ servers / controller

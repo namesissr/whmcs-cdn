@@ -130,6 +130,20 @@
       };
       op.addEventListener('input', upd);
     }
+    // Billing mode: highlight the chosen card and show only the fields that apply to it.
+    var syncBilling = function () {
+      var sel = wiz.querySelector('input[name="billing"]:checked');
+      var mode = sel ? sel.value : 'prepaid';
+      Array.prototype.forEach.call(wiz.querySelectorAll('.pcdna-radio-card'), function (c) {
+        var inp = c.querySelector('input');
+        c.classList.toggle('is-on', !!(inp && inp.checked));
+      });
+      Array.prototype.forEach.call(wiz.querySelectorAll('[data-billing-show]'), function (el) {
+        el.hidden = (' ' + el.getAttribute('data-billing-show') + ' ').indexOf(' ' + mode + ' ') < 0;
+      });
+    };
+    wiz.addEventListener('change', function (ev) { if (ev.target && ev.target.name === 'billing') syncBilling(); });
+    syncBilling();
     // Monthly price → suggested multi-period prices, until the admin edits those cells.
     var FACTOR = { quarterly: 2.85, semiannually: 5.4, annually: 10 };
     function nice(v) {

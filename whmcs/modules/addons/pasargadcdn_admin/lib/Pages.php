@@ -234,6 +234,10 @@ final class Pages
                 $w[] = ['warn', View::n($e['with_errors']) . ' نود خطای اعمال تنظیمات دارد (last_error).'];
             }
         }
+        if ($sites !== null && ($cut = self::cutForCredit($sites))) {
+            $w[] = ['warn', View::n($cut) . ' سرویس پیش‌پرداخت به‌دلیل اعتبار ناکافی کیف پول قطع است (پس از شارژ مشتری خودکار وصل می‌شود). <a href="'
+                . View::url(['page' => 'sites', 'cdn' => 'over_quota']) . '">مشاهده</a>'];
+        }
         if ($sites !== null) {
             $sync = Data::sync($sites);
             if ($sync['missing']) {
@@ -250,6 +254,27 @@ final class Pages
             }
         }
         return $w;
+    }
+
+    /** Number of live prepaid services whose site is over its cap (= cut until the wallet covers a block). */
+    public static function cutForCredit(array $sites): int
+    {
+        $ids = [];
+        foreach ($sites as $s) {
+            if (is_array($s) && ($s['status'] ?? '') === 'over_quota' && ctype_digit((string) ($s['external_id'] ?? ''))) {
+                $ids[] = (int) $s['external_id'];
+            }
+        }
+        if (!$ids) {
+            return 0;
+        }
+        $n = 0;
+        $rows = Data::serviceQuery()->whereIn('h.id', $ids)->where('h.domainstatus', 'Active')->get(Data::SERVICE_COLS)->all();
+        $co = Data::configOptions($rows);
+        foreach ($rows as $svc) {
+            $n += Data::prepaid($svc, $co[(int) $svc->id] ?? []) !== null ? 1 : 0;
+        }
+        return $n;
     }
 
     // ------------------------------------------------------------------ 1. dashboard
@@ -290,8 +315,10 @@ final class Pages
         $h .= View::kpi('activity', 'violet', 'ترافیک این ماه', $ov ? View::bytes($ov['month']['bytes'] ?? 0) : $na,
             $ov ? View::n($ov['month']['requests'] ?? 0) . ' درخواست' : '');
         $h .= View::kpi('shield', 'bad', 'تهدیدهای متوقف‌شده', $ov ? View::n($sec) : $na, 'این ماه، همه سایت‌ها');
+        $cutN = $sites !== null ? self::cutForCredit($sites) : 0;
         $h .= View::kpi('users', 'brand', 'سرویس‌های WHMCS', View::n($counts['Active'] ?? 0) . ' <small>فعال</small>',
-            View::n($counts['Suspended'] ?? 0) . ' معلق · ' . View::n($counts['Pending'] ?? 0) . ' در انتظار');
+            View::n($counts['Suspended'] ?? 0) . ' معلق · ' . View::n($counts['Pending'] ?? 0) . ' در انتظار'
+            . ($cutN ? '<br><span class="pcdna-err" data-cut-credit="' . $cutN . '">' . View::n($cutN) . ' قطع به‌دلیل اعتبار</span>' : ''));
         $h .= '</div>';
 
         // warnings
@@ -472,6 +499,7 @@ final class Pages
             [$rows, $total] = Data::services($f, $page, $per);
         }
 
+        $co = Data::configOptions($rows);
         // Per-site details (NS / SSL) for the visible rows only, in parallel.
         $details = [];
         if ($usage !== null) {
@@ -544,7 +572,9 @@ final class Pages
             if ($site === false) {
                 $cdnCell = '<span class="pcdna-muted">—</span>';
             } elseif ($site) {
-                $cdnCell = self::cdnBadge((string) ($site['status'] ?? ''));
+                $cdnCell = ($site['status'] ?? '') === 'over_quota' && Data::prepaid($svc, $co[(int) $svc->id] ?? []) !== null
+                    ? View::badge('قطع به‌دلیل اعتبار ناکافی', 'bad', ' title="ترافیک این ماه تمام شده و اعتبار کیف پول مشتری برای بسته بعدی کافی نیست (یا سقف خرید ماهانه پر شده)"')
+                    : self::cdnBadge((string) ($site['status'] ?? ''));
             } elseif ($liveSvc) {
                 $cdnCell = self::cdnBadge(null);
             } else {
@@ -780,6 +810,7 @@ final class Pages
             $pid = (int) $p->id;
             $plan = function_exists('pasargadcdn_plan') ? \pasargadcdn_plan((array) $p) : null;
             $o = function_exists('pasargadcdn_overage') ? \pasargadcdn_overage((array) $p) : null;
+            $pp = function_exists('pasargadcdn_prepaid') ? \pasargadcdn_prepaid((array) $p) : null;
             $f = $plan['features'] ?? [];
             $feat = function ($on, $label) {
                 return '<span class="pcdna-feat' . ($on ? ' is-on' : '') . '">' . View::icon($on ? 'check' : 'x') . '<span>' . View::e($label) . '</span></span>';
@@ -788,7 +819,10 @@ final class Pages
             $body = '<dl class="pcdna-dl pcdna-dl-3">'
                 . '<div><dt>ترافیک پلن</dt><dd>' . ($o ? View::n($o['included_gb']) . ' GB' : (($plan['bandwidth_limit_gb'] ?? 0) ? View::n($plan['bandwidth_limit_gb']) . ' GB' : 'نامحدود')) . '</dd></div>'
                 . '<div><dt>سقف قطع روی CDN</dt><dd>' . (($plan['bandwidth_limit_gb'] ?? 0) ? View::n($plan['bandwidth_limit_gb']) . ' GB' : 'نامحدود') . '</dd></div>'
-                . '<div><dt>ترافیک اضافه</dt><dd>' . ($o ? View::n($o['price_per_gb'], $o['price_per_gb'] >= 100 ? 0 : 2) . ' برای هر گیگابایت<div class="pcdna-small pcdna-muted">ذخیره در WHMCS: ' . View::n($p->overagesbwprice, 4) . ' برای هر مگابایت</div>' : 'غیرفعال') . '</dd></div>'
+                . '<div><dt>ترافیک اضافه</dt><dd>' . ($o ? View::n($o['price_per_gb'], $o['price_per_gb'] >= 100 ? 0 : 2) . ' برای هر گیگابایت<div class="pcdna-small pcdna-muted">فاکتور پایان ماه — ذخیره در WHMCS: ' . View::n($p->overagesbwprice, 4) . ' برای هر مگابایت</div>'
+                    : ($pp !== null ? ($pp['price_per_gb'] !== null ? View::n($pp['price_per_gb'], $pp['price_per_gb'] >= 100 ? 0 : 2) . ' برای هر گیگابایت' : View::badge('قیمت ثبت نشده', 'bad'))
+                        . '<div class="pcdna-small pcdna-muted">پیش‌پرداخت از کیف پول — بسته‌های ' . View::n($pp['block_gb']) . ' گیگابایتی</div>'
+                    : ((int) $p->configoption1 > 0 ? 'قطع در پایان ترافیک' : '—'))) . '</dd></div>'
                 . '<div><dt>رکورد DNS</dt><dd>' . View::n($plan['max_records'] ?? 0) . '</dd></div>'
                 . '<div><dt>قوانین فایروال / صفحه / نرخ</dt><dd>' . View::n($f['max_firewall_rules'] ?? 0) . ' / ' . View::n($f['max_page_rules'] ?? 0) . ' / ' . View::n($f['max_ratelimit_rules'] ?? 0) . '</dd></div>'
                 . '<div><dt>استخر توزیع بار</dt><dd>' . View::n($f['max_pools'] ?? 0) . '</dd></div>'
@@ -854,20 +888,28 @@ final class Pages
             . self::check('update', $in['update'], 'به‌روزرسانی محصولات و قیمت‌های موجود (در غیر این صورت فقط موارد جاافتاده ساخته می‌شوند)')
             . '</div></fieldset>';
 
-        $h .= '<fieldset class="pcdna-fieldset"><legend>ترافیک اضافه (Overage)</legend>'
-            . '<div class="pcdna-checks-row">' . self::check('overage', $in['overage'], 'صورتحساب ترافیک اضافه فعال باشد (به جای قطع سرویس در پایان ترافیک پلن)') . '</div>'
-            . '<div class="pcdna-form-grid">'
-            . '<label><span>قیمت هر گیگابایت اضافه (' . View::e($def ? $def->code : '') . ')</span><input class="pcdna-input" name="overage_price" dir="ltr" inputmode="decimal" value="'
-            . View::e(Wizard::fmt((float) $in['overage_price'])) . '" data-per-mb="1"><small data-per-mb-out="1">WHMCS قیمت را به ازای هر مگابایت ذخیره می‌کند: '
-            . View::n(Wizard::perMb((float) $in['overage_price']), 4) . ' هر MB</small></label>'
-            . '<label><span>سقف ترافیک اضافه (درصد از ترافیک پلن)</span><input class="pcdna-input" name="overage_allow" dir="ltr" inputmode="numeric" value="' . (int) $in['overage_allow'] . '">'
-            . '<small>مثلاً ۱۰۰ یعنی سرویس ۱۰۰ گیگابایتی حداکثر تا ۲۰۰ گیگابایت ادامه می‌دهد و سپس روی CDN متوقف می‌شود (محافظت در برابر صورتحساب ناخواسته).</small></label>'
-            . '</div><p class="pcdna-muted pcdna-small">ترافیک پلن به‌عنوان «Soft Limit» پهنای باند در WHMCS ثبت می‌شود و WHMCS در پایان ماه مازاد را فاکتور می‌کند '
-            . '(Automation Settings → Overage Billing). قیمت در ارزهای دیگر با نرخ تبدیل WHMCS محاسبه می‌شود.</p></fieldset>';
+        $h .= '<fieldset class="pcdna-fieldset" data-billing-fs="1"><legend>صورتحساب ترافیک بیش از پلن</legend><div class="pcdna-billing">';
+        $hints = [
+            'prepaid' => 'پس از اتمام ترافیک پلن، بسته‌های ترافیک خودکار از اعتبار کیف پول مشتری خریده و فاکتورشان با اعتبار پرداخت می‌شود. اگر اعتبار کافی نباشد سرویس قطع و پس از شارژ کیف پول ظرف چند ثانیه دوباره وصل می‌شود.',
+            'overage' => 'سرویس تا سقف تعیین‌شده ادامه می‌دهد و WHMCS در پایان ماه مازاد را فاکتور می‌کند (Overage Billing).',
+            'cut' => 'سرویس در پایان ترافیک پلن تا ماه بعد قطع می‌شود؛ هیچ هزینه اضافه‌ای گرفته نمی‌شود.',
+        ];
+        foreach (Wizard::BILLING as $k => $label) {
+            $h .= '<label class="pcdna-radio-card' . ($in['billing'] === $k ? ' is-on' : '') . '"><input type="radio" name="billing" value="' . $k . '"'
+                . ($in['billing'] === $k ? ' checked' : '') . '><span><strong>' . View::e($label) . '</strong><small>' . View::e($hints[$k]) . '</small></span></label>';
+        }
+        $h .= '</div><div class="pcdna-form-grid">'
+            . '<label data-billing-show="prepaid overage"><span>قیمت هر گیگابایت ترافیک اضافه (' . View::e($def ? $def->code : '') . ')</span><input class="pcdna-input" name="overage_price" dir="ltr" inputmode="decimal" value="'
+            . View::e(Wizard::fmt((float) $in['overage_price'])) . '" data-per-mb="1"><small data-billing-show="overage" data-per-mb-out="1">WHMCS قیمت را به ازای هر مگابایت ذخیره می‌کند: '
+            . View::n(Wizard::perMb((float) $in['overage_price']), 4) . ' هر MB</small>'
+            . '<small data-billing-show="prepaid">اندازه بسته (' . View::n((int) Env::setting('block_gb', '10') ?: 10) . ' GB) و سقف خرید ماهانه در تنظیمات ماژول هستند.</small></label>'
+            . '<label data-billing-show="overage"><span>سقف ترافیک اضافه (درصد از ترافیک پلن)</span><input class="pcdna-input" name="overage_allow" dir="ltr" inputmode="numeric" value="' . (int) $in['overage_allow'] . '">'
+            . '<small>مثلاً ۱۰۰ یعنی سرویس ۱۰۰ گیگابایتی حداکثر تا ۲۰۰ گیگابایت ادامه می‌دهد و سپس روی CDN متوقف می‌شود.</small></label>'
+            . '</div></fieldset>';
 
-        $h .= '<fieldset class="pcdna-fieldset"><legend>ایمیل خوش‌آمد</legend><div class="pcdna-checks-row">'
-            . self::check('email', $in['email'], 'قالب ایمیل «' . Wizard::EMAIL_NAME . '» ساخته و به محصولات وصل شود (نیم‌سرورها از کنترلر خوانده می‌شوند)')
-            . self::check('email_update', $in['email_update'], 'به‌روزرسانی: اگر قالبی با این نام وجود دارد متن آن بازنویسی شود')
+        $h .= '<fieldset class="pcdna-fieldset"><legend>قالب‌های ایمیل</legend><div class="pcdna-checks-row">'
+            . self::check('email', $in['email'], 'قالب‌های «' . Wizard::EMAIL_NAME . '» (به محصولات وصل می‌شود)، «' . Wizard::EMAIL_EXHAUSTED . '» و «' . Wizard::EMAIL_WARNING . '» ساخته شوند')
+            . self::check('email_update', $in['email_update'], 'به‌روزرسانی: اگر قالبی با این نام‌ها وجود دارد متن آن بازنویسی شود')
             . '</div></fieldset>';
 
         // feature matrix
@@ -1008,6 +1050,7 @@ final class Pages
         foreach (Data::serviceQuery()->get(Data::SERVICE_COLS)->all() as $svc) {
             $services[(int) $svc->id] = $svc;
         }
+        $co = Data::configOptions(array_values($services));
         $currencies = [];
         foreach (Data::currencies() as $c) {
             $currencies[(int) $c->id] = $c;
@@ -1021,13 +1064,21 @@ final class Pages
             }
         }
         $rows = [];
-        $tot = ['used' => 0.0, 'over' => 0.0, 'amount' => []];
+        $tot = ['used' => 0.0, 'over' => 0.0, 'amount' => [], 'bought_gb' => 0, 'bought' => []];
+        $tops = Data::topupSums($month);
         foreach ((array) ($r['data']['sites'] ?? []) as $s) {
             $ext = (string) ($s['external_id'] ?? '');
             $svc = ($ext !== '' && ctype_digit($ext) && isset($services[(int) $ext])) ? $services[(int) $ext] : ($ix[strtolower((string) ($s['domain'] ?? ''))] ?? null);
             $used = round((float) ($s['bytes'] ?? 0) / 1073741824, 3);
             $o = $svc && function_exists('pasargadcdn_overage') ? \pasargadcdn_overage((array) $svc) : null;
             $limit = $o ? (float) $o['included_gb'] : (float) ($s['bandwidth_limit_gb'] ?? 0);
+            $pp = $svc ? Data::prepaid($svc, $co[(int) $svc->id] ?? []) : null;
+            $top = $svc ? ($tops[(int) $svc->id] ?? null) : null;
+            $plan = $limit;
+            if ($pp !== null) {
+                $plan = (float) $pp['plan_gb'];
+                $limit = $plan + ($top ? $top['gb'] : 0);
+            }
             $over = $limit > 0 ? max(0.0, round($used - $limit, 3)) : 0.0;
             $amount = null;
             $cur = $def;
@@ -1042,8 +1093,14 @@ final class Pages
                 'client' => $svc ? Data::clientName($svc) : '', 'domain' => (string) ($s['domain'] ?? ''),
                 'product' => $svc ? (string) $svc->product : '', 'status' => $svc ? (string) $svc->domainstatus : '',
                 'used' => $used, 'limit' => $limit, 'over' => $over, 'amount' => $amount, 'currency' => $amount !== null ? $code : '',
-                'requests' => (int) ($s['requests'] ?? 0),
+                'requests' => (int) ($s['requests'] ?? 0), 'prepaid' => $pp !== null, 'plan' => $plan,
+                'bought_gb' => $top ? $top['gb'] : 0, 'bought' => $top ? round($top['amount'], 2) : 0.0,
+                'bought_code' => $top ? $top['code'] : '', 'invoices' => $top ? $top['invoices'] : [],
             ];
+            if ($top) {
+                $tot['bought_gb'] += $top['gb'];
+                $tot['bought'][$top['code']] = ($tot['bought'][$top['code']] ?? 0) + $top['amount'];
+            }
             $tot['used'] += $used;
             $tot['over'] += $over;
             if ($amount !== null && $amount > 0) {
@@ -1095,35 +1152,80 @@ final class Pages
         $money = function ($a) {
             return View::n($a, abs($a) >= 100 ? 0 : 2);
         };
-        $amounts = [];
-        foreach ($tot['amount'] as $code => $a) {
-            $amounts[] = $money($a) . ' <small>' . View::e($code) . '</small>';
-        }
-        $h .= '<div class="pcdna-kpis pcdna-kpis-3">' . View::kpi('activity', 'brand', 'کل ترافیک ماه', View::gb($tot['used']), View::n(count($rows)) . ' سایت')
-            . View::kpi('warn', 'warn', 'ترافیک مازاد', View::gb($tot['over']), 'بیش از ترافیک پلن')
-            . View::kpi('tag', 'violet', 'مبلغ تخمینی مازاد', $amounts ? implode('<br>', $amounts) : '<span class="pcdna-muted">۰</span>', 'فاکتور نهایی را WHMCS صادر می‌کند') . '</div>';
+        $sumList = function (array $by) use ($money) {
+            $out = [];
+            foreach ($by as $code => $a) {
+                if ($a > 0) {
+                    $out[] = $money($a) . ' <small>' . View::e($code) . '</small>';
+                }
+            }
+            return $out;
+        };
+        $amounts = $sumList($tot['amount']);
+        $bought = $sumList($tot['bought']);
+        $h .= '<div class="pcdna-kpis">' . View::kpi('activity', 'brand', 'کل ترافیک ماه', View::gb($tot['used']), View::n(count($rows)) . ' سایت')
+            . View::kpi('wallet', 'ok', 'ترافیک خریداری‌شده (کیف پول)', View::gb($tot['bought_gb']), $bought ? implode(' · ', $bought) : 'خریدی ثبت نشده')
+            . View::kpi('warn', 'warn', 'ترافیک مازاد', View::gb($tot['over']), 'بیش از سقف (پلن + خرید)')
+            . View::kpi('tag', 'violet', 'مبلغ تخمینی مازاد', $amounts ? implode('<br>', $amounts) : '<span class="pcdna-muted">۰</span>', 'حالت فاکتور پایان ماه') . '</div>';
         if (!$rows) {
-            return $h . View::card('', View::emptyState('برای این ماه مصرفی ثبت نشده است', '', 'chart'));
+            return $h . View::card('', View::emptyState('برای این ماه مصرفی ثبت نشده است', '', 'chart')) . self::purchases($month);
         }
         $t = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-usage"><thead><tr><th>دامنه / محصول</th><th>سرویس / مشتری</th>'
-            . '<th>مصرف (GB)</th><th>ترافیک پلن (GB)</th><th>مازاد (GB)</th><th>مبلغ تخمینی</th></tr></thead><tbody>';
+            . '<th>مصرف (GB)</th><th>پلن + خرید (GB)</th><th>مازاد (GB)</th><th>مبلغ</th></tr></thead><tbody>';
         foreach ($rows as $r) {
+            if ($r['prepaid']) {
+                $inv = implode(' ', array_map(function ($id) {
+                    return '<a href="invoices.php?action=edit&amp;id=' . (int) $id . '">#' . View::n($id) . '</a>';
+                }, $r['invoices']));
+                $amountCell = $r['bought'] > 0 ? '<strong>' . $money($r['bought']) . '</strong> <small>' . View::e($r['bought_code']) . '</small>'
+                    . '<div class="pcdna-small pcdna-muted">از کیف پول ' . $inv . '</div>' : '<span class="pcdna-muted" title="پیش‌پرداخت: خریدی در این ماه ثبت نشده">۰</span>';
+                $limitCell = View::n($r['plan']) . ($r['bought_gb'] > 0 ? ' <span class="pcdna-bought">+ ' . View::n($r['bought_gb']) . '</span>' : '');
+            } else {
+                $amountCell = $r['amount'] === null ? '<span class="pcdna-muted" title="صورتحساب ترافیک اضافه برای این محصول فعال نیست">—</span>'
+                    : ($r['amount'] > 0 ? '<strong>' . $money($r['amount']) . '</strong> <small>' . View::e($r['currency']) . '</small><div class="pcdna-small pcdna-muted">تخمین فاکتور پایان ماه</div>' : '<span class="pcdna-muted">۰</span>');
+                $limitCell = $r['limit'] > 0 ? View::n($r['limit']) : 'نامحدود';
+            }
             $t .= '<tr' . ($r['over'] > 0 ? ' class="is-warn"' : '') . '><td class="pcdna-nowrap">' . View::ltr($r['domain'])
-                . '<div class="pcdna-small pcdna-muted">' . View::e($r['product'] ?: '—') . '</div></td>'
+                . '<div class="pcdna-small pcdna-muted">' . View::e($r['product'] ?: '—') . ($r['prepaid'] ? ' · پیش‌پرداخت' : '') . '</div></td>'
                 . '<td>' . ($r['service'] ? '<a href="' . View::e(Data::serviceUrl($r['userid'], $r['service'])) . '">#' . View::n($r['service']) . '</a>'
                     . '<div class="pcdna-small"><a href="' . View::e(Data::clientUrl($r['userid'])) . '">' . View::e($r['client']) . '</a></div>'
                     : View::badge('بدون سرویس', 'muted')) . '</td>'
                 . '<td class="pcdna-num">' . View::n($r['used'], 2) . ($r['limit'] > 0 ? View::meter($r['used'] / $r['limit']) : '') . '</td>'
-                . '<td class="pcdna-num">' . ($r['limit'] > 0 ? View::n($r['limit']) : 'نامحدود') . '</td>'
+                . '<td class="pcdna-num">' . $limitCell . '</td>'
                 . '<td class="pcdna-num">' . ($r['over'] > 0 ? '<strong>' . View::n($r['over'], 2) . '</strong>' : '<span class="pcdna-muted">۰</span>') . '</td>'
-                . '<td class="pcdna-num">' . ($r['amount'] === null ? '<span class="pcdna-muted" title="صورتحساب ترافیک اضافه برای این محصول فعال نیست">—</span>'
-                    : ($r['amount'] > 0 ? '<strong>' . $money($r['amount']) . '</strong> <small>' . View::e($r['currency']) . '</small>' : '<span class="pcdna-muted">۰</span>')) . '</td></tr>';
+                . '<td class="pcdna-num">' . $amountCell . '</td></tr>';
         }
-        $t .= '</tbody><tfoot><tr><th colspan="2">جمع</th><th class="pcdna-num">' . View::n($tot['used'], 2) . '</th><th></th><th class="pcdna-num">'
-            . View::n($tot['over'], 2) . '</th><th class="pcdna-num">' . ($amounts ? implode('<br>', $amounts) : '—') . '</th></tr></tfoot></table></div>';
-        $h .= View::card('مصرف ' . View::digits($month), $t . '<p class="pcdna-muted pcdna-small pcdna-pad">مبلغ تخمینی = مازاد × قیمت هر گیگابایت محصول × نرخ ارز مشتری. '
-                . 'WHMCS مازاد را بر اساس مصرفی که کران روزانه (UsageUpdate) ثبت کرده در پایان ماه فاکتور می‌کند؛ ممکن است با این گزارش لحظه‌ای کمی تفاوت داشته باشد.</p>', '', 'pcdna-flush', 'chart');
-        return $h;
+        $t .= '</tbody><tfoot><tr><th colspan="2">جمع</th><th class="pcdna-num">' . View::n($tot['used'], 2) . '</th><th class="pcdna-num">'
+            . ($tot['bought_gb'] > 0 ? '<span class="pcdna-bought">+ ' . View::n($tot['bought_gb']) . '</span>' : '') . '</th><th class="pcdna-num">'
+            . View::n($tot['over'], 2) . '</th><th class="pcdna-num">' . (($bought || $amounts) ? implode('<br>', array_merge($bought, $amounts)) : '—') . '</th></tr></tfoot></table></div>';
+        $h .= View::card('مصرف ' . View::digits($month), $t . '<p class="pcdna-muted pcdna-small pcdna-pad">پیش‌پرداخت: بسته‌های خریداری‌شده از کیف پول با فاکتور پرداخت‌شده ثبت می‌شوند. '
+                . 'حالت فاکتور پایان ماه: مبلغ تخمینی = مازاد × قیمت هر گیگابایت محصول × نرخ ارز مشتری؛ WHMCS مازاد را بر اساس مصرفی که کران روزانه (UsageUpdate) ثبت کرده در پایان ماه فاکتور می‌کند.</p>', '', 'pcdna-flush', 'chart');
+        return $h . self::purchases($month);
+    }
+
+    const TOPUP_STATUS = ['paid' => ['پرداخت‌شده', 'ok'], 'pending' => ['در حال پرداخت', 'warn'], 'failed' => ['ناموفق/لغو', 'bad']];
+
+    /** «خریدهای ترافیک» of a month. */
+    public static function purchases(string $month): string
+    {
+        $list = Data::topups($month, 300);
+        if (!$list) {
+            return View::card('خریدهای ترافیک', View::emptyState('در این ماه ترافیکی از کیف پول خریده نشده است',
+                'در حالت پیش‌پرداخت، وقتی مصرف سرویسی به سقفش نزدیک شود و اعتبار مشتری کافی باشد، بسته‌ها خودکار خریده می‌شوند.', 'wallet'), '', '', 'wallet');
+        }
+        $t = '<div class="pcdna-table-wrap"><table class="pcdna-table"><thead><tr><th>زمان</th><th>دامنه / سرویس</th><th>مشتری</th><th>حجم</th><th>مبلغ</th><th>فاکتور</th><th>وضعیت</th></tr></thead><tbody>';
+        foreach ($list as $x) {
+            [$st, $tone] = self::TOPUP_STATUS[$x->status] ?? [$x->status, 'muted'];
+            $t .= '<tr><td class="pcdna-nowrap">' . View::e(View::date($x->created_at, true)) . '</td>'
+                . '<td>' . View::ltr(Env::domain((string) $x->domain)) . '<div class="pcdna-small"><a href="' . View::e(Data::serviceUrl((int) $x->userid, (int) $x->service_id)) . '">#' . View::n($x->service_id) . '</a></div></td>'
+                . '<td><a href="' . View::e(Data::clientUrl((int) $x->userid)) . '">' . View::e(Data::clientName($x)) . '</a></td>'
+                . '<td class="pcdna-num">' . View::n($x->gb) . ' GB' . ((int) $x->blocks > 1 ? '<div class="pcdna-small pcdna-muted">' . View::n($x->blocks) . ' بسته</div>' : '') . '</td>'
+                . '<td class="pcdna-num">' . View::n($x->amount, (float) $x->amount >= 100 ? 0 : 2) . ' <small>' . View::e($x->currency_code) . '</small></td>'
+                . '<td>' . ($x->invoice_id ? '<a href="invoices.php?action=edit&amp;id=' . (int) $x->invoice_id . '">#' . View::n($x->invoice_id) . '</a>' : '—') . '</td>'
+                . '<td>' . View::badge($st, $tone) . '</td></tr>';
+        }
+        $t .= '</tbody></table></div>';
+        return View::card('خریدهای ترافیک (' . View::n(count($list)) . ')', $t, '', 'pcdna-flush', 'wallet');
     }
 
     /** CSV (UTF-8 with BOM so Excel shows Persian correctly). */
@@ -1135,12 +1237,14 @@ final class Pages
         }
         $fh = fopen('php://temp', 'w+');
         fwrite($fh, "\xEF\xBB\xBF");
-        fputcsv($fh, ['شناسه سرویس', 'مشتری', 'دامنه', 'محصول', 'وضعیت', 'مصرف (GB)', 'ترافیک پلن (GB)', 'مازاد (GB)', 'مبلغ تخمینی', 'ارز', 'درخواست‌ها'], ',', '"', '\\');
+        fputcsv($fh, ['شناسه سرویس', 'مشتری', 'دامنه', 'محصول', 'وضعیت', 'مصرف (GB)', 'سقف ترافیک (GB)', 'مازاد (GB)', 'مبلغ تخمینی', 'ارز', 'درخواست‌ها',
+            'خرید پیش‌پرداخت (GB)', 'مبلغ خرید پیش‌پرداخت', 'فاکتورهای خرید'], ',', '"', '\\');
         foreach ($rows as $r) {
             fputcsv($fh, [$r['service'] ?: '', self::csvSafe($r['client']), $r['domain'], self::csvSafe($r['product']), $r['status'],
                 number_format($r['used'], 3, '.', ''), $r['limit'] > 0 ? number_format($r['limit'], 3, '.', '') : '',
                 number_format($r['over'], 3, '.', ''), $r['amount'] === null ? '' : number_format($r['amount'], 2, '.', ''),
-                $r['currency'], $r['requests']], ',', '"', '\\');
+                $r['currency'], $r['requests'], $r['bought_gb'] ?: '', $r['bought'] > 0 ? number_format($r['bought'], 2, '.', '') : '',
+                implode(' ', $r['invoices'])], ',', '"', '\\');
         }
         rewind($fh);
         $csv = (string) stream_get_contents($fh);
@@ -1243,13 +1347,44 @@ final class Pages
             $add($noDomain ? 'bad' : 'ok', 'نیاز به دامنه در سفارش', $noDomain ? 'بدون «Require Domain»: ' . View::e(implode('، ', array_map(function ($p) {
                 return $p->name;
             }, $noDomain))) : 'همه محصولات دامنه را در سفارش می‌گیرند', 'در تب Details محصول تیک Require Domain را بزنید؛ دامنه سرویس همان دامنه روی CDN است.');
-            $noOverage = array_filter($products, function ($p) {
-                return (int) $p->configoption1 > 0 && (!function_exists('pasargadcdn_overage') || \pasargadcdn_overage((array) $p) === null);
+            $mode = function_exists('pasargadcdn_billing_mode') ? \pasargadcdn_billing_mode() : 'none';
+            $label = Wizard::BILLING[$mode] ?? 'نامشخص';
+            $metered = array_filter($products, function ($p) {
+                return (int) $p->configoption1 > 0;
             });
-            $add($noOverage ? 'warn' : 'ok', 'صورتحساب ترافیک اضافه', $noOverage ? 'غیرفعال برای: ' . View::e(implode('، ', array_map(function ($p) {
-                return $p->name;
-            }, $noOverage))) . ' (سرویس در پایان ترافیک متوقف می‌شود)' : 'برای محصولات دارای سقف ترافیک تنظیم شده است',
-                'تب Other محصول → Overages Billing، یا ویزارد پلن‌ها با گزینه ترافیک اضافه. در Automation Settings گزینه Overage Billing را هم فعال کنید.');
+            if ($mode === 'prepaid') {
+                $noPrice = array_filter($metered, function ($p) {
+                    $pp = \pasargadcdn_prepaid((array) $p);
+                    return $pp !== null && $pp['price_per_gb'] === null;
+                });
+                $onOverage = array_filter($metered, function ($p) {
+                    return \pasargadcdn_overage((array) $p) !== null;
+                });
+                $add($noPrice ? 'bad' : ($onOverage ? 'warn' : 'ok'), 'روش صورتحساب: ' . $label,
+                    $noPrice ? 'قیمت هر گیگابایت برای این محصولات ثبت نشده و خرید خودکار ممکن نیست: ' . View::e(implode('، ', array_map(function ($p) {
+                        return $p->name;
+                    }, $noPrice)))
+                    : ($onOverage ? 'این محصولات هنوز Overage WHMCS دارند و با فاکتور پایان ماه صورتحساب می‌شوند (نه کیف پول): ' . View::e(implode('، ', array_map(function ($p) {
+                        return $p->name;
+                    }, $onOverage))) : 'بسته‌های ' . View::n((int) Env::setting('block_gb', '10') ?: 10) . ' گیگابایتی، حداکثر ' . View::n((int) Env::setting('max_blocks', '20')) . ' بسته در ماه برای هر سرویس'),
+                    'ویزارد پلن‌ها را با روش «پیش‌پرداخت» و تیک «به‌روزرسانی» اجرا کنید، یا «قیمت هر گیگابایت» را در تنظیمات ماژول وارد کنید.');
+                $last = (int) Env::kvGet('prepaid_last_run', 0);
+                $add($last > time() - 3600 ? 'ok' : 'bad', 'کران WHMCS (خرید خودکار و وصل مجدد)', $last ? 'آخرین اجرا: ' . View::e(View::date($last, true)) : 'هنوز اجرا نشده است',
+                    'کران WHMCS باید هر ۵ دقیقه اجرا شود (crontab: php -q /path/to/crons/cron.php)؛ هوک AfterCronJob بعد از هر اجرا خرید ترافیک، وصل مجدد و ماه جدید را انجام می‌دهد.');
+                foreach (self::automationChecks() as $chk) {
+                    $add($chk[0], $chk[1], $chk[2], $chk[3]);
+                }
+            } elseif ($mode === 'overage') {
+                $noOverage = array_filter($metered, function ($p) {
+                    return \pasargadcdn_overage((array) $p) === null;
+                });
+                $add($noOverage ? 'warn' : 'ok', 'روش صورتحساب: ' . $label, $noOverage ? 'Overage غیرفعال برای: ' . View::e(implode('، ', array_map(function ($p) {
+                    return $p->name;
+                }, $noOverage))) . ' (سرویس در پایان ترافیک متوقف می‌شود)' : 'برای محصولات دارای سقف ترافیک تنظیم شده است',
+                    'تب Other محصول → Overages Billing، یا ویزارد پلن‌ها با روش «فاکتور پایان ماه». در Automation Settings گزینه Overage Billing را هم فعال کنید.');
+            } else {
+                $add('ok', 'روش صورتحساب: ' . $label, 'سرویس‌ها در پایان ترافیک پلن تا ماه بعد قطع می‌شوند.', '');
+            }
             $upgradeOk = true;
             if (count($products) > 1) {
                 if (Env::hasTable('tblproduct_upgrade_products')) {
@@ -1294,6 +1429,51 @@ final class Pages
                 'در Automation Settings گزینه «Update Usage Statistics» را روشن کنید؛ کران روزانه WHMCS باید اجرا شود.');
         }
         return $c;
+    }
+
+    /**
+     * WHMCS automation settings the prepaid flow relies on (read-only; nothing is changed).
+     * @return array list of [status, title, detail, fix]
+     */
+    public static function automationChecks(): array
+    {
+        $cfg = [];
+        try {
+            foreach (Capsule::table('tblconfiguration')->whereIn('setting', ['AutoSuspension', 'AutoSuspensionDays', 'AutoUnsuspend',
+                'NoAutoApplyCredit', 'AddFundsEnabled'])->get(['setting', 'value']) as $r) {
+                $cfg[(string) $r->setting] = (string) $r->value;
+            }
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $on = function ($k) use ($cfg) {
+            return isset($cfg[$k]) ? in_array(strtolower($cfg[$k]), ['on', '1', 'yes', 'true'], true) : null;
+        };
+        $unk = 'این تنظیم در پایگاه داده پیدا نشد (نسخه WHMCS متفاوت است)؛ دستی بررسی کنید.';
+        $out = [];
+        $v = $on('AddFundsEnabled');
+        $out[] = [$v ? 'ok' : ($v === null ? 'warn' : 'bad'), 'شارژ کیف پول (Add Funds) فعال است', $v ? 'مشتری می‌تواند از clientarea.php?action=addfunds اعتبار بخرد'
+            : ($v === null ? $unk : 'غیرفعال است؛ مشتری راهی برای شارژ کیف پول ندارد'), 'System Settings → Payment → Credit: گزینه «Enable Add Funds» را روشن کنید و حداقل/حداکثر شارژ را تعیین کنید.'];
+        $v = $on('AutoUnsuspend');
+        $out[] = [$v ? 'ok' : ($v === null ? 'warn' : 'bad'), 'رفع تعلیق خودکار پس از پرداخت (AutoUnsuspend)', $v ? 'روشن است' : ($v === null ? $unk : 'خاموش است؛ پس از پرداخت فاکتور تمدید از کیف پول، سرویس معلق وصل نمی‌شود'),
+            'Automation Settings → Automatic Suspension: «Enable Unsuspension» را روشن کنید.'];
+        $v = $on('AutoSuspension');
+        $days = isset($cfg['AutoSuspensionDays']) ? (int) $cfg['AutoSuspensionDays'] : null;
+        $out[] = [$v === null ? 'warn' : 'ok', 'تعلیق خودکار سرویس‌های معوق (AutoSuspension)', $v === null ? $unk
+            : ($v ? 'روشن — ' . ($days === null ? '' : View::n($days) . ' روز پس از سررسید') : 'خاموش — سرویس‌های تمدیدنشده قطع نمی‌شوند'),
+            'برای «قطع با اتمام اعتبار»، تعلیق خودکار را روشن و «Suspend Days» را ۰ (همان روز سررسید) قرار دهید.'];
+        if ($v && $days !== null && $days > 0) {
+            $c = &$out[count($out) - 1];
+            $c[0] = 'warn';
+            $c[2] .= ' (پیشنهاد: ۰ تا سرویس تمدیدنشده همان روز قطع و پس از شارژ کیف پول وصل شود)';
+            unset($c);
+        }
+        $v = $on('NoAutoApplyCredit');
+        $out[] = [$v === null ? 'warn' : ($v ? 'warn' : 'ok'), 'اعمال خودکار اعتبار روی فاکتورهای جدید', $v === null ? $unk
+            : ($v ? 'خاموش است (NoAutoApplyCredit)؛ فاکتورهای تمدید CDN را این ماژول پس از هر شارژ و در کران از اعتبار پرداخت می‌کند، ولی فاکتور سایر محصولات دستی پرداخت می‌شوند'
+                : 'روشن است؛ اعتبار موجود هنگام صدور فاکتور تمدید خودکار اعمال می‌شود'),
+            'System Settings → Payment → Credit: «Automatically apply any available credit … when generating invoices» را روشن کنید (اختیاری).'];
+        return $out;
     }
 
     public static function settings(): string
@@ -1355,6 +1535,8 @@ final class Pages
         }
         $boot['billing'] = function_exists('pasargadcdn_billing') ? \pasargadcdn_billing(['pid' => (int) $svc->pid,
             'clientsdetails' => ['currency' => (int) ($svc->currency ?? 0)]]) : null;
+        $boot['wallet'] = function_exists('pasargadcdn_wallet') ? \pasargadcdn_wallet(['pid' => (int) $svc->pid, 'userid' => (int) $svc->userid,
+            'serviceid' => $sid]) : null;
         $base = '../modules/servers/pasargadcdn';
         $assets = function_exists('pasargadcdn_assets') ? \pasargadcdn_assets($base) : ['css' => $base . '/assets/app.css', 'scripts' => []];
         $api = View::url(['page' => 'api', 'service' => $sid] + (Env::whmcsToken() !== '' ? ['token' => Env::whmcsToken()] : []), false);

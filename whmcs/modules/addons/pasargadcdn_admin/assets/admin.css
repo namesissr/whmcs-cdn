@@ -139,6 +139,7 @@
 .pcdna-meter > .pcdna-t-bad { background: var(--a-bad); }
 .pcdna-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
 .pcdna-yes { color: var(--a-ok); }
+.pcdna-bought { color: var(--a-ok); font-weight: 700; }
 .pcdna-no { color: var(--a-warn); }
 .pcdna-err { color: var(--a-bad); font-size: 12px; display: inline-block; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
 .pcdna-table .pcdna-ltr { white-space: nowrap; }
@@ -304,6 +305,16 @@
 .pcdna-manage-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .pcdna-manage-head h3 { font-size: 16px; }
 .pcdna[data-page="manage"] #pcdn-app.pcdn { margin: 0; }
+
+/* ---------- billing mode cards */
+.pcdna-billing { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 6px 0 12px; }
+.pcdna .pcdna-radio-card { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--a-border-strong); border-radius: 10px; cursor: pointer; background: #fff; }
+.pcdna .pcdna-radio-card input { margin-top: 5px; accent-color: var(--a-brand); flex: none; }
+.pcdna-radio-card span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pcdna-radio-card small { color: var(--a-muted); line-height: 1.6; }
+.pcdna .pcdna-radio-card.is-on { border-color: var(--a-brand); background: var(--a-brand-50); box-shadow: 0 0 0 1px var(--a-brand); }
+.pcdna [data-billing-show][hidden] { display: none !important; }
+@media (max-width: 1180px) { .pcdna-billing { grid-template-columns: minmax(0, 1fr); } }
 
 /* ---------- responsive (the WHMCS sidebar takes ~250px, so breakpoints are generous) */
 @media (max-width: 1180px) {

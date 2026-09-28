@@ -22,6 +22,13 @@ final class Wizard
     const GROUP_NAME = 'CDN و امنیت وب';
     const SERVER_GROUP_NAME = 'CDN Servers';
     const EMAIL_NAME = 'Pasargad CDN Welcome';
+    const EMAIL_EXHAUSTED = 'Pasargad CDN Traffic Exhausted';
+    const EMAIL_WARNING = 'Pasargad CDN Traffic Warning';
+    const BILLING = [
+        'prepaid' => 'پیش‌پرداخت از کیف پول (پیشنهادی)',
+        'overage' => 'فاکتور ترافیک اضافه در پایان ماه',
+        'cut' => 'قطع در پایان ترافیک پلن (بدون هزینه اضافه)',
+    ];
     const ORIGIN_FIELD = 'Origin IP|IP سرور اصلی (اختیاری)';
     const ORIGIN_REGEX = '/^$|^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/';
 
@@ -162,7 +169,8 @@ final class Wizard
         $in = [
             'group_name' => self::GROUP_NAME, 'servergroup' => 'new', 'server_id' => Env::server() ? (int) Env::server()->id : 0,
             'autosetup' => 'payment', 'hidden' => false,
-            'overage' => true, 'overage_price' => (float) self::BASE_OVERAGE[$kind], 'overage_allow' => 100,
+            'billing' => self::currentBilling(), 'overage' => self::currentBilling() === 'overage',
+            'overage_price' => (float) self::BASE_OVERAGE[$kind], 'overage_allow' => 100,
             'email' => true, 'email_update' => false, 'update' => false, 'plans' => [],
         ];
         $existing = self::existingServerGroup();
@@ -211,7 +219,8 @@ final class Wizard
             'server_id' => (int) ($post['server_id'] ?? 0),
             'autosetup' => in_array($post['autosetup'] ?? '', ['payment', 'order', 'on', ''], true) ? (string) $post['autosetup'] : 'payment',
             'hidden' => !empty($post['hidden']),
-            'overage' => !empty($post['overage']),
+            'billing' => array_key_exists((string) ($post['billing'] ?? ''), self::BILLING) ? (string) $post['billing'] : 'prepaid',
+            'overage' => false,
             'overage_price' => 0.0,
             'overage_allow' => 0,
             'email' => !empty($post['email']),
@@ -222,9 +231,12 @@ final class Wizard
         if ($in['group_name'] === '') {
             $e[] = 'نام گروه محصولات را وارد کنید.';
         }
+        $in['overage'] = $in['billing'] === 'overage';
         $op = $numv($post['overage_price'] ?? '0');
-        if ($in['overage'] && (!is_numeric($op) || (float) $op < 0 || (float) $op > 1e12)) {
+        if ($in['billing'] !== 'cut' && (!is_numeric($op) || (float) $op < 0 || (float) $op > 1e12)) {
             $e[] = 'قیمت هر گیگابایت ترافیک اضافه باید عددی نامنفی باشد.';
+        } elseif ($in['billing'] === 'prepaid' && (float) $op <= 0) {
+            $e[] = 'در حالت پیش‌پرداخت، قیمت هر گیگابایت ترافیک اضافه را وارد کنید (بیشتر از صفر).';
         }
         $in['overage_price'] = is_numeric($op) ? max(0.0, (float) $op) : 0.0;
         $oa = $numv($post['overage_allow'] ?? '0');
@@ -311,7 +323,7 @@ final class Wizard
                 $names[$row['name']] = true;
             }
         }
-        if ($in['overage']) {
+        if ($in['billing'] === 'overage') {
             $perMb = self::perMb($in['overage_price']);
             $max = Env::decimalMax('tblproducts', 'overagesbwprice');
             if ($perMb > $max) {
@@ -323,13 +335,23 @@ final class Wizard
         return [$in, array_values(array_unique($e))];
     }
 
+    /** Billing mode saved in the addon settings (prepaid by default). */
+    public static function currentBilling(): string
+    {
+        $m = Env::setting('billing', 'prepaid');
+        return array_key_exists($m, self::BILLING) ? $m : 'prepaid';
+    }
+
     /** WHMCS keeps overage prices per MB (4 decimals). */
     public static function perMb(float $perGb): float
     {
         return round($perGb / 1024, 4);
     }
 
-    /** Controller hard cap for a plan: included × (1 + allowance%) when overage billing is on. */
+    /**
+     * Controller hard cap for a plan: included × (1 + allowance%) in overage-invoice mode;
+     * plan GB in prepaid mode (bought blocks are added on top at run time) and in cut mode.
+     */
     public static function hardCap(array $p, array $in): int
     {
         $bw = (int) $p['bw'];
@@ -409,9 +431,9 @@ final class Wizard
         return $q->orderBy('id')->first();
     }
 
-    public static function findEmail()
+    public static function findEmail(string $name = self::EMAIL_NAME)
     {
-        return Capsule::table('tblemailtemplates')->where('name', self::EMAIL_NAME)->where('type', 'product')
+        return Capsule::table('tblemailtemplates')->where('name', $name)->where('type', 'product')
             ->where(function ($q) {
                 $q->where('language', '')->orWhereNull('language');
             })->orderBy('id')->first();
@@ -439,6 +461,38 @@ final class Wizard
             // fall back below
         }
         return Env::DEFAULT_NS;
+    }
+
+    /** name => [subject, HTML body] of the templates the wizard manages. */
+    public static function templates(array $ns): array
+    {
+        $wrap = function (string $inner) {
+            return '<div dir="rtl" style="text-align:right;font-family:Tahoma,Arial,sans-serif;line-height:1.9;font-size:14px">' . "\n"
+                . $inner . "\n<p>{\$signature}</p>\n</div>";
+        };
+        $btn = '<p><a href="{$whmcs_url}clientarea.php?action=addfunds" style="display:inline-block;background:#1d5fd6;color:#fff;'
+            . 'padding:8px 18px;border-radius:8px;text-decoration:none">شارژ کیف پول</a></p>';
+        return [
+            self::EMAIL_NAME => [self::emailSubject(), self::emailBody($ns)],
+            self::EMAIL_EXHAUSTED => ['ترافیک سرویس CDN شما تمام شد — برای وصل شدن کیف پول را شارژ کنید', $wrap(
+                "<p>{\$client_name} عزیز، سلام</p>\n"
+                . "<p>ترافیک این ماه سرویس <strong>{\$service_product_name}</strong> برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> "
+                . "({\$cdn_used_gb} از {\$cdn_cap_gb} گیگابایت) تمام شده و سایت از طریق CDN سرو نمی‌شود.</p>\n"
+                . "{if \$cdn_limit_reached}<p>سقف خرید خودکار ترافیک این ماه برای سرویس شما پر شده است. برای ادامه، پلن را ارتقا دهید یا با پشتیبانی تماس بگیرید.</p>"
+                . "{else}<p>ترافیک اضافه به‌صورت بسته‌های {\$cdn_block_gb} گیگابایتی (هر بسته {\$cdn_block_price}) از اعتبار کیف پول شما خریده می‌شود. "
+                . "اعتبار فعلی شما {\$cdn_credit} است؛ با شارژ دست‌کم <strong>{\$cdn_needed}</strong> سرویس ظرف چند ثانیه دوباره وصل می‌شود.</p>\n"
+                . $btn . "{/if}\n"
+                . '<p>برای ترافیک بیشتر در ماه‌های آینده می‌توانید پلن را از ناحیه کاربری ارتقا دهید: '
+                . '<a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}">مدیریت سرویس</a></p>')],
+            self::EMAIL_WARNING => ['هشدار: ترافیک سرویس CDN دامنه {$service_domain} رو به اتمام است', $wrap(
+                "<p>{\$client_name} عزیز، سلام</p>\n"
+                . "<p>از ترافیک این ماه سرویس <strong>{\$service_product_name}</strong> برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> "
+                . "{\$cdn_used_gb} از {\$cdn_cap_gb} گیگابایت مصرف شده است.</p>\n"
+                . "{if \$cdn_limit_reached}<p>سقف خرید خودکار ترافیک این ماه پر شده است؛ پس از اتمام ترافیک، سرویس تا ماه بعد قطع می‌شود مگر اینکه پلن را ارتقا دهید.</p>"
+                . "{else}<p>پس از اتمام، بسته‌های {\$cdn_block_gb} گیگابایتی (هر بسته {\$cdn_block_price}) خودکار از کیف پول خریده می‌شوند، "
+                . "اما اعتبار فعلی شما ({\$cdn_credit}) برای یک بسته کافی نیست. برای جلوگیری از قطع سرویس، دست‌کم {\$cdn_needed} شارژ کنید.</p>\n"
+                . $btn . "{/if}")],
+        ];
     }
 
     public static function emailSubject(): string
@@ -495,11 +549,19 @@ final class Wizard
         }
 
         if ($in['email']) {
-            $tpl = self::findEmail();
-            $steps[] = ['op' => $tpl ? ($in['email_update'] ? 'update' : 'skip') : 'create', 'kind' => 'قالب ایمیل',
-                'label' => self::EMAIL_NAME, 'detail' => $tpl ? ($in['email_update'] ? 'متن قالب موجود بازنویسی می‌شود' : 'قالب موجود دست نمی‌خورد')
-                    : 'قالب خوش‌آمدگویی فارسی با نیم‌سرورها: ' . implode('، ', self::nameservers())];
+            $what = [self::EMAIL_NAME => 'قالب خوش‌آمدگویی فارسی با نیم‌سرورها: ' . implode('، ', self::nameservers()),
+                self::EMAIL_EXHAUSTED => 'اطلاع‌رسانی قطع سرویس به‌دلیل اتمام ترافیک و کافی نبودن اعتبار (حداکثر یک بار در ماه)',
+                self::EMAIL_WARNING => 'هشدار ۹۰٪ ترافیک وقتی اعتبار برای بسته بعدی کافی نیست'];
+            foreach ($what as $name => $desc) {
+                $tpl = self::findEmail($name);
+                $steps[] = ['op' => $tpl ? ($in['email_update'] ? 'update' : 'skip') : 'create', 'kind' => 'قالب ایمیل',
+                    'label' => $name, 'detail' => $tpl ? ($in['email_update'] ? 'متن قالب موجود بازنویسی می‌شود' : 'قالب موجود دست نمی‌خورد') : $desc];
+            }
         }
+        $steps[] = ['op' => $in['billing'] === self::currentBilling() ? 'skip' : 'update', 'kind' => 'روش صورتحساب ترافیک',
+            'label' => self::BILLING[$in['billing']], 'detail' => $in['billing'] === 'prepaid'
+                ? 'پس از اتمام ترافیک پلن، بسته‌های ' . View::n((int) Env::setting('block_gb', '10') ?: 10) . ' گیگابایتی از کیف پول مشتری خریده می‌شود؛ اعتبار ناکافی = قطع تا شارژ مجدد. Overage WHMCS برای این محصولات خاموش است.'
+                : ($in['billing'] === 'overage' ? 'WHMCS در پایان ماه ترافیک مازاد را فاکتور می‌کند.' : 'سرویس در پایان ترافیک پلن قطع می‌شود؛ هزینه اضافه‌ای گرفته نمی‌شود.')];
 
         $perMb = self::perMb($in['overage_price']);
         $found = [];
@@ -511,7 +573,9 @@ final class Wizard
             $found[] = $prod ? (int) $prod->id : 0;
             $cap = self::hardCap($p, $in);
             $detail = self::FIELD_LABELS['bw'] . ': ' . ($p['bw'] > 0 ? View::n($p['bw']) : 'نامحدود');
-            if ($in['overage'] && $p['bw'] > 0) {
+            if ($in['billing'] === 'prepaid' && $p['bw'] > 0) {
+                $detail .= ' — پیش‌پرداخت: هر GB ' . View::n($in['overage_price'], 2) . ' از کیف پول؛ قطع در ' . View::n($cap) . ' GB + ترافیک خریداری‌شده';
+            } elseif ($in['overage'] && $p['bw'] > 0) {
                 $detail .= ' — ترافیک اضافه هر GB ' . View::n($in['overage_price'], 4) . ' (ذخیره: ' . View::n($perMb, 4) . ' هر MB)'
                     . ' — سقف قطع روی CDN: ' . View::n($cap) . ' GB';
             }
@@ -566,6 +630,17 @@ final class Wizard
         }
         if ($pids) {
             Env::kvSet('wizard_pids', array_merge((array) Env::kvGet('wizard_pids', []), $pids));
+            // per-GB price of prepaid traffic, in the default currency (read by the prepaid engine)
+            $prices = (array) Env::kvGet('gb_prices', []);
+            foreach ($summary as $s) {
+                if (!empty($s['plan']) && ($s['op'] !== 'skip' || !isset($prices[(string) $s['pid']]))) {
+                    $prices[(string) $s['pid']] = round((float) $in['overage_price'], 2);
+                }
+            }
+            Env::kvSet('gb_prices', $prices);
+        }
+        if (Env::setting('billing', '') !== $in['billing']) {
+            Env::saveSetting('billing', $in['billing']);
         }
         return $summary;
     }
@@ -612,26 +687,30 @@ final class Wizard
             $sgid = (int) $in['servergroup'];
         }
 
-        // welcome email
+        // email templates (welcome + the two prepaid traffic notices)
         $emailId = 0;
         if ($in['email']) {
-            $tpl = self::findEmail();
-            $fields = ['subject' => self::emailSubject(), 'message' => self::emailBody($ns), 'updated_at' => $now];
-            if ($tpl) {
-                $emailId = (int) $tpl->id;
-                if ($in['email_update']) {
-                    Capsule::table('tblemailtemplates')->where('id', $emailId)->update(Env::onlyColumns('tblemailtemplates', $fields));
-                    $out[] = ['op' => 'update', 'kind' => 'قالب ایمیل', 'label' => self::EMAIL_NAME, 'link' => 'configemailtemplates.php?action=edit&id=' . $emailId];
+            foreach (self::templates($ns) as $name => [$subject, $body]) {
+                $tpl = self::findEmail($name);
+                $fields = ['subject' => $subject, 'message' => $body, 'updated_at' => $now];
+                if ($tpl) {
+                    $id = (int) $tpl->id;
+                    if ($in['email_update']) {
+                        Capsule::table('tblemailtemplates')->where('id', $id)->update(Env::onlyColumns('tblemailtemplates', $fields));
+                    }
+                    $op = $in['email_update'] ? 'update' : 'skip';
                 } else {
-                    $out[] = ['op' => 'skip', 'kind' => 'قالب ایمیل', 'label' => self::EMAIL_NAME, 'link' => 'configemailtemplates.php?action=edit&id=' . $emailId];
+                    $id = (int) Capsule::table('tblemailtemplates')->insertGetId(Env::onlyColumns('tblemailtemplates', $fields + [
+                        'type' => 'product', 'name' => $name, 'attachments' => '', 'fromname' => '', 'fromemail' => '',
+                        'disabled' => 0, 'custom' => 1, 'language' => '', 'copyto' => '', 'blind_copy_to' => '', 'plaintext' => 0,
+                        'created_at' => $now,
+                    ]));
+                    $op = 'create';
                 }
-            } else {
-                $emailId = (int) Capsule::table('tblemailtemplates')->insertGetId(Env::onlyColumns('tblemailtemplates', $fields + [
-                    'type' => 'product', 'name' => self::EMAIL_NAME, 'attachments' => '', 'fromname' => '', 'fromemail' => '',
-                    'disabled' => 0, 'custom' => 1, 'language' => '', 'copyto' => '', 'blind_copy_to' => '', 'plaintext' => 0,
-                    'created_at' => $now,
-                ]));
-                $out[] = ['op' => 'create', 'kind' => 'قالب ایمیل', 'label' => self::EMAIL_NAME, 'link' => 'configemailtemplates.php?action=edit&id=' . $emailId];
+                if ($name === self::EMAIL_NAME) {
+                    $emailId = $id;
+                }
+                $out[] = ['op' => $op, 'kind' => 'قالب ایمیل', 'label' => $name, 'link' => 'configemailtemplates.php?action=edit&id=' . $id];
             }
         }
 

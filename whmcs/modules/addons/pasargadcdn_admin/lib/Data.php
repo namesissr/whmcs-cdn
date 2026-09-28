@@ -99,6 +99,61 @@ final class Data
         return 'clientssummary.php?userid=' . $userId;
     }
 
+    /** Prepaid settings of a service row (SERVICE_COLS), or null. */
+    public static function prepaid($svc, array $configoptions = []): ?array
+    {
+        if (!function_exists('pasargadcdn_prepaid')) {
+            return null;
+        }
+        return \pasargadcdn_prepaid(['id' => (int) ($svc->packageid ?? 0), 'configoption1' => $svc->plan_gb ?? 0,
+            'overagesenabled' => $svc->overagesenabled ?? '', 'overagesbwlimit' => $svc->overagesbwlimit ?? 0,
+            'overagesbwprice' => $svc->overagesbwprice ?? 0], $configoptions);
+    }
+
+    /** Configurable option values of these services, one query ([sid => [name => value]]). */
+    public static function configOptions(array $rows): array
+    {
+        if (!function_exists('pasargadcdn_config_options') || !$rows) {
+            return [];
+        }
+        return \pasargadcdn_config_options(array_map(function ($r) {
+            return (int) $r->id;
+        }, $rows));
+    }
+
+    /** Traffic purchases of $month (newest first), with service/client facts. */
+    public static function topups(string $month, int $limit = 500): array
+    {
+        if (!Env::hasTable(Env::TOPUPS)) {
+            return [];
+        }
+        return Capsule::table(Env::TOPUPS . ' as t')
+            ->leftJoin('tblhosting as h', 'h.id', '=', 't.service_id')
+            ->leftJoin('tblclients as c', 'c.id', '=', 't.userid')
+            ->leftJoin('tblcurrencies as cu', 'cu.id', '=', 't.currency')
+            ->where('t.month', $month)->orderBy('t.id', 'desc')->limit($limit)
+            ->get(['t.*', 'h.domain', 'c.firstname', 'c.lastname', 'c.companyname', 'cu.code as currency_code'])->all();
+    }
+
+    /** service id => ['gb' => paid GB, 'amount' => paid amount, 'code' => currency, 'invoices' => [ids]] for $month. */
+    public static function topupSums(string $month): array
+    {
+        $out = [];
+        foreach (self::topups($month, 100000) as $t) {
+            if ($t->status !== 'paid') {
+                continue;
+            }
+            $o = $out[(int) $t->service_id] ?? ['gb' => 0, 'amount' => 0.0, 'code' => (string) $t->currency_code, 'invoices' => []];
+            $o['gb'] += (int) $t->gb;
+            $o['amount'] += (float) $t->amount;
+            if ($t->invoice_id) {
+                $o['invoices'][] = (int) $t->invoice_id;
+            }
+            $out[(int) $t->service_id] = $o;
+        }
+        return $out;
+    }
+
     // ------------------------------------------------------------------ products / pricing
 
     public static function products(): array

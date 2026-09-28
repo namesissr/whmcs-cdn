@@ -11,6 +11,12 @@
  *  - ShoppingCartValidateProductUpdate: same local rules for the edited item,
  *    no controller request.
  *  - AdminHomeWidgets: registers the widget (data cached 5 minutes).
+ *  - InvoicePaid: one query on the paid invoice's items; only an Add Funds or a
+ *    CDN traffic top-up invoice does more (prepaid mode: buy traffic / reconnect
+ *    this client's CDN services, pay its CDN-only invoices from credit).
+ *  - AfterCronJob: prepaid mode only; no CDN products → 2 small queries. Otherwise
+ *    one controller /api/v1/usage call per CDN server and work only for services
+ *    at/near their cap. Errors are logged, never thrown into WHMCS's cron.
  */
 
 if (!defined('WHMCS')) {
@@ -69,5 +75,35 @@ add_hook('AdminHomeWidgets', 1, function () {
         return class_exists('\\PasargadCdn\\Admin\\Widget') ? new \PasargadCdn\Admin\Widget() : null;
     } catch (\Throwable $e) {
         return null;
+    }
+});
+
+add_hook('InvoicePaid', 1, function ($vars) {
+    $id = is_array($vars) ? (int) ($vars['invoiceid'] ?? 0) : 0;
+    if ($id <= 0) {
+        return;
+    }
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Prepaid.php';
+        \PasargadCdn\Admin\Prepaid::onInvoicePaid($id);
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: InvoicePaid hook error: ' . $e->getMessage());
+        }
+    }
+});
+
+add_hook('AfterCronJob', 1, function ($vars) {
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Prepaid.php';
+        \PasargadCdn\Admin\Prepaid::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: cron hook error: ' . $e->getMessage());
+        }
     }
 });

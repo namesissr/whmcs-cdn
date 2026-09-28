@@ -35,7 +35,7 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.0.0',
+        'version' => '1.1.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',
@@ -43,6 +43,44 @@ function pasargadcdn_admin_config()
                 'Options' => $servers,
                 'Default' => '0',
                 'Description' => 'سرور Pasargad CDN برای داشبورد، نودها، گزارش‌ها، ویجت و بررسی سبد خرید',
+            ],
+            'billing' => [
+                'FriendlyName' => 'روش صورتحساب ترافیک',
+                'Type' => 'dropdown',
+                'Options' => [
+                    'prepaid' => 'پیش‌پرداخت از کیف پول (قطع با اتمام اعتبار، وصل پس از شارژ)',
+                    'overage' => 'فاکتور ترافیک اضافه در پایان ماه',
+                    'cut' => 'قطع در پایان ترافیک پلن',
+                ],
+                'Default' => 'prepaid',
+                'Description' => 'در حالت پیش‌پرداخت، پس از اتمام ترافیک پلن بسته‌های ترافیک از اعتبار (Credit) مشتری خریده می‌شود',
+            ],
+            'block_gb' => [
+                'FriendlyName' => 'اندازه بسته ترافیک (GB)',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '10',
+                'Description' => 'حالت پیش‌پرداخت: هر خرید خودکار چند گیگابایت باشد',
+            ],
+            'gb_price' => [
+                'FriendlyName' => 'قیمت هر گیگابایت (اختیاری)',
+                'Type' => 'text',
+                'Size' => '12',
+                'Default' => '',
+                'Description' => 'خالی = قیمتی که در ویزارد پلن‌ها برای هر محصول ثبت شده (ارز پیش‌فرض WHMCS)',
+            ],
+            'max_blocks' => [
+                'FriendlyName' => 'حداکثر خرید خودکار در ماه (بسته)',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '20',
+                'Description' => 'محافظت از مشتری در برابر هزینه ناخواسته (مثلاً حمله): پس از این تعداد بسته در یک ماه، خرید خودکار متوقف می‌شود',
+            ],
+            'warn_email' => [
+                'FriendlyName' => 'ایمیل هشدار ۹۰٪',
+                'Type' => 'yesno',
+                'Default' => 'yes',
+                'Description' => 'وقتی ۹۰٪ ترافیک مصرف شده و اعتبار برای بسته بعدی کافی نیست، یک بار در ماه به مشتری ایمیل شود',
             ],
             'widget' => [
                 'FriendlyName' => 'ویجت صفحه اصلی',
