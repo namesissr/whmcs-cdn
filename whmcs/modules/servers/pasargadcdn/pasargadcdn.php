@@ -38,7 +38,7 @@ function pasargadcdn_ConfigOptions()
     return [
         'Bandwidth (GB)' => [
             'Type' => 'text', 'Size' => '8', 'Default' => '100',
-            'Description' => 'ترافیک ماهانه (گیگابایت) — 0 یعنی نامحدود',
+            'Description' => 'سقف ترافیک ماهانه روی CDN (گیگابایت) — 0 یعنی نامحدود. با صورتحساب ترافیک اضافه، ترافیک پلن همان Overage Soft Limit تب Other است و این عدد سقف قطع سرویس است',
         ],
         'Max DNS records' => [
             'Type' => 'text', 'Size' => '8', 'Default' => '100',
@@ -184,11 +184,16 @@ function pasargadcdn_CreateAccount(array $params)
             if ($e->getCode() !== 409) {
                 throw $e;
             }
-            // Re-run of Create on an existing site of the same service is fine.
-            $site = ApiClient::fromParams($params)->get(ApiClient::site($domain));
-            if (($site['external_id'] ?? '') !== (string) $params['serviceid']) {
-                throw $e;
+            // Re-run of Create on an existing site of the same service is fine
+            // (e.g. a retry after a timeout): bring its plan up to date.
+            $api = ApiClient::fromParams($params);
+            $site = $api->get(ApiClient::site($domain));
+            if ((string) ($site['external_id'] ?? '') !== (string) $params['serviceid']) {
+                throw new ApiException('دامنه ' . $domain . ' از قبل روی CDN و برای سرویس دیگری ('
+                    . (($site['external_id'] ?? '') !== '' ? '#' . $site['external_id'] : 'بدون شناسه')
+                    . ') ثبت شده است. از بخش «همگام‌سازی» ماژول مدیریت CDN آن را بررسی کنید.', 409);
             }
+            $api->patch(ApiClient::site($domain) . '/plan', pasargadcdn_plan($params));
         }
     });
 }
@@ -241,21 +246,69 @@ function pasargadcdn_UsageUpdate(array $params)
     } catch (\Throwable $e) {
         return $e->getMessage();
     }
+    // With overage billing the product's soft limit (included traffic) is the
+    // limit WHMCS shows and bills against; the controller limit is the hard cap.
+    $included = [];
+    $packageOf = [];
+    try {
+        foreach (Capsule::table('tblproducts')->where('servertype', 'pasargadcdn')
+                     ->get(['id', 'overagesenabled', 'overagesbwlimit', 'overagesbwprice']) as $p) {
+            $o = pasargadcdn_overage((array) $p);
+            if ($o !== null) {
+                $included[(int) $p->id] = (int) round($o['included_gb'] * 1024);
+            }
+        }
+        if ($included) {
+            $packageOf = Capsule::table('tblhosting')->where('server', $params['serverid'])
+                ->whereIn('packageid', array_keys($included))->pluck('packageid', 'id')->all();
+        }
+    } catch (\Throwable $e) {
+        $included = [];
+    }
     foreach ($data['sites'] ?? [] as $site) {
         $serviceId = (int) ($site['external_id'] ?? 0);
         if ($serviceId <= 0) {
             continue;
+        }
+        $limitMb = (int) ($site['bandwidth_limit_gb'] ?? 0) * 1024;
+        if (isset($packageOf[$serviceId], $included[(int) $packageOf[$serviceId]])) {
+            $limitMb = $included[(int) $packageOf[$serviceId]];
         }
         Capsule::table('tblhosting')
             ->where('id', $serviceId)
             ->where('server', $params['serverid'])
             ->update([
                 'bwusage' => (int) round(($site['bytes'] ?? 0) / 1048576),
-                'bwlimit' => (int) ($site['bandwidth_limit_gb'] ?? 0) * 1024,
+                'bwlimit' => $limitMb,
                 'lastupdate' => date('Y-m-d H:i:s'),
             ]);
     }
     return 'success';
+}
+
+/**
+ * Overage settings of a product row (overagesenabled "1[,diskunit,bwunit]",
+ * overagesbwlimit and overagesbwprice in bwunit, MB by default).
+ * Returns null when bandwidth overage billing is off.
+ *
+ * @return array{included_gb: float, price_per_gb: float}|null
+ */
+function pasargadcdn_overage(array $p): ?array
+{
+    $parts = explode(',', (string) ($p['overagesenabled'] ?? ''));
+    if (trim($parts[0]) === '' || trim($parts[0]) === '0') {
+        return null;
+    }
+    $limit = (float) ($p['overagesbwlimit'] ?? 0);
+    if ($limit <= 0) {
+        return null;
+    }
+    $unit = strtoupper(trim($parts[2] ?? 'MB'));
+    $toGb = ['MB' => 1 / 1024, 'GB' => 1.0, 'TB' => 1024.0][$unit] ?? 1 / 1024;
+    return [
+        'included_gb' => round($limit * $toGb, 3),
+        'price_per_gb' => round((float) ($p['overagesbwprice'] ?? 0) / $toGb, 4),
+    ];
 }
 
 // --------------------------------------------------------------- admin area
@@ -309,9 +362,9 @@ function pasargadcdn_AdminServicesTabFields(array $params)
     try {
         $s = ApiClient::fromParams($params)->get(ApiClient::site(pasargadcdn_domain($params)));
     } catch (\Throwable $e) {
-        return ['Pasargad CDN' => '<span style="color:#c00">' . htmlspecialchars($e->getMessage()) . '</span>'];
+        return ['Pasargad CDN' => '<span style="color:#c00">' . pasargadcdn_e($e->getMessage()) . '</span>'];
     }
-    $h = 'htmlspecialchars';
+    $h = 'pasargadcdn_e';
     $u = $s['usage_month'] ?? [];
     return [
         'وضعیت CDN' => $h($s['status'] ?? '-'),
@@ -326,6 +379,11 @@ function pasargadcdn_AdminServicesTabFields(array $params)
         'DNSSEC' => $h(pasargadcdn_admin_dnssec($params)),
         'امکانات پلن' => $h(pasargadcdn_features_text($s['plan']['features'] ?? [])),
     ];
+}
+
+function pasargadcdn_e($v): string
+{
+    return htmlspecialchars((string) $v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
 function pasargadcdn_admin_dnssec(array $params): string
@@ -390,24 +448,76 @@ function pasargadcdn_ClientArea(array $params)
     } catch (\Throwable $e) {
         $boot['error'] = $e->getMessage();
     }
+    $boot['billing'] = pasargadcdn_billing($params);
     $base = pasargadcdn_module_url();
-    $ver = function (string $f) {
-        return (string) @filemtime(__DIR__ . '/' . $f);
-    };
+    $assets = pasargadcdn_assets($base);
     return [
         'tabOverviewModuleOutputTemplate' => 'templates/clientarea.tpl',
         'templateVariables' => [
             'pcdnCsrf' => pasargadcdn_csrf_token(),
             'pcdnApiUrl' => $base . '/api.php',
-            'pcdnCssUrl' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
-            'pcdnJsUrl' => $base . '/assets/app.js?v=' . $ver('assets/app.js'),
+            'pcdnCssUrl' => $assets['css'],
+            'pcdnJsUrl' => end($assets['scripts']),
             // Loaded in this order (all deferred); app.js boots last.
-            'pcdnScripts' => array_map(function ($f) use ($base, $ver) {
-                return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-            }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'app.js']),
-            // Safe inside <script type="application/json">: no raw < > & ' "
-            'pcdnBoot' => json_encode($boot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-                | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_PARTIAL_OUTPUT_ON_ERROR),
+            'pcdnScripts' => $assets['scripts'],
+            'pcdnBoot' => pasargadcdn_boot_json($boot),
         ],
     ];
+}
+
+/** Versioned URLs of the client app under $base (the module's web path). */
+function pasargadcdn_assets(string $base): array
+{
+    $ver = function (string $f) {
+        return (string) @filemtime(__DIR__ . '/' . $f);
+    };
+    return [
+        'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
+        'scripts' => array_map(function ($f) use ($base, $ver) {
+            return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
+        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'app.js']),
+    ];
+}
+
+/** Boot JSON, safe inside <script type="application/json">: no raw < > & ' " */
+function pasargadcdn_boot_json(array $boot): string
+{
+    return (string) json_encode($boot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_PARTIAL_OUTPUT_ON_ERROR);
+}
+
+/**
+ * Included traffic and overage price of the service's product, in the client's
+ * currency, for the usage bar of the client app. null when overage billing is
+ * off (the controller limit is then the whole story) or on any error.
+ */
+function pasargadcdn_billing(array $params): ?array
+{
+    try {
+        $pid = (int) ($params['pid'] ?? $params['packageid'] ?? 0);
+        if ($pid <= 0) {
+            return null;
+        }
+        $p = Capsule::table('tblproducts')->where('id', $pid)
+            ->first(['overagesenabled', 'overagesbwlimit', 'overagesbwprice']);
+        $o = $p ? pasargadcdn_overage((array) $p) : null;
+        if ($o === null) {
+            return null;
+        }
+        $currency = '';
+        $rate = 1.0;
+        $cid = (int) ($params['clientsdetails']['currency'] ?? 0);
+        $c = $cid > 0 ? Capsule::table('tblcurrencies')->where('id', $cid)->first(['code', 'suffix', 'rate']) : null;
+        if ($c) {
+            $currency = trim((string) $c->suffix) !== '' ? trim((string) $c->suffix) : (string) $c->code;
+            $rate = (float) $c->rate > 0 ? (float) $c->rate : 1.0;
+        }
+        return [
+            'included_gb' => $o['included_gb'],
+            'price_per_gb' => round($o['price_per_gb'] * $rate, 2),
+            'currency' => $currency,
+        ];
+    } catch (\Throwable $e) {
+        return null;
+    }
 }

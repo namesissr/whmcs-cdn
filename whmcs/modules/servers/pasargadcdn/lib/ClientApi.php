@@ -4,6 +4,10 @@ namespace PasargadCdn;
 
 use WHMCS\Database\Capsule;
 
+if (class_exists(__NAMESPACE__ . '\\ClientApi', false)) {
+    return;
+}
+
 /**
  * Core of api.php — the JSON proxy between the client-area app and the
  * controller. Kept free of globals so it can be tested without WHMCS:
@@ -11,6 +15,11 @@ use WHMCS\Database\Capsule;
  *
  * The site domain always comes from the service row, never from the client;
  * the client only picks one of the whitelisted sub-paths below.
+ *
+ * Admin mode (the addon's «مدیریت کامل» page, 'admin_id' > 0 in the request):
+ * same whitelist, CSRF and domain-from-service rules, but no ownership check
+ * and writes are allowed whatever the WHMCS status is; every admin write is
+ * recorded with logActivity().
  */
 class ClientApi
 {
@@ -41,6 +50,7 @@ class ClientApi
      *   'method' => 'GET', 'id' => '123', 'path' => 'config/cache', 'query' => [...],
      *   'body' => raw request body, 'csrf' => X-PCDN-CSRF header,
      *   'session_csrf' => token stored in the session, 'client_id' => logged-in client id or 0,
+     *   'admin_id' => WHMCS admin id (admin mode only — set by the addon, never from input),
      * ]
      * @param callable|null $clientFactory fn(array $serverParams): ApiClient (tests)
      * @return array [http status, response array]
@@ -50,7 +60,9 @@ class ClientApi
         $method = strtoupper((string) ($req['method'] ?? 'GET'));
         $path = (string) ($req['path'] ?? '');
 
-        if ((int) ($req['client_id'] ?? 0) <= 0) {
+        $adminId = (int) ($req['admin_id'] ?? 0);
+        $admin = $adminId > 0;
+        if (!$admin && (int) ($req['client_id'] ?? 0) <= 0) {
             return self::fail(401, 'لطفاً دوباره وارد حساب کاربری شوید.');
         }
         $sessionToken = (string) ($req['session_csrf'] ?? '');
@@ -68,7 +80,7 @@ class ClientApi
         $svc = Capsule::table('tblhosting')->where('id', (int) $id)
             ->first(['id', 'userid', 'packageid', 'server', 'domain', 'domainstatus']);
         // Same answer for "missing" and "not yours" so ids can't be probed.
-        if (!$svc || (int) $svc->userid !== (int) $req['client_id']) {
+        if (!$svc || (!$admin && (int) $svc->userid !== (int) ($req['client_id'] ?? 0))) {
             return self::fail(404, 'سرویس یافت نشد.');
         }
         $product = Capsule::table('tblproducts')->where('id', (int) $svc->packageid)->first(['servertype']);
@@ -76,7 +88,7 @@ class ClientApi
             return self::fail(404, 'سرویس یافت نشد.');
         }
         $status = (string) $svc->domainstatus;
-        if ($method === 'GET' ? !in_array($status, ['Active', 'Suspended'], true) : $status !== 'Active') {
+        if (!$admin && ($method === 'GET' ? !in_array($status, ['Active', 'Suspended'], true) : $status !== 'Active')) {
             return self::fail(403, 'این سرویس فعال نیست.');
         }
 
@@ -121,11 +133,18 @@ class ClientApi
                 'serverpassword' => (trim((string) $server->accesshash) === '' && function_exists('decrypt'))
                     ? decrypt($server->password) : '',
             ];
-            $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params);
+            // Admin pages keep every controller call within 10 s.
+            $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params, $admin ? 10 : 20);
             [$code, $data] = $api->raw($method, $target, $body);
         } catch (\Throwable $e) {
             self::log($method . ' ' . $target, $e->getMessage());
+            if ($admin && $method !== 'GET') {
+                self::adminLog($adminId, $method, $path, $svc, 'failed: controller unreachable');
+            }
             return self::fail(502, 'اتصال به سرور CDN برقرار نشد.');
+        }
+        if ($admin && $method !== 'GET') {
+            self::adminLog($adminId, $method, $path, $svc, 'HTTP ' . $code);
         }
         if ($code >= 500 || $code < 200 || ($code >= 300 && $code < 400)) {
             self::log($method . ' ' . $target, 'HTTP ' . $code);
@@ -167,6 +186,15 @@ class ClientApi
     private static function fail(int $code, string $detail): array
     {
         return [$code, ['detail' => $detail]];
+    }
+
+    private static function adminLog(int $adminId, string $method, string $path, $svc, string $result): void
+    {
+        if (function_exists('logActivity')) {
+            // Path and service facts only — request bodies (certificates, keys) are never logged.
+            logActivity(sprintf('Pasargad CDN [admin #%d, full management]: %s %s on service #%d (%s) — %s',
+                $adminId, $method, $path === '' ? '/' : $path, (int) $svc->id, (string) $svc->domain, $result), (int) $svc->userid);
+        }
     }
 
     private static function log(string $action, string $error): void

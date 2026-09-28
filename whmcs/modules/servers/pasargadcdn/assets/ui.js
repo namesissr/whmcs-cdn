@@ -202,7 +202,8 @@
 
   var CFG = { api: '', csrf: '', serviceId: 0 };
   function api(method, path, body, query) {
-    var url = CFG.api + '?id=' + encodeURIComponent(CFG.serviceId) + '&path=' + encodeURIComponent(path);
+    // The admin-mode endpoint (addonmodules.php?module=…) already has a query string.
+    var url = CFG.api + (CFG.api.indexOf('?') >= 0 ? '&' : '?') + 'id=' + encodeURIComponent(CFG.serviceId) + '&path=' + encodeURIComponent(path);
     Object.keys(query || {}).forEach(function (k) { url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
     var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'Accept': 'application/json' } };
     if (body !== undefined) {

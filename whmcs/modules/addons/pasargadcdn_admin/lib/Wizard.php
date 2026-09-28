@@ -1,0 +1,828 @@
+<?php
+
+namespace PasargadCdn\Admin;
+
+use WHMCS\Database\Capsule;
+
+if (class_exists(__NAMESPACE__ . '\\Wizard', false)) {
+    return;
+}
+
+/**
+ * «راه‌اندازی خودکار محصولات»: product group, four CDN plans with pricing,
+ * server group, «Origin IP» custom field, upgrade paths and the welcome email.
+ *
+ * Idempotent: everything is looked up before it is created; existing products,
+ * prices and the email template are only changed when the admin ticks
+ * «به‌روزرسانی». plan() is read-only (preview); apply() runs the same plan in
+ * one DB transaction.
+ */
+final class Wizard
+{
+    const GROUP_NAME = 'CDN و امنیت وب';
+    const SERVER_GROUP_NAME = 'CDN Servers';
+    const EMAIL_NAME = 'Pasargad CDN Welcome';
+    const ORIGIN_FIELD = 'Origin IP|IP سرور اصلی (اختیاری)';
+    const ORIGIN_REGEX = '/^$|^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/';
+
+    const CYCLES = ['monthly' => 'ماهانه', 'quarterly' => 'سه‌ماهه', 'semiannually' => 'شش‌ماهه', 'annually' => 'سالانه'];
+    /** months and discount multiplier used for the default prices */
+    const CYCLE_FACTOR = ['monthly' => 1, 'quarterly' => 2.85, 'semiannually' => 5.4, 'annually' => 10];
+    const SETUP_COL = ['monthly' => 'msetupfee', 'quarterly' => 'qsetupfee', 'semiannually' => 'ssetupfee',
+        'annually' => 'asetupfee', 'biennially' => 'bsetupfee', 'triennially' => 'tsetupfee'];
+
+    /** plan field => configoption number */
+    const FLAGS = ['ssl' => 3, 'waf' => 5, 'ddos' => 6, 'lb' => 7, 'image' => 8, 'customssl' => 9, 'dnssec' => 10];
+    const NUMS = ['records' => 2, 'rate' => 4, 'page' => 11, 'fw' => 12, 'rl' => 13, 'pools' => 14];
+    const NUM_MAX = ['bw' => 1000000, 'records' => 100000, 'rate' => 100000, 'page' => 10000, 'fw' => 10000, 'rl' => 10000, 'pools' => 1000];
+
+    const FIELD_LABELS = [
+        'bw' => 'ترافیک ماهانه (GB)', 'records' => 'رکورد DNS', 'rate' => 'محدودیت درخواست هر IP (req/s)',
+        'ssl' => 'SSL رایگان', 'waf' => 'WAF', 'ddos' => 'حفاظت DDoS', 'lb' => 'توزیع بار', 'image' => 'بهینه‌سازی تصویر',
+        'customssl' => 'گواهی اختصاصی', 'dnssec' => 'DNSSEC', 'page' => 'قوانین صفحه', 'fw' => 'قوانین فایروال',
+        'rl' => 'قوانین محدودیت نرخ', 'pools' => 'استخر توزیع بار',
+    ];
+
+    const PLANS = [
+        'basic' => ['title' => 'پایه', 'name' => 'CDN پایه', 'bw' => 100, 'records' => 50, 'rate' => 0, 'ssl' => 1, 'waf' => 0,
+            'ddos' => 1, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 1, 'page' => 3, 'fw' => 5, 'rl' => 1, 'pools' => 0],
+        'pro' => ['title' => 'حرفه‌ای', 'name' => 'CDN حرفه‌ای', 'bw' => 500, 'records' => 200, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
+            'ddos' => 1, 'lb' => 0, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 10, 'fw' => 20, 'rl' => 5, 'pools' => 0],
+        'business' => ['title' => 'تجاری', 'name' => 'CDN تجاری', 'bw' => 2000, 'records' => 500, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
+            'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 25, 'fw' => 50, 'rl' => 15, 'pools' => 3],
+        'enterprise' => ['title' => 'سازمانی', 'name' => 'CDN سازمانی', 'bw' => 10000, 'records' => 2000, 'rate' => 0, 'ssl' => 1,
+            'waf' => 1, 'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 100, 'fw' => 200, 'rl' => 50, 'pools' => 10],
+    ];
+
+    /** Default monthly price per plan by currency kind. */
+    const BASE_PRICE = [
+        'irt' => ['basic' => 150000, 'pro' => 450000, 'business' => 1200000, 'enterprise' => 4500000],
+        'irr' => ['basic' => 1500000, 'pro' => 4500000, 'business' => 12000000, 'enterprise' => 45000000],
+        'usd' => ['basic' => 5, 'pro' => 15, 'business' => 40, 'enterprise' => 150],
+    ];
+    const BASE_OVERAGE = ['irt' => 3000, 'irr' => 30000, 'usd' => 0.1];
+
+    // ------------------------------------------------------------------ input
+
+    public static function currencyKind($c): string
+    {
+        $code = strtoupper(trim((string) ($c->code ?? '')));
+        $txt = (string) ($c->prefix ?? '') . (string) ($c->suffix ?? '');
+        if ($code === 'IRR' || strpos($txt, 'ریال') !== false) {
+            return 'irr';
+        }
+        if (in_array($code, ['IRT', 'TMN', 'TOM', 'TOMAN'], true) || strpos($txt, 'تومان') !== false) {
+            return 'irt';
+        }
+        return 'usd';
+    }
+
+    public static function defaultCurrency(array $currencies)
+    {
+        foreach ($currencies as $c) {
+            if (!empty($c->default)) {
+                return $c;
+            }
+        }
+        return $currencies[0] ?? null;
+    }
+
+    public static function nice(float $v): float
+    {
+        if ($v >= 100000) {
+            return round($v / 1000) * 1000;
+        }
+        if ($v >= 1000) {
+            return round($v / 100) * 100;
+        }
+        return round($v, 2);
+    }
+
+    /** Default monthly price of $key in currency $c. */
+    public static function basePrice(string $key, $c, array $currencies): float
+    {
+        $kind = self::currencyKind($c);
+        $def = self::defaultCurrency($currencies);
+        if ($kind === 'usd' && $def && (int) $def->id !== (int) $c->id && (float) $c->rate > 0) {
+            // A foreign currency next to a Toman/Rial default: convert with the WHMCS rate.
+            $dk = self::currencyKind($def);
+            return self::nice(self::BASE_PRICE[$dk][$key] * (float) $c->rate);
+        }
+        return (float) self::BASE_PRICE[$kind][$key];
+    }
+
+    public static function defaultDescription(array $p): string
+    {
+        $li = [];
+        $li[] = $p['bw'] > 0 ? self::fa($p['bw']) . ' گیگابایت ترافیک ماهانه' : 'ترافیک ماهانه نامحدود';
+        $li[] = 'تا ' . self::fa($p['records']) . ' رکورد DNS روی نیم‌سرورهای پاسارگاد';
+        if ($p['ssl']) {
+            $li[] = 'SSL رایگان Let\'s Encrypt (دامنه و wildcard) با تمدید خودکار';
+        }
+        $sec = [];
+        if ($p['waf']) {
+            $sec[] = 'فایروال برنامه وب (WAF)';
+        }
+        if ($p['ddos']) {
+            $sec[] = 'حفاظت DDoS و حالت زیر حمله';
+        }
+        if ($sec) {
+            $li[] = implode(' و ', $sec);
+        }
+        $li[] = self::fa($p['fw']) . ' قانون فایروال، ' . self::fa($p['page']) . ' قانون صفحه، ' . self::fa($p['rl']) . ' قانون محدودیت نرخ';
+        if ($p['lb'] && $p['pools'] > 0) {
+            $li[] = 'توزیع بار بین چند سرور با ' . self::fa($p['pools']) . ' استخر و بررسی سلامت';
+        }
+        $extra = [];
+        if ($p['image']) {
+            $extra[] = 'بهینه‌سازی تصویر';
+        }
+        if ($p['customssl']) {
+            $extra[] = 'گواهی SSL اختصاصی';
+        }
+        if ($p['dnssec']) {
+            $extra[] = 'DNSSEC';
+        }
+        if ($extra) {
+            $li[] = implode('، ', $extra);
+        }
+        return "<ul>\n<li>" . implode("</li>\n<li>", $li) . "</li>\n</ul>";
+    }
+
+    private static function fa($n): string
+    {
+        return View::n($n);
+    }
+
+    /** Form defaults (currencies from tblcurrencies, nameservers from the controller when reachable). */
+    public static function defaults(array $currencies): array
+    {
+        $def = self::defaultCurrency($currencies);
+        $kind = $def ? self::currencyKind($def) : 'irt';
+        $in = [
+            'group_name' => self::GROUP_NAME, 'servergroup' => 'new', 'server_id' => Env::server() ? (int) Env::server()->id : 0,
+            'autosetup' => 'payment', 'hidden' => false,
+            'overage' => true, 'overage_price' => (float) self::BASE_OVERAGE[$kind], 'overage_allow' => 100,
+            'email' => true, 'email_update' => false, 'update' => false, 'plans' => [],
+        ];
+        $existing = self::existingServerGroup();
+        if ($existing) {
+            $in['servergroup'] = (int) $existing->id;
+        }
+        $i = 0;
+        foreach (self::PLANS as $key => $p) {
+            $row = $p;
+            $row['enabled'] = true;
+            $row['desc'] = self::defaultDescription($p);
+            $row['prices'] = [];
+            foreach ($currencies as $c) {
+                $m = self::basePrice($key, $c, $currencies);
+                foreach (self::CYCLE_FACTOR as $cycle => $f) {
+                    $row['prices'][(int) $c->id][$cycle] = self::fmt(self::nice($m * $f));
+                }
+            }
+            $in['plans'][$key] = $row;
+            $i++;
+        }
+        return $in;
+    }
+
+    public static function fmt(float $v): string
+    {
+        return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
+    }
+
+    /** Parses the wizard form. @return array [input, errors] */
+    public static function fromPost(array $post, array $currencies): array
+    {
+        $e = [];
+        $str = function ($v, int $max) {
+            $v = Env::input($v);
+            return function_exists('mb_substr') ? mb_substr($v, 0, $max) : substr($v, 0, $max);
+        };
+        $numv = function ($v) {
+            $v = str_replace([',', '٬', ' '], '', strtr(Env::input($v), ['۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3',
+                '۴' => '4', '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9', '٫' => '.']));
+            return $v;
+        };
+        $in = [
+            'group_name' => $str($post['group_name'] ?? '', 100),
+            'servergroup' => ($post['servergroup'] ?? 'new') === 'new' ? 'new' : (int) ($post['servergroup'] ?? 0),
+            'server_id' => (int) ($post['server_id'] ?? 0),
+            'autosetup' => in_array($post['autosetup'] ?? '', ['payment', 'order', 'on', ''], true) ? (string) $post['autosetup'] : 'payment',
+            'hidden' => !empty($post['hidden']),
+            'overage' => !empty($post['overage']),
+            'overage_price' => 0.0,
+            'overage_allow' => 0,
+            'email' => !empty($post['email']),
+            'email_update' => !empty($post['email_update']),
+            'update' => !empty($post['update']),
+            'plans' => [],
+        ];
+        if ($in['group_name'] === '') {
+            $e[] = 'نام گروه محصولات را وارد کنید.';
+        }
+        $op = $numv($post['overage_price'] ?? '0');
+        if ($in['overage'] && (!is_numeric($op) || (float) $op < 0 || (float) $op > 1e12)) {
+            $e[] = 'قیمت هر گیگابایت ترافیک اضافه باید عددی نامنفی باشد.';
+        }
+        $in['overage_price'] = is_numeric($op) ? max(0.0, (float) $op) : 0.0;
+        $oa = $numv($post['overage_allow'] ?? '0');
+        if (!ctype_digit($oa) || (int) $oa > 1000) {
+            $e[] = 'سقف ترافیک اضافه باید عددی بین ۰ تا ۱۰۰۰ درصد باشد.';
+        }
+        $in['overage_allow'] = ctype_digit($oa) ? min(1000, (int) $oa) : 0;
+        if ($in['servergroup'] === 'new' && !Env::serverById($in['server_id'])) {
+            $e[] = 'برای ساخت گروه سرور جدید، سرور CDN را انتخاب کنید.';
+        }
+        if ($in['servergroup'] !== 'new' && !Capsule::table('tblservergroups')->where('id', $in['servergroup'])->exists()) {
+            $e[] = 'گروه سرور انتخاب‌شده وجود ندارد.';
+        }
+        $any = false;
+        foreach (self::PLANS as $key => $defaults) {
+            $p = (array) ($post['plan'][$key] ?? []);
+            $row = ['title' => $defaults['title'], 'enabled' => !empty($p['enabled'])];
+            $row['name'] = $str($p['name'] ?? '', 100);
+            $row['desc'] = Env::input($p['desc'] ?? '');
+            if (strlen($row['desc']) > 20000) {
+                $e[] = 'توضیحات پلن ' . $defaults['title'] . ' بیش از حد طولانی است.';
+            }
+            foreach (array_merge(['bw' => 0], self::NUMS) as $f => $_) {
+                $v = $numv($p[$f] ?? '');
+                if (!ctype_digit($v) || (int) $v > self::NUM_MAX[$f]) {
+                    if ($row['enabled']) {
+                        $e[] = 'مقدار «' . self::FIELD_LABELS[$f] . '» در پلن ' . $defaults['title'] . ' باید عدد صحیح بین ۰ و '
+                            . View::n(self::NUM_MAX[$f]) . ' باشد.';
+                    }
+                    $v = '0';
+                }
+                $row[$f] = (int) $v;
+            }
+            if ($row['records'] < 1) {
+                $row['records'] = 1;
+            }
+            foreach (self::FLAGS as $f => $_) {
+                $row[$f] = !empty($p[$f]) ? 1 : 0;
+            }
+            if (!$row['lb']) {
+                $row['pools'] = 0;
+            }
+            $row['prices'] = [];
+            foreach ($currencies as $c) {
+                $cid = (int) $c->id;
+                $priced = 0;
+                foreach (self::CYCLES as $cycle => $label) {
+                    $v = $numv($post['price'][$key][$cid][$cycle] ?? '');
+                    if ($v === '') {
+                        $row['prices'][$cid][$cycle] = '';
+                        continue;
+                    }
+                    if (!is_numeric($v) || (float) $v < 0 || (float) $v > 1e12) {
+                        if ($row['enabled']) {
+                            $e[] = 'قیمت ' . $label . ' پلن ' . $defaults['title'] . ' (' . $c->code . ') نامعتبر است.';
+                        }
+                        $row['prices'][$cid][$cycle] = '';
+                        continue;
+                    }
+                    $row['prices'][$cid][$cycle] = self::fmt((float) $v);
+                    $priced++;
+                }
+                if ($row['enabled'] && $priced === 0) {
+                    $e[] = 'برای پلن ' . $defaults['title'] . ' دست‌کم یک دوره پرداخت با واحد ' . $c->code . ' قیمت‌گذاری کنید.';
+                }
+            }
+            if ($row['enabled']) {
+                $any = true;
+                if ($row['name'] === '') {
+                    $e[] = 'نام محصول پلن ' . $defaults['title'] . ' را وارد کنید.';
+                }
+            }
+            $in['plans'][$key] = $row;
+        }
+        if (!$any) {
+            $e[] = 'دست‌کم یک پلن را انتخاب کنید.';
+        }
+        $names = [];
+        foreach ($in['plans'] as $row) {
+            if ($row['enabled'] && $row['name'] !== '') {
+                if (isset($names[$row['name']])) {
+                    $e[] = 'نام محصول «' . $row['name'] . '» تکراری است.';
+                }
+                $names[$row['name']] = true;
+            }
+        }
+        if ($in['overage']) {
+            $perMb = self::perMb($in['overage_price']);
+            $max = Env::decimalMax('tblproducts', 'overagesbwprice');
+            if ($perMb > $max) {
+                $e[] = 'قیمت ترافیک اضافه در WHMCS به ازای هر مگابایت ذخیره می‌شود و ستون آن حداکثر ' . View::n($max, 4)
+                    . ' را می‌پذیرد؛ یعنی حداکثر ' . View::n(floor($max * 1024)) . ' برای هر گیگابایت. مقدار را کمتر کنید '
+                    . '(یا از واحد پول بزرگ‌تر، مثلاً تومان به جای ریال، استفاده کنید).';
+            }
+        }
+        return [$in, array_values(array_unique($e))];
+    }
+
+    /** WHMCS keeps overage prices per MB (4 decimals). */
+    public static function perMb(float $perGb): float
+    {
+        return round($perGb / 1024, 4);
+    }
+
+    /** Controller hard cap for a plan: included × (1 + allowance%) when overage billing is on. */
+    public static function hardCap(array $p, array $in): int
+    {
+        $bw = (int) $p['bw'];
+        if ($bw <= 0 || !$in['overage']) {
+            return $bw;
+        }
+        return (int) ceil($bw * (100 + (int) $in['overage_allow']) / 100);
+    }
+
+    /** configoption1..14 for a plan. */
+    public static function configOptions(array $p, array $in): array
+    {
+        $o = ['configoption1' => (string) self::hardCap($p, $in)];
+        foreach (self::NUMS as $f => $n) {
+            $o['configoption' . $n] = (string) (int) $p[$f];
+        }
+        foreach (self::FLAGS as $f => $n) {
+            $o['configoption' . $n] = $p[$f] ? 'on' : '';
+        }
+        ksort($o, SORT_NATURAL);
+        return $o;
+    }
+
+    // ------------------------------------------------------------------ lookups
+
+    public static function existingServerGroup()
+    {
+        try {
+            $named = Capsule::table('tblservergroups')->where('name', self::SERVER_GROUP_NAME)->first();
+            if ($named) {
+                return $named;
+            }
+            $ids = array_map(function ($s) {
+                return (int) $s->id;
+            }, Env::servers());
+            if (!$ids) {
+                return null;
+            }
+            return Capsule::table('tblservergroups as g')->join('tblservergroupsrel as r', 'r.groupid', '=', 'g.id')
+                ->whereIn('r.serverid', $ids)->orderBy('g.id')->first(['g.id', 'g.name']);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    public static function serverGroups(): array
+    {
+        try {
+            return Capsule::table('tblservergroups')->orderBy('id')->get(['id', 'name'])->all();
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    public static function findGroup(string $name)
+    {
+        return Capsule::table('tblproductgroups')->where('name', $name)->orderBy('id')->first();
+    }
+
+    /** Existing product for a plan: remembered mapping first, then by name. */
+    public static function findProduct(string $key, string $name, int $gid)
+    {
+        $map = (array) Env::kvGet('wizard_pids', []);
+        if (!empty($map[$key])) {
+            $p = Capsule::table('tblproducts')->where('id', (int) $map[$key])->where('servertype', 'pasargadcdn')->first();
+            if ($p) {
+                return $p;
+            }
+        }
+        $q = Capsule::table('tblproducts')->where('name', $name)->where('servertype', 'pasargadcdn');
+        if ($gid > 0) {
+            $p = (clone $q)->where('gid', $gid)->orderBy('id')->first();
+            if ($p) {
+                return $p;
+            }
+        }
+        return $q->orderBy('id')->first();
+    }
+
+    public static function findEmail()
+    {
+        return Capsule::table('tblemailtemplates')->where('name', self::EMAIL_NAME)->where('type', 'product')
+            ->where(function ($q) {
+                $q->where('language', '')->orWhereNull('language');
+            })->orderBy('id')->first();
+    }
+
+    public static function originField(int $pid)
+    {
+        return Capsule::table('tblcustomfields')->where('type', 'product')->where('relid', $pid)
+            ->where(function ($q) {
+                $q->where('fieldname', 'Origin IP')->orWhere('fieldname', 'like', 'Origin IP|%');
+            })->first();
+    }
+
+    // ------------------------------------------------------------------ email
+
+    public static function nameservers(): array
+    {
+        try {
+            $r = Env::api(8)->get('/api/v1/ping');
+            $ns = array_values(array_filter((array) ($r['nameservers'] ?? []), 'is_string'));
+            if ($ns) {
+                return $ns;
+            }
+        } catch (\Throwable $e) {
+            // fall back below
+        }
+        return Env::DEFAULT_NS;
+    }
+
+    public static function emailSubject(): string
+    {
+        return 'سرویس CDN دامنه {$service_domain} فعال شد';
+    }
+
+    public static function emailBody(array $ns): string
+    {
+        $nsHtml = '';
+        foreach ($ns as $n) {
+            $nsHtml .= '<div dir="ltr" style="font-family:Consolas,monospace;font-size:15px;background:#f1f5f9;padding:4px 10px;'
+                . 'margin:4px 0;border-radius:6px;display:inline-block">' . htmlspecialchars($n, ENT_QUOTES, 'UTF-8') . '</div><br>';
+        }
+        return '<div dir="rtl" style="text-align:right;font-family:Tahoma,Arial,sans-serif;line-height:1.9;font-size:14px">'
+            . "\n<p>{\$client_name} عزیز، سلام</p>"
+            . "\n<p>سرویس <strong>{\$service_product_name}</strong> برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> "
+            . 'روی CDN پاسارگاد ساخته شد. برای فعال شدن کامل، این سه مرحله را انجام دهید:</p>'
+            . "\n<ol>"
+            . "\n<li><strong>رکوردهای DNS را کامل کنید.</strong> در ناحیه کاربری، بخش «DNS»، رکوردهای فعلی دامنه "
+            . '(ایمیل، زیردامنه‌ها و ...) را وارد یا با فایل زون درون‌ریزی کنید تا پس از تغییر نیم‌سرورها سرویسی قطع نشود.</li>'
+            . "\n<li><strong>نیم‌سرورهای دامنه را تغییر دهید.</strong> در پنل ثبت‌کننده دامنه (مثلاً nic.ir)، "
+            . 'نیم‌سرورها را فقط به این مقادیر تغییر دهید:<br>' . $nsHtml . '</li>'
+            . "\n<li><strong>منتظر تأیید بمانید.</strong> تغییر نیم‌سرور معمولاً چند ساعت (برای دامنه‌های .ir گاهی تا ۲۴ ساعت) "
+            . 'طول می‌کشد. پس از تأیید، گواهی SSL رایگان به‌صورت خودکار صادر می‌شود و سایت از طریق CDN سرو می‌شود.</li>'
+            . "\n</ol>"
+            . "\n<p>مدیریت کامل CDN (DNS، کش، فایروال، SSL و گزارش‌ها): "
+            . '<a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}">ورود به ناحیه کاربری</a></p>'
+            . "\n<p>{\$signature}</p>\n</div>";
+    }
+
+    // ------------------------------------------------------------------ plan (preview) & apply
+
+    /**
+     * Read-only description of what apply() will do.
+     * @return array list of ['op' => create|update|reuse|skip, 'kind' => ..., 'label' => ..., 'detail' => ...]
+     */
+    public static function plan(array $in, array $currencies): array
+    {
+        $steps = [];
+        $group = self::findGroup($in['group_name']);
+        $gid = $group ? (int) $group->id : 0;
+        $steps[] = ['op' => $group ? 'reuse' : 'create', 'kind' => 'گروه محصولات', 'label' => $in['group_name'],
+            'detail' => $group ? 'گروه موجود #' . $gid . ' استفاده می‌شود' : 'گروه جدید ساخته می‌شود'];
+
+        if ($in['servergroup'] === 'new') {
+            $sg = Capsule::table('tblservergroups')->where('name', self::SERVER_GROUP_NAME)->first();
+            $srv = Env::serverById((int) $in['server_id']);
+            $steps[] = ['op' => $sg ? 'reuse' : 'create', 'kind' => 'گروه سرور', 'label' => self::SERVER_GROUP_NAME,
+                'detail' => ($sg ? 'گروه موجود #' . (int) $sg->id : 'گروه جدید') . ' با سرور ' . ($srv ? $srv->name . ' (#' . (int) $srv->id . ')' : '—')];
+        } else {
+            $sg = Capsule::table('tblservergroups')->where('id', (int) $in['servergroup'])->first();
+            $steps[] = ['op' => 'reuse', 'kind' => 'گروه سرور', 'label' => $sg ? $sg->name : '#' . $in['servergroup'], 'detail' => 'گروه موجود'];
+        }
+
+        if ($in['email']) {
+            $tpl = self::findEmail();
+            $steps[] = ['op' => $tpl ? ($in['email_update'] ? 'update' : 'skip') : 'create', 'kind' => 'قالب ایمیل',
+                'label' => self::EMAIL_NAME, 'detail' => $tpl ? ($in['email_update'] ? 'متن قالب موجود بازنویسی می‌شود' : 'قالب موجود دست نمی‌خورد')
+                    : 'قالب خوش‌آمدگویی فارسی با نیم‌سرورها: ' . implode('، ', self::nameservers())];
+        }
+
+        $perMb = self::perMb($in['overage_price']);
+        $found = [];
+        foreach ($in['plans'] as $key => $p) {
+            if (!$p['enabled']) {
+                continue;
+            }
+            $prod = self::findProduct($key, $p['name'], $gid);
+            $found[] = $prod ? (int) $prod->id : 0;
+            $cap = self::hardCap($p, $in);
+            $detail = self::FIELD_LABELS['bw'] . ': ' . ($p['bw'] > 0 ? View::n($p['bw']) : 'نامحدود');
+            if ($in['overage'] && $p['bw'] > 0) {
+                $detail .= ' — ترافیک اضافه هر GB ' . View::n($in['overage_price'], 4) . ' (ذخیره: ' . View::n($perMb, 4) . ' هر MB)'
+                    . ' — سقف قطع روی CDN: ' . View::n($cap) . ' GB';
+            }
+            $steps[] = ['op' => $prod ? ($in['update'] ? 'update' : 'skip') : 'create', 'kind' => 'محصول', 'label' => $p['name'],
+                'detail' => ($prod ? 'محصول موجود #' . (int) $prod->id . ($in['update'] ? ' به‌روزرسانی می‌شود' : ' دست نمی‌خورد') . ' — ' : '') . $detail,
+                'pid' => $prod ? (int) $prod->id : 0];
+            $existingPricing = $prod ? Data::pricing([(int) $prod->id])[(int) $prod->id] ?? [] : [];
+            foreach ($currencies as $c) {
+                $has = isset($existingPricing[(int) $c->id]);
+                $op = !$prod || !$has ? 'create' : ($in['update'] ? 'update' : 'skip');
+                $parts = [];
+                foreach (self::CYCLES as $cycle => $label) {
+                    $v = $p['prices'][(int) $c->id][$cycle] ?? '';
+                    $parts[] = $label . ': ' . ($v === '' ? 'غیرفعال' : View::n((float) $v, 2));
+                }
+                $steps[] = ['op' => $op, 'kind' => 'قیمت', 'label' => $p['name'] . ' — ' . $c->code, 'detail' => implode(' · ', $parts)];
+            }
+            $field = $prod ? self::originField((int) $prod->id) : null;
+            $steps[] = ['op' => $field ? 'skip' : 'create', 'kind' => 'فیلد سفارشی', 'label' => 'Origin IP — ' . $p['name'],
+                'detail' => $field ? 'از قبل وجود دارد' : 'فیلد متنی اختیاری با اعتبارسنجی IPv4 در فرم سفارش'];
+        }
+        $n = count(array_filter($in['plans'], function ($p) {
+            return $p['enabled'];
+        }));
+        if ($n > 1) {
+            $missing = in_array(0, $found, true) ? 1 : self::missingPaths($found);
+            $steps[] = ['op' => $missing ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => 'ارتقا/تنزل بین ' . View::n($n) . ' پلن',
+                'detail' => 'مسیرهای موجود حفظ و فقط مسیرهای جاافتاده اضافه می‌شوند (' . (Env::hasTable('tblproduct_upgrade_products')
+                    ? 'tblproduct_upgrade_products' : 'tblproducts.upgradepackages') . ')'];
+        }
+        return $steps;
+    }
+
+    /**
+     * Runs the plan in one transaction.
+     * @return array summary rows ['op', 'kind', 'label', 'link']
+     */
+    public static function apply(array $in, array $currencies): array
+    {
+        $ns = $in['email'] ? self::nameservers() : [];
+        $summary = [];
+        $run = function () use ($in, $currencies, $ns, &$summary) {
+            $summary = self::applyInner($in, $currencies, $ns);
+        };
+        $conn = Capsule::connection();
+        $conn->transaction($run);
+        $pids = [];
+        foreach ($summary as $s) {
+            if (!empty($s['plan'])) {
+                $pids[$s['plan']] = $s['pid'];
+            }
+        }
+        if ($pids) {
+            Env::kvSet('wizard_pids', array_merge((array) Env::kvGet('wizard_pids', []), $pids));
+        }
+        return $summary;
+    }
+
+    private static function applyInner(array $in, array $currencies, array $ns): array
+    {
+        $now = date('Y-m-d H:i:s');
+        $out = [];
+
+        // product group
+        $group = self::findGroup($in['group_name']);
+        if ($group) {
+            $gid = (int) $group->id;
+            $out[] = ['op' => 'reuse', 'kind' => 'گروه محصولات', 'label' => $in['group_name'], 'link' => 'configproducts.php?action=editgroup&ids=' . $gid];
+        } else {
+            $row = ['name' => $in['group_name'], 'headline' => 'CDN و امنیت وب پاسارگاد میزبان',
+                'tagline' => 'سرعت بیشتر و امنیت بالاتر برای سایت شما، با نیم‌سرورها و نودهای داخل ایران',
+                'orderfrmtpl' => '', 'disabledgateways' => '', 'hidden' => 0,
+                'order' => (int) Capsule::table('tblproductgroups')->max('order') + 1,
+                'created_at' => $now, 'updated_at' => $now];
+            if (Env::hasColumn('tblproductgroups', 'slug')) {
+                $row['slug'] = self::uniqueSlug('cdn');
+            }
+            $gid = (int) Capsule::table('tblproductgroups')->insertGetId(Env::onlyColumns('tblproductgroups', $row));
+            $out[] = ['op' => 'create', 'kind' => 'گروه محصولات', 'label' => $in['group_name'], 'link' => 'configproducts.php?action=editgroup&ids=' . $gid];
+        }
+
+        // server group
+        if ($in['servergroup'] === 'new') {
+            $sg = Capsule::table('tblservergroups')->where('name', self::SERVER_GROUP_NAME)->first();
+            if ($sg) {
+                $sgid = (int) $sg->id;
+                $out[] = ['op' => 'reuse', 'kind' => 'گروه سرور', 'label' => self::SERVER_GROUP_NAME, 'link' => 'configservers.php'];
+            } else {
+                $sgid = (int) Capsule::table('tblservergroups')->insertGetId(Env::onlyColumns('tblservergroups',
+                    ['name' => self::SERVER_GROUP_NAME, 'filltype' => 1, 'created_at' => $now, 'updated_at' => $now]));
+                $out[] = ['op' => 'create', 'kind' => 'گروه سرور', 'label' => self::SERVER_GROUP_NAME, 'link' => 'configservers.php'];
+            }
+            $sid = (int) $in['server_id'];
+            if ($sid > 0 && !Capsule::table('tblservergroupsrel')->where('groupid', $sgid)->where('serverid', $sid)->exists()) {
+                Capsule::table('tblservergroupsrel')->insert(['groupid' => $sgid, 'serverid' => $sid]);
+            }
+        } else {
+            $sgid = (int) $in['servergroup'];
+        }
+
+        // welcome email
+        $emailId = 0;
+        if ($in['email']) {
+            $tpl = self::findEmail();
+            $fields = ['subject' => self::emailSubject(), 'message' => self::emailBody($ns), 'updated_at' => $now];
+            if ($tpl) {
+                $emailId = (int) $tpl->id;
+                if ($in['email_update']) {
+                    Capsule::table('tblemailtemplates')->where('id', $emailId)->update(Env::onlyColumns('tblemailtemplates', $fields));
+                    $out[] = ['op' => 'update', 'kind' => 'قالب ایمیل', 'label' => self::EMAIL_NAME, 'link' => 'configemailtemplates.php?action=edit&id=' . $emailId];
+                } else {
+                    $out[] = ['op' => 'skip', 'kind' => 'قالب ایمیل', 'label' => self::EMAIL_NAME, 'link' => 'configemailtemplates.php?action=edit&id=' . $emailId];
+                }
+            } else {
+                $emailId = (int) Capsule::table('tblemailtemplates')->insertGetId(Env::onlyColumns('tblemailtemplates', $fields + [
+                    'type' => 'product', 'name' => self::EMAIL_NAME, 'attachments' => '', 'fromname' => '', 'fromemail' => '',
+                    'disabled' => 0, 'custom' => 1, 'language' => '', 'copyto' => '', 'blind_copy_to' => '', 'plaintext' => 0,
+                    'created_at' => $now,
+                ]));
+                $out[] = ['op' => 'create', 'kind' => 'قالب ایمیل', 'label' => self::EMAIL_NAME, 'link' => 'configemailtemplates.php?action=edit&id=' . $emailId];
+            }
+        }
+
+        // products
+        $pids = [];
+        $order = 0;
+        foreach ($in['plans'] as $key => $p) {
+            $order++;
+            if (!$p['enabled']) {
+                continue;
+            }
+            $prod = self::findProduct($key, $p['name'], $gid);
+            $cols = self::productColumns($p, $in, $gid, $sgid, $emailId, $order);
+            if ($prod) {
+                $pid = (int) $prod->id;
+                if ($in['update']) {
+                    // Keep where the admin placed/hid the product; only its CDN settings, text and billing change.
+                    $upd = $cols;
+                    unset($upd['gid'], $upd['order'], $upd['hidden']);
+                    if (!$emailId) {
+                        unset($upd['welcomeemail']);
+                    }
+                    Capsule::table('tblproducts')->where('id', $pid)->update(Env::onlyColumns('tblproducts', $upd));
+                    $out[] = ['op' => 'update', 'kind' => 'محصول', 'label' => $p['name'], 'link' => 'configproducts.php?action=edit&id=' . $pid,
+                        'plan' => $key, 'pid' => $pid];
+                } else {
+                    if ($emailId && empty($prod->welcomeemail)) {
+                        Capsule::table('tblproducts')->where('id', $pid)->update(['welcomeemail' => $emailId]);
+                    }
+                    $out[] = ['op' => 'skip', 'kind' => 'محصول', 'label' => $p['name'], 'link' => 'configproducts.php?action=edit&id=' . $pid,
+                        'plan' => $key, 'pid' => $pid];
+                }
+            } else {
+                $pid = self::createProduct($p, $in, $cols, $gid, $sgid, $emailId, $order);
+                $out[] = ['op' => 'create', 'kind' => 'محصول', 'label' => $p['name'], 'link' => 'configproducts.php?action=edit&id=' . $pid,
+                    'plan' => $key, 'pid' => $pid];
+            }
+            $pids[$key] = $pid;
+
+            // pricing
+            foreach ($currencies as $c) {
+                $cid = (int) $c->id;
+                $row = ['type' => 'product', 'currency' => $cid, 'relid' => $pid];
+                $vals = [];
+                foreach (self::SETUP_COL as $cycle => $setup) {
+                    $v = $p['prices'][$cid][$cycle] ?? '';
+                    $vals[$cycle] = $v === '' ? -1.0 : (float) $v;
+                    $vals[$setup] = 0.0;
+                }
+                $existing = Capsule::table('tblpricing')->where($row)->first();
+                if (!$existing) {
+                    Capsule::table('tblpricing')->insert($row + $vals);
+                    $out[] = ['op' => 'create', 'kind' => 'قیمت', 'label' => $p['name'] . ' — ' . $c->code, 'link' => ''];
+                } elseif ($in['update']) {
+                    Capsule::table('tblpricing')->where('id', $existing->id)->update($vals);
+                    $out[] = ['op' => 'update', 'kind' => 'قیمت', 'label' => $p['name'] . ' — ' . $c->code, 'link' => ''];
+                } else {
+                    $out[] = ['op' => 'skip', 'kind' => 'قیمت', 'label' => $p['name'] . ' — ' . $c->code, 'link' => ''];
+                }
+            }
+
+            // custom field
+            if (!self::originField($pid)) {
+                Capsule::table('tblcustomfields')->insert(Env::onlyColumns('tblcustomfields', [
+                    'type' => 'product', 'relid' => $pid, 'fieldname' => self::ORIGIN_FIELD, 'fieldtype' => 'text',
+                    'description' => 'اختیاری — IP عمومی سرور فعلی سایت (IPv4). اگر وارد کنید، رکوردهای @ و www به‌صورت خودکار ساخته و از طریق CDN پروکسی می‌شوند.',
+                    'fieldoptions' => '', 'regexpr' => self::ORIGIN_REGEX, 'adminonly' => '', 'required' => '', 'showorder' => 'on',
+                    'showinvoice' => '', 'sortorder' => 0, 'created_at' => $now, 'updated_at' => $now,
+                ]));
+                $out[] = ['op' => 'create', 'kind' => 'فیلد سفارشی', 'label' => 'Origin IP — ' . $p['name'], 'link' => ''];
+            } else {
+                $out[] = ['op' => 'skip', 'kind' => 'فیلد سفارشی', 'label' => 'Origin IP — ' . $p['name'], 'link' => ''];
+            }
+        }
+
+        // upgrade / downgrade paths between the wizard products
+        $added = self::upgradePaths(array_values($pids));
+        if (count($pids) > 1) {
+            $out[] = ['op' => $added ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => View::n($added) . ' مسیر جدید', 'link' => ''];
+        }
+        return $out;
+    }
+
+    public static function productColumns(array $p, array $in, int $gid, int $sgid, int $emailId, int $order): array
+    {
+        $overage = $in['overage'] && $p['bw'] > 0;
+        $cols = [
+            'type' => 'other', 'gid' => $gid, 'name' => $p['name'], 'description' => $p['desc'],
+            'hidden' => $in['hidden'] ? 1 : 0, 'showdomainoptions' => 1, 'paytype' => 'recurring',
+            'autosetup' => $in['autosetup'], 'servertype' => 'pasargadcdn', 'servergroup' => $sgid,
+            'welcomeemail' => $emailId, 'order' => $order,
+            // "1,diskunit,bwunit": units MB, so limits are MB and prices are per MB (WHMCS convention).
+            'overagesenabled' => $overage ? '1,MB,MB' : '',
+            'overagesdisklimit' => 0, 'overagesdiskprice' => 0,
+            'overagesbwlimit' => $overage ? $p['bw'] * 1024 : 0,
+            'overagesbwprice' => $overage ? self::perMb($in['overage_price']) : 0,
+            'updated_at' => date('Y-m-d H:i:s'),
+        ];
+        return $cols + self::configOptions($p, $in);
+    }
+
+    private static function createProduct(array $p, array $in, array $cols, int $gid, int $sgid, int $emailId, int $order): int
+    {
+        $pid = 0;
+        if (function_exists('localAPI')) {
+            $args = [
+                'type' => 'other', 'gid' => $gid, 'name' => $p['name'], 'description' => $p['desc'],
+                'hidden' => $in['hidden'], 'showdomainoptions' => true, 'paytype' => 'recurring',
+                'autosetup' => $in['autosetup'], 'module' => 'pasargadcdn', 'servergroupid' => $sgid,
+                'welcomeemail' => $emailId, 'order' => $order,
+            ] + self::configOptions($p, $in);
+            $r = Env::localApi('AddProduct', $args);
+            if (($r['result'] ?? '') === 'success' && (int) ($r['pid'] ?? 0) > 0) {
+                $pid = (int) $r['pid'];
+            } else {
+                throw new \RuntimeException('ساخت محصول «' . $p['name'] . '» با AddProduct ناموفق بود: ' . ($r['message'] ?? 'خطای نامشخص'));
+            }
+        } else {
+            $pid = (int) Capsule::table('tblproducts')->insertGetId(Env::onlyColumns('tblproducts',
+                $cols + ['created_at' => date('Y-m-d H:i:s')]));
+        }
+        // AddProduct does not cover every column (overage, all config options) — set them all explicitly.
+        Capsule::table('tblproducts')->where('id', $pid)->update(Env::onlyColumns('tblproducts', $cols));
+        return $pid;
+    }
+
+    /** Number of missing upgrade pairs between existing products (read-only). */
+    public static function missingPaths(array $pids): int
+    {
+        $missing = 0;
+        if (!Env::hasTable('tblproduct_upgrade_products')) {
+            return count($pids) * (count($pids) - 1);
+        }
+        foreach ($pids as $a) {
+            foreach ($pids as $b) {
+                if ($a !== $b && !Capsule::table('tblproduct_upgrade_products')->where(['product_id' => $a, 'upgrade_product_id' => $b])->exists()) {
+                    $missing++;
+                }
+            }
+        }
+        return $missing;
+    }
+
+    /** Adds missing upgrade paths between all $pids (both directions). Returns the number added. */
+    public static function upgradePaths(array $pids): int
+    {
+        $pids = array_values(array_unique(array_map('intval', $pids)));
+        if (count($pids) < 2) {
+            return 0;
+        }
+        $added = 0;
+        if (Env::hasTable('tblproduct_upgrade_products')) {
+            foreach ($pids as $a) {
+                foreach ($pids as $b) {
+                    if ($a === $b) {
+                        continue;
+                    }
+                    $row = ['product_id' => $a, 'upgrade_product_id' => $b];
+                    if (!Capsule::table('tblproduct_upgrade_products')->where($row)->exists()) {
+                        Capsule::table('tblproduct_upgrade_products')->insert($row);
+                        $added++;
+                    }
+                }
+            }
+        } elseif (Env::hasColumn('tblproducts', 'upgradepackages')) {
+            foreach ($pids as $a) {
+                $cur = Capsule::table('tblproducts')->where('id', $a)->value('upgradepackages');
+                $list = $cur ? @unserialize((string) $cur, ['allowed_classes' => false]) : [];
+                $list = is_array($list) ? array_map('intval', $list) : [];
+                $new = $list;
+                foreach ($pids as $b) {
+                    if ($b !== $a && !in_array($b, $new, true)) {
+                        $new[] = $b;
+                        $added++;
+                    }
+                }
+                if ($new !== $list) {
+                    Capsule::table('tblproducts')->where('id', $a)->update(['upgradepackages' => serialize($new)]);
+                }
+            }
+        }
+        return $added;
+    }
+
+    private static function uniqueSlug(string $base): string
+    {
+        $slug = $base;
+        $i = 2;
+        while (Capsule::table('tblproductgroups')->where('slug', $slug)->exists()) {
+            $slug = $base . '-' . $i++;
+        }
+        return $slug;
+    }
+}

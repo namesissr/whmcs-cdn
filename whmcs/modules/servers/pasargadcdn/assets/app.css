@@ -163,6 +163,14 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 .pcdn-page > .pcdn-form { display: flex; flex-direction: column; gap: var(--pc-gap); }
 .pcdn-stack { display: flex; flex-direction: column; gap: var(--pc-gap); }
 .pcdn-main > .pcdn-alert { margin-bottom: 14px; }
+/* admin mode («مدیریت کامل» from the WHMCS admin addon) */
+.pcdn .pcdn-admin-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 14px; padding: 9px 12px; border-radius: 10px;
+  background: #1e293b; color: #e2e8f0; font-size: 13px; line-height: 1.7; }
+.pcdn .pcdn-admin-badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; background: #f59e0b; color: #1f1300; font-weight: 800; white-space: nowrap; }
+.pcdn .pcdn-admin-badge .pcdn-icon { width: 15px; height: 15px; }
+.pcdn .pcdn-admin-text { flex: 1 1 260px; min-width: 0; }
+.pcdn .pcdn-admin-links { display: inline-flex; flex-wrap: wrap; gap: 4px 14px; }
+.pcdn .pcdn-admin-bar a.pcdn-link, .pcdn .pcdn-admin-bar a.pcdn-link:hover { color: #bfdbfe; text-decoration: underline; }
 
 .pcdn-page-head { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 14px; }
 .pcdn-page-icon { width: 44px; height: 44px; flex: none; border-radius: 12px; display: grid; place-items: center; color: var(--pc-brand); background: var(--pc-surface); border: 1px solid var(--pc-border); box-shadow: var(--pc-shadow); }

@@ -1,0 +1,342 @@
+/* Pasargad CDN — WHMCS admin addon. Everything is scoped under .pcdna so it can
+   sit inside the WHMCS admin theme (Blend / Bootstrap 3) without leaking styles. */
+
+@font-face {
+  font-family: 'PCDN Vazirmatn';
+  src: url('../../../servers/pasargadcdn/assets/fonts/Vazirmatn-Variable.woff2') format('woff2-variations'),
+       url('../../../servers/pasargadcdn/assets/fonts/Vazirmatn-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+.pcdna {
+  --a-bg: #f3f5f9;
+  --a-surface: #fff;
+  --a-surface-2: #f8fafc;
+  --a-border: #e2e8f0;
+  --a-border-strong: #cbd5e1;
+  --a-text: #0f172a;
+  --a-text-2: #334155;
+  --a-muted: #5b6475;
+  --a-brand: #1d5fd6;
+  --a-brand-600: #184fb4;
+  --a-brand-50: #eef4ff;
+  --a-ok: #13733a;
+  --a-ok-50: #eaf8ef;
+  --a-warn: #a24a06;
+  --a-warn-50: #fff7e8;
+  --a-bad: #c11f1f;
+  --a-bad-50: #fdf1f1;
+  --a-violet: #6532c9;
+  --a-violet-50: #f3effd;
+  --a-radius: 12px;
+  --a-shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 1px 3px rgba(15, 23, 42, .06);
+  --a-font: 'PCDN Vazirmatn', Vazirmatn, Tahoma, 'Segoe UI', sans-serif;
+  --a-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  direction: rtl;
+  text-align: right;
+  font-family: var(--a-font);
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--a-text);
+  background: var(--a-bg);
+  border-radius: 14px;
+  padding: 16px;
+  margin: 0 0 20px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- reset against Bootstrap 3 / Blend */
+.pcdna *, .pcdna *::before, .pcdna *::after { box-sizing: border-box; }
+.pcdna h2, .pcdna h3, .pcdna h4, .pcdna p, .pcdna ul, .pcdna ol, .pcdna dl, .pcdna dd, .pcdna fieldset, .pcdna legend, .pcdna figure { margin: 0; padding: 0; }
+.pcdna h2, .pcdna h3, .pcdna h4 { font-family: var(--a-font); color: var(--a-text); line-height: 1.5; font-weight: 700; letter-spacing: 0; }
+.pcdna ul, .pcdna ol { list-style: none; }
+.pcdna label { margin: 0; font-weight: inherit; display: inline; max-width: none; }
+.pcdna a { color: var(--a-brand); text-decoration: none; }
+.pcdna a:hover, .pcdna a:focus { color: var(--a-brand-600); text-decoration: underline; }
+.pcdna code, .pcdna kbd { font-family: var(--a-mono); font-size: 12.5px; color: inherit; background: none; padding: 0; border-radius: 0; }
+.pcdna small { font-size: 12px; }
+.pcdna table { border-collapse: collapse; border-spacing: 0; background: none; }
+.pcdna button, .pcdna input, .pcdna select, .pcdna textarea { font-family: inherit; font-size: inherit; line-height: inherit; color: inherit; margin: 0; }
+.pcdna input[type="checkbox"] { margin: 0; }
+.pcdna details > summary { list-style: none; cursor: pointer; }
+.pcdna details > summary::-webkit-details-marker { display: none; }
+.pcdna :focus-visible { outline: 2px solid var(--a-brand); outline-offset: 2px; }
+.pcdna-icon { width: 18px; height: 18px; flex: none; vertical-align: middle; }
+.pcdna-ltr { direction: ltr; unicode-bidi: isolate; font-family: var(--a-mono); font-size: 12.5px; }
+.pcdna-code { background: var(--a-surface-2); border: 1px solid var(--a-border); border-radius: 6px; padding: 0 6px; display: inline-block; margin: 1px 0; }
+.pcdna-muted { color: var(--a-muted); }
+.pcdna-small { font-size: 12px; }
+.pcdna-nowrap { white-space: nowrap; }
+.pcdna-num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pcdna-pad { padding: 12px 16px 0; }
+.pcdna-inline { display: inline; margin: 0; }
+
+/* ---------- header + tabs */
+.pcdna-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.pcdna-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.pcdna-brand h2 { font-size: 19px; }
+.pcdna-brand p { color: var(--a-muted); font-size: 12.5px; }
+.pcdna-logo { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, #1d5fd6, #6532c9); flex: none; }
+.pcdna-logo .pcdna-icon { width: 22px; height: 22px; }
+.pcdna-chip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px; background: var(--a-surface); border: 1px solid var(--a-border); font-size: 12.5px; color: var(--a-text-2); max-width: 100%; }
+.pcdna-chip .pcdna-ltr { color: var(--a-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.pcdna-chip.pcdna-t-bad { background: var(--a-bad-50); border-color: #f8d0d0; color: var(--a-bad); }
+.pcdna-tabs { display: flex; gap: 4px; flex-wrap: wrap; background: var(--a-surface); border: 1px solid var(--a-border); border-radius: 12px; padding: 5px; margin-bottom: 16px; box-shadow: var(--a-shadow); }
+.pcdna .pcdna-tab { display: inline-flex; align-items: center; gap: 7px; padding: 7px 13px; border-radius: 9px; color: var(--a-text-2); font-weight: 600; white-space: nowrap; }
+.pcdna .pcdna-tab:hover { background: var(--a-surface-2); color: var(--a-text); text-decoration: none; }
+.pcdna .pcdna-tab.is-active { background: var(--a-brand-50); color: var(--a-brand-600); }
+.pcdna-tab .pcdna-icon { width: 17px; height: 17px; }
+.pcdna-body > * + * { margin-top: 16px; }
+
+/* ---------- cards / grid / kpis */
+.pcdna-card { background: var(--a-surface); border: 1px solid var(--a-border); border-radius: var(--a-radius); box-shadow: var(--a-shadow); min-width: 0; }
+.pcdna-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--a-border); }
+.pcdna-card-head h3 { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.pcdna-card-head h3 .pcdna-icon { color: var(--a-brand); }
+.pcdna-card-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pcdna-card-body { padding: 14px 16px; }
+.pcdna-card.pcdna-flush > .pcdna-card-body { padding: 0; }
+.pcdna-card.pcdna-flush > .pcdna-card-body > .pcdna-pager, .pcdna-card.pcdna-flush > .pcdna-card-body > p { padding: 12px 16px; }
+.pcdna-card-bad { border-color: #f1b5b5; }
+.pcdna-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.pcdna-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; }
+.pcdna-kpis-3 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.pcdna-kpi { display: flex; gap: 12px; align-items: flex-start; background: var(--a-surface); border: 1px solid var(--a-border); border-radius: var(--a-radius); padding: 14px; box-shadow: var(--a-shadow); min-width: 0; }
+.pcdna-kpi-icon { width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; flex: none; }
+.pcdna-kpi-body { min-width: 0; }
+.pcdna-kpi-label { color: var(--a-muted); font-size: 12.5px; }
+.pcdna-kpi-value { font-size: 21px; font-weight: 800; line-height: 1.35; font-variant-numeric: tabular-nums; }
+.pcdna-kpi-value small { font-size: 13px; font-weight: 500; color: var(--a-muted); }
+.pcdna-kpi-sub { color: var(--a-muted); font-size: 12px; }
+
+/* tones */
+.pcdna-t-brand { background: var(--a-brand-50); color: var(--a-brand-600); }
+.pcdna-t-ok { background: var(--a-ok-50); color: var(--a-ok); }
+.pcdna-t-warn { background: var(--a-warn-50); color: var(--a-warn); }
+.pcdna-t-bad { background: var(--a-bad-50); color: var(--a-bad); }
+.pcdna-t-violet { background: var(--a-violet-50); color: var(--a-violet); }
+.pcdna-t-muted { background: #eef1f5; color: #475569; }
+.pcdna-t-bad-soft { background: #fff; color: var(--a-bad); box-shadow: inset 0 0 0 1px #f1b5b5; }
+
+/* ---------- badges, dl, feats, meters */
+.pcdna-badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; line-height: 1.8; vertical-align: middle; }
+.pcdna-dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+.pcdna-dl-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pcdna-dl > div { min-width: 0; }
+.pcdna-dl dt { color: var(--a-muted); font-size: 12px; font-weight: 500; }
+.pcdna-dl dd { font-weight: 600; overflow-wrap: anywhere; }
+.pcdna-feats { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.pcdna-feat { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px 2px 8px; border-radius: 999px; font-size: 12px; background: #f1f5f9; color: #64748b; text-decoration: line-through; text-decoration-color: rgba(100, 116, 139, .5); }
+.pcdna-feat .pcdna-icon { width: 14px; height: 14px; }
+.pcdna-feat.is-on { background: var(--a-ok-50); color: var(--a-ok); text-decoration: none; }
+.pcdna-meter { display: block; height: 5px; background: #e7ecf3; border-radius: 99px; overflow: hidden; margin-top: 4px; min-width: 70px; }
+.pcdna-meter > span { display: block; height: 100%; border-radius: 99px; }
+.pcdna-meter > .pcdna-t-brand { background: var(--a-brand); }
+.pcdna-meter > .pcdna-t-warn { background: #d97706; }
+.pcdna-meter > .pcdna-t-bad { background: var(--a-bad); }
+.pcdna-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.pcdna-yes { color: var(--a-ok); }
+.pcdna-no { color: var(--a-warn); }
+.pcdna-err { color: var(--a-bad); font-size: 12px; display: inline-block; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+.pcdna-table .pcdna-ltr { white-space: nowrap; }
+.pcdna-edges td { white-space: nowrap; }
+.pcdna-edges tr[data-has-error] > td { border-bottom: 0; }
+.pcdna-table tr.pcdna-errrow > td { white-space: normal; padding-top: 0; background: #fff8f8; color: var(--a-bad); font-size: 12px; }
+.pcdna-errrow code { overflow-wrap: anywhere; color: #8e1515; }
+.pcdna-err-label { display: inline-flex; align-items: center; gap: 4px; font-weight: 700; }
+.pcdna-err-label .pcdna-icon { width: 14px; height: 14px; }
+
+/* ---------- alerts / empty / lists */
+.pcdna-alert { display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px; border-radius: 10px; border: 1px solid; font-size: 13.5px; }
+.pcdna-alert > .pcdna-icon { margin-top: 3px; }
+.pcdna-alert > div { flex: 1; min-width: 0; }
+.pcdna-alert-ok { background: var(--a-ok-50); border-color: #c9ecd6; color: #0e5a2d; }
+.pcdna-alert-warn { background: var(--a-warn-50); border-color: #fde5b8; color: #6f3304; }
+.pcdna-alert-bad { background: var(--a-bad-50); border-color: #f8d0d0; color: #8e1515; }
+.pcdna-alert-info { background: var(--a-brand-50); border-color: #d9e6fd; color: #173f8a; }
+.pcdna-alert a { font-weight: 700; }
+.pcdna-card-body > .pcdna-alert + *, .pcdna-card-body > * + .pcdna-alert { margin-top: 12px; }
+.pcdna-empty { text-align: center; padding: 28px 16px; color: var(--a-muted); }
+.pcdna-empty > .pcdna-icon { width: 34px; height: 34px; color: #94a3b8; display: block; margin: 0 auto 8px; }
+.pcdna-empty strong { display: block; color: var(--a-text); font-size: 14.5px; }
+.pcdna-empty p { max-width: 520px; margin: 4px auto 0; }
+.pcdna-warnlist li { display: flex; gap: 8px; align-items: flex-start; padding: 7px 0; border-bottom: 1px dashed var(--a-border); }
+.pcdna-warnlist li:last-child { border-bottom: 0; }
+.pcdna-warnlist .pcdna-icon { margin-top: 3px; width: 16px; height: 16px; }
+.pcdna-w-bad .pcdna-icon { color: var(--a-bad); }
+.pcdna-w-warn .pcdna-icon { color: #c2610c; }
+.pcdna-okline { display: flex; gap: 8px; align-items: center; color: var(--a-ok); font-weight: 600; }
+.pcdna-bullets li { position: relative; padding-right: 16px; margin-bottom: 8px; }
+.pcdna-bullets li::before { content: ''; position: absolute; right: 2px; top: 10px; width: 6px; height: 6px; border-radius: 50%; background: var(--a-brand); }
+.pcdna-back { margin: 0; }
+
+/* ---------- tables */
+.pcdna-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.pcdna-table { width: 100%; font-size: 13px; }
+.pcdna-table th, .pcdna-table td { padding: 9px 12px; text-align: right; vertical-align: middle; border-bottom: 1px solid var(--a-border); }
+.pcdna-table thead th { background: var(--a-surface-2); color: var(--a-muted); font-weight: 600; font-size: 12px; white-space: nowrap; border-bottom-color: var(--a-border-strong); }
+.pcdna-table tbody tr:hover > td { background: #fafcff; }
+.pcdna-table tbody tr:last-child > td, .pcdna-table tbody tr:last-child > th { border-bottom: 0; }
+.pcdna-table tfoot th { background: var(--a-surface-2); border-top: 1px solid var(--a-border-strong); border-bottom: 0; }
+.pcdna-table tr.is-bad > td { background: #fff8f8; }
+.pcdna-table tr.is-warn > td { background: #fffcf3; }
+.pcdna-table .pcdna-actions { white-space: nowrap; text-align: left; }
+.pcdna-table .pcdna-actions > * + * { margin-right: 4px; }
+.pcdna-table .pcdna-path, .pcdna-table .pcdna-ua { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pcdna-card-body > .pcdna-table-wrap { margin: 0 -16px; }
+.pcdna-card-body > .pcdna-table-wrap:first-child { margin-top: -14px; }
+.pcdna-card-body > .pcdna-table-wrap:last-child { margin-bottom: -14px; }
+.pcdna-card.pcdna-flush > .pcdna-card-body > .pcdna-table-wrap { margin: 0; }
+.pcdna-sites td { vertical-align: top; }
+.pcdna-sites .pcdna-traffic { min-width: 120px; }
+.pcdna-sites .pcdna-domain-cell { white-space: nowrap; }
+.pcdna .pcdna-domain { font-weight: 700; }
+.pcdna-domain .pcdna-ltr { font-size: 13px; }
+.pcdna-sites .pcdna-client { min-width: 120px; max-width: 190px; }
+.pcdna-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.pcdna-events td { white-space: nowrap; }
+.pcdna-clip { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--a-mono); font-size: 12px; text-align: left; }
+@media (max-width: 1180px) { .pcdna-clip { max-width: 150px; } }
+.pcdna-prices th, .pcdna-prices td { padding: 6px 12px; }
+
+/* ---------- buttons & forms */
+.pcdna .pcdna-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 13px; border-radius: 9px; border: 1px solid var(--a-border-strong);
+  background: var(--a-surface); color: var(--a-text-2); font-weight: 600; font-size: 13px; cursor: pointer; white-space: nowrap; text-decoration: none; line-height: 1; vertical-align: middle; }
+.pcdna .pcdna-btn:hover { background: var(--a-surface-2); color: var(--a-text); text-decoration: none; border-color: #94a3b8; }
+.pcdna .pcdna-btn .pcdna-icon { width: 16px; height: 16px; }
+.pcdna .pcdna-btn-sm { height: 29px; padding: 0 10px; font-size: 12.5px; border-radius: 8px; }
+.pcdna .pcdna-btn-primary { background: var(--a-brand); border-color: var(--a-brand); color: #fff; }
+.pcdna .pcdna-btn-primary:hover { background: var(--a-brand-600); border-color: var(--a-brand-600); color: #fff; }
+.pcdna .pcdna-btn-danger { color: var(--a-bad); border-color: #f1b5b5; }
+.pcdna .pcdna-btn-danger:hover { background: var(--a-bad-50); color: var(--a-bad); border-color: var(--a-bad); }
+.pcdna .pcdna-btn-ghost { border-color: transparent; background: transparent; }
+.pcdna .pcdna-btn-icon { width: 29px; padding: 0; }
+.pcdna .pcdna-btn-icon > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.pcdna .pcdna-btn[disabled] { opacity: .6; cursor: progress; }
+.pcdna .pcdna-input { display: block; width: 100%; height: 36px; padding: 5px 11px; border: 1px solid var(--a-border-strong); border-radius: 9px; background: #fff; color: var(--a-text); box-shadow: none; font-size: 13.5px; }
+.pcdna textarea.pcdna-input { height: auto; min-height: 90px; line-height: 1.7; font-family: var(--a-mono); font-size: 12.5px; resize: vertical; }
+.pcdna select.pcdna-input { padding-left: 28px; width: auto; max-width: 100%; }
+.pcdna .pcdna-input:focus { border-color: var(--a-brand); outline: 0; box-shadow: 0 0 0 3px rgba(29, 95, 214, .2); }
+.pcdna .pcdna-input-num { width: 100%; min-width: 72px; text-align: left; font-variant-numeric: tabular-nums; }
+.pcdna-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px 16px; }
+.pcdna-form-grid label, .pcdna-desc-grid label { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pcdna-form-grid label > span, .pcdna-desc-grid label > span, .pcdna-label { font-weight: 600; font-size: 12.5px; color: var(--a-text-2); }
+.pcdna-form-grid label > small { color: var(--a-muted); line-height: 1.6; }
+.pcdna-form-grid select.pcdna-input { width: 100%; }
+.pcdna-form-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.pcdna-sticky { position: sticky; bottom: 0; background: rgba(255, 255, 255, .96); padding: 10px 0; border-top: 1px solid var(--a-border); z-index: 2; }
+.pcdna-fieldset { border: 1px solid var(--a-border); border-radius: 10px; padding: 12px 14px 14px; margin: 0 0 14px; min-width: 0; }
+.pcdna .pcdna-fieldset legend { width: auto; border: 0; padding: 0 6px; margin: 0; font-size: 13.5px; font-weight: 700; color: var(--a-text); }
+.pcdna-checks-row { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.pcdna .pcdna-check { display: inline-flex; align-items: flex-start; gap: 8px; cursor: pointer; font-weight: 500; }
+.pcdna .pcdna-check input { margin-top: 5px; width: 15px; height: 15px; accent-color: var(--a-brand); flex: none; }
+.pcdna .pcdna-switch { position: relative; display: inline-block; width: 38px; height: 22px; cursor: pointer; vertical-align: middle; }
+.pcdna-switch input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; cursor: pointer; margin: 0; z-index: 1; }
+.pcdna-switch span { position: absolute; inset: 0; background: #cbd5e1; border-radius: 99px; transition: background .15s; }
+.pcdna-switch span::after { content: ''; position: absolute; top: 3px; right: 3px; width: 16px; height: 16px; background: #fff; border-radius: 50%; box-shadow: 0 1px 2px rgba(0, 0, 0, .2); transition: transform .15s; }
+.pcdna-switch input:checked + span { background: var(--a-brand); }
+.pcdna-switch input:checked + span::after { transform: translateX(-16px); }
+.pcdna-switch input:focus-visible + span { box-shadow: 0 0 0 3px rgba(29, 95, 214, .3); }
+.pcdna-matrix th, .pcdna-matrix td { padding: 6px 8px; }
+.pcdna-matrix tbody th { font-weight: 600; color: var(--a-text-2); white-space: nowrap; font-size: 12.5px; }
+.pcdna-matrix td { text-align: center; }
+.pcdna-matrix thead th { text-align: center; font-size: 13px; color: var(--a-text); }
+.pcdna-matrix thead th:first-child { text-align: right; }
+.pcdna-price-matrix { margin-bottom: 10px; }
+.pcdna-desc-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+.pcdna-filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; background: var(--a-surface); border: 1px solid var(--a-border); border-radius: 12px; padding: 10px; box-shadow: var(--a-shadow); }
+.pcdna-search { position: relative; flex: 1 1 260px; display: block; }
+.pcdna-search .pcdna-icon { position: absolute; right: 10px; top: 9px; color: var(--a-muted); pointer-events: none; }
+.pcdna-search .pcdna-input { padding-right: 34px; }
+.pcdna-inline-label { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
+.pcdna-form-inline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+
+/* ---------- row menu (positioned by admin.js so tables never clip it) */
+.pcdna-menu { display: inline-block; position: relative; }
+.pcdna-menu[open] > summary { background: var(--a-surface-2); border-color: #94a3b8; }
+.pcdna-menu-list { position: absolute; left: 0; top: calc(100% + 4px); z-index: 50; min-width: 220px; background: #fff; border: 1px solid var(--a-border); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, .18); padding: 5px; text-align: right; white-space: normal; }
+.pcdna-menu-list.is-fixed { position: fixed; }
+.pcdna-menu-list form { display: block; }
+.pcdna .pcdna-menu-item { display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 7px; background: none; border: 0; color: var(--a-text-2); font-size: 13px; font-weight: 500; cursor: pointer; text-align: right; }
+.pcdna .pcdna-menu-item:hover { background: var(--a-surface-2); color: var(--a-text); text-decoration: none; }
+.pcdna .pcdna-menu-item .pcdna-icon { width: 16px; height: 16px; color: var(--a-muted); }
+.pcdna .pcdna-menu-item.is-danger { color: var(--a-bad); }
+.pcdna .pcdna-menu-item.is-danger .pcdna-icon { color: var(--a-bad); }
+
+/* ---------- pager, copy, token */
+.pcdna-pager { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; }
+.pcdna-pager a, .pcdna-pager span { min-width: 32px; height: 32px; display: inline-grid; place-items: center; border-radius: 8px; border: 1px solid var(--a-border); padding: 0 8px; font-size: 13px; }
+.pcdna-pager .is-current { background: var(--a-brand); border-color: var(--a-brand); color: #fff; font-weight: 700; }
+.pcdna-copy { display: flex; gap: 8px; align-items: stretch; margin: 6px 0 12px; }
+.pcdna-copy code { flex: 1; min-width: 0; display: block; background: #0f172a; color: #e2e8f0; border-radius: 9px; padding: 9px 12px; font-size: 13px; overflow-x: auto; white-space: nowrap; direction: ltr; text-align: left; }
+.pcdna-copy .pcdna-btn { height: auto; }
+.pcdna-token { border-color: #fcd34d; box-shadow: 0 0 0 3px rgba(245, 158, 11, .15); }
+.pcdna-token .pcdna-card-head h3 .pcdna-icon { color: #b45309; }
+
+/* ---------- products */
+.pcdna-products { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.pcdna-product .pcdna-card-actions { gap: 6px; }
+.pcdna-wizard > summary.pcdna-card-head { border-bottom: 0; }
+.pcdna-wizard[open] > summary.pcdna-card-head { border-bottom: 1px solid var(--a-border); }
+.pcdna-wizard > summary h3::after { content: '▾'; font-size: 12px; color: var(--a-muted); margin-right: 4px; }
+.pcdna-summary { margin: 12px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+.pcdna-preview tr.is-create > td:first-child { box-shadow: inset -3px 0 0 var(--a-ok); }
+.pcdna-preview tr.is-update > td:first-child { box-shadow: inset -3px 0 0 #d97706; }
+
+/* ---------- diagnostics */
+.pcdna-diag li { display: flex; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--a-border); }
+.pcdna-diag li:last-child { border-bottom: 0; }
+.pcdna-d-icon { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; flex: none; }
+.pcdna-d-icon .pcdna-icon { width: 16px; height: 16px; }
+.pcdna-d-ok .pcdna-d-icon { background: var(--a-ok-50); color: var(--a-ok); }
+.pcdna-d-warn .pcdna-d-icon { background: var(--a-warn-50); color: var(--a-warn); }
+.pcdna-d-bad .pcdna-d-icon { background: var(--a-bad-50); color: var(--a-bad); }
+.pcdna-diag li > div { min-width: 0; flex: 1; }
+.pcdna-diag p { color: var(--a-text-2); }
+.pcdna-fix { display: flex; gap: 6px; align-items: flex-start; margin-top: 4px; font-size: 12.5px; color: var(--a-muted) !important; background: var(--a-surface-2); border-radius: 8px; padding: 6px 10px; }
+.pcdna-fix .pcdna-icon { width: 15px; height: 15px; margin-top: 3px; color: var(--a-brand); }
+
+/* ---------- manage (admin mode of the client app) */
+.pcdna-manage-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.pcdna-manage-head h3 { font-size: 16px; }
+.pcdna[data-page="manage"] #pcdn-app.pcdn { margin: 0; }
+
+/* ---------- responsive (the WHMCS sidebar takes ~250px, so breakpoints are generous) */
+@media (max-width: 1180px) {
+  .pcdna .pcdna-tab { padding: 6px 9px; font-size: 12.5px; gap: 5px; }
+  .pcdna .pcdna-tab .pcdna-icon { display: none; }
+  .pcdna-kpis { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 10px; }
+  .pcdna-kpi { padding: 12px; }
+  .pcdna-kpis .pcdna-kpi-icon { display: none; }
+  .pcdna-kpi-value { font-size: 19px; }
+  /* sites table → stacked rows */
+  .pcdna-sites thead { display: none; }
+  .pcdna-sites, .pcdna-sites tbody { display: block; }
+  .pcdna-sites tr { display: grid; grid-template-columns: 1.3fr 1fr 1fr .45fr .7fr 1.1fr; gap: 8px 14px; padding: 12px 16px; border-bottom: 1px solid var(--a-border); }
+  .pcdna-sites tbody tr:last-child { border-bottom: 0; }
+  .pcdna-sites tbody tr:hover > td { background: none; }
+  .pcdna-table.pcdna-sites td { display: block; padding: 0; border: 0; min-width: 0; max-width: none; }
+  .pcdna-sites td[data-label]::before { content: attr(data-label); display: block; color: var(--a-muted); font-size: 11.5px; font-weight: 600; margin-bottom: 2px; }
+  .pcdna-sites .pcdna-domain-cell { grid-column: 1 / 4; }
+  .pcdna-sites .pcdna-actions { grid-column: 4 / 7; grid-row: 1; text-align: left; }
+}
+@media (max-width: 760px) {
+  .pcdna-sites tr { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pcdna-sites .pcdna-domain-cell { grid-column: 1 / 3; }
+  .pcdna-sites .pcdna-actions { grid-column: 1 / 3; grid-row: auto; text-align: right; }
+}
+
+@media (max-width: 1100px) {
+  .pcdna-grid-2, .pcdna-products { grid-template-columns: minmax(0, 1fr); }
+  .pcdna-dl-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .pcdna { padding: 10px; }
+  .pcdna-kpis, .pcdna-kpis-3 { grid-template-columns: minmax(0, 1fr); }
+  .pcdna-desc-grid, .pcdna-dl, .pcdna-dl-3 { grid-template-columns: minmax(0, 1fr); }
+  .pcdna-tabs { flex-wrap: nowrap; overflow-x: auto; }
+}

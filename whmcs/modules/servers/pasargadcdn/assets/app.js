@@ -20,8 +20,12 @@
   P.CFG.csrf = root.getAttribute('data-csrf') || '';
   P.CFG.serviceId = boot.serviceId || 0;
   var WEBROOT = P.CFG.api.replace(/modules\/servers\/pasargadcdn\/api\.php$/, '');
-  var UPGRADE_URL = WEBROOT + 'upgrade.php?type=package&id=' + encodeURIComponent(boot.serviceId || '');
+  // Admin mode (addon «مدیریت کامل»): boot.admin carries WHMCS admin links; plan changes happen on the admin service page.
+  var ADMIN = boot.admin && typeof boot.admin === 'object' ? boot.admin : null;
+  var UPGRADE_URL = ADMIN ? String(ADMIN.serviceUrl || '#') : WEBROOT + 'upgrade.php?type=package&id=' + encodeURIComponent(boot.serviceId || '');
   var SID = String(boot.serviceId || '0');
+  // Overage billing: included traffic (WHMCS soft limit) vs the controller hard cap.
+  var BILL = boot.billing && Number(boot.billing.included_gb) > 0 ? boot.billing : null;
 
   var S = {
     site: boot.site || null,
@@ -324,12 +328,12 @@
     clear(mainEl);
     S.form = null;
     var id = S.page, p = page(id);
-    var banner = null;
+    var banner = null, adminBar = ADMIN ? adminBanner() : null;
     if (!S.active) banner = P.alertBox('warning', [h('strong', { text: 'این سرویس فعال نیست. ' }), 'اطلاعات فقط قابل مشاهده است و امکان تغییر تنظیمات وجود ندارد.'], { icon: 'lock' });
     else if (S.site.status === 'suspended') banner = P.alertBox('danger', 'این سرویس در CDN معلق است و بازدیدکنندگان صفحه تعلیق را می‌بینند.');
     else if (S.site.status === 'over_quota') banner = P.alertBox('danger', [h('strong', { text: 'ترافیک ماهانه تمام شده است. ' }), 'برای ادامه سرویس‌دهی، پلن را ارتقا دهید. ',
       h('a', { href: UPGRADE_URL, className: 'pcdn-link', text: 'ارتقای پلن' })]);
-    append(mainEl, [banner, pageHead(p, id)]);
+    append(mainEl, [adminBar, banner, pageHead(p, id)]);
     var body = h('div', { className: 'pcdn-page', 'data-panel': id });
     mainEl.appendChild(body);
     if (locked(id)) append(body, upgradePanel(p));
@@ -337,6 +341,18 @@
     mainEl.appendChild(buildSaveBar());
     lockWrites(mainEl);
     updateSaveBar();
+  }
+
+  function adminBanner() {
+    var links = [];
+    if (ADMIN.serviceUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.serviceUrl), 'data-ro-ok': '1', text: 'صفحه سرویس در WHMCS' }));
+    if (ADMIN.clientUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.clientUrl), 'data-ro-ok': '1', text: 'پروفایل مشتری' }));
+    if (ADMIN.backUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.backUrl), 'data-ro-ok': '1', text: 'بازگشت به فهرست سایت‌ها' }));
+    return h('div', { className: 'pcdn-admin-bar', role: 'note', 'data-admin-mode': '1' },
+      h('span', { className: 'pcdn-admin-badge' }, icon('shieldCheck'), h('span', { text: 'حالت مدیر' })),
+      h('span', { className: 'pcdn-admin-text', text: 'سرویس #' + SID + (ADMIN.client ? ' — ' + ADMIN.client : '') +
+        (ADMIN.status && ADMIN.status !== 'Active' ? ' (وضعیت WHMCS: ' + ADMIN.status + ')' : '') + '. تغییرات شما در گزارش فعالیت WHMCS ثبت می‌شود.' }),
+      h('span', { className: 'pcdn-admin-links' }, links));
   }
 
   function upgradePanel(p) {
@@ -577,13 +593,16 @@
     out.push(checklist());
 
     // KPIs
-    var limit = Number(plan.bandwidth_limit_gb) || 0, usedGb = (Number(u.bytes) || 0) / 1073741824;
+    var cap = Number(plan.bandwidth_limit_gb) || 0, usedGb = (Number(u.bytes) || 0) / 1073741824;
+    var limit = BILL ? Number(BILL.included_gb) : cap;
     var ratio = limit > 0 ? usedGb / limit : 0;
+    var trafficSub = limit > 0 ? 'از ' + num(limit) + ' گیگابایت (' + P.pct(usedGb, limit) + ')' : 'بدون محدودیت ترافیک';
+    if (BILL && usedGb > limit) trafficSub = num(Math.ceil((usedGb - limit) * 10) / 10) + ' گیگابایت بیش از ترافیک پلن (با هزینه ترافیک اضافه)';
     var threatVal = h('span', null, P.skeleton(1, 'is-inline'));
     var reqs = Number(u.requests) || 0, hits = Number(u.cache_hits) || 0;
     out.push(h('div', { className: 'pcdn-kpis' },
-      kpi('activity', 'brand', 'ترافیک این ماه', P.bytes(u.bytes), limit > 0 ? 'از ' + num(limit) + ' گیگابایت (' + P.pct(usedGb, limit) + ')' : 'بدون محدودیت ترافیک',
-        limit > 0 ? P.meter(ratio, ratio >= 0.95 ? 'danger' : ratio >= 0.8 ? 'warning' : 'brand') : null, { id: 'traffic' }),
+      kpi('activity', 'brand', 'ترافیک این ماه', P.bytes(u.bytes), trafficSub,
+        limit > 0 ? P.meter(Math.min(ratio, 1), BILL ? (ratio >= 1 ? 'warning' : 'brand') : ratio >= 0.95 ? 'danger' : ratio >= 0.8 ? 'warning' : 'brand') : null, { id: 'traffic' }),
       kpi('chart', 'violet', 'درخواست‌های این ماه', num(reqs), 'حدود ' + P.short(reqs) + ' درخواست', null, { id: 'requests' }),
       kpi('zap', 'success', 'نرخ کش', P.pct(hits, reqs), 'پاسخ مستقیم از سرورهای CDN', reqs ? P.meter(hits / reqs, 'success') : null, { id: 'cache' }),
       kpi('shieldCheck', 'danger', 'تهدیدهای متوقف‌شده', threatVal, 'در ۲۴ ساعت گذشته', goLink('events', 'مشاهده رویدادها'), { id: 'threats' })));
@@ -701,7 +720,9 @@
     function feat(on, label) { return h('span', { className: 'pcdn-feat' + (on ? ' is-on' : '') }, icon(on ? 'check' : 'lock'), h('span', { text: label })); }
     append(c.body, [
       h('dl', { className: 'pcdn-dl' },
-        h('div', null, h('dt', { text: 'ترافیک ماهانه' }), h('dd', { text: plan.bandwidth_limit_gb ? num(plan.bandwidth_limit_gb) + ' گیگابایت' : 'نامحدود' })),
+        h('div', null, h('dt', { text: 'ترافیک ماهانه' }), h('dd', { text: BILL ? num(BILL.included_gb) + ' گیگابایت' : plan.bandwidth_limit_gb ? num(plan.bandwidth_limit_gb) + ' گیگابایت' : 'نامحدود' })),
+        BILL ? h('div', { 'data-billing': '1' }, h('dt', { text: 'ترافیک اضافه' }), h('dd', { text: (Number(BILL.price_per_gb) > 0 ? 'هر گیگابایت ' + num(BILL.price_per_gb) + (BILL.currency ? ' ' + BILL.currency : '') : 'طبق تعرفه') +
+          (plan.bandwidth_limit_gb ? ' — حداکثر تا ' + num(plan.bandwidth_limit_gb) + ' گیگابایت' : '') })) : null,
         h('div', null, h('dt', { text: 'رکوردهای DNS' }), h('dd', { text: num((S.site.records || []).length) + ' از ' + num(plan.max_records) })),
         h('div', null, h('dt', { text: 'قوانین فایروال / صفحه / نرخ' }), h('dd', { text: num(f.max_firewall_rules || 0) + ' / ' + num(f.max_page_rules || 0) + ' / ' + num(f.max_ratelimit_rules || 0) }))),
       h('div', { className: 'pcdn-feats' },

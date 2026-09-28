@@ -1,0 +1,426 @@
+<?php
+
+namespace PasargadCdn\Admin;
+
+use PasargadCdn\ApiClient;
+use PasargadCdn\ApiException;
+use PasargadCdn\ClientApi;
+use WHMCS\Database\Capsule;
+
+if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
+    return;
+}
+
+/**
+ * Router of the addon output: pages, POST actions (CSRF-checked, logged) and
+ * the two raw endpoints (the admin-mode JSON API and the usage CSV).
+ */
+final class Admin
+{
+    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'usage', 'events', 'settings', 'manage', 'api'];
+
+    /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
+    public static $sink = null;
+
+    public static function output(array $vars, array $get, array $post, string $method): string
+    {
+        // Only plain string query values are ever used (arrays like ?q[]=x are dropped).
+        $get = array_filter($get, 'is_string');
+        if (!empty($vars['modulelink'])) {
+            View::$link = (string) $vars['modulelink'];
+        }
+        $page = is_string($get['page'] ?? null) && in_array($get['page'], self::PAGES, true) ? $get['page'] : 'dashboard';
+        if (Env::adminId() <= 0) {
+            if ($page === 'api') {
+                self::emit(401, 'application/json; charset=utf-8', json_encode(['detail' => 'نشست مدیر معتبر نیست؛ دوباره وارد شوید.'], JSON_UNESCAPED_UNICODE));
+                return '';
+            }
+            return '<div class="pcdna" dir="rtl">' . View::alert('bad', 'دسترسی فقط برای مدیران WHMCS مجاز است.') . '</div>';
+        }
+        if (!Env::loadServerModule()) {
+            return Pages::layout($page, View::alert('bad', 'ماژول سرور Pasargad CDN پیدا نشد. پوشه <code>modules/servers/pasargadcdn</code> را آپلود کنید.'), []);
+        }
+        if ($page === 'api') {
+            [$code, $data] = self::api($get, $method);
+            self::emit($code, 'application/json; charset=utf-8', (string) json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            return '';
+        }
+        if ($page === 'usage' && ($get['export'] ?? '') === 'csv') {
+            [$code, $type, $body, $file] = Pages::usageCsv(is_string($get['month'] ?? null) ? $get['month'] : '');
+            Env::log('usage CSV exported (' . Pages::validMonth($get['month'] ?? '') . ') by admin #' . Env::adminId());
+            self::emit($code, $type, $body, $file);
+            return '';
+        }
+
+        $flash = [];
+        $state = [];
+        if ($method === 'POST') {
+            $action = is_string($post['a'] ?? null) ? $post['a'] : '';
+            if (!Env::checkCsrf($post['pcdn_csrf'] ?? null)) {
+                $flash[] = ['bad', 'درخواست رد شد: توکن امنیتی نامعتبر یا منقضی است. صفحه را دوباره بارگذاری و دوباره تلاش کنید.'];
+            } else {
+                try {
+                    [$flash, $state] = self::action($page, $action, $post);
+                } catch (\Throwable $e) {
+                    $flash[] = ['bad', 'خطا: ' . View::e($e->getMessage())];
+                }
+            }
+        }
+
+        switch ($page) {
+            case 'sites':
+                $body = Pages::sites($get);
+                break;
+            case 'edges':
+                $body = Pages::edges($state['token'] ?? null, $state['old'] ?? []);
+                break;
+            case 'plans':
+                $body = Pages::plans($state);
+                break;
+            case 'usage':
+                $body = Pages::usage($get);
+                break;
+            case 'events':
+                $body = Pages::events($get);
+                break;
+            case 'settings':
+                $body = Pages::settings();
+                break;
+            case 'manage':
+                $body = Pages::manage((int) ($get['service'] ?? 0));
+                break;
+            default:
+                $body = Pages::dashboard();
+        }
+        // After a POST, the browser URL is replaced with the GET URL so a refresh never re-submits.
+        $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'q' => $get['q'] ?? null,
+            'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
+        return Pages::layout($page, $body, $flash, $clean);
+    }
+
+    // ------------------------------------------------------------------ admin-mode JSON API
+
+    public static function api(array $get, string $method): array
+    {
+        $sid = is_string($get['service'] ?? null) ? $get['service'] : '';
+        $id = is_string($get['id'] ?? null) ? $get['id'] : '';
+        if ($sid === '' || $sid !== $id) {
+            return [404, ['detail' => 'سرویس یافت نشد.']];
+        }
+        $body = '';
+        if ($method === 'POST' || $method === 'PUT') {
+            $body = (string) self::readBody(ClientApi::MAX_BODY + 1);
+        }
+        $query = $get;
+        unset($query['module'], $query['page'], $query['service'], $query['id'], $query['path'], $query['token']);
+        return ClientApi::handle([
+            'method' => $method,
+            'id' => $id,
+            'path' => is_string($get['path'] ?? null) ? $get['path'] : '',
+            'query' => $query,
+            'body' => $body,
+            'csrf' => (string) ($_SERVER['HTTP_X_PCDN_CSRF'] ?? ''),
+            'session_csrf' => (string) ($_SESSION['pasargadcdn_admin_csrf'] ?? ''),
+            'client_id' => 0,
+            'admin_id' => Env::adminId(),
+        ], self::$apiFactory);
+    }
+
+    /** @var callable|null tests */
+    public static $apiFactory = null;
+    /** @var string|null tests: request body */
+    public static $body = null;
+
+    private static function readBody(int $max): string
+    {
+        if (self::$body !== null) {
+            return self::$body;
+        }
+        return (string) file_get_contents('php://input', false, null, 0, $max);
+    }
+
+    public static function emit(int $code, string $type, string $body, string $file = ''): void
+    {
+        if (self::$sink) {
+            (self::$sink)([$code, $type, $body, $file]);
+            return;
+        }
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        if (!headers_sent()) {
+            http_response_code($code);
+            header('Content-Type: ' . $type);
+            header('Cache-Control: no-store');
+            header('X-Content-Type-Options: nosniff');
+            if ($file !== '') {
+                header('Content-Disposition: attachment; filename="' . preg_replace('/[^A-Za-z0-9._-]/', '', $file) . '"');
+            }
+        }
+        echo $body;
+        exit;
+    }
+
+    // ------------------------------------------------------------------ actions
+
+    /** @return array [flash list, page state] */
+    public static function action(string $page, string $action, array $post): array
+    {
+        $admin = Env::adminId();
+        switch ($action) {
+            case 'purge':
+            case 'nscheck':
+            case 'dnssync':
+            case 'ssl':
+                return [[self::siteAction($action, (int) ($post['service'] ?? 0), $admin)], []];
+            case 'suspend':
+            case 'unsuspend':
+            case 'create':
+                return [[self::moduleAction($action, (int) ($post['service'] ?? 0), $admin)], []];
+            case 'orphan_delete':
+                return [[self::orphanDelete(Env::input($post['domain'] ?? ''), Env::input($post['confirm'] ?? ''), $admin)], []];
+            case 'edge_add':
+                return self::edgeAdd($post, $admin);
+            case 'edge_toggle':
+            case 'edge_rotate':
+            case 'edge_delete':
+                return self::edgeAction($action, (int) ($post['id'] ?? 0), (string) ($post['enabled'] ?? ''), $admin);
+            case 'wizard_preview':
+            case 'wizard_edit':
+            case 'wizard_apply':
+                return self::wizard($action, $post, $admin);
+            case 'save_server':
+                $sid = (int) ($post['server'] ?? 0);
+                if ($sid !== 0 && !Env::serverById($sid)) {
+                    return [[['bad', 'سرور انتخاب‌شده از نوع Pasargad CDN نیست.']], []];
+                }
+                Env::saveSetting('server', (string) $sid);
+                Env::cacheDelete(WidgetData::KEY);
+                Pages::reset();
+                Env::log('admin panel server set to #' . $sid . ' by admin #' . $admin);
+                return [[['ok', 'سرور ذخیره شد.']], []];
+            case 'clear_cache':
+                Env::cacheDelete(WidgetData::KEY);
+                return [[['ok', 'حافظه موقت ویجت پاک شد؛ در بارگذاری بعدی صفحه اصلی داده تازه نمایش داده می‌شود.']], []];
+        }
+        return [[['bad', 'عملیات نامعتبر است.']], []];
+    }
+
+    /** Service row (CDN products only) + its server, or an error string. */
+    private static function service(int $sid)
+    {
+        if ($sid <= 0) {
+            return 'شناسه سرویس نامعتبر است.';
+        }
+        $svc = Data::serviceQuery()->where('h.id', $sid)->first(['h.id', 'h.userid', 'h.domain', 'h.domainstatus', 'h.server']);
+        if (!$svc) {
+            return 'سرویس CDN #' . $sid . ' پیدا نشد.';
+        }
+        return $svc;
+    }
+
+    private static function serverOf($svc)
+    {
+        $s = Capsule::table('tblservers')->where('id', (int) $svc->server)->first();
+        return $s && $s->type === 'pasargadcdn' ? $s : Env::server();
+    }
+
+    const SITE_ACTIONS = [
+        'purge' => ['/purge', 'پاکسازی کل کش', 'درخواست پاکسازی کل کش %s ثبت شد.'],
+        'nscheck' => ['/ns-check', 'بررسی NS', ''],
+        'dnssync' => ['/dns-sync', 'همگام‌سازی DNS', 'زون DNS دامنه %s دوباره در PowerDNS نوشته شد.'],
+        'ssl' => ['/ssl', 'درخواست SSL', 'درخواست صدور گواهی SSL برای %s ثبت شد.'],
+    ];
+
+    private static function siteAction(string $action, int $sid, int $admin): array
+    {
+        $svc = self::service($sid);
+        if (is_string($svc)) {
+            return ['bad', View::e($svc)];
+        }
+        $domain = Env::domain((string) $svc->domain);
+        if (!Env::validHostname($domain)) {
+            return ['bad', 'دامنه سرویس #' . $sid . ' معتبر نیست.'];
+        }
+        [$suffix, $label, $okMsg] = self::SITE_ACTIONS[$action];
+        try {
+            $api = Env::api(10, self::serverOf($svc));
+            $r = $api->post(ApiClient::site($domain) . $suffix, $action === 'purge' ? ['urls' => []] : []);
+        } catch (\Throwable $e) {
+            Env::log($label . ' on ' . $domain . ' (service #' . $sid . ') failed: ' . $e->getMessage() . ' — admin #' . $admin, (int) $svc->userid);
+            return ['bad', View::e($label . ' برای ' . $domain . ' ناموفق بود: ' . $e->getMessage())];
+        }
+        Env::log($label . ' on ' . $domain . ' (service #' . $sid . ') by admin #' . $admin, (int) $svc->userid);
+        if ($action === 'nscheck') {
+            return !empty($r['ok']) ? ['ok', 'نیم‌سرورهای ' . View::ltr($domain) . ' تأیید شد.']
+                : ['warn', 'نیم‌سرورهای ' . View::ltr($domain) . ' هنوز تغییر نکرده است. فعلی: ' . View::ltr(implode(', ', (array) ($r['found'] ?? [])) ?: '—')];
+        }
+        if ($action === 'dnssync' && empty($r['ok'])) {
+            return ['bad', 'همگام‌سازی DNS ناموفق بود: ' . View::e((string) ($r['error'] ?? ''))];
+        }
+        return ['ok', sprintf(View::e($okMsg), View::ltr($domain))];
+    }
+
+    const MODULE_ACTIONS = [
+        'suspend' => ['ModuleSuspend', 'تعلیق', 'سرویس #%d در WHMCS و CDN معلق شد.'],
+        'unsuspend' => ['ModuleUnsuspend', 'رفع تعلیق', 'تعلیق سرویس #%d برداشته شد.'],
+        'create' => ['ModuleCreate', 'ساخت روی CDN', 'سایت سرویس #%d روی کنترلر ساخته شد.'],
+    ];
+
+    /** Through WHMCS localAPI, so WHMCS status, emails and hooks stay consistent. */
+    private static function moduleAction(string $action, int $sid, int $admin): array
+    {
+        $svc = self::service($sid);
+        if (is_string($svc)) {
+            return ['bad', View::e($svc)];
+        }
+        [$cmd, $label, $okMsg] = self::MODULE_ACTIONS[$action];
+        $args = ['serviceid' => $sid];
+        if ($action === 'suspend') {
+            if ((string) $svc->domainstatus !== 'Active') {
+                return ['bad', 'فقط سرویس فعال را می‌توان معلق کرد.'];
+            }
+            $args['suspendreason'] = 'تعلیق توسط مدیر از پنل CDN';
+        } elseif ($action === 'unsuspend' && (string) $svc->domainstatus !== 'Suspended') {
+            return ['bad', 'این سرویس معلق نیست.'];
+        } elseif ($action === 'create' && !in_array((string) $svc->domainstatus, ['Active', 'Suspended', 'Pending'], true)) {
+            return ['bad', 'برای سرویس با وضعیت ' . View::e($svc->domainstatus) . ' نمی‌توان سایت ساخت.'];
+        }
+        $r = Env::localApi($cmd, $args);
+        $ok = ($r['result'] ?? '') === 'success';
+        Env::log($label . ' (' . $cmd . ') service #' . $sid . ' by admin #' . $admin . ': ' . ($ok ? 'success' : 'failed — ' . ($r['message'] ?? '')), (int) $svc->userid);
+        Pages::reset();
+        return $ok ? ['ok', sprintf($okMsg, $sid)] : ['bad', View::e($label . ' ناموفق بود: ' . ($r['message'] ?? 'خطای نامشخص'))];
+    }
+
+    private static function orphanDelete(string $domain, string $confirm, int $admin): array
+    {
+        $domain = strtolower($domain);
+        if (!Env::validHostname($domain)) {
+            return ['bad', 'دامنه نامعتبر است.'];
+        }
+        if (strtolower($confirm) !== $domain) {
+            return ['bad', 'برای حذف، نام دامنه را دقیقاً تایپ کنید.'];
+        }
+        try {
+            $api = Env::api(10);
+            $sites = $api->get('/api/v1/sites');
+            if (!Data::isOrphan($domain, $sites)) {
+                return ['bad', 'دامنه ' . View::ltr($domain) . ' به یک سرویس فعال WHMCS تعلق دارد و حذف نشد.'];
+            }
+            $api->delete(ApiClient::site($domain));
+        } catch (\Throwable $e) {
+            return ['bad', View::e('حذف ' . $domain . ' ناموفق بود: ' . $e->getMessage())];
+        }
+        Env::log('orphan site ' . $domain . ' deleted from the controller by admin #' . $admin);
+        Pages::reset();
+        return ['ok', 'سایت ' . View::ltr($domain) . ' از کنترلر حذف شد.'];
+    }
+
+    private static function edgeAdd(array $post, int $admin): array
+    {
+        $old = ['name' => Env::input($post['name'] ?? ''), 'ipv4' => Env::input($post['ipv4'] ?? ''),
+            'ipv6' => Env::input($post['ipv6'] ?? ''), 'region' => Env::input($post['region'] ?? '')];
+        $e = [];
+        if (!preg_match('/^[A-Za-z0-9_.-]{1,64}$/D', $old['name'])) {
+            $e[] = 'نام نود فقط می‌تواند حروف انگلیسی، عدد، نقطه، زیرخط و خط تیره باشد (حداکثر ۶۴).';
+        }
+        if (!filter_var($old['ipv4'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            $e[] = 'IPv4 باید یک آدرس عمومی معتبر باشد.';
+        }
+        if ($old['ipv6'] !== '' && !filter_var($old['ipv6'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            $e[] = 'IPv6 معتبر نیست.';
+        }
+        if (!in_array($old['region'], ['home', 'global'], true)) {
+            $e[] = 'منطقه نامعتبر است.';
+        }
+        if ($e) {
+            return [array_map(function ($m) {
+                return ['bad', View::e($m)];
+            }, $e), ['old' => $old]];
+        }
+        $body = ['name' => $old['name'], 'ipv4' => $old['ipv4'], 'region' => $old['region']];
+        if ($old['ipv6'] !== '') {
+            $body['ipv6'] = $old['ipv6'];
+        }
+        try {
+            $r = Env::api(10)->post('/api/v1/edges', $body);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('افزودن نود ناموفق بود: ' . $ex->getMessage())]], ['old' => $old]];
+        }
+        // The token is only rendered in this response — never logged, stored or put in a redirect.
+        Env::log('edge ' . $old['name'] . ' (' . $old['ipv4'] . ', ' . $old['region'] . ') added by admin #' . $admin);
+        Pages::reset();
+        $token = is_string($r['token'] ?? null) ? $r['token'] : '';
+        return [[['ok', 'نود ' . View::ltr($old['name']) . ' ثبت شد.']], $token !== ''
+            ? ['token' => ['token' => $token, 'name' => $old['name'], 'title' => 'نود جدید: دستور نصب']] : []];
+    }
+
+    private static function edgeAction(string $action, int $id, string $enabled, int $admin): array
+    {
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        try {
+            $api = Env::api(10);
+            $name = '#' . $id;
+            foreach ($api->get('/api/v1/edges') as $e) {
+                if ((int) ($e['id'] ?? 0) === $id) {
+                    $name = (string) $e['name'];
+                }
+            }
+            if ($action === 'edge_toggle') {
+                $on = $enabled === '1';
+                $api->request('PATCH', '/api/v1/edges/' . $id . '?enabled=' . ($on ? 'true' : 'false'));
+                Env::log('edge ' . $name . ' ' . ($on ? 'enabled' : 'disabled') . ' by admin #' . $admin);
+                Pages::reset();
+                return [[['ok', 'نود ' . View::ltr($name) . ($on ? ' فعال شد.' : ' غیرفعال و از DNS خارج شد.')]], []];
+            }
+            if ($action === 'edge_delete') {
+                $api->delete('/api/v1/edges/' . $id);
+                Env::log('edge ' . $name . ' deleted by admin #' . $admin);
+                Pages::reset();
+                return [[['ok', 'نود ' . View::ltr($name) . ' حذف شد.']], []];
+            }
+            $r = $api->post('/api/v1/edges/' . $id . '/rotate-token');
+            Env::log('edge ' . $name . ' token rotated by admin #' . $admin);
+            $token = is_string($r['token'] ?? null) ? $r['token'] : '';
+            return [[['ok', 'توکن نود ' . View::ltr($name) . ' عوض شد؛ توکن قبلی دیگر کار نمی‌کند.']],
+                $token !== '' ? ['token' => ['token' => $token, 'name' => $name, 'title' => 'توکن جدید نود']] : []];
+        } catch (\Throwable $e) {
+            return [[['bad', View::e('عملیات روی نود ناموفق بود: ' . $e->getMessage())]], []];
+        }
+    }
+
+    private static function wizard(string $action, array $post, int $admin): array
+    {
+        $currencies = Data::currencies();
+        [$in, $errors] = Wizard::fromPost($post, $currencies);
+        if ($action === 'wizard_edit') {
+            return [[], ['input' => $in]];
+        }
+        if ($errors) {
+            return [[['bad', 'فرم ایراد دارد؛ موارد مشخص‌شده را اصلاح کنید.']], ['input' => $in, 'errors' => $errors]];
+        }
+        if ($action === 'wizard_preview') {
+            return [[], ['preview' => true, 'input' => $in, 'post' => $post]];
+        }
+        try {
+            $summary = Wizard::apply($in, $currencies);
+        } catch (\Throwable $e) {
+            Env::log('product wizard failed (rolled back) by admin #' . $admin . ': ' . $e->getMessage());
+            return [[['bad', 'راه‌اندازی انجام نشد و هیچ تغییری ذخیره نشد: ' . View::e($e->getMessage())]], ['input' => $in]];
+        }
+        Env::reset();
+        $n = ['create' => 0, 'update' => 0];
+        foreach ($summary as $s) {
+            if (isset($n[$s['op']])) {
+                $n[$s['op']]++;
+            }
+        }
+        Env::log('product wizard applied by admin #' . $admin . ': ' . $n['create'] . ' created, ' . $n['update'] . ' updated');
+        Env::cacheDelete(WidgetData::KEY);
+        return [[['ok', 'راه‌اندازی انجام شد: ' . View::n($n['create']) . ' مورد ساخته و ' . View::n($n['update']) . ' مورد به‌روزرسانی شد.']],
+            ['summary' => $summary]];
+    }
+}

@@ -2,8 +2,14 @@
 
 namespace PasargadCdn;
 
-class ApiException extends \Exception
-{
+if (!class_exists(__NAMESPACE__ . '\\ApiException', false)) {
+    class ApiException extends \Exception
+    {
+    }
+}
+
+if (class_exists(__NAMESPACE__ . '\\ApiClient', false)) {
+    return;
 }
 
 /**
@@ -22,7 +28,8 @@ class ApiClient
         $this->timeout = $timeout;
     }
 
-    public static function fromParams(array $params): self
+    /** @param int $timeout total seconds per request (connect timeout is capped at 10 s) */
+    public static function fromParams(array $params, int $timeout = 20): self
     {
         $host = trim($params['serverhostname'] ?? '') ?: trim($params['serverip'] ?? '');
         if ($host === '') {
@@ -37,7 +44,103 @@ class ApiClient
         if ($key === '') {
             throw new ApiException('API key is not configured (put it in the server "Access Hash" field)');
         }
-        return new self($host, $key);
+        return new self($host, $key, $timeout);
+    }
+
+    /**
+     * Client for a tblservers row (object or array with type/hostname/ipaddress/
+     * secure/port/accesshash/password). The password column is WHMCS-encrypted.
+     */
+    public static function fromServerRow($server, int $timeout = 20): self
+    {
+        $s = (array) $server;
+        $hash = trim((string) ($s['accesshash'] ?? ''));
+        $password = '';
+        if ($hash === '' && (string) ($s['password'] ?? '') !== '') {
+            $password = function_exists('decrypt') ? (string) decrypt($s['password']) : (string) $s['password'];
+        }
+        return self::fromParams([
+            'serverhostname' => $s['hostname'] ?? '',
+            'serverip' => $s['ipaddress'] ?? '',
+            'serversecure' => $s['secure'] ?? '',
+            'serverport' => $s['port'] ?? '',
+            'serveraccesshash' => $hash,
+            'serverpassword' => $password,
+        ], $timeout);
+    }
+
+    public function getTimeout(): int
+    {
+        return $this->timeout;
+    }
+
+    /**
+     * Parallel GETs (curl_multi) bounded by this client's timeout in total.
+     * Never throws: returns [path => ['code' => int, 'data' => mixed, 'error' => ?string]].
+     */
+    public function getMany(array $paths): array
+    {
+        $out = [];
+        if (!$paths) {
+            return $out;
+        }
+        $mh = curl_multi_init();
+        $handles = [];
+        foreach (array_values(array_unique($paths)) as $path) {
+            $ch = curl_init($this->baseUrl . $path);
+            curl_setopt_array($ch, $this->curlOptions('GET', null));
+            curl_multi_add_handle($mh, $ch);
+            $handles[$path] = $ch;
+        }
+        $deadline = microtime(true) + $this->timeout + 1;
+        do {
+            $status = curl_multi_exec($mh, $running);
+            if ($running) {
+                curl_multi_select($mh, 0.2);
+            }
+        } while ($running && $status === CURLM_OK && microtime(true) < $deadline);
+        foreach ($handles as $path => $ch) {
+            $raw = curl_multi_getcontent($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $err = curl_error($ch);
+            if (function_exists('logModuleCall')) {
+                logModuleCall('pasargadcdn', 'GET ' . $path, null, self::redact($raw), null, [$this->apiKey]);
+            }
+            if ($code === 0 || $raw === null || $raw === false) {
+                $out[$path] = ['code' => 0, 'data' => null, 'error' => 'اتصال به سرور CDN برقرار نشد' . ($err !== '' ? ': ' . $err : '')];
+            } else {
+                $data = json_decode((string) $raw, true);
+                $out[$path] = ['code' => $code, 'data' => $data,
+                    'error' => $code >= 400 ? self::errorMessage($data, $code) : null];
+            }
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+        }
+        curl_multi_close($mh);
+        return $out;
+    }
+
+    private function curlOptions(string $method, ?string $payload): array
+    {
+        $headers = [
+            'Authorization: Bearer ' . $this->apiKey,
+            'Accept: application/json',
+        ];
+        $opts = [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => max(1, min(10, $this->timeout)),
+            CURLOPT_TIMEOUT => $this->timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_NOSIGNAL => true,
+        ];
+        if ($payload !== null) {
+            $headers[] = 'Content-Type: application/json';
+            $opts[CURLOPT_POSTFIELDS] = $payload;
+        }
+        $opts[CURLOPT_HTTPHEADER] = $headers;
+        return $opts;
     }
 
     public function get(string $path): array
@@ -90,30 +193,14 @@ class ApiClient
     public function raw(string $method, string $path, ?string $payload = null): array
     {
         $ch = curl_init($this->baseUrl . $path);
-        $headers = [
-            'Authorization: Bearer ' . $this->apiKey,
-            'Accept: application/json',
-        ];
-        if ($payload !== null) {
-            $headers[] = 'Content-Type: application/json';
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-        }
-        curl_setopt_array($ch, [
-            CURLOPT_CUSTOMREQUEST => $method,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => $this->timeout,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-        ]);
+        curl_setopt_array($ch, $this->curlOptions($method, $payload));
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err = curl_error($ch);
         curl_close($ch);
 
         if (function_exists('logModuleCall')) {
-            logModuleCall('pasargadcdn', $method . ' ' . $path, $payload, $raw, null, [$this->apiKey]);
+            logModuleCall('pasargadcdn', $method . ' ' . $path, self::redact($payload), self::redact($raw), null, [$this->apiKey]);
         }
         if ($raw === false) {
             throw new ApiException('اتصال به سرور CDN برقرار نشد: ' . $err);
@@ -121,7 +208,20 @@ class ApiClient
         return [$code, json_decode((string) $raw, true)];
     }
 
-    private static function errorMessage($data, int $code): string
+    /**
+     * Secrets never reach the WHMCS module log: edge tokens (shown to the admin
+     * once), private keys of custom certificates.
+     */
+    public static function redact($text)
+    {
+        if (!is_string($text) || $text === '') {
+            return $text;
+        }
+        $text = (string) preg_replace('/"(token|key)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        return (string) preg_replace('/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/s', '***PRIVATE KEY***', $text);
+    }
+
+    public static function errorMessage($data, int $code): string
     {
         $detail = is_array($data) ? ($data['detail'] ?? null) : null;
         if (is_string($detail)) {

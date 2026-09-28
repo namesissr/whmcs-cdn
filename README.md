@@ -229,6 +229,13 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 
 ## ۴. نصب ماژول WHMCS
 
+> راهنمای کامل WHMCS، شامل پنل مدیریت CDN، ساخت خودکار پلن‌ها و قیمت‌ها و سناریوی سفارش مشتری، در [`docs/WHMCS.md`](docs/WHMCS.md) آمده است. خلاصه آن:
+> 1. پوشه‌های `whmcs/modules/servers/pasargadcdn` و `whmcs/modules/addons/pasargadcdn_admin` را آپلود کنید.
+> 2. افزونه «مدیریت CDN پاسارگاد» را در `System Settings → Addon Modules` فعال کنید و دسترسی نقش مدیران را به آن بدهید.
+> 3. سرور را تعریف کنید و از صفحه «پلن‌ها و قیمت‌گذاری» جادوی ساخت محصولات را اجرا کنید.
+>
+> مراحل دستی زیر برای مواقعی است که بخواهید محصولات را خودتان بسازید.
+
 1. پوشه `whmcs/modules/servers/pasargadcdn` را در مسیر `modules/servers/` نصب WHMCS در `my.pasargadmizban.com` کپی کنید:
    ```bash
    rsync -a whmcs/modules/servers/pasargadcdn/ /path/to/whmcs/modules/servers/pasargadcdn/
