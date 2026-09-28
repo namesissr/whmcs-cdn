@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import routes_admin, routes_edge
+from . import routes_admin, routes_edge, routes_v2
 from .config import settings
 from .db import init_db
 
@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Pasargad CDN Controller", version="1.0.0", lifespan=lifespan)
 app.include_router(routes_admin.router)
+app.include_router(routes_v2.router)
 app.include_router(routes_edge.router)
 
 

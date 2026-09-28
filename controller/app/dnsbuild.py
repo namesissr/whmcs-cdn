@@ -69,6 +69,13 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
     have_v4 = bool(v4_home or v4_global)
     have_v6 = bool(v6_home or v6_global)
 
+    # non-proxied A/AAAA sets where the customer asked for health checks
+    checked: dict[tuple[str, str], list] = defaultdict(list)
+    for r in site.records:
+        if not (r.proxied and have_v4) and r.type in ("A", "AAAA"):
+            checked[(fqdn(r.name, domain), r.type)].append(r)
+    checked = {k: v for k, v in checked.items() if any(getattr(r, "health_check", False) for r in v)}
+
     proxied_names: dict[str, list] = defaultdict(list)
     for r in site.records:
         name = fqdn(r.name, domain)
@@ -76,7 +83,9 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             proxied_names[name].append(r)
             continue
         ttl = r.ttl or settings.default_ttl
-        if r.type in ("CNAME", "NS"):
+        if (name, r.type) in checked:
+            continue
+        if r.type in ("CNAME", "NS", "ALIAS"):
             add(name, r.type, ttl, dot(r.content))
         elif r.type == "MX":
             add(name, "MX", ttl, f"{r.priority} {dot(r.content)}")
@@ -87,6 +96,13 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             add(name, "TXT", ttl, _txt(r.content))
         else:
             add(name, r.type, ttl, r.content)
+
+    for (name, rtype), recs in checked.items():
+        port = next((r.health_port for r in recs if r.health_port), None) or 80
+        ips = sorted({r.content for r in recs})
+        ttl = min(r.ttl or settings.default_ttl for r in recs)
+        add(name, "LUA", min(ttl, settings.proxied_ttl),
+            f"{rtype} \"ifportup({int(port)}, {_lua_list(ips)}, {{selector='all', backupSelector='all'}})\"")
 
     for name in proxied_names:
         # The customer sees their record; resolvers see our edges.

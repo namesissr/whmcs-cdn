@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly refresh of the Pasargad CDN GeoIP database
+
+[Timer]
+# DB-IP publishes the new month's file during the first days of the month
+OnCalendar=*-*-04 03:00:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

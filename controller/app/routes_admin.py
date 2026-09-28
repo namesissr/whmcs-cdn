@@ -5,11 +5,11 @@ import json
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import nscheck, pdns
+from . import nscheck, pdns, sections
 from .auth import hash_token, new_token, require_admin
 from .config import settings
 from .db import get_db
@@ -49,11 +49,26 @@ def get_site(db: Session, domain: str) -> Site:
     return site
 
 
+class FeaturesIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    waf: bool | None = None
+    ddos: bool | None = None
+    load_balancer: bool | None = None
+    image_optimization: bool | None = None
+    custom_ssl: bool | None = None
+    dnssec: bool | None = None
+    max_page_rules: int | None = Field(default=None, ge=0, le=1000)
+    max_firewall_rules: int | None = Field(default=None, ge=0, le=1000)
+    max_ratelimit_rules: int | None = Field(default=None, ge=0, le=1000)
+    max_pools: int | None = Field(default=None, ge=0, le=100)
+
+
 class Plan(BaseModel):
     bandwidth_limit_gb: int | None = Field(default=None, ge=0)
     max_records: int | None = Field(default=None, ge=1, le=10000)
     ssl_allowed: bool | None = None
     rate_limit_rps: int | None = Field(default=None, ge=0, le=100000)
+    features: FeaturesIn | None = None
 
 
 class SiteCreate(BaseModel):
@@ -80,6 +95,10 @@ class RecordIn(BaseModel):
     ttl: int = Field(default=300, ge=60, le=86400)
     priority: int | None = None
     proxied: bool = False
+    pool: str | None = Field(default=None, pattern=r"^[a-z0-9_-]{1,32}$")
+    origin_port: int | None = Field(default=None, ge=1, le=65535)
+    health_check: bool = False
+    health_port: int | None = Field(default=None, ge=1, le=65535)
 
 
 class PurgeIn(BaseModel):
@@ -94,8 +113,15 @@ class EdgeIn(BaseModel):
 
 
 def apply_plan(site: Site, plan: Plan):
-    for k, v in plan.model_dump(exclude_none=True).items():
+    data = plan.model_dump(exclude_none=True)
+    feats = data.pop("features", None)
+    for k, v in data.items():
         setattr(site, k, v)
+    if feats:
+        site.features = json.dumps({**sections.features_of(site), **feats})
+    if not sections.features_of(site)["custom_ssl"] and site.ssl_source == "custom":
+        site.ssl_status, site.ssl_cert, site.ssl_key, site.ssl_expires_at = "none", None, None, None
+        site.ssl_source = None
     if not site.ssl_allowed and site.ssl_status != "none":
         site.ssl_status, site.ssl_cert, site.ssl_key, site.ssl_expires_at = "none", None, None, None
     elif site.ssl_allowed and site.ssl_status == "none" and site.ns_verified_at:
@@ -161,6 +187,7 @@ def update_plan(domain: str, plan: Plan, db: Session = Depends(get_db)):
 
 @router.patch("/sites/{domain}/settings")
 def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_db)):
+    """v1 settings endpoint; values are written into the cache/ssl sections."""
     site = get_site(db, domain)
     data = body.model_dump(exclude_none=True)
     if "blocked_ips" in data:
@@ -176,8 +203,15 @@ def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_d
         if len(ips) > 1000:
             bad(ValidationError("حداکثر ۱۰۰۰ آدرس"))
         site.blocked_ips = json.dumps(sorted(set(ips)))
+    cache, ssl_opts = sections.get_section(site, "cache"), sections.get_section(site, "ssl")
+    mapping = {"cache_enabled": (cache, "enabled"), "dev_mode": (cache, "dev_mode"),
+               "edge_cache_ttl": (cache, "edge_ttl"), "browser_cache_ttl": (cache, "browser_ttl"),
+               "force_https": (ssl_opts, "force_https"), "origin_protocol": (ssl_opts, "origin_protocol")}
     for k, v in data.items():
-        setattr(site, k, v)
+        target, key = mapping[k]
+        target[key] = max(v, 60) if key == "edge_ttl" else v
+    for name, value in (("cache", cache), ("ssl", ssl_opts)):
+        sections.store_section(site, name, sections.validate_section(site, name, value))
     db.commit()
     return site_to_dict(db, site)
 
@@ -227,6 +261,8 @@ def request_ssl(domain: str, db: Session = Depends(get_db)):
         raise HTTPException(403, "SSL در این پلن فعال نیست")
     if site.ns_verified_at is None:
         raise HTTPException(409, "ابتدا نیم‌سرورهای دامنه را تغییر دهید")
+    if site.ssl_source == "custom" and site.ssl_status == "active":
+        raise HTTPException(409, "ابتدا گواهی اختصاصی را حذف کنید")
     if site.ssl_status != "pending":
         site.ssl_status, site.ssl_error = "pending", None
         db.commit()
@@ -292,17 +328,43 @@ def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None)
         raise ValidationError("رکورد CNAME نمی‌تواند با رکورد دیگری هم‌نام باشد")
     if any(r.type == "CNAME" for r in others):
         raise ValidationError("برای این نام یک رکورد CNAME وجود دارد")
+    # ALIAS answers A/AAAA itself, so it cannot share a name with address records
+    address = {"A", "AAAA", "ALIAS"}
+    if rtype in address and any(r.type in address and (r.type == "ALIAS" or rtype == "ALIAS") for r in others):
+        raise ValidationError("رکورد ALIAS نمی‌تواند با رکورد A/AAAA هم‌نام باشد")
 
 
-def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> tuple:
+def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> dict:
     name = normalize_name(body.name, site.domain)
     rtype, content, prio, proxied = validate_record(body.type, body.content, body.priority, body.proxied)
     if rtype == "CNAME" and name == "@" and not proxied:
-        raise ValidationError("CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است")
+        raise ValidationError("CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است؛ از ALIAS استفاده کنید")
     if rtype == "NS" and name == "@":
         raise ValidationError("نیم‌سرورهای ریشه به‌صورت خودکار مدیریت می‌شوند")
     _conflicts(site, name, rtype, exclude_id)
-    return name, rtype, content, prio, proxied
+    pool = body.pool if proxied else None
+    if pool:
+        if not sections.features_of(site)["load_balancer"]:
+            raise PermissionError("توزیع بار در پلن شما فعال نیست")
+        if pool not in {p["name"] for p in sections.get_section(site, "pools")["pools"]}:
+            raise ValidationError(f"استخر {pool} تعریف نشده است")
+    health = body.health_check and not proxied and rtype in ("A", "AAAA")
+    return {
+        "name": name, "type": rtype, "content": content, "priority": prio, "proxied": proxied, "ttl": body.ttl,
+        "pool": pool,
+        "origin_port": body.origin_port if proxied and not pool else None,
+        "health_check": health,
+        "health_port": body.health_port if health else None,
+    }
+
+
+def _record_or_error(site: Site, body: RecordIn, exclude_id: int | None = None) -> dict:
+    try:
+        return _record_from(site, body, exclude_id)
+    except ValidationError as e:
+        bad(e)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
 
 
 @router.get("/sites/{domain}/records")
@@ -315,11 +377,7 @@ def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     if len(site.records) >= site.max_records:
         raise HTTPException(403, f"سقف تعداد رکوردها ({site.max_records}) پر شده است")
-    try:
-        name, rtype, content, prio, proxied = _record_from(site, body)
-    except ValidationError as e:
-        bad(e)
-    rec = Record(name=name, type=rtype, content=content, ttl=body.ttl, priority=prio, proxied=proxied)
+    rec = Record(**_record_or_error(site, body))
     site.records.append(rec)
     db.commit()
     return {**record_to_dict(rec), "dns_error": sync_site_dns(db, site)}
@@ -331,11 +389,8 @@ def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Dep
     rec = next((r for r in site.records if r.id == record_id), None)
     if rec is None:
         raise HTTPException(404, "record not found")
-    try:
-        rec.name, rec.type, rec.content, rec.priority, rec.proxied = _record_from(site, body, exclude_id=rec.id)
-    except ValidationError as e:
-        bad(e)
-    rec.ttl = body.ttl
+    for k, v in _record_or_error(site, body, exclude_id=rec.id).items():
+        setattr(rec, k, v)
     db.commit()
     return {**record_to_dict(rec), "dns_error": sync_site_dns(db, site)}
 

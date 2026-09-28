@@ -19,13 +19,19 @@ jobs:
       - run: python -m pytest -q
 
   edge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -y -q nginx python3-pytest && sudo systemctl stop nginx
-      # nginx -t binds :80, so this needs root
+      - name: nginx + modules used on the edges
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nginx libnginx-mod-http-js libnginx-mod-http-geoip2 \
+            libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter python3-pytest
+          sudo systemctl stop nginx
+          sudo pip install --break-system-packages -q mmdb-writer netaddr
+      # nginx -t binds the listen ports, so the tests run as root
       - run: sudo python3 -m pytest -q -p no:cacheprovider edge/tests
-      - run: bash -n edge/install.sh
+      - run: bash -n edge/install.sh && bash -n edge/pcdn-geoip-update.sh
 
   whmcs:
     runs-on: ubuntu-latest

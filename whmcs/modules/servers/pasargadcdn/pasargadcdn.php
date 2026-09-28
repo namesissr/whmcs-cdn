@@ -34,6 +34,7 @@ function pasargadcdn_MetaData()
 
 function pasargadcdn_ConfigOptions()
 {
+    // Order matters: WHMCS stores these as configoption1..14.
     return [
         'Bandwidth (GB)' => [
             'Type' => 'text', 'Size' => '8', 'Default' => '100',
@@ -50,33 +51,81 @@ function pasargadcdn_ConfigOptions()
             'Type' => 'text', 'Size' => '8', 'Default' => '0',
             'Description' => 'محدودیت درخواست هر IP در ثانیه — 0 یعنی خاموش',
         ],
+        'WAF' => ['Type' => 'yesno', 'Default' => 'on', 'Description' => 'فایروال برنامه وب (امضاهای OWASP)'],
+        'DDoS protection' => ['Type' => 'yesno', 'Default' => 'on', 'Description' => 'چالش JS / کپچا در حملات'],
+        'Load balancer' => ['Type' => 'yesno', 'Default' => 'on', 'Description' => 'توزیع بار بین چند سرور اصلی'],
+        'Image optimization' => ['Type' => 'yesno', 'Default' => 'on'],
+        'Custom SSL' => ['Type' => 'yesno', 'Default' => 'on', 'Description' => 'بارگذاری گواهی اختصاصی مشتری'],
+        'DNSSEC' => ['Type' => 'yesno', 'Default' => 'on'],
+        'Max page rules' => ['Type' => 'text', 'Size' => '8', 'Default' => '10'],
+        'Max firewall rules' => ['Type' => 'text', 'Size' => '8', 'Default' => '20'],
+        'Max rate-limit rules' => ['Type' => 'text', 'Size' => '8', 'Default' => '5'],
+        'Max LB pools' => ['Type' => 'text', 'Size' => '8', 'Default' => '3'],
     ];
 }
 
 /**
- * Plan values from the product config, overridable by configurable options
- * named "Bandwidth", "DNS Records", "SSL" or "Rate Limit".
+ * Plan (SPEC §1) from the product config, overridable per service by
+ * configurable options with these exact names:
+ *   Bandwidth, DNS Records, Rate Limit, Page Rules, Firewall Rules,
+ *   Rate Limit Rules, LB Pools            — quantity / text (number)
+ *   SSL, WAF, DDoS, Load Balancer, Image Optimization, Custom SSL, DNSSEC
+ *                                         — yes/no
+ * Products saved before v2 have empty configoption5..14, i.e. every v2
+ * feature off / 0 until the admin ticks them.
  */
 function pasargadcdn_plan(array $params): array
 {
+    $opt = function (int $n) use ($params) {
+        return $params['configoption' . $n] ?? '';
+    };
     $plan = [
-        'bandwidth_limit_gb' => max(0, (int) ($params['configoption1'] ?? 0)),
-        'max_records' => max(1, (int) ($params['configoption2'] ?: 100)),
-        'ssl_allowed' => ($params['configoption3'] ?? '') === 'on',
-        'rate_limit_rps' => max(0, (int) ($params['configoption4'] ?? 0)),
+        'bandwidth_limit_gb' => max(0, (int) $opt(1)),
+        'max_records' => max(1, (int) ($opt(2) ?: 100)),
+        'ssl_allowed' => $opt(3) === 'on',
+        'rate_limit_rps' => max(0, (int) $opt(4)),
+        'features' => [
+            'waf' => $opt(5) === 'on',
+            'ddos' => $opt(6) === 'on',
+            'load_balancer' => $opt(7) === 'on',
+            'image_optimization' => $opt(8) === 'on',
+            'custom_ssl' => $opt(9) === 'on',
+            'dnssec' => $opt(10) === 'on',
+            'max_page_rules' => max(0, (int) $opt(11)),
+            'max_firewall_rules' => max(0, (int) $opt(12)),
+            'max_ratelimit_rules' => max(0, (int) $opt(13)),
+            'max_pools' => max(0, (int) $opt(14)),
+        ],
     ];
     $co = $params['configoptions'] ?? [];
-    if (isset($co['Bandwidth']) && $co['Bandwidth'] !== '') {
-        $plan['bandwidth_limit_gb'] = max(0, (int) $co['Bandwidth']);
+    $numbers = [
+        'Bandwidth' => ['bandwidth_limit_gb', 0], 'DNS Records' => ['max_records', 1],
+        'Rate Limit' => ['rate_limit_rps', 0], 'Page Rules' => ['features.max_page_rules', 0],
+        'Firewall Rules' => ['features.max_firewall_rules', 0],
+        'Rate Limit Rules' => ['features.max_ratelimit_rules', 0], 'LB Pools' => ['features.max_pools', 0],
+    ];
+    $flags = [
+        'SSL' => 'ssl_allowed', 'WAF' => 'features.waf', 'DDoS' => 'features.ddos',
+        'Load Balancer' => 'features.load_balancer', 'Image Optimization' => 'features.image_optimization',
+        'Custom SSL' => 'features.custom_ssl', 'DNSSEC' => 'features.dnssec',
+    ];
+    $set = function (string $key, $value) use (&$plan) {
+        $k = explode('.', $key);
+        if (count($k) === 2) {
+            $plan[$k[0]][$k[1]] = $value;
+        } else {
+            $plan[$k[0]] = $value;
+        }
+    };
+    foreach ($numbers as $name => [$key, $min]) {
+        if (isset($co[$name]) && $co[$name] !== '') {
+            $set($key, max($min, (int) $co[$name]));
+        }
     }
-    if (isset($co['DNS Records']) && $co['DNS Records'] !== '') {
-        $plan['max_records'] = max(1, (int) $co['DNS Records']);
-    }
-    if (isset($co['SSL'])) {
-        $plan['ssl_allowed'] = (bool) $co['SSL'];
-    }
-    if (isset($co['Rate Limit']) && $co['Rate Limit'] !== '') {
-        $plan['rate_limit_rps'] = max(0, (int) $co['Rate Limit']);
+    foreach ($flags as $name => $key) {
+        if (isset($co[$name])) {
+            $set($key, (bool) $co[$name]);
+        }
     }
     return $plan;
 }
@@ -273,15 +322,42 @@ function pasargadcdn_AdminServicesTabFields(array $params)
         'مصرف این ماه' => $h(($u['gb'] ?? 0) . ' GB / ' . (($s['plan']['bandwidth_limit_gb'] ?? 0) ?: '∞') . ' GB — '
             . number_format((int) ($u['requests'] ?? 0)) . ' درخواست'),
         'تعداد رکورد' => $h(count($s['records'] ?? []) . ' / ' . ($s['plan']['max_records'] ?? '-')),
+        'WAF / DDoS' => $h('WAF: ' . ($s['config']['waf']['mode'] ?? '-') . ' — DDoS: ' . ($s['config']['ddos']['mode'] ?? '-')),
+        'DNSSEC' => $h(pasargadcdn_admin_dnssec($params)),
+        'امکانات پلن' => $h(pasargadcdn_features_text($s['plan']['features'] ?? [])),
     ];
 }
 
-// --------------------------------------------------------------- client area
-
-function pasargadcdn_ClientAreaAllowedFunctions()
+function pasargadcdn_admin_dnssec(array $params): string
 {
-    return ['addRecord', 'updateRecord', 'deleteRecord', 'purgeCache', 'saveSettings', 'requestSsl', 'checkNs'];
+    try {
+        $d = ApiClient::fromParams($params)->get(ApiClient::site(pasargadcdn_domain($params)) . '/dnssec');
+    } catch (\Throwable $e) {
+        return '-';
+    }
+    return empty($d['enabled']) ? 'خاموش' : 'روشن — DS: ' . implode(' | ', $d['ds'] ?? []);
 }
+
+function pasargadcdn_features_text(array $f): string
+{
+    if (!$f) {
+        return '-';
+    }
+    $on = [];
+    foreach (['waf' => 'WAF', 'ddos' => 'DDoS', 'load_balancer' => 'LB', 'image_optimization' => 'Image',
+                 'custom_ssl' => 'Custom SSL', 'dnssec' => 'DNSSEC'] as $k => $label) {
+        if (!empty($f[$k])) {
+            $on[] = $label;
+        }
+    }
+    return (implode(', ', $on) ?: '—') . sprintf(' · page rules %d · firewall %d · rate-limit %d · pools %d',
+        $f['max_page_rules'] ?? 0, $f['max_firewall_rules'] ?? 0, $f['max_ratelimit_rules'] ?? 0, $f['max_pools'] ?? 0);
+}
+
+// --------------------------------------------------------------- client area
+//
+// The client area is a small vanilla-JS app (assets/app.js) that talks to
+// api.php, a JSON proxy restricted to this service's own domain.
 
 function pasargadcdn_csrf_token(): string
 {
@@ -291,144 +367,43 @@ function pasargadcdn_csrf_token(): string
     return $_SESSION['pasargadcdn_csrf'];
 }
 
-/** Guard for every state-changing client action. */
-function pasargadcdn_client_action(array $params, callable $fn)
+/** Web path of this module dir, e.g. "/billing/modules/servers/pasargadcdn". */
+function pasargadcdn_module_url(): string
 {
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST'
-        || !hash_equals(pasargadcdn_csrf_token(), (string) ($_POST['pcdn_csrf'] ?? ''))) {
-        return 'درخواست نامعتبر است، صفحه را دوباره بارگذاری کنید.';
-    }
-    if (($params['status'] ?? '') !== 'Active') {
-        return 'این سرویس فعال نیست.';
-    }
-    return pasargadcdn_call(function () use ($params, $fn) {
-        $fn(ApiClient::fromParams($params), ApiClient::site(pasargadcdn_domain($params)));
-    });
-}
-
-function pasargadcdn_record_body(): array
-{
-    $prio = trim((string) ($_POST['priority'] ?? ''));
-    return [
-        'name' => trim((string) ($_POST['name'] ?? '@')),
-        'type' => strtoupper(trim((string) ($_POST['type'] ?? ''))),
-        'content' => trim((string) ($_POST['content'] ?? '')),
-        'ttl' => max(60, (int) ($_POST['ttl'] ?? 300)),
-        'priority' => $prio === '' ? null : (int) $prio,
-        'proxied' => !empty($_POST['proxied']),
-    ];
-}
-
-function pasargadcdn_addRecord(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $api->post($site . '/records', pasargadcdn_record_body());
-    });
-}
-
-function pasargadcdn_updateRecord(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $api->put($site . '/records/' . (int) ($_POST['record_id'] ?? 0), pasargadcdn_record_body());
-    });
-}
-
-function pasargadcdn_deleteRecord(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $api->delete($site . '/records/' . (int) ($_POST['record_id'] ?? 0));
-    });
-}
-
-function pasargadcdn_purgeCache(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $urls = preg_split('/\s+/', trim((string) ($_POST['urls'] ?? '')), -1, PREG_SPLIT_NO_EMPTY);
-        $api->post($site . '/purge', ['urls' => empty($_POST['purge_all']) ? $urls : []]);
-    });
-}
-
-function pasargadcdn_saveSettings(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $ips = preg_split('/[\s,]+/', trim((string) ($_POST['blocked_ips'] ?? '')), -1, PREG_SPLIT_NO_EMPTY);
-        $api->patch($site . '/settings', [
-            'cache_enabled' => !empty($_POST['cache_enabled']),
-            'dev_mode' => !empty($_POST['dev_mode']),
-            'force_https' => !empty($_POST['force_https']),
-            'origin_protocol' => ($_POST['origin_protocol'] ?? 'http') === 'https' ? 'https' : 'http',
-            'edge_cache_ttl' => max(0, (int) ($_POST['edge_cache_ttl'] ?? 86400)),
-            'browser_cache_ttl' => max(0, (int) ($_POST['browser_cache_ttl'] ?? 0)),
-            'blocked_ips' => $ips,
-        ]);
-    });
-}
-
-function pasargadcdn_requestSsl(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $api->post($site . '/ssl');
-    });
-}
-
-function pasargadcdn_checkNs(array $params)
-{
-    return pasargadcdn_client_action($params, function (ApiClient $api, string $site) {
-        $r = $api->post($site . '/ns-check');
-        if (empty($r['ok'])) {
-            throw new ApiException('نیم‌سرورهای دامنه هنوز تغییر نکرده‌اند. تغییر NS ممکن است تا ۲۴ ساعت زمان ببرد.');
-        }
-    });
-}
-
-function pasargadcdn_ratio($hits, $requests): string
-{
-    return $requests > 0 ? round($hits * 100 / $requests) . '%' : '—';
+    // Client area pages (clientarea.php, index.php?rm=...) live in the WHMCS root.
+    $root = str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '/index.php')));
+    return rtrim($root, '/.') . '/modules/servers/pasargadcdn';
 }
 
 function pasargadcdn_ClientArea(array $params)
 {
-    $vars = [
+    $active = ($params['status'] ?? '') === 'Active';
+    $boot = [
+        'serviceId' => (int) $params['serviceid'],
+        'domain' => pasargadcdn_domain($params),
+        'active' => $active,
         'site' => null,
         'error' => null,
-        'csrf' => pasargadcdn_csrf_token(),
-        'serviceid' => (int) $params['serviceid'],
-        'active' => ($params['status'] ?? '') === 'Active',
-        'recordTypes' => ['A', 'AAAA', 'CNAME', 'TXT', 'MX', 'SRV', 'CAA', 'NS'],
-        'daily' => [],
-        'view' => [],
     ];
     try {
-        $api = ApiClient::fromParams($params);
-        $site = ApiClient::site(pasargadcdn_domain($params));
-        $s = $api->get($site);
-        $usage = $api->get($site . '/usage?days=14');
-        $month = $s['usage_month'] ?? [];
-        $limit = (int) ($s['plan']['bandwidth_limit_gb'] ?? 0);
-        // Pre-formatted here: newer Smarty in WHMCS 8.x blocks PHP functions as modifiers.
-        $vars['site'] = $s;
-        $vars['view'] = [
-            'nsFound' => implode(', ', $s['ns_found'] ?? []),
-            'blockedIps' => implode("\n", $s['settings']['blocked_ips'] ?? []),
-            'recordCount' => count($s['records'] ?? []),
-            'requests' => number_format((int) ($month['requests'] ?? 0)),
-            'hitRatio' => pasargadcdn_ratio($month['cache_hits'] ?? 0, $month['requests'] ?? 0),
-            'usagePercent' => $limit > 0 ? min(100, (int) round((float) ($month['gb'] ?? 0) * 100 / $limit)) : 0,
-            'sslExpires' => substr((string) ($s['ssl']['expires_at'] ?? ''), 0, 10),
-        ];
-        foreach (array_reverse($usage['daily'] ?? []) as $d) {
-            $vars['daily'][] = [
-                'date' => $d['date'],
-                'mb' => number_format($d['bytes'] / 1048576, 1),
-                'requests' => number_format((int) $d['requests']),
-                'hitRatio' => pasargadcdn_ratio($d['cache_hits'], $d['requests']),
-            ];
-        }
+        $boot['site'] = ApiClient::fromParams($params)->get(ApiClient::site($boot['domain']));
     } catch (\Throwable $e) {
-        $vars['error'] = $e->getMessage();
+        $boot['error'] = $e->getMessage();
     }
+    $base = pasargadcdn_module_url();
+    $ver = function (string $f) {
+        return (string) @filemtime(__DIR__ . '/' . $f);
+    };
     return [
         'tabOverviewModuleOutputTemplate' => 'templates/clientarea.tpl',
-        'templateVariables' => $vars,
+        'templateVariables' => [
+            'pcdnCsrf' => pasargadcdn_csrf_token(),
+            'pcdnApiUrl' => $base . '/api.php',
+            'pcdnCssUrl' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
+            'pcdnJsUrl' => $base . '/assets/app.js?v=' . $ver('assets/app.js'),
+            // Safe inside <script type="application/json">: no raw < > & ' "
+            'pcdnBoot' => json_encode($boot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+                | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_PARTIAL_OUTPUT_ON_ERROR),
+        ],
     ];
 }

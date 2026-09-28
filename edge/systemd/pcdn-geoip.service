@@ -1,0 +1,8 @@
+[Unit]
+Description=Pasargad CDN GeoIP database refresh (DB-IP Country Lite)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcdn-geoip-update

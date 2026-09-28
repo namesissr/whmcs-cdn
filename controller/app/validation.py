@@ -6,7 +6,7 @@ DOMAIN_RE = re.compile(rf"^(?:{LABEL}\.)+[a-z][a-z0-9-]{{1,62}}$")
 HOST_RE = re.compile(rf"^(?:{LABEL}\.)*{LABEL}\.?$")
 NAME_RE = re.compile(r"^(?:@|\*|(?:\*\.)?(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?)(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?)*)$")
 
-RECORD_TYPES = {"A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"}
+RECORD_TYPES = {"A", "AAAA", "CNAME", "ALIAS", "TXT", "MX", "NS", "SRV", "CAA"}
 PROXYABLE = {"A", "AAAA", "CNAME"}
 
 
@@ -76,7 +76,7 @@ def validate_record(rtype: str, content: str, priority: int | None, proxied: boo
         content = validate_ip(content, 4)
     elif rtype == "AAAA":
         content = validate_ip(content, 6)
-    elif rtype in ("CNAME", "NS"):
+    elif rtype in ("CNAME", "NS", "ALIAS"):
         content = validate_hostname(content)
     elif rtype == "MX":
         content = validate_hostname(content)

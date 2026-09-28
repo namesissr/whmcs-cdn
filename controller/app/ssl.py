@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime
 
@@ -52,4 +53,50 @@ def issue(site: Site) -> None:
         key = f.read()
     site.ssl_cert, site.ssl_key = cert, key
     site.ssl_expires_at = cert_expiry(cert)
-    site.ssl_status, site.ssl_error = "active", None
+    site.ssl_status, site.ssl_error, site.ssl_source = "active", None, "letsencrypt"
+
+
+def _openssl(args: list[str], stdin: str) -> str:
+    p = subprocess.run(["openssl", *args], input=stdin, capture_output=True, text=True, timeout=20)
+    if p.returncode != 0:
+        raise SslError(p.stderr.strip()[-300:] or "openssl failed")
+    return p.stdout
+
+
+def cert_info(pem: str) -> dict:
+    """Names (SAN, else CN) and expiry of the first certificate in a PEM chain."""
+    out = _openssl(["x509", "-noout", "-subject", "-enddate", "-ext", "subjectAltName", "-nameopt", "RFC2253"], pem)
+    names = [n.strip().lower() for n in re.findall(r"DNS:([^,\s]+)", out)]
+    if not names:
+        m = re.search(r"subject=.*?CN=([^,\n]+)", out)
+        names = [m.group(1).strip().lower()] if m else []
+    m = re.search(r"notAfter=(.+)", out)
+    return {"names": names, "expires_at": datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z")}
+
+
+def covers(names: list[str], host: str) -> bool:
+    for n in names:
+        if n == host or (n.startswith("*.") and host.count(".") == n.count(".") and host.endswith(n[1:])):
+            return True
+    return False
+
+
+def validate_custom(domain: str, cert: str, key: str) -> dict:
+    """Check a customer-supplied certificate; returns cert_info. Raises SslError with a Persian message."""
+    if "PRIVATE KEY" not in key or "BEGIN CERTIFICATE" not in cert:
+        raise SslError("گواهی یا کلید خصوصی در قالب PEM نیست")
+    if "ENCRYPTED" in key:
+        raise SslError("کلید خصوصی نباید رمزگذاری‌شده باشد")
+    try:
+        info = cert_info(cert)
+        cert_pub = _openssl(["x509", "-noout", "-pubkey"], cert)
+        key_pub = _openssl(["pkey", "-pubout"], key)
+    except SslError as e:
+        raise SslError(f"گواهی یا کلید قابل خواندن نیست: {e}") from None
+    if cert_pub.strip() != key_pub.strip():
+        raise SslError("کلید خصوصی با گواهی مطابقت ندارد")
+    if info["expires_at"] <= datetime.utcnow():
+        raise SslError("این گواهی منقضی شده است")
+    if not covers(info["names"], domain):
+        raise SslError(f"این گواهی دامنه {domain} را پوشش نمی‌دهد")
+    return info

@@ -72,14 +72,29 @@ class ApiClient
 
     public function request(string $method, string $path, ?array $body = null): array
     {
+        $payload = ($body !== null && $method !== 'GET')
+            ? json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            : null;
+        [$code, $data] = $this->raw($method, $path, $payload);
+        if ($code >= 400) {
+            throw new ApiException(self::errorMessage($data, $code), $code);
+        }
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * Low-level call used by request() and by the client-area JSON proxy,
+     * which needs the controller's status code and body as they are.
+     * Returns [http status, decoded JSON (null when not JSON)].
+     */
+    public function raw(string $method, string $path, ?string $payload = null): array
+    {
         $ch = curl_init($this->baseUrl . $path);
         $headers = [
             'Authorization: Bearer ' . $this->apiKey,
             'Accept: application/json',
         ];
-        $payload = null;
-        if ($body !== null && $method !== 'GET') {
-            $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($payload !== null) {
             $headers[] = 'Content-Type: application/json';
             curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
         }
@@ -103,11 +118,7 @@ class ApiClient
         if ($raw === false) {
             throw new ApiException('اتصال به سرور CDN برقرار نشد: ' . $err);
         }
-        $data = json_decode((string) $raw, true);
-        if ($code >= 400) {
-            throw new ApiException(self::errorMessage($data, $code), $code);
-        }
-        return is_array($data) ? $data : [];
+        return [$code, json_decode((string) $raw, true)];
     }
 
     private static function errorMessage($data, int $code): string

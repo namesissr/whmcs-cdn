@@ -79,8 +79,8 @@ def test_edge_config_and_lua(client, fake_pdns):
     assert r.status_code == 200
     cfg = r.json()
     assert cfg["sites"][0]["hosts"] == [
-        {"name": "example.com", "origin": "93.184.216.34"},
-        {"name": "www.example.com", "origin": "93.184.216.34"},
+        {"name": "example.com", "origin": {"address": "93.184.216.34", "port": None}},
+        {"name": "www.example.com", "origin": {"address": "93.184.216.34", "port": None}},
     ]
     etag = r.headers["etag"]
     assert edge_get(client, t1, "/edge/v1/config", headers={"If-None-Match": etag}).status_code == 304
@@ -144,7 +144,7 @@ def test_purge_and_settings(client):
     assert client.patch("/api/v1/sites/example.com/settings",
                         json={"blocked_ips": ["nope"]}).status_code == 422
     cfg = edge_get(client, token, "/edge/v1/config").json()
-    assert cfg["sites"][0]["cache_enabled"] is False  # dev mode bypasses cache
+    assert cfg["sites"][0]["cache"]["enabled"] is False  # dev mode bypasses cache
 
 
 def test_delete_site(client, fake_pdns):
@@ -176,5 +176,5 @@ def test_cname_origin_resolution(client):
         assert client.post("/api/v1/sites/example.com/records", json=body).status_code == 201
     token = add_edge(client)
     hosts = edge_get(client, token, "/edge/v1/config").json()["sites"][0]["hosts"]
-    assert hosts == [{"name": "shop.example.com", "origin": "shops.myshopify.com"},
-                     {"name": "v6.example.com", "origin": "[2a01:4f8::1]"}]
+    assert hosts == [{"name": "shop.example.com", "origin": {"address": "shops.myshopify.com", "port": None}},
+                     {"name": "v6.example.com", "origin": {"address": "[2a01:4f8::1]", "port": None}}]

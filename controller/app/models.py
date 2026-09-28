@@ -1,4 +1,5 @@
 import json
+import secrets
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -40,14 +41,14 @@ class Site(Base):
     ssl_allowed: Mapped[bool] = mapped_column(Boolean, default=True)
     rate_limit_rps: Mapped[int] = mapped_column(Integer, default=0)  # per client IP, 0 = off
 
-    # customer settings
-    cache_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    dev_mode: Mapped[bool] = mapped_column(Boolean, default=False)
-    force_https: Mapped[bool] = mapped_column(Boolean, default=False)
-    origin_protocol: Mapped[str] = mapped_column(String(5), default="http")
-    edge_cache_ttl: Mapped[int] = mapped_column(Integer, default=86400)
-    browser_cache_ttl: Mapped[int] = mapped_column(Integer, default=0)
+    features: Mapped[str] = mapped_column(Text, default="{}")  # plan feature flags, see sections.DEFAULT_FEATURES
+
+    # customer settings: JSON document of sections (see sections.SECTIONS / SPEC §2)
+    config: Mapped[str] = mapped_column(Text, default="{}")
     blocked_ips: Mapped[str] = mapped_column(Text, default="[]")
+    # HMAC key the edges use for challenge clearance cookies
+    secret: Mapped[str] = mapped_column(String(64), default=lambda: secrets.token_hex(32))
+    dnssec_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # ssl
     ssl_status: Mapped[str] = mapped_column(String(10), default="none")  # none|pending|active|failed
@@ -55,6 +56,7 @@ class Site(Base):
     ssl_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     ssl_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ssl_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ssl_source: Mapped[str | None] = mapped_column(String(12), nullable=True)  # letsencrypt | custom
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -90,6 +92,10 @@ class Record(Base):
     ttl: Mapped[int] = mapped_column(Integer, default=300)
     priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     proxied: Mapped[bool] = mapped_column(Boolean, default=False)
+    pool: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    origin_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    health_check: Mapped[bool] = mapped_column(Boolean, default=False)
+    health_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     site: Mapped[Site] = relationship(back_populates="records")
 
@@ -130,6 +136,26 @@ class UsageHourly(Base):
     bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     requests: Mapped[int] = mapped_column(BigInteger, default=0)
     cache_hits: Mapped[int] = mapped_column(BigInteger, default=0)
+    # {"status": {...}, "codes": {...}, "countries": {...}, "paths": {...}, "security": {...}}
+    details: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class SecurityEvent(Base):
+    __tablename__ = "security_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    edge_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, index=True)
+    ip: Mapped[str] = mapped_column(String(45), default="")
+    country: Mapped[str] = mapped_column(String(2), default="")
+    method: Mapped[str] = mapped_column(String(10), default="")
+    host: Mapped[str] = mapped_column(String(253), default="")
+    path: Mapped[str] = mapped_column(Text, default="")
+    action: Mapped[str] = mapped_column(String(12), default="")
+    source: Mapped[str] = mapped_column(String(12), default="")
+    rule: Mapped[str] = mapped_column(String(64), default="")
+    user_agent: Mapped[str] = mapped_column(Text, default="")
 
 
 class State(Base):

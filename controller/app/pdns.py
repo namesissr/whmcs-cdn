@@ -91,6 +91,27 @@ class PdnsClient:
         return []
 
 
+    # --- DNSSEC ---------------------------------------------------------
+    def cryptokeys(self, domain: str) -> list[dict]:
+        r = self._req("GET", f"/zones/{dot(domain)}/cryptokeys")
+        return [] if r.status_code == 404 else r.json()
+
+    def cryptokey(self, domain: str, key_id: int) -> dict:
+        return self._req("GET", f"/zones/{dot(domain)}/cryptokeys/{key_id}").json()
+
+    def add_cryptokey(self, domain: str, privatekey: str | None = None) -> dict:
+        body = {"keytype": "csk", "active": True, "published": True}
+        if privatekey:
+            body["privatekey"] = privatekey
+        else:
+            body["algorithm"] = "ECDSAP256SHA256"
+        return self._req("POST", f"/zones/{dot(domain)}/cryptokeys", json=body).json()
+
+    def delete_cryptokeys(self, domain: str):
+        for k in self.cryptokeys(domain):
+            self._req("DELETE", f"/zones/{dot(domain)}/cryptokeys/{k['id']}")
+
+
 class PdnsCluster:
     """Fans every write out to all PowerDNS servers; fails if any server fails."""
 
@@ -138,6 +159,35 @@ class PdnsCluster:
         if zone is None:
             return
         self._each(lambda c: c.set_txt(zone, name, [v for v in c.get_txt(zone, name) if v != value]))
+
+
+    def enable_dnssec(self, domain: str) -> dict:
+        """Sign the zone with ONE key shared by every server (so all NS serve valid signatures)."""
+        first, rest = self.clients[0], self.clients[1:]
+        keys = [k for k in first.cryptokeys(domain) if k.get("active")]
+        key = first.cryptokey(domain, keys[0]["id"]) if keys else first.add_cryptokey(domain)
+        if "privatekey" not in key:
+            key = first.cryptokey(domain, key["id"])
+
+        def mirror(c: PdnsClient):
+            c.delete_cryptokeys(domain)
+            c.add_cryptokey(domain, key["privatekey"])
+
+        for c in rest:
+            mirror(c)
+        return self.dnssec_info(domain)
+
+    def disable_dnssec(self, domain: str):
+        self._each(lambda c: c.delete_cryptokeys(domain))
+
+    def dnssec_info(self, domain: str) -> dict:
+        keys = [k for k in self.clients[0].cryptokeys(domain) if k.get("active")]
+        if not keys:
+            return {"enabled": False, "ds": [], "dnskey": None}
+        k = keys[0]
+        # prefer SHA-256 digests (digest type 2)
+        ds = [d for d in k.get("ds", []) if d.split()[2:3] == ["2"]] or k.get("ds", [])
+        return {"enabled": True, "ds": ds, "dnskey": k.get("dnskey")}
 
 
 _client: PdnsCluster | None = None

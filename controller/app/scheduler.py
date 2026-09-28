@@ -9,7 +9,8 @@ from sqlalchemy import delete, or_, select
 from . import nscheck, ssl
 from .config import settings
 from .db import SessionLocal
-from .models import Purge, Site, State, utcnow
+from .models import Purge, Site, State, UsageHourly, utcnow
+from .routes_v2 import prune_events
 from .services import month_start, online_edges, sync_all_dns, sync_site_dns, usage_totals
 
 log = logging.getLogger("pcdn.scheduler")
@@ -59,7 +60,8 @@ def job_ns(db):
 def job_ssl(db):
     renew_before = utcnow() + timedelta(days=30)
     for site in db.scalars(select(Site).where(
-        Site.ssl_status == "active", Site.ssl_allowed.is_(True), Site.ssl_expires_at < renew_before
+        Site.ssl_status == "active", Site.ssl_allowed.is_(True), Site.ssl_expires_at < renew_before,
+        or_(Site.ssl_source.is_(None), Site.ssl_source != "custom"),  # customers renew their own certs
     )):
         site.ssl_status = "pending"
     db.commit()
@@ -96,6 +98,8 @@ def job_quota(db):
 
 def job_cleanup(db):
     db.execute(delete(Purge).where(Purge.created_at < utcnow() - timedelta(days=2)))
+    db.execute(delete(UsageHourly).where(UsageHourly.hour < utcnow() - timedelta(days=400)))
+    prune_events(db)
     db.commit()
 
 

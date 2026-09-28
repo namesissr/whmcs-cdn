@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import pdns
+from . import pdns, sections
 from .config import settings
 from .models import Edge, Purge, Site, UsageHourly, utcnow
 from .validation import fqdn
@@ -61,6 +61,8 @@ def usage_totals(db: Session, site_id: int, start: datetime, end: datetime | Non
 
 def site_to_dict(db: Session, site: Site) -> dict:
     usage = usage_totals(db, site.id, month_start())
+    config = sections.all_config(site)
+    cache, ssl_opts = config["cache"], config["ssl"]
     return {
         "id": site.id,
         "domain": site.domain,
@@ -74,31 +76,48 @@ def site_to_dict(db: Session, site: Site) -> dict:
             "max_records": site.max_records,
             "ssl_allowed": site.ssl_allowed,
             "rate_limit_rps": site.rate_limit_rps,
+            "features": sections.features_of(site),
         },
+        # v1 view, kept for older clients; the source of truth is "config"
         "settings": {
-            "cache_enabled": site.cache_enabled,
-            "dev_mode": site.dev_mode,
-            "force_https": site.force_https,
-            "origin_protocol": site.origin_protocol,
-            "edge_cache_ttl": site.edge_cache_ttl,
-            "browser_cache_ttl": site.browser_cache_ttl,
+            "cache_enabled": cache["enabled"],
+            "dev_mode": cache["dev_mode"],
+            "force_https": ssl_opts["force_https"],
+            "origin_protocol": ssl_opts["origin_protocol"],
+            "edge_cache_ttl": cache["edge_ttl"],
+            "browser_cache_ttl": cache["browser_ttl"],
             "blocked_ips": site.blocked_ip_list,
         },
+        "config": config,
         "ssl": {
             "status": site.ssl_status,
+            "source": site.ssl_source if site.ssl_status == "active" else None,
+            "names": cert_names(site.ssl_cert) if site.ssl_status == "active" and site.ssl_cert else [],
             "expires_at": site.ssl_expires_at.isoformat() + "Z" if site.ssl_expires_at else None,
             "error": site.ssl_error,
         },
+        "dnssec": site.dnssec_enabled,
         "usage_month": {**usage, "gb": round(usage["bytes"] / 1024**3, 3)},
         "records": [record_to_dict(r) for r in site.records],
         "created_at": site.created_at.isoformat() + "Z",
     }
 
 
+def cert_names(pem: str) -> list[str]:
+    from . import ssl
+
+    try:
+        return ssl.cert_info(pem)["names"]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def record_to_dict(r) -> dict:
     return {
         "id": r.id, "name": r.name, "type": r.type, "content": r.content,
         "ttl": r.ttl, "priority": r.priority, "proxied": r.proxied,
+        "pool": r.pool, "origin_port": r.origin_port,
+        "health_check": r.health_check, "health_port": r.health_port,
     }
 
 
@@ -129,41 +148,80 @@ def resolve_origin(site: Site, rec) -> str | None:
 
 
 def build_edge_config(db: Session) -> dict:
-    sites = []
+    out = []
     for site in db.scalars(select(Site).order_by(Site.id)):
-        hosts = []
+        hosts, seen = [], set()
         for r in site.records:
             if not r.proxied:
                 continue
-            origin = resolve_origin(site, r)
-            if origin:
-                hosts.append({"name": fqdn(r.name, site.domain), "origin": origin})
+            name = fqdn(r.name, site.domain)
+            if name in seen:  # one origin per hostname (first proxied record wins)
+                continue
+            if r.pool:
+                origin = {"pool": r.pool}
+            else:
+                address = resolve_origin(site, r)
+                if not address:
+                    continue
+                origin = {"address": address, "port": r.origin_port}
+            seen.add(name)
+            hosts.append({"name": name, "origin": origin})
         if not hosts:
             continue
-        # one origin per hostname (first proxied record wins, like round-robin off)
-        seen, uniq = set(), []
-        for h in hosts:
-            if h["name"] not in seen:
-                seen.add(h["name"])
-                uniq.append(h)
+        cfg = sections.all_config(site)
+        feats = sections.features_of(site)
         ssl = None
         if site.ssl_status == "active" and site.ssl_cert and site.ssl_key:
             ssl = {"cert": site.ssl_cert, "key": site.ssl_key}
-        sites.append({
+
+        cache = dict(cfg["cache"])
+        if cache["dev_mode"]:
+            cache["enabled"] = False
+        ssl_opts = dict(cfg["ssl"])
+        if ssl is None:
+            ssl_opts["force_https"] = False
+            ssl_opts["hsts"] = dict(ssl_opts["hsts"], enabled=False)
+        # a feature switched off by the plan wins over what the customer saved
+        if not feats["waf"]:
+            cfg["waf"] = dict(cfg["waf"], mode="off")
+        if not feats["ddos"]:
+            cfg["ddos"] = dict(cfg["ddos"], mode="off")
+        if not feats["image_optimization"]:
+            cfg["image"] = dict(cfg["image"], enabled=False)
+        if not feats["load_balancer"]:
+            cfg["pools"] = {"pools": []}
+            hosts = [h for h in hosts if "pool" not in h["origin"]]
+        for key, feat in (("firewall", "max_firewall_rules"), ("ratelimit", "max_ratelimit_rules"),
+                          ("pagerules", "max_page_rules")):
+            cfg[key] = dict(cfg[key], rules=cfg[key]["rules"][: feats[feat]])
+        pool_names = {p["name"] for p in cfg["pools"]["pools"]}
+        hosts = [h for h in hosts if "pool" not in h["origin"] or h["origin"]["pool"] in pool_names]
+        if not hosts:
+            continue
+
+        out.append({
             "id": site.id,
             "domain": site.domain,
             "status": site.effective_status,
-            "hosts": uniq,
-            "cache_enabled": site.cache_enabled and not site.dev_mode,
-            "force_https": site.force_https and ssl is not None,
-            "origin_protocol": site.origin_protocol,
-            "edge_cache_ttl": site.edge_cache_ttl,
-            "browser_cache_ttl": site.browser_cache_ttl,
+            "secret": site.secret,
+            "hosts": hosts,
+            "ssl": ssl,
             "rate_limit_rps": site.rate_limit_rps,
             "blocked_ips": site.blocked_ip_list,
-            "ssl": ssl,
+            "cache": cache,
+            "ssl_options": ssl_opts,
+            "waf": cfg["waf"],
+            "ddos": cfg["ddos"],
+            "firewall": cfg["firewall"],
+            "ratelimit": cfg["ratelimit"],
+            "pagerules": cfg["pagerules"],
+            "pools": cfg["pools"],
+            "headers": cfg["headers"],
+            "hotlink": cfg["hotlink"],
+            "image": cfg["image"],
+            "errorpages": cfg["errorpages"],
         })
-    body = {"sites": sites}
+    body = {"sites": out}
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     return {"version": version, **body}
 
