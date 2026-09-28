@@ -23,8 +23,10 @@ set -e
 # IPv4 (required): allow the controller, drop everyone else
 iptables -N PCDN-NS2 2>/dev/null || iptables -F PCDN-NS2
 iptables -C DOCKER-USER -j PCDN-NS2 2>/dev/null || iptables -I DOCKER-USER -j PCDN-NS2
+# match on the connection's ORIGINAL source (conntrack), not the packet source:
+# reply packets come from the container and must pass too
 for ip in $*; do
-  iptables -A PCDN-NS2 -p tcp -m conntrack --ctorigdstport $PORT -s "\$ip" -j RETURN
+  iptables -A PCDN-NS2 -p tcp -m conntrack --ctorigsrc "\$ip" --ctorigdstport $PORT -j RETURN
 done
 iptables -A PCDN-NS2 -p tcp -m conntrack --ctorigdstport $PORT -j DROP
 # IPv6 (best effort; only exists when Docker manages ip6tables): drop all
