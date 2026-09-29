@@ -536,6 +536,20 @@ def test_metrics_collection(tmp_path):
     assert m["rx_mbps"] == 0 and m["connections"] == 0
     # without a default route every non-virtual interface counts (not lo / docker / veth)
     assert agent.net_bytes(None, str(dev)) == (13500000, 27000000)
+    # disk/mem are added from the real host and stay in a sane range
+    assert 0 <= m2["disk_pct"] <= 100 if (m2 := agent.collect_metrics(cfg, None)).get("disk_pct") is not None else True
+
+
+def test_disk_and_mem_pct(tmp_path):
+    mi = tmp_path / "meminfo"
+    mi.write_text("MemTotal:       8000000 kB\nMemFree:  1000000 kB\nMemAvailable: 2000000 kB\nBuffers: 5 kB\n")
+    assert agent.mem_pct(str(mi)) == 75.0  # (8000000 - 2000000) / 8000000
+    assert agent.mem_pct(str(tmp_path / "nope")) is None
+    (tmp_path / "no_avail").write_text("MemTotal: 100 kB\n")
+    assert agent.mem_pct(str(tmp_path / "no_avail")) is None  # old kernels without MemAvailable
+    d = agent.disk_pct(str(tmp_path))
+    assert d is not None and 0 <= d <= 100
+    assert agent.disk_pct("/nonexistent/path/xyz") is None
 
 
 def test_periodic_heartbeat_carries_metrics(tmp_path, monkeypatch):
@@ -547,7 +561,8 @@ def test_periodic_heartbeat_carries_metrics(tmp_path, monkeypatch):
     a.tick()
     [body] = a.ctl.bodies
     assert body["applied_version"] == "v1" and body["error"] is None
-    assert set(body["metrics"]) == {"rx_mbps", "tx_mbps", "connections", "load1", "cpus"}
+    assert {"rx_mbps", "tx_mbps", "connections", "load1", "cpus"} <= set(body["metrics"])
+    assert set(body["metrics"]) <= {"rx_mbps", "tx_mbps", "connections", "load1", "cpus", "disk_pct", "mem_pct"}
     a.tick()  # within HEARTBEAT_INTERVAL: nothing new
     assert len(a.ctl.bodies) == 1
     a.ctl = RecordingCtl(fail=True)

@@ -426,7 +426,9 @@ For billing, the controller adds `bytes_up` of tunnel traffic to `bytes` (both d
 - Every edge still receives every site's config. DNS answers for a site use only online edges of the
   site's `features.edge_group`; if that group has no online edge, all online edges are used (fail open).
 - Heartbeat (`POST /edge/v1/heartbeat`) optional metrics:
-  `{"metrics": {"rx_mbps": 12.5, "tx_mbps": 80.1, "connections": 1532, "load1": 0.8, "cpus": 4}}`.
+  `{"metrics": {"rx_mbps": 12.5, "tx_mbps": 80.1, "connections": 1532, "load1": 0.8, "cpus": 4,
+   "disk_pct": 41.0, "mem_pct": 63.5}}`. `disk_pct` (cache/nginx filesystem) and `mem_pct` are
+  optional — older agents omit them and the controller then raises no disk/memory alert for that edge.
   Controller keeps the latest per edge (edge object: `"metrics": {..., "at": "…Z"}` or null, plus
   `"shed": bool`). PATCH responses are `{"ok": true, "dns_failed": n, "edge": {...edge object...}}`.
 - Load shedding: an edge whose `max(rx,tx)_mbps >= EDGE_SHED_PERCENT (default 90) % of capacity_mbps`

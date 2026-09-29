@@ -1121,7 +1121,43 @@ def collect_metrics(cfg: dict, prev: tuple | None, cur: tuple | None = None) -> 
     except (OSError, AttributeError):
         pass
     m["cpus"] = os.cpu_count() or 0
+    disk = disk_pct(cfg.get("CACHE_DIR") or cfg.get("NGINX_DIR") or "/")
+    if disk is not None:
+        m["disk_pct"] = disk
+    mem = mem_pct(cfg.get("PROC_MEMINFO", "/proc/meminfo"))
+    if mem is not None:
+        m["mem_pct"] = mem
     return m
+
+
+def disk_pct(path: str) -> float | None:
+    """Percent of the filesystem holding `path` that is used. None on error."""
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        if total <= 0:
+            return None
+        free = st.f_bavail * st.f_frsize
+        return round((total - free) * 100 / total, 1)
+    except OSError:
+        return None
+
+
+def mem_pct(meminfo: str = "/proc/meminfo") -> float | None:
+    """Percent of RAM in use (total - available). None on error."""
+    try:
+        vals = {}
+        with open(meminfo) as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                if k in ("MemTotal", "MemAvailable"):
+                    vals[k] = int(rest.split()[0])  # kB
+        total, avail = vals.get("MemTotal", 0), vals.get("MemAvailable")
+        if total <= 0 or avail is None:
+            return None
+        return round((total - avail) * 100 / total, 1)
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 # ----------------------------------------------------------------- controller
