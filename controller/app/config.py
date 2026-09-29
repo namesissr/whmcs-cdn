@@ -49,6 +49,10 @@ class Settings:
         "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
         "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
         "2a06:98c0::/29", "2c0f:f248::/32",
+        # Quad9 (9.9.9.9 / 149.112.112.112; egress from WoodyNet/PCH, AS42), no ECS by default.
+        # Seen in production: an Iranian ISP's queries left through Quad9 in Bulgaria/Germany.
+        "74.63.16.0/20", "74.80.64.0/18", "9.9.9.0/24", "149.112.112.0/24", "149.112.149.0/24",
+        "2620:fe::/48", "2620:171::/32",
     ])
     # visitors whose country is unknown to the database: home | global
     geo_unknown_pool: str = field(default_factory=lambda: (os.getenv("GEO_UNKNOWN_POOL") or "home").strip().lower())
