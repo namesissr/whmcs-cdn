@@ -11,6 +11,7 @@ from .validation import ValidationError
 
 ID_RE = r"^[a-z0-9_-]{1,32}$"
 PATH_PATTERN_RE = re.compile(r"^/[A-Za-z0-9\-._~%!$&'()*+,;=:@/]*$")
+TUNNEL_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{1,200}$")
 HEADER_NAME_RE = r"^[A-Za-z0-9-]{1,64}$"
 FORBIDDEN_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "upgrade",
                      "te", "trailer", "proxy-authorization", "proxy-authenticate"}
@@ -26,7 +27,14 @@ DEFAULT_FEATURES = {
     "max_firewall_rules": 20,
     "max_ratelimit_rules": 5,
     "max_pools": 3,
+    # tunnel mode (SPEC §7.1)
+    "tunnel": False,
+    "max_tunnel_paths": 10,
+    "max_tunnel_connections": 0,  # per site per edge, 0 = unlimited
+    "tunnel_max_mbps": 0,         # cap for tunnel.per_connection_mbps, 0 = no cap
+    "edge_group": "general",      # which edges DNS answers with: general | tunnel
 }
+EDGE_GROUPS = ("general", "tunnel")
 
 
 class Strict(BaseModel):
@@ -44,6 +52,11 @@ class Features(Strict):
     max_firewall_rules: int = Field(20, ge=0, le=1000)
     max_ratelimit_rules: int = Field(5, ge=0, le=1000)
     max_pools: int = Field(3, ge=0, le=100)
+    tunnel: bool = False
+    max_tunnel_paths: int = Field(10, ge=0, le=50)
+    max_tunnel_connections: int = Field(0, ge=0, le=1000000)
+    tunnel_max_mbps: int = Field(0, ge=0, le=100000)
+    edge_group: Literal["general", "tunnel"] = "general"
 
 
 # ------------------------------------------------------------------ sections
@@ -245,14 +258,7 @@ class PoolOrigin(Strict):
     @field_validator("address")
     @classmethod
     def _addr(cls, v):
-        from .validation import validate_hostname, validate_ip
-
-        v = v.strip().lower().strip("[]")
-        if ":" in v:
-            return "[" + validate_ip(v, 6) + "]"
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
-            return validate_ip(v, 4)
-        return validate_hostname(v)
+        return _origin_address(v)
 
 
 class Health(Strict):
@@ -289,6 +295,88 @@ class Pools(Strict):
         if len(names) != len(set(names)):
             raise ValueError("نام استخرها باید یکتا باشد")
         return v
+
+
+class TunnelOrigin(Strict):
+    address: str
+    port: int | None = Field(None, ge=1, le=65535)  # default 443 with tls, else 80
+    tls: bool = False
+    sni: str | None = None
+    verify: bool = False
+
+    @field_validator("address")
+    @classmethod
+    def _addr(cls, v):
+        return _origin_address(v)
+
+    @field_validator("sni")
+    @classmethod
+    def _sni(cls, v):
+        from .validation import validate_hostname
+
+        return validate_hostname(v) if v else None
+
+    @model_validator(mode="after")
+    def _port(self):
+        if self.port is None:
+            self.port = 443 if self.tls else 80
+        return self
+
+
+class TunnelPath(Strict):
+    id: str = Field(pattern=ID_RE)
+    path: str
+    protocol: Literal["ws", "httpupgrade", "grpc", "xhttp", "h2"]
+    origin: TunnelOrigin | None = None
+    pool: str | None = Field(None, pattern=ID_RE)
+
+    @field_validator("path")
+    @classmethod
+    def _path(cls, v):
+        v = (v or "").strip()
+        if not TUNNEL_PATH_RE.match(v):
+            raise ValueError("مسیر تونل باید با / شروع شود و فقط حروف انگلیسی، عدد و . _ ~ / - داشته باشد "
+                             "(حداکثر ۲۰۰ کاراکتر، مثل /my-secret-service)")
+        if v.lower().startswith("/__pcdn"):
+            raise ValueError("مسیرهای /__pcdn رزرو شده‌اند")
+        return v
+
+    @model_validator(mode="after")
+    def _target(self):
+        if self.origin is not None and self.pool is not None:
+            raise ValueError("برای هر مسیر تونل فقط یکی از origin یا pool را تعیین کنید")
+        return self
+
+
+class Tunnel(Strict):
+    enabled: bool = False
+    paths: list[TunnelPath] = Field(default_factory=list, max_length=50)
+    idle_timeout: int = Field(3600, ge=60, le=86400)
+    per_connection_mbps: int = Field(0, ge=0, le=100000)
+    max_connections_per_ip: int = Field(0, ge=0, le=10000)
+    allowed_countries: list[str] = Field(default_factory=list, max_length=250)
+    fallback: Literal["origin", "decoy", "404"] = "origin"
+
+    @field_validator("paths")
+    @classmethod
+    def _unique(cls, v):
+        _unique_ids(v)
+        paths = [p.path for p in v]
+        if len(paths) != len(set(paths)):
+            raise ValueError("مسیرهای تونل باید یکتا باشند")
+        return v
+
+    @field_validator("allowed_countries")
+    @classmethod
+    def _countries(cls, v):
+        out = []
+        for c in v:
+            c = c.strip().upper()
+            if not re.match(r"^[A-Z]{2}$", c):
+                raise ValueError("کد کشور باید دو حرفی باشد (مثل IR)")
+            if c not in out:
+                out.append(c)
+        return out
 
 
 class Header(Strict):
@@ -360,13 +448,27 @@ SECTIONS: dict[str, type[BaseModel]] = {
     "hotlink": Hotlink,
     "image": Image,
     "errorpages": ErrorPages,
+    "tunnel": Tunnel,
 }
 
 # section -> feature flag that must be on to write it
-FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization"}
+FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
+                 "tunnel": "tunnel"}
 
 
 # ------------------------------------------------------------------ helpers
+
+def _origin_address(v: str) -> str:
+    """Public IPv4, [IPv6] or hostname of an origin server."""
+    from .validation import validate_hostname, validate_ip
+
+    v = (v or "").strip().lower().strip("[]")
+    if ":" in v:
+        return "[" + validate_ip(v, 6) + "]"
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
+        return validate_ip(v, 4)
+    return validate_hostname(v)
+
 
 def _pattern(v: str) -> str:
     v = (v or "").strip()
@@ -431,14 +533,34 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
         key, feat = limits[name]
         if len(value[key]) > feats[feat]:
             raise PermissionError(f"حداکثر {feats[feat]} مورد در پلن شما مجاز است")
+    if name == "pools":
+        # pools referenced by tunnel paths cannot be removed either
+        pools_in_use = set(pools_in_use or ()) | {p["pool"] for p in get_section(site, "tunnel")["paths"]
+                                                  if p["pool"]}
     if name == "pools" and pools_in_use:
         missing = pools_in_use - {p["name"] for p in value["pools"]}
         if missing:
             raise ValidationError(f"استخر {', '.join(sorted(missing))} در رکوردها استفاده شده است")
+    if name == "tunnel":
+        _check_tunnel(site, value, feats)
     if name == "ssl" and value["hsts"]["preload"] and not (
             value["hsts"]["include_subdomains"] and value["hsts"]["max_age"] >= 31536000):
         raise ValidationError("preload نیازمند includeSubDomains و max-age حداقل یک سال است")
     return value
+
+
+def _check_tunnel(site, value: dict, feats: dict):
+    """Plan limits and references of the tunnel section (the shape is checked by Tunnel)."""
+    if len(value["paths"]) > feats["max_tunnel_paths"]:
+        raise PermissionError(f"حداکثر {feats['max_tunnel_paths']} مسیر تونل در پلن شما مجاز است")
+    cap = feats["tunnel_max_mbps"]
+    # 0 (unlimited) is accepted: the edge config then applies the plan's cap (see tunnel_for_edge)
+    if cap > 0 and value["per_connection_mbps"] > cap:
+        raise PermissionError(f"سرعت هر اتصال تونل در پلن شما حداکثر {cap} مگابیت بر ثانیه است")
+    pools = {p["name"] for p in get_section(site, "pools")["pools"]}
+    for p in value["paths"]:
+        if p["pool"] and p["pool"] not in pools:
+            raise ValidationError(f"استخر {p['pool']} در بخش استخرها (pools) تعریف نشده است")
 
 
 def _is_enabled(name: str, value: dict) -> bool:
@@ -450,6 +572,8 @@ def _is_enabled(name: str, value: dict) -> bool:
         return value["enabled"]
     if name == "pools":
         return bool(value["pools"])
+    if name == "tunnel":
+        return value["enabled"]
     return True
 
 

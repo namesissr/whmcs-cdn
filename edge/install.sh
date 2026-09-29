@@ -79,11 +79,27 @@ install -m 755 "$HERE/pcdn-geoip-update.sh" /usr/local/sbin/pcdn-geoip-update
 echo 'include /etc/nginx/pcdn/http.conf;' > /etc/nginx/conf.d/00-pcdn.conf
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
 
+# >>> nginx.conf edits (idempotent; edge/tests/test_agent.py runs this block against the stock file)
 # directives that our http.conf sets would be "duplicate" next to the stock nginx.conf ones
-sed -i -E 's/^([[:space:]]*)(gzip[[:space:]]+on;|ssl_protocols[[:space:]]|ssl_prefer_server_ciphers[[:space:]])/\1# pcdn (set in pcdn http.conf): \2/' /etc/nginx/nginx.conf
-# more connections / open files than the stock config
-sed -i 's/^\([[:space:]]*worker_connections\).*/\1 16384;/' /etc/nginx/nginx.conf
-grep -q '^worker_rlimit_nofile' /etc/nginx/nginx.conf || sed -i '1i worker_rlimit_nofile 200000;' /etc/nginx/nginx.conf
+sed -i -E 's/^([[:space:]]*)(gzip[[:space:]]+on;|ssl_protocols[[:space:]]|ssl_prefer_server_ciphers[[:space:]]|keepalive_timeout[[:space:]])/\1# pcdn (set in pcdn http.conf): \2/' /etc/nginx/nginx.conf
+# many long-lived connections (tunnel mode): every proxied stream holds 2 descriptors
+sed -i 's/^\([[:space:]]*worker_connections\).*/\1 65535;/' /etc/nginx/nginx.conf
+if grep -q '^[[:space:]]*#*[[:space:]]*multi_accept' /etc/nginx/nginx.conf; then
+  sed -i 's/^\([[:space:]]*\)#*[[:space:]]*multi_accept.*/\1multi_accept on;/' /etc/nginx/nginx.conf
+else
+  sed -i 's/^\([[:space:]]*\)\(worker_connections.*\)$/\1\2\n\1multi_accept on;/' /etc/nginx/nginx.conf
+fi
+if grep -q '^worker_rlimit_nofile' /etc/nginx/nginx.conf; then
+  sed -i 's/^worker_rlimit_nofile.*/worker_rlimit_nofile 524288;/' /etc/nginx/nginx.conf
+else
+  sed -i '1i worker_rlimit_nofile 524288;' /etc/nginx/nginx.conf
+fi
+# <<< nginx.conf edits
+install -d -m 755 /etc/systemd/system/nginx.service.d
+cat > /etc/systemd/system/nginx.service.d/pcdn-limits.conf <<'EOF'
+[Service]
+LimitNOFILE=1048576
+EOF
 
 umask 077
 cat > /etc/pcdn/agent.conf <<EOF
@@ -115,16 +131,37 @@ cat > /etc/logrotate.d/pcdn <<'EOF'
 }
 EOF
 
+# kernel tuning for many long-lived connections (VPN tunnels) and high-latency clients
+modprobe tcp_bbr 2>/dev/null || true
+echo tcp_bbr > /etc/modules-load.d/pcdn-bbr.conf
 cat > /etc/sysctl.d/99-pcdn.conf <<'EOF'
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.ip_local_port_range = 10240 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-fs.file-max = 1000000
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_fastopen = 3
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+fs.file-max = 2097152
+fs.nr_open = 2097152
 EOF
+# conntrack only exists when netfilter connection tracking is loaded (firewall rules / docker)
+if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+  printf 'net.netfilter.nf_conntrack_max = 1048576\nnet.netfilter.nf_conntrack_tcp_timeout_established = 86400\n' \
+    > /etc/sysctl.d/99-pcdn-conntrack.conf
+fi
 sysctl --system >/dev/null 2>&1 || true
 
 echo "==> GeoIP (DB-IP IP to Country Lite, CC BY 4.0)"

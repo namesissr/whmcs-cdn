@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from . import pdns, sections, ssl
+from . import pdns, sections, ssl, tunnel
 from .auth import require_admin
 from .config import settings
 from .db import get_db
@@ -61,6 +61,22 @@ def write_section(domain: str, section: str, body: dict, db: Session = Depends(g
     sections.store_section(site, section, value)
     db.commit()
     return value
+
+
+# ------------------------------------------------------------------ tunnel mode (SPEC §7.5)
+
+@router.get("/sites/{domain}/tunnel/stats")
+def tunnel_stats(domain: str, hours: int = 24, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return tunnel.stats(db, site, max(1, min(hours, 24 * 31)))
+
+
+@router.post("/sites/{domain}/tunnel/check")
+def tunnel_check(domain: str, db: Session = Depends(get_db)):
+    """Can the controller reach each tunnel path's origin (TCP, plus TLS when used)?"""
+    paths = tunnel.targets(get_site(db, domain))
+    db.rollback()  # do not hold a transaction open while connecting
+    return {"results": tunnel.check(paths)}
 
 
 # ------------------------------------------------------------------ custom SSL

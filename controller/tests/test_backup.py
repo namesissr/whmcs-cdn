@@ -11,7 +11,7 @@ import httpx
 import pytest
 from sqlalchemy import create_engine, text
 
-from app import alerts, backup, scheduler
+from app import alerts, backup, migrate, scheduler
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Site, State, utcnow
@@ -60,7 +60,7 @@ def test_sqlite_backup_and_restore(client, env):
     assert oct(os.stat(res["path"]).st_mode & 0o777) == "0o600"
     names, manifest = members(res["path"])
     assert names == ["acme", "controller.sqlite3", "manifest.json", "pdns.sqlite3"]
-    assert manifest["contents"]["controller"]["kind"] == "sqlite" and manifest["alembic_revision"] == "0002"
+    assert manifest["contents"]["controller"]["kind"] == "sqlite" and manifest["alembic_revision"] == migrate.head_revision()
 
     # disaster: sites deleted, PowerDNS DB corrupted, acme home lost
     assert client.delete("/api/v1/sites/example.com").status_code == 200

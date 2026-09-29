@@ -17,6 +17,7 @@ CDN اختصاصی **پاسارگاد میزبان** برای فروش خودک�
 - [۴. نصب ماژول WHMCS](#۴-نصب-ماژول-whmcs)
 - [روند کار مشتری](#روند-کار-مشتری)
 - [GeoDNS (ترافیک ایران از نودهای داخل)](#geodns-ترافیک-ایران-از-نودهای-داخل)
+- [حالت تونل (VPN از طریق CDN)](#حالت-تونل-vpn-از-طریق-cdn)
 - [مرجع API](#مرجع-api)
 - [ساختار پروژه](#ساختار-پروژه)
 - [تست‌ها](#تستها)
@@ -224,6 +225,7 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 | `journalctl -u pcdn-agent -f` | لاگ agent |
 | `curl -H 'Host: health.pcdn' http://127.0.0.1/__pcdn/health` | سلامت نود |
 | `curl -X PATCH ".../api/v1/edges/ID?enabled=false" -H "Authorization: Bearer $KEY"` | خارج کردن موقت نود از سرویس (برای نگهداری) |
+| `curl -X PATCH .../api/v1/edges/ID -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{"capacity_mbps":1000}'` | ثبت ظرفیت نود (برای [خروج خودکار از DNS هنگام بار زیاد](#حالت-تونل-vpn-از-طریق-cdn)) |
 | `curl -X POST .../api/v1/edges/ID/rotate-token -H "Authorization: Bearer $KEY"` | تعویض توکن نود |
 
 ---
@@ -372,6 +374,31 @@ sudo docker logs --since 10m deploy-pdns-1 2>&1 | grep pcdn-geo         # روی
 
 اگر `download.db-ip.com` یا `ftp.ripe.net` از سرور در دسترس نبود، `DBIP_URL_BASE` و `RIPE_URL` را به یک آینه (یا `file:///...`) بدهید. اگر فقط فایل RIPE در دسترس نباشد، اسکریپت با هشدار از DB-IP تنها استفاده می‌کند.
 
+## حالت تونل (VPN از طریق CDN)
+
+مشتری می‌تواند سرور Xray / V2Ray / sing-box خود را پشت CDN بگذارد (WebSocket، HTTPUpgrade، gRPC، XHTTP و HTTP/2 خام). کاربر به نود داخل ایران وصل می‌شود و نود، اتصال طولانی را بدون بافر، کش و فیلترهای امنیتی به سرور مشتری می‌رساند. قرارداد کامل در بخش ۷ [`docs/SPEC.md`](docs/SPEC.md) آمده است.
+
+**پلن:** در WHMCS یا با `PATCH /api/v1/sites/{domain}/plan` قابلیت‌های `tunnel`، `max_tunnel_paths`، `max_tunnel_connections` (اتصال همزمان هر سایت روی هر نود)، `tunnel_max_mbps` (سقف سرعت هر اتصال) و `edge_group` را تنظیم کنید. مشتری مسیرهای تونل را در بخش `tunnel` تعریف می‌کند. ترافیک تونل در هر دو جهت (دانلود و آپلود) در مصرف ماهانه حساب می‌شود.
+
+**گروه نودها:** هر نود `group` دارد: `general` (پیش‌فرض) یا `tunnel`. همه نودها کانفیگ همه سایت‌ها را می‌گیرند، ولی DNS هر سایت فقط نودهای آنلاینِ گروهِ `edge_group` پلن آن سایت را برمی‌گرداند. این‌طوری ترافیک سنگین VPN روی نودهای جدا می‌ماند و سایت‌های معمولی کند نمی‌شوند. اگر هیچ نودی از آن گروه آنلاین نباشد، همه نودهای آنلاین جواب می‌دهند. تقسیم `home`/`global` در GeoDNS داخل هر گروه مثل قبل انجام می‌شود.
+
+**ظرفیت و خروج خودکار از DNS:** برای هر نود `capacity_mbps` (پهنای باند واقعی پورت) را ثبت کنید. agent هر ۲۰ ثانیه مصرف (`rx_mbps`، `tx_mbps`، تعداد اتصال و load) را گزارش می‌دهد. وقتی مصرف یک نود به `EDGE_SHED_PERCENT` درصد ظرفیت (پیش‌فرض ۹۰) برسد، تا وقتی نود دیگری از همان گروه و منطقه در DNS باشد، این نود از پاسخ‌ها کنار می‌رود. وقتی مصرف به زیر `EDGE_SHED_PERCENT - 15` درصد برگردد، نود دوباره در DNS قرار می‌گیرد. اتصال‌های باز قطع نمی‌شوند؛ فقط کاربران جدید به نودهای دیگر می‌روند. اگر نود خارج شود یا در سه گزارش پشت سر هم بالای ۸۰٪ بماند، هشدار `edge_saturated` فرستاده می‌شود. با `capacity_mbps: 0` این رفتار خاموش است.
+
+```bash
+# نود مخصوص تونل با پورت ۱ گیگابیت
+curl -X POST https://cdn-api.pasargadmizban.com/api/v1/edges -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ir-thr-t1","ipv4":"5.160.x.x","region":"home","group":"tunnel","capacity_mbps":1000}'
+# تغییر گروه / ظرفیت / منطقه یک نود موجود
+curl -X PATCH https://cdn-api.pasargadmizban.com/api/v1/edges/ID -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{"group":"tunnel","capacity_mbps":1000}'
+```
+مصرف لحظه‌ای هر نود در فیلد `metrics` و وضعیت خروج از DNS در فیلد `shed` خروجی `GET /api/v1/edges` دیده می‌شود.
+
+| متغیر `.env` | پیش‌فرض | کاربرد |
+|---|---|---|
+| `EDGE_SHED_PERCENT` | `90` | درصدی از `capacity_mbps` که نود از آن به بعد از DNS کنار می‌رود (بازگشت: ۱۵ درصد پایین‌تر) |
+
 ## مرجع API
 
 همه مسیرهای `/api/v1/*` هدر `Authorization: Bearer <ADMIN_API_KEY>` لازم دارند. قرارداد کامل بین اجزا، شامل ساختار JSON هر بخش، در [`docs/SPEC.md`](docs/SPEC.md) آمده است.
@@ -382,7 +409,9 @@ sudo docker logs --since 10m deploy-pdns-1 2>&1 | grep pcdn-geo         # روی
 | POST | `/api/v1/sites` | ساخت سایت `{domain, external_id?, origin_ip?, plan{..., features{...}}}` |
 | GET | `/api/v1/sites` · `/api/v1/sites/{domain}` | فهرست / جزئیات سایت (شامل `config` همه بخش‌ها) |
 | PATCH | `/api/v1/sites/{domain}/plan` | تغییر پلن و قابلیت‌ها |
-| GET / PUT | `/api/v1/sites/{domain}/config/{section}` | بخش‌های `cache`، `ssl`، `waf`، `ddos`، `firewall`، `ratelimit`، `pagerules`، `pools`، `headers`، `hotlink`، `image` و `errorpages` |
+| GET / PUT | `/api/v1/sites/{domain}/config/{section}` | بخش‌های `cache`، `ssl`، `waf`، `ddos`، `firewall`، `ratelimit`، `pagerules`، `pools`، `headers`، `hotlink`، `image`، `errorpages` و `tunnel` |
+| GET | `/api/v1/sites/{domain}/tunnel/stats?hours=24` | آمار ساعتی تونل (نشست، مدت، آپلود و دانلود) |
+| POST | `/api/v1/sites/{domain}/tunnel/check` | بررسی دسترسی کنترلر به سرور مقصد هر مسیر تونل (TCP و TLS) |
 | PATCH | `/api/v1/sites/{domain}/settings` | تنظیمات v1 (برای سازگاری) |
 | POST | `/api/v1/sites/{domain}/suspend` · `/unsuspend` | تعلیق / رفع تعلیق |
 | DELETE | `/api/v1/sites/{domain}` | حذف سایت و زون |
@@ -398,7 +427,7 @@ sudo docker logs --since 10m deploy-pdns-1 2>&1 | grep pcdn-geo         # روی
 | GET | `/api/v1/sites/{domain}/events?limit=100` | رویدادهای امنیتی |
 | GET | `/api/v1/sites/{domain}/usage?days=30` | مصرف روزانه |
 | GET | `/api/v1/usage?month=YYYY-MM` | مصرف ماهانه همه سایت‌ها (برای WHMCS) |
-| GET/POST/PATCH/DELETE | `/api/v1/edges[/{id}]` | مدیریت نودها |
+| GET/POST/PATCH/DELETE | `/api/v1/edges[/{id}]` | مدیریت نودها (`group`، `capacity_mbps`؛ PATCH با بدنه JSON یا `?enabled=`) |
 
 مسیرهای `/edge/v1/*` مخصوص agent هستند و با توکن نود احراز هویت می‌شوند: `config` (با ETag)، `heartbeat`، `purges` و `usage` (که آمار و رویدادها را هم شامل می‌شود).
 

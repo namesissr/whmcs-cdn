@@ -55,6 +55,7 @@ DEFAULTS = {
     "LISTEN_IPV6": "yes",
     "POLL_INTERVAL": "20",
     "USAGE_INTERVAL": "60",
+    "HEARTBEAT_INTERVAL": "60",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -70,6 +71,9 @@ SAFE_CIDR = re.compile(r"^[0-9a-fA-F.:]{2,45}(/\d{1,3})?$")
 SAFE_FSPATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 SAFE_SIZE = re.compile(r"^\d{1,6}[kKmMgG]?$")
 SAFE_RESOLVER = re.compile(r"^[0-9a-fA-F.:\[\] ]{2,200}$")
+SAFE_TUNNEL_PATH = re.compile(r"^/[A-Za-z0-9._~/-]{1,200}$")
+IP_LITERAL = re.compile(r"^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])$")
+TUNNEL_PROTOCOLS = ("ws", "httpupgrade", "grpc", "xhttp", "h2")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
                "transfer-encoding", "upgrade", "host", "content-length"}
 FW_ACTIONS = {"allow", "block", "challenge", "captcha", "log"}
@@ -234,6 +238,61 @@ def norm_pools(site: dict) -> dict:
     return out
 
 
+def norm_tunnel(site: dict, pools: dict) -> dict | None:
+    """Validated `tunnel` section (SPEC §7.2/7.3), or None when tunnel mode is off."""
+    t = _sec(site, "tunnel")
+    if not t.get("enabled") or site.get("status", "active") != "active":
+        return None
+    paths, seen = [], set()
+    for p in t.get("paths") or []:
+        if not isinstance(p, dict):
+            continue
+        pid, path, proto = str(p.get("id") or "").lower(), str(p.get("path") or ""), p.get("protocol")
+        if (not SAFE_ID.match(pid) or not SAFE_TUNNEL_PATH.match(path) or path.startswith("/__pcdn")
+                or proto not in TUNNEL_PROTOCOLS or path in seen):
+            continue
+        entry = {"id": pid, "path": path, "protocol": proto, "origin": None, "pool": None}
+        o, pool = p.get("origin"), p.get("pool")
+        if isinstance(o, dict):
+            addr = str(o.get("address") or "").lower()
+            port = o.get("port")
+            sni = str(o.get("sni") or "").lower()
+            if (not SAFE_ORIGIN.match(addr) or not (isinstance(port, int) or str(port).isdigit())
+                    or not 1 <= int(port) <= 65535 or (sni and (not SAFE_NAME.match(sni) or "*" in sni))):
+                continue
+            entry["origin"] = {"hp": _hp(addr, port), "ip": bool(IP_LITERAL.match(addr)), "tls": bool(o.get("tls")),
+                               "sni": sni or None, "verify": bool(o.get("verify"))}
+        elif pool is not None:
+            if str(pool) not in pools:
+                continue
+            entry["pool"] = str(pool)
+        seen.add(path)
+        paths.append(entry)
+    if not paths:
+        return None
+    return {
+        "paths": paths,
+        "idle_timeout": _int(t.get("idle_timeout"), 3600, 60, 86400),
+        "per_connection_mbps": _int(t.get("per_connection_mbps"), 0, 0, 100000),
+        "max_connections_per_ip": _int(t.get("max_connections_per_ip"), 0, 0, 10000),
+        "max_connections": _int(t.get("max_connections"), 0, 0, 10000000),
+        "allowed_countries": sorted({str(c).upper() for c in (t.get("allowed_countries") or [])
+                                     if re.match(r"^[A-Za-z]{2}$", str(c))}),
+        "fallback": t.get("fallback") if t.get("fallback") in ("decoy", "404") else "origin",
+    }
+
+
+def decoy_page(cfg: dict, domain: str) -> str:
+    """Neutral placeholder page served on non-tunnel paths when tunnel.fallback = decoy."""
+    path = os.path.join(cfg.get("PAGES_DIR") or "", "decoy.html")
+    if not os.path.isfile(path):
+        path = os.path.join(HERE, "pages", "decoy.html")
+    with open(path) as f:
+        text = f.read()
+    name = domain.split(".")[0].replace("-", " ").title() if domain else "Welcome"
+    return text.replace("{{NAME}}", name).replace("{{YEAR}}", str(datetime.now(timezone.utc).year))
+
+
 def page_rules(site: dict) -> list:
     rules = []
     for r in (_sec(site, "pagerules").get("rules") or []):
@@ -244,7 +303,7 @@ def page_rules(site: dict) -> list:
     return rules
 
 
-def site_js(site: dict, hosts: list, pools: dict, sslo: dict) -> dict:
+def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None) -> dict:
     """Per-site data for njs (sites.js). Only validated / typed values end up here."""
     fw = _sec(site, "firewall")
     rules = []
@@ -311,6 +370,8 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict) -> dict:
         "pools": pools,
         "image": {"enabled": bool(im.get("enabled")), "quality": _int(im.get("quality"), 85, 1, 100),
                   "max_width": _int(im.get("max_width"), 2000, 16, 10000)},
+        # prefixes where only firewall allow/block/log rules apply (tunnel mode)
+        "tunnel_paths": [p["path"] for p in tunnel["paths"]] if tunnel else [],
     }
 
 
@@ -375,7 +436,7 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     for h in hdr.get("request") or []:
         n, v = str(h.get("name") or ""), h.get("value")
         if SAFE_HEADER.match(n) and n.lower() not in HOP_HEADERS and v is not None and SAFE_VALUE.match(str(v)):
-            req_headers[n.lower()] = f"proxy_set_header {n} {_qv(str(v))};"
+            req_headers[n.lower()] = (n, _qv(str(v)))
     resp_add, resp_hide = [], []
     for h in hdr.get("response") or []:
         n, v = str(h.get("name") or ""), h.get("value")
@@ -386,16 +447,16 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         elif SAFE_VALUE.match(str(v)):
             resp_hide.append(n)  # replace the origin's value instead of sending both
             resp_add.append(f"add_header {n} {_qv(str(v))} always;")
-    base_req = [("host", "proxy_set_header Host $host;"),
-                ("x-real-ip", "proxy_set_header X-Real-IP $remote_addr;"),
-                ("x-forwarded-for", "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"),
-                ("x-forwarded-proto", "proxy_set_header X-Forwarded-Proto $scheme;"),
-                ("x-country-code", "proxy_set_header X-Country-Code $pcdn_country;"),
-                ("upgrade", "proxy_set_header Upgrade $http_upgrade;"),
-                ("connection", "proxy_set_header Connection $pcdn_connection_upgrade;")]
+    base_req = [("Host", "$host"), ("X-Real-IP", "$remote_addr"), ("X-Forwarded-For", "$proxy_add_x_forwarded_for"),
+                ("X-Forwarded-Proto", "$scheme"), ("X-Country-Code", "$pcdn_country")]
+
+    def req_hdrs(directive, conn=(("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))):
+        pairs = [(n, v) for n, v in base_req if n.lower() not in req_headers] + list(req_headers.values()) + list(conn)
+        return [f"{directive} {n} {v};" for n, v in pairs]
+
     # nginx drops inherited proxy_set_header / add_header / proxy_hide_header as soon as
     # a location sets one of them, so every proxying location gets the complete set.
-    proxy_hdrs = [line for k, line in base_req if k not in req_headers] + list(req_headers.values())
+    proxy_hdrs = req_hdrs("proxy_set_header")
 
     def loc_common(hides=(), extra_add=()):
         lines = list(proxy_hdrs)
@@ -455,6 +516,88 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     resize_port = _int(cfg["RESIZE_PORT"], 8089, 1, 65535)
     prules = page_rules(site)
     valid_hosts = []
+
+    # --- tunnel mode (SPEC §7): per-site http-context parts
+    tunnel = norm_tunnel(site, pools)
+    fallback = tunnel["fallback"] if tunnel else "origin"
+    image_on = image_on and fallback == "origin"  # decoy / 404 sites never fetch origin content
+    decoy = decoy_page(cfg, domain) if fallback == "decoy" else None
+    tn_upstreams = {}  # (h2?, host:port) -> upstream name (keepalive towards IP-literal origins)
+    if tunnel and tunnel["allowed_countries"]:
+        out.append(f"map $pcdn_country $pcdn_tcc_{sid} {{\n"
+                   + "".join(f"    {cc} 1;\n" for cc in tunnel["allowed_countries"]) + "    default 0;\n}")
+
+    def tn_upstream(hp, h2):
+        # separate pools for HTTP/2 (grpc_pass) and HTTP/1.1 (proxy_pass): a cached keepalive
+        # connection must never be handed to the other protocol
+        if (h2, hp) not in tn_upstreams:
+            name = f"pcdn_tn_{sid}_{len(tn_upstreams)}"
+            tn_upstreams[(h2, hp)] = name
+            # one server: never marked down (max_fails=0); idle keepalive connections are reused
+            out.append(f"upstream {name} {{\n    server {hp} max_fails=0;\n    keepalive 16;\n"
+                       f"    keepalive_timeout 60s;\n}}")
+        return tn_upstreams[(h2, hp)]
+
+    def tunnel_loc(p, proto, pool, target):
+        """One `location ^~ <path>` for a tunnel path; host defaults: proto / pool / target."""
+        kind, idle = p["protocol"], tunnel["idle_timeout"]
+        grpc = kind in ("grpc", "h2")
+        keepalive_ok = kind in ("xhttp", "grpc", "h2")  # upgraded (ws) connections are never reused
+        L = [f"set $pcdn_tn {kind};"]
+        if tunnel["allowed_countries"]:
+            L.append(f"if ($pcdn_tcc_{sid} = 0) {{ return 403; }}")
+        o = p["origin"]
+        if o:
+            tls, sni, verify = o["tls"], o["sni"] or "$host", o["verify"]
+            if o["ip"] and keepalive_ok:
+                dest = tn_upstream(o["hp"], grpc)
+            else:
+                L.append(f"set $pcdn_tn_target {_q(o['hp'])};")  # variable: resolved at request time
+                dest = "$pcdn_tn_target"
+        elif p["pool"]:
+            tls, sni, verify = pools[p["pool"]]["protocol"] == "https", "$host", bool(sslo.get("origin_verify"))
+            L += [f"set $pcdn_tn_pool {_q(p['pool'])};", "set $pcdn_tn_target $pcdn_tn_upstream;"]
+            dest = "$pcdn_tn_target"
+        else:
+            tls, sni, verify = proto == "https", "$host", bool(sslo.get("origin_verify"))
+            host_addr = (target or "").rsplit(":", 1)[0]
+            dest = tn_upstream(target, grpc) if not pool and keepalive_ok and IP_LITERAL.match(host_addr) else "$pcdn_target"
+        if tunnel["max_connections"]:
+            L.append(f"limit_conn pcdn_tn_site {tunnel['max_connections']};")
+        if tunnel["max_connections_per_ip"]:
+            L.append(f"limit_conn pcdn_tn_ip {tunnel['max_connections_per_ip']};")
+        L.append("limit_conn_status 429;")
+        if rps > 0:
+            L.append("limit_req_dry_run on;")  # the legacy per-IP request limit is not for streams
+        # tunnel.per_connection_mbps is not rendered: nginx 1.24 resets limit_rate to 0 for
+        # unbuffered proxying (proxy_buffering off, every grpc_pass) and never applies it to
+        # upgraded (101) connections, where a limit_rate delay on the 101 response even makes
+        # nginx miss the client's close. See docs/EDGE.md.
+        L += ["client_max_body_size 0;", f"client_body_timeout {idle}s;", f"send_timeout {idle}s;",
+              "tcp_nodelay on;", "gzip off;", "brotli off;"]
+        if grpc:
+            L += req_hdrs("grpc_set_header", conn=())
+            L += [f"grpc_read_timeout {idle}s;", f"grpc_send_timeout {idle}s;", "grpc_socket_keepalive on;",
+                  "grpc_next_upstream off;", "grpc_intercept_errors off;"]
+            if tls:
+                L += ["grpc_ssl_server_name on;", f"grpc_ssl_name {sni};"]
+                if verify:
+                    L += ["grpc_ssl_verify on;", f"grpc_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
+                          "grpc_ssl_verify_depth 4;"]
+            L.append(f"grpc_pass {'grpcs' if tls else 'grpc'}://{dest};")
+        else:
+            conn = (("Connection", '""'),) if kind == "xhttp" else (
+                ("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))
+            L += ["proxy_http_version 1.1;"] + req_hdrs("proxy_set_header", conn)
+            L += ["proxy_buffering off;", "proxy_request_buffering off;", "proxy_cache off;",
+                  f"proxy_read_timeout {idle}s;", f"proxy_send_timeout {idle}s;", "proxy_socket_keepalive on;",
+                  "proxy_next_upstream off;", "proxy_intercept_errors off;"]
+            if tls:
+                L += ["proxy_ssl_server_name on;", f"proxy_ssl_name {sni};"]
+                L += (["proxy_ssl_verify on;", f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
+                       "proxy_ssl_verify_depth 4;"] if verify else ["proxy_ssl_verify off;"])
+            L.append(f"proxy_pass {'https' if tls else 'http'}://{dest};")
+        return [f"    location ^~ {_q(p['path'])} {{"] + ["        " + x for x in L] + ["    }"]
 
     for host in site["hosts"]:
         name = str(host["name"]).lower()
@@ -544,6 +687,25 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
                 f"proxy_pass http://127.0.0.1:{resize_port};"]
             s += ["    location ^~ /__pcdn/img/ {"] + ["        " + x for x in L] + ["    }"]
 
+        # tunnel paths: "^~" prefix locations, so no page rule / static regex location can take them
+        if tunnel:
+            for p in tunnel["paths"]:
+                s += tunnel_loc(p, proto, pool, target)
+            if fallback == "decoy":
+                s.append("    location / {")
+                s.append("        default_type text/html;")
+                s.append("        add_header Cache-Control \"no-cache\" always;")
+                s.append(f"        return 200 {_qv(decoy)};")
+                s.append("    }")
+                s.append("}")
+                out.append("\n".join(s))
+                continue
+            if fallback == "404":
+                s.append("    location / { return 404; }")
+                s.append("}")
+                out.append("\n".join(s))
+                continue
+
         # page rules: regex locations in order (nginx uses the first matching regex)
         for r in prules:
             match = f"~ \"{r['_re']}\""
@@ -574,7 +736,7 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         s.append("}")
         out.append("\n".join(s))
 
-    js = site_js(site, valid_hosts, pools, sslo) if status not in ("suspended", "over_quota") and valid_hosts else None
+    js = site_js(site, valid_hosts, pools, sslo, tunnel) if status not in ("suspended", "over_quota") and valid_hosts else None
     return "\n\n".join(out) + "\n", files, js
 
 
@@ -672,7 +834,9 @@ def render_rev(cfg: dict) -> str:
     """Changes whenever local rendering inputs change (agent/njs/template upgrade, GeoIP DB
     appearing, local settings) so the next sync re-renders even if the config ETag is unchanged."""
     h = hashlib.sha256()
+    decoy = os.path.join(cfg.get("PAGES_DIR") or "", "decoy.html")
     for path in (asset(cfg, "NJS_FILE", "njs/pcdn.js"), asset(cfg, "BASE_TEMPLATE", "nginx/pcdn-base.conf"),
+                 decoy if os.path.isfile(decoy) else os.path.join(HERE, "pages", "decoy.html"),
                  os.path.abspath(__file__)):
         try:
             with open(path, "rb") as f:
@@ -769,6 +933,9 @@ def _account(e: dict, pending: dict, events: list):
         path = uri.split("?", 1)[0][:512]
         if path in a["paths"] or len(a["paths"]) < PATH_TRACK:
             _inc(a["paths"], path)
+    tn = e.get("tn")
+    if tn in TUNNEL_PROTOCOLS:
+        _account_tunnel(a, e, tn, code)
     parts = str(e.get("v") or "ok").split(":", 2)
     if len(parts) == 3 and parts[0] in ("block", "challenge", "captcha", "log"):
         action, source, rule = parts
@@ -778,6 +945,31 @@ def _account(e: dict, pending: dict, events: list):
         events.append({"t": _utc(e["t"]).strftime("%Y-%m-%dT%H:%M:%SZ"), "host": host, "ip": str(e.get("ip") or ""),
                        "country": cc, "method": str(e.get("m") or ""), "path": uri[:2048], "action": action,
                        "source": source, "rule": rule, "user_agent": str(e.get("ua") or "")[:512]})
+
+
+def _nsum(v) -> int:
+    """Sum of an nginx multi-upstream value ("12, 34 : 5"; "-" / "" = 0)."""
+    return sum(int(x) for x in re.findall(r"\d+", str(v or "")))
+
+
+def _account_tunnel(a: dict, e: dict, proto: str, code: int):
+    """Tunnel counters of a host-hour (SPEC §7.3). One log line = one tunnel request: a whole
+    WebSocket / HTTPUpgrade session or gRPC / h2 stream, or one XHTTP request.
+    Bytes from the client: $request_length counts request bodies (HTTP/1.1 and HTTP/2) but not
+    the frames of an upgraded connection; $upstream_bytes_sent counts everything written to the
+    origin, including upgraded frames. Both include the request head, so the larger one is used."""
+    t = a.setdefault("tunnel", {"sessions": 0, "seconds": 0.0, "bytes_up": 0, "bytes_down": 0, "by_protocol": {}})
+    if code == 101 or 200 <= code < 300:
+        t["sessions"] += 1
+    try:
+        t["seconds"] += max(0.0, float(e.get("rt") or 0))
+    except (TypeError, ValueError):
+        pass
+    up = max(int(e.get("bu") or 0), _nsum(e.get("ub")))
+    down = int(e.get("b") or 0)
+    t["bytes_up"] += up
+    t["bytes_down"] += down
+    _inc(t["by_protocol"], proto, up + down)
 
 
 def _consume(path: str, pos: int, state: dict, max_bytes: int) -> int:
@@ -834,6 +1026,10 @@ def usage_item(key: str, a) -> dict:
     for k in ("status", "codes", "countries", "security"):
         if a[k]:
             item[k] = a[k]
+    if a.get("tunnel"):
+        t = a["tunnel"]
+        item["tunnel"] = {"sessions": t["sessions"], "seconds": int(round(t["seconds"])), "bytes_up": t["bytes_up"],
+                          "bytes_down": t["bytes_down"], "by_protocol": dict(t["by_protocol"])}
     if a["paths"]:
         item["paths"] = dict(sorted(a["paths"].items(), key=lambda kv: (-kv[1], kv[0]))[:PATHS_PER_ITEM])
     return item
@@ -841,6 +1037,91 @@ def usage_item(key: str, a) -> dict:
 
 def usage_items(pending: dict) -> list[dict]:
     return [usage_item(k, v) for k, v in pending.items()]
+
+
+# ----------------------------------------------------------------- metrics (heartbeat, SPEC §7.4)
+
+VIRTUAL_IFACES = re.compile(r"^(lo|docker|veth|br-|virbr|cni|flannel|cali|vxlan|tun|tap|wg|kube|dummy)")
+
+
+def default_iface(route_path: str = "/proc/net/route") -> str | None:
+    """Interface of the IPv4 default route (None when there is none)."""
+    try:
+        with open(route_path) as f:
+            next(f, None)
+            for line in f:
+                p = line.split()
+                if len(p) > 3 and p[1] == "00000000" and int(p[3], 16) & 1 and not VIRTUAL_IFACES.match(p[0]):
+                    return p[0]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def net_bytes(iface: str | None, dev_path: str = "/proc/net/dev") -> tuple[int, int] | None:
+    """(rx, tx) bytes of iface, or of every non-virtual interface when iface is None."""
+    rx = tx = 0
+    found = False
+    try:
+        with open(dev_path) as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                name, data = line.split(":", 1)
+                name, p = name.strip(), data.split()
+                if (iface and name != iface) or (not iface and VIRTUAL_IFACES.match(name)) or len(p) < 9:
+                    continue
+                rx, tx, found = rx + int(p[0]), tx + int(p[8]), True
+    except (OSError, ValueError):
+        return None
+    return (rx, tx) if found else None
+
+
+def tcp_established(ports, paths=("/proc/net/tcp", "/proc/net/tcp6")) -> int | None:
+    """ESTABLISHED TCP connections whose local port is one of `ports` (client connections)."""
+    want = {f"{int(p):04X}" for p in ports}
+    n, ok = 0, False
+    for path in paths:
+        try:
+            with open(path) as f:
+                ok = True
+                next(f, None)
+                for line in f:
+                    p = line.split(None, 4)
+                    if len(p) > 3 and p[3] == "01" and p[1].rsplit(":", 1)[-1] in want:
+                        n += 1
+        except (OSError, ValueError):
+            continue
+    return n if ok else None
+
+
+def net_sample(cfg: dict) -> tuple[float, tuple[int, int] | None]:
+    return time.monotonic(), net_bytes(default_iface(cfg.get("PROC_ROUTE", "/proc/net/route")),
+                                       cfg.get("PROC_NET_DEV", "/proc/net/dev"))
+
+
+def collect_metrics(cfg: dict, prev: tuple | None, cur: tuple | None = None) -> dict:
+    """Heartbeat metrics from two net samples (see net_sample). Never raises; missing values are 0."""
+    m = {"rx_mbps": 0.0, "tx_mbps": 0.0, "connections": 0, "load1": 0.0, "cpus": 0}
+    try:
+        cur = cur or net_sample(cfg)
+        if prev and prev[1] and cur[1] and cur[0] > prev[0]:
+            dt = cur[0] - prev[0]
+            m["rx_mbps"] = round(max(0, cur[1][0] - prev[1][0]) * 8 / dt / 1e6, 3)  # counter reset -> 0
+            m["tx_mbps"] = round(max(0, cur[1][1] - prev[1][1]) * 8 / dt / 1e6, 3)
+    except Exception as e:  # noqa: BLE001
+        log.debug("net metrics: %s", e)
+    try:
+        ports = {_int(cfg.get("HTTP_PORT"), 80, 1, 65535), _int(cfg.get("HTTPS_PORT"), 443, 1, 65535)}
+        m["connections"] = tcp_established(ports, cfg.get("PROC_TCP", ("/proc/net/tcp", "/proc/net/tcp6"))) or 0
+    except Exception as e:  # noqa: BLE001
+        log.debug("connection count: %s", e)
+    try:
+        m["load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        pass
+    m["cpus"] = os.cpu_count() or 0
+    return m
 
 
 # ----------------------------------------------------------------- controller
@@ -894,6 +1175,8 @@ class Agent:
         self.state = load_state(cfg["STATE_FILE"])
         self.running = True
         self.last_usage = 0.0
+        self.last_heartbeat = 0.0
+        self.net_prev = None
 
     def sync_config(self):
         headers = {}
@@ -904,6 +1187,7 @@ class Agent:
         if code == 304:
             return
         err = apply_config(body, self.cfg)
+        self.state["last_error"] = err
         if err:
             log.error(err)
             self.ctl.call("POST", "/edge/v1/heartbeat",
@@ -944,12 +1228,38 @@ class Agent:
                 del pending[k]
             del events[: len(evs)]
 
+    def metrics(self) -> dict:
+        """Current load; the first call measures the network rate over one second."""
+        try:
+            if self.net_prev is None or time.monotonic() - self.net_prev[0] < 1:
+                self.net_prev = net_sample(self.cfg)
+                time.sleep(1)
+            cur = net_sample(self.cfg)
+        except Exception:  # noqa: BLE001
+            cur = None
+        m = collect_metrics(self.cfg, self.net_prev, cur)
+        if cur:
+            self.net_prev = cur
+        return m
+
+    def heartbeat(self):
+        """Periodic heartbeat with load metrics (keeps applied_version / last error as reported)."""
+        self.ctl.call("POST", "/edge/v1/heartbeat", {"applied_version": self.state.get("version"),
+                                                     "error": self.state.get("last_error"),
+                                                     "metrics": self.metrics()})
+
     def tick(self):
         for step in (self.sync_config, self.sync_purges):
             try:
                 step()
             except Exception as e:  # noqa: BLE001
                 log.error("%s failed: %s", step.__name__, e)
+        if time.time() - self.last_heartbeat >= int(self.cfg.get("HEARTBEAT_INTERVAL") or 60):
+            try:
+                self.heartbeat()
+                self.last_heartbeat = time.time()
+            except Exception as e:  # noqa: BLE001
+                log.error("heartbeat failed: %s", e)
         if time.time() - self.last_usage >= int(self.cfg["USAGE_INTERVAL"]):
             try:
                 self.push_usage()

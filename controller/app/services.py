@@ -22,6 +22,61 @@ def online_edges(db: Session) -> list[Edge]:
     ))
 
 
+# ---------------------------------------------------------------- edge load (SPEC §7.4)
+
+# hysteresis: a shed edge comes back once its load drops below EDGE_SHED_PERCENT - this
+SHED_HYSTERESIS = 15
+# edge_saturated alert when the load stays above this for LOAD_ALERT_CHECKS reports
+LOAD_ALERT_PERCENT = 80
+LOAD_ALERT_CHECKS = 3
+
+
+def edge_metrics(e: Edge) -> dict | None:
+    """Latest heartbeat metrics as shown on the edge object ({..., "at": "...Z"}) or None."""
+    if not e.metrics or e.metrics_at is None:
+        return None
+    try:
+        m = json.loads(e.metrics)
+    except ValueError:
+        return None
+    return {**m, "at": e.metrics_at.isoformat() + "Z"}
+
+
+def metrics_fresh(e, now: datetime | None = None) -> bool:
+    at = getattr(e, "metrics_at", None)
+    return at is not None and (now or utcnow()) - at <= timedelta(seconds=settings.edge_offline_seconds)
+
+
+def edge_load_percent(e: Edge, now: datetime | None = None) -> float | None:
+    """max(rx, tx) as % of capacity_mbps; None when the capacity or fresh metrics are unknown."""
+    if not e.capacity_mbps or e.capacity_mbps <= 0 or not metrics_fresh(e, now):
+        return None
+    m = edge_metrics(e) or {}
+    peak = max(float(m.get("rx_mbps") or 0), float(m.get("tx_mbps") or 0))
+    return peak * 100 / e.capacity_mbps
+
+
+def update_shed(e: Edge, now: datetime | None = None):
+    """Recompute the load-shedding flag (with hysteresis). Caller commits."""
+    pct = edge_load_percent(e, now)
+    if pct is None:
+        e.shed = False
+    elif pct >= settings.edge_shed_percent:
+        e.shed = True
+    elif pct < settings.edge_shed_percent - SHED_HYSTERESIS:
+        e.shed = False
+
+
+def record_metrics(e: Edge, metrics: dict, now: datetime | None = None):
+    """Store heartbeat metrics and update the shed flag and the high-load counter. Caller commits."""
+    now = now or utcnow()
+    e.metrics = json.dumps(metrics)
+    e.metrics_at = now
+    update_shed(e, now)
+    pct = edge_load_percent(e, now)
+    e.load_high = (e.load_high or 0) + 1 if pct is not None and pct > LOAD_ALERT_PERCENT else 0
+
+
 DNS_DIRTY_KEY = "dns_dirty"
 
 
@@ -262,10 +317,25 @@ def build_edge_config(db: Session) -> dict:
             "hotlink": cfg["hotlink"],
             "image": cfg["image"],
             "errorpages": cfg["errorpages"],
+            "tunnel": tunnel_for_edge(site, cfg["tunnel"], feats, pool_names),
         })
     body = {"sites": out}
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     return {"version": version, **body}
+
+
+def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str]) -> dict:
+    """Tunnel section as the edges get it (SPEC §7.3): plan limits folded in."""
+    t = dict(tunnel)
+    # a path whose pool is gone (or load balancing is off) is dropped, like hosts above
+    t["paths"] = [p for p in t["paths"] if not p["pool"] or p["pool"] in pool_names][: feats["max_tunnel_paths"]]
+    cap = feats["tunnel_max_mbps"]
+    if cap > 0 and (t["per_connection_mbps"] == 0 or t["per_connection_mbps"] > cap):
+        t["per_connection_mbps"] = cap
+    t["max_connections"] = feats["max_tunnel_connections"]
+    if not feats["tunnel"] or site.effective_status != "active":
+        t["enabled"] = False
+    return t
 
 
 def queue_purge(db: Session, site: Site, urls: list[str]):

@@ -312,7 +312,7 @@ def check_all(db, edges: bool = True) -> None:
 
     edges=False skips the edge checks right after a controller outage (see scheduler).
     """
-    for fn in ((check_edges,) if edges else ()) + (check_certs, check_pdns):
+    for fn in ((check_edges, check_edge_load) if edges else ()) + (check_certs, check_pdns):
         try:
             fn(db)
         except Exception:  # noqa: BLE001
@@ -364,6 +364,45 @@ def check_edges(db) -> None:
             "critical",
         )
     sync("all_edges_offline", all_down, lambda c: "دست‌کم یک نود دوباره آنلاین است.")
+
+
+def check_edge_load(db) -> None:
+    """edge_saturated:{id} while an edge is shed from DNS or stays above 80 % of its capacity."""
+    from .models import Edge
+    from .services import LOAD_ALERT_CHECKS, LOAD_ALERT_PERCENT, edge_load_percent, edge_metrics
+
+    now = utcnow()
+    cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
+    active, names = {}, {}
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
+        key = f"edge_saturated:{e.id}"
+        names[key] = e.name
+        if e.last_seen_at is None or e.last_seen_at < cutoff:
+            continue  # offline edges have their own alert
+        pct = edge_load_percent(e, now)
+        if pct is None or not (e.shed or (e.load_high or 0) >= LOAD_ALERT_CHECKS):
+            continue
+        m = edge_metrics(e) or {}
+        peak = max(float(m.get("rx_mbps") or 0), float(m.get("tx_mbps") or 0))
+        if e.shed:
+            state = (f"بار از آستانه EDGE_SHED_PERCENT ({settings.edge_shed_percent:g}٪) گذشته است؛ تا وقتی نود "
+                     "دیگری از همان گروه و منطقه آنلاین باشد، این نود در پاسخ‌های DNS قرار نمی‌گیرد.")
+        else:
+            state = f"بار بیش از {LOAD_ALERT_PERCENT}٪ ظرفیت مانده است؛ نود یا ظرفیت بیشتری اضافه کنید."
+        active[key] = (
+            f"نود {e.name} نزدیک به ظرفیت کامل است",
+            f"نود {e.name} ({e.ipv4}، گروه {e.group}) {pct:.0f}٪ ظرفیت را مصرف می‌کند "
+            f"({peak:.0f} از {e.capacity_mbps} مگابیت بر ثانیه، {int(m.get('connections') or 0)} اتصال).\n{state}",
+            "critical" if e.shed else "warning",
+        )
+
+    def normal(cond):
+        name = names.get(cond["key"])
+        if name is None:
+            return "نود غیرفعال یا حذف شد؛ هشدار بسته شد."
+        return f"بار نود {name} به حالت عادی برگشت."
+
+    sync("edge_saturated:", active, normal)
 
 
 def check_certs(db) -> None:

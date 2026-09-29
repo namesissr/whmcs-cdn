@@ -133,6 +133,16 @@ class Edge(Base):
     applied_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # tunnel mode (SPEC §7.4): DNS answers a site with the edges of its plan's edge_group
+    group: Mapped[str] = mapped_column(String(16), default="general")  # "general" | "tunnel"
+    capacity_mbps: Mapped[int] = mapped_column(Integer, default=0)  # 0 = unknown, never shed
+    # latest heartbeat metrics (JSON: rx_mbps, tx_mbps, connections, load1, cpus)
+    metrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metrics_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # load shedding: left out of DNS while saturated (hysteresis, see services.update_shed)
+    shed: Mapped[bool] = mapped_column(Boolean, default=False)
+    # consecutive metric reports above services.LOAD_ALERT_PERCENT (edge_saturated alert)
+    load_high: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Purge(Base):
@@ -155,7 +165,8 @@ class UsageHourly(Base):
     bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     requests: Mapped[int] = mapped_column(BigInteger, default=0)
     cache_hits: Mapped[int] = mapped_column(BigInteger, default=0)
-    # {"status": {...}, "codes": {...}, "countries": {...}, "paths": {...}, "security": {...}}
+    # {"status": {...}, "codes": {...}, "countries": {...}, "paths": {...}, "security": {...},
+    #  "tunnel": {"sessions", "seconds", "bytes_up", "bytes_down", "by_protocol": {...}}}
     details: Mapped[str] = mapped_column(Text, default="{}")
 
 

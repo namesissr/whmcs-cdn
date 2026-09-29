@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .auth import require_edge
 from .db import get_db
 from .models import Edge, Purge, SecurityEvent, Site, UsageHourly, utcnow
-from .services import build_edge_config
+from .services import build_edge_config, record_metrics
 
 router = APIRouter(prefix="/edge/v1")
 
@@ -33,9 +33,19 @@ def config(
     return cfg
 
 
+class Metrics(BaseModel):
+    """Edge load (SPEC §7.4); unknown keys are ignored."""
+    rx_mbps: float = Field(0, ge=0, le=10_000_000)
+    tx_mbps: float = Field(0, ge=0, le=10_000_000)
+    connections: int = Field(0, ge=0, le=1_000_000_000)
+    load1: float = Field(0, ge=0, le=1_000_000)
+    cpus: int = Field(0, ge=0, le=100_000)
+
+
 class Heartbeat(BaseModel):
     applied_version: str | None = None
     error: str | None = Field(default=None, max_length=4000)
+    metrics: Metrics | None = None
 
 
 @router.post("/heartbeat")
@@ -43,6 +53,9 @@ def heartbeat(body: Heartbeat, edge: Edge = Depends(require_edge), db: Session =
     edge.last_seen_at = utcnow()
     edge.applied_version = body.applied_version
     edge.last_error = body.error
+    if body.metrics is not None:
+        # the shed flag changes here; scheduler.job_edges rewrites DNS on its next tick
+        record_metrics(edge, body.metrics.model_dump(), edge.last_seen_at)
     db.commit()
     return {"ok": True}
 
@@ -59,6 +72,19 @@ def purges(after: int = 0, edge: Edge = Depends(require_edge), db: Session = Dep
 Counts = dict[str, int]
 
 
+TUNNEL_PROTOCOLS = ("ws", "httpupgrade", "grpc", "xhttp", "h2")
+TUNNEL_COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down")
+BIG = 10**18
+
+
+class TunnelUsage(BaseModel):
+    sessions: int = Field(0, ge=0, le=BIG)
+    seconds: float = Field(0, ge=0, le=BIG)
+    bytes_up: int = Field(0, ge=0, le=BIG)    # received from the client (billed too, SPEC §7.3)
+    bytes_down: int = Field(0, ge=0, le=BIG)  # sent to the client (already part of `bytes`)
+    by_protocol: Counts = {}                  # protocol -> bytes (up + down)
+
+
 class UsageItem(BaseModel):
     host: str
     hour: datetime
@@ -70,6 +96,7 @@ class UsageItem(BaseModel):
     countries: Counts = {}
     paths: Counts = {}
     security: Counts = {}
+    tunnel: TunnelUsage | None = None
 
 
 class EventIn(BaseModel):
@@ -104,6 +131,15 @@ def _merge_details(current: dict, add: dict) -> dict:
             k = str(k)[:512]
             if k in dst or len(dst) < MAX_KEYS.get(key, 50):
                 dst[k] = dst.get(k, 0) + max(int(v), 0)
+    tn = add.get("tunnel")
+    if tn:
+        dst = current.setdefault("tunnel", {})
+        for k in TUNNEL_COUNTERS:
+            dst[k] = int(dst.get(k, 0)) + max(int(round(tn.get(k) or 0)), 0)
+        protos = dst.setdefault("by_protocol", {})
+        for k, v in (tn.get("by_protocol") or {}).items():
+            if k in TUNNEL_PROTOCOLS:
+                protos[k] = protos.get(k, 0) + max(int(v), 0)
     return current
 
 
@@ -127,7 +163,8 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
             continue
         hour = _naive(it.hour).replace(minute=0, second=0, microsecond=0)
         a = agg.setdefault((sid, hour), {"b": 0, "r": 0, "h": 0, "d": {}})
-        a["b"] += it.bytes
+        # tunnels are charged in both directions: `bytes` is what the edge sent to the client
+        a["b"] += it.bytes + (it.tunnel.bytes_up if it.tunnel else 0)
         a["r"] += it.requests
         a["h"] += it.cache_hits
         _merge_details(a["d"], it.model_dump())

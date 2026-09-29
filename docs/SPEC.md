@@ -345,3 +345,104 @@ Max 20 000 items and 2 000 events per request.
   Edge object: `{id, name, ipv4, ipv6, region ("home"|"global"), enabled, last_seen_at, applied_version, last_error}`;
   create/rotate responses include `"token"` exactly once. An edge is "online" when last_seen_at is
   within EDGE_OFFLINE_SECONDS (default 180 s).
+
+---------------------------------------------------------------------------
+## 7. Tunnel mode (VPN-over-CDN: WebSocket, HTTPUpgrade, gRPC, XHTTP, raw HTTP/2)
+
+Goal: customers run Xray/V2Ray/sing-box behind the CDN. Visitors (mostly in Iran)
+reach a domestic edge; the edge relays long-lived streams to the customer's origin
+with no buffering, no caching and no security filters in the way.
+
+### 7.1 Plan features (additions to §1 `features`)
+```json
+{
+  "tunnel": false,                 // section `tunnel` may be enabled
+  "max_tunnel_paths": 10,          // 0..50
+  "max_tunnel_connections": 0,     // per site per edge (concurrent), 0 = unlimited
+  "tunnel_max_mbps": 0,            // cap for tunnel.per_connection_mbps, 0 = no cap
+  "edge_group": "general"          // "general" | "tunnel": which edges DNS answers with (§7.4)
+}
+```
+Defaults above apply to existing sites (tunnel off, group general).
+
+### 7.2 Section `tunnel` (requires `features.tunnel`, else PUT → 403 and edge gets `enabled:false`)
+```json
+{
+  "enabled": false,
+  "paths": [
+    {
+      "id": "grpc1",                    // [a-z0-9_-]{1,32}, unique
+      "path": "/my-secret-service",     // prefix match, "/" + [A-Za-z0-9._~/-]{1,200}, unique, not "/" alone,
+                                        // must not start with "/__pcdn"
+      "protocol": "grpc",               // "ws" | "httpupgrade" | "grpc" | "xhttp" | "h2"
+      "origin": null,                   // null = the host's own origin (record content / pool)
+                                        // or {"address": "1.2.3.4"|"host.name"|"[v6]", "port": 1..65535,
+                                        //     "tls": false, "sni": null, "verify": false}
+                                        // (port omitted → 443 when tls else 80; stored normalised)
+      "pool": null                      // or a pool name from section `pools` (mutually exclusive with origin)
+    }
+  ],
+  "idle_timeout": 3600,                 // seconds 60..86400: read/send timeout of tunnel streams
+  "per_connection_mbps": 0,             // 0 = unlimited; <= features.tunnel_max_mbps when that is > 0
+  "max_connections_per_ip": 0,          // 0 = unlimited, 0..10000 (per edge)
+  "allowed_countries": [],              // ISO codes; [] = everyone. Others get 403 on tunnel paths
+  "fallback": "origin"                  // other paths: "origin" (normal site) | "decoy" (built-in neutral
+                                        // page, 200) | "404"
+}
+```
+Max `features.max_tunnel_paths` paths. Controller validates everything above (Persian `detail` on
+error; like the other sections: 422 for invalid values, 403 for plan limits — too many paths,
+`per_connection_mbps` above `tunnel_max_mbps`, or enabling without `features.tunnel`).
+`per_connection_mbps: 0` is accepted; when the plan has a cap the edge config carries the cap instead.
+A pool referenced by a tunnel path cannot be removed from section `pools` (422). Protocol semantics on the edge:
+- `ws` / `httpupgrade`: HTTP/1.1 `proxy_pass` with `Upgrade`/`Connection` forwarded.
+- `grpc`: `grpc_pass grpc://` (or `grpcs://` when origin.tls) — client side needs HTTP/2 (TLS).
+- `xhttp`: HTTP/1.1 `proxy_pass`, `proxy_buffering off`, `proxy_request_buffering off`,
+  `proxy_http_version 1.1`, chunked both ways (XHTTP packet-up / stream-up over HTTP/1.1).
+- `h2`: raw HTTP/2 streams to an h2c/h2 origin through `grpc_pass` (XHTTP stream-one/stream-up
+  with an h2c inbound).
+All tunnel locations: no cache, no WAF/DDoS challenge/firewall-challenge/ratelimit/hotlink/image/
+headers-response rewriting/gzip/brotli; firewall *block* rules and `blocked_ips` still apply;
+`client_max_body_size 0`; timeouts = idle_timeout; `limit_rate` = per_connection_mbps;
+`limit_conn` per site (`features.max_tunnel_connections`) and per IP (`max_connections_per_ip`);
+TCP_NODELAY; upstream keepalive where the protocol allows.
+
+### 7.3 Edge config (§5) additions
+Per site: `"tunnel": {...section..., "max_connections": <features.max_tunnel_connections>}`
+(`enabled:false` when the feature is off or the site is not active; `per_connection_mbps` already
+capped by `features.tunnel_max_mbps`; paths beyond `max_tunnel_paths` or whose pool is not in the
+site's `pools` are left out). Tunnel requests are logged with
+two extra access-log fields: `"tn"` protocol, `"rt"` request_time seconds, and `"bu"` bytes received
+from the client (`$request_length` + upstream-bound bytes where nginx reports them); `"b"` stays bytes
+sent to the client. Usage item optional field:
+`"tunnel": {"sessions": 3, "seconds": 5400, "bytes_up": 123, "bytes_down": 456, "by_protocol": {"grpc": 579}}`.
+For billing, the controller adds `bytes_up` of tunnel traffic to `bytes` (both directions are charged).
+`by_protocol` values are bytes (up + down); keys other than the five protocols are ignored.
+
+### 7.4 Edge groups and load-aware DNS
+- Edge object gains `"group": "general" | "tunnel"` (default general) and `"capacity_mbps"` (int, 0 = unknown).
+  `POST /api/v1/edges` accepts both; `PATCH /api/v1/edges/{id}` accepts JSON body
+  `{"enabled"?, "group"?, "capacity_mbps"?, "region"?}` (query `?enabled=` keeps working).
+- Every edge still receives every site's config. DNS answers for a site use only online edges of the
+  site's `features.edge_group`; if that group has no online edge, all online edges are used (fail open).
+- Heartbeat (`POST /edge/v1/heartbeat`) optional metrics:
+  `{"metrics": {"rx_mbps": 12.5, "tx_mbps": 80.1, "connections": 1532, "load1": 0.8, "cpus": 4}}`.
+  Controller keeps the latest per edge (edge object: `"metrics": {..., "at": "…Z"}` or null, plus
+  `"shed": bool`). PATCH responses are `{"ok": true, "dns_failed": n, "edge": {...edge object...}}`.
+- Load shedding: an edge whose `max(rx,tx)_mbps >= EDGE_SHED_PERCENT (default 90) % of capacity_mbps`
+  (capacity > 0) is left out of DNS answers while at least one other edge of the same group+region pool
+  stays in; it returns below `EDGE_SHED_PERCENT - 15`%. Alert `edge_saturated:{id}` when shed or > 80 % for
+  3 consecutive heartbeat metric reports. Metrics older than EDGE_OFFLINE_SECONDS never shed an edge.
+
+### 7.5 Customer API (through the WHMCS proxy, same as other sections)
+`GET/PUT /api/v1/sites/{domain}/config/tunnel`.
+`GET /api/v1/sites/{domain}/tunnel/stats?hours=24` →
+`{"hours": [{"hour": "…Z", "sessions": 3, "seconds": 5400, "bytes_up": 1, "bytes_down": 2}],
+  "by_protocol": {"grpc": 579}, "totals": {"sessions": 3, "bytes_up": 1, "bytes_down": 2}}`.
+`POST /api/v1/sites/{domain}/tunnel/check` → `{"results": [{"id": "grpc1", "ok": true, "ms": 42,
+ "error": null}]}`: the controller opens a TCP (and TLS when origin.tls) connection to each path's
+effective origin (timeout 5 s) so customers can see whether their VPN server is reachable.
+Effective origin: `origin`; else every origin of `pool` (ok when any answers; TLS when the pool's
+protocol is https); else the apex's proxied record (or the first proxied host). SNI = `origin.sni` or
+the site domain. Addresses that are not public (after DNS resolution) are never contacted.
+`hours` is clamped to 1..744; `hours` has one zero-filled entry per hour, oldest first.

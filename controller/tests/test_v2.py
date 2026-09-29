@@ -23,7 +23,7 @@ def test_sections_defaults_and_roundtrip(client):
     s = site(client)
     assert s["plan"]["features"]["max_page_rules"] == 10
     assert set(s["config"]) == {"cache", "ssl", "waf", "ddos", "firewall", "ratelimit", "pagerules", "pools",
-                                "headers", "hotlink", "image", "errorpages"}
+                                "headers", "hotlink", "image", "errorpages", "tunnel"}
     assert s["config"]["cache"]["level"] == "standard"
 
     fw = {"default_action": "allow", "rules": [

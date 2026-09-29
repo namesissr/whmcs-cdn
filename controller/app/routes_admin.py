@@ -3,8 +3,9 @@
 import ipaddress
 import json
 from datetime import datetime, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -19,9 +20,11 @@ from .services import (
     month_start,
     queue_purge,
     record_to_dict,
+    edge_metrics,
     site_to_dict,
     sync_all_dns,
     sync_site_dns,
+    update_shed,
     usage_totals,
 )
 from .validation import (
@@ -62,6 +65,11 @@ class FeaturesIn(BaseModel):
     max_firewall_rules: int | None = Field(default=None, ge=0, le=1000)
     max_ratelimit_rules: int | None = Field(default=None, ge=0, le=1000)
     max_pools: int | None = Field(default=None, ge=0, le=100)
+    tunnel: bool | None = None
+    max_tunnel_paths: int | None = Field(default=None, ge=0, le=50)
+    max_tunnel_connections: int | None = Field(default=None, ge=0, le=1000000)
+    tunnel_max_mbps: int | None = Field(default=None, ge=0, le=100000)
+    edge_group: Literal["general", "tunnel"] | None = None
 
 
 class Plan(BaseModel):
@@ -111,6 +119,16 @@ class EdgeIn(BaseModel):
     ipv4: str
     ipv6: str | None = None
     region: str = Field(default="global", pattern="^(home|global)$")
+    group: Literal["general", "tunnel"] = "general"
+    capacity_mbps: int = Field(default=0, ge=0, le=10_000_000)  # 0 = unknown (never shed)
+
+
+class EdgePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None = None
+    group: Literal["general", "tunnel"] | None = None
+    capacity_mbps: int | None = Field(default=None, ge=0, le=10_000_000)
+    region: str | None = Field(default=None, pattern="^(home|global)$")
 
 
 def apply_plan(site: Site, plan: Plan):
@@ -181,10 +199,13 @@ def read_site(domain: str, db: Session = Depends(get_db)):
 @router.patch("/sites/{domain}/plan")
 def update_plan(domain: str, plan: Plan, db: Session = Depends(get_db)):
     site = get_site(db, domain)
+    group = sections.features_of(site)["edge_group"]
     apply_plan(site, plan)
     # a raised/lowered bandwidth limit takes effect now, not on the next scheduler tick
     refresh_quota(db, site)
     db.commit()
+    if sections.features_of(site)["edge_group"] != group:
+        sync_site_dns(db, site)  # the site is now answered by the other group of edges
     return site_to_dict(db, site)
 
 
@@ -423,6 +444,7 @@ def edge_to_dict(e: Edge) -> dict:
         "id": e.id, "name": e.name, "ipv4": e.ipv4, "ipv6": e.ipv6, "region": e.region,
         "enabled": e.enabled, "last_seen_at": e.last_seen_at.isoformat() + "Z" if e.last_seen_at else None,
         "applied_version": e.applied_version, "last_error": e.last_error,
+        "group": e.group, "capacity_mbps": e.capacity_mbps, "metrics": edge_metrics(e), "shed": e.shed,
     }
 
 
@@ -441,7 +463,8 @@ def create_edge(body: EdgeIn, db: Session = Depends(get_db)):
     if db.scalar(select(Edge).where(Edge.name == body.name)):
         raise HTTPException(409, "edge name exists")
     token = new_token()
-    edge = Edge(name=body.name, ipv4=ipv4, ipv6=ipv6, region=body.region, token_hash=hash_token(token))
+    edge = Edge(name=body.name, ipv4=ipv4, ipv6=ipv6, region=body.region, token_hash=hash_token(token),
+                group=body.group, capacity_mbps=body.capacity_mbps)
     db.add(edge)
     db.commit()
     # DNS changes once the edge sends its first heartbeat
@@ -460,13 +483,22 @@ def rotate_edge_token(edge_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/edges/{edge_id}")
-def toggle_edge(edge_id: int, enabled: bool, db: Session = Depends(get_db)):
+def update_edge(edge_id: int, enabled: bool | None = None, body: EdgePatch | None = Body(default=None),
+                db: Session = Depends(get_db)):
+    """JSON body {enabled?, group?, capacity_mbps?, region?}; v1 clients send ?enabled=true|false."""
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")
-    edge.enabled = enabled
+    changes = body.model_dump(exclude_none=True) if body else {}
+    if enabled is not None:
+        changes.setdefault("enabled", enabled)
+    if not changes:
+        bad(ValidationError("هیچ تغییری ارسال نشده است"))
+    for k, v in changes.items():
+        setattr(edge, k, v)
+    update_shed(edge)
     db.commit()
-    return {"ok": True, "dns_failed": sync_all_dns(db)}
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": edge_to_dict(edge)}
 
 
 @router.delete("/edges/{edge_id}")

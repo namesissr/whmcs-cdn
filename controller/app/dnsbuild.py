@@ -1,10 +1,12 @@
 """Turns a site's records + the live edge list into PowerDNS rrsets."""
 
 import ipaddress
+import json
 from collections import defaultdict
+from datetime import timedelta
 
 from .config import settings
-from .models import Edge, Site
+from .models import Edge, Site, utcnow
 from .validation import fqdn
 
 
@@ -139,9 +141,47 @@ def edge_pools(edges: list[Edge], family: int) -> tuple[list[str], list[str]]:
     return sorted(home), sorted(global_)
 
 
+def site_edge_group(site) -> str:
+    """The plan's edge_group (SPEC §7.4); "general" for sites without the feature."""
+    try:
+        group = json.loads(getattr(site, "features", None) or "{}").get("edge_group")
+    except (ValueError, AttributeError):
+        group = None
+    return group if group in ("general", "tunnel") else "general"
+
+
+def edge_group(e) -> str:
+    return getattr(e, "group", None) or "general"
+
+
+def is_shed(e, now=None) -> bool:
+    """Shed by load (services.update_shed) and the metrics behind that are still fresh."""
+    at = getattr(e, "metrics_at", None)
+    return bool(getattr(e, "shed", False)) and at is not None and (
+        (now or utcnow()) - at <= timedelta(seconds=settings.edge_offline_seconds))
+
+
+def dns_edges(site, edges: list) -> list:
+    """The online edges that answer for this site.
+
+    Only the site's edge group; every online edge when that group has none (fail open).
+    A saturated (shed) edge is left out while another edge of the same region (pool)
+    stays in, so a pool never goes empty because of load.
+    """
+    group = site_edge_group(site)
+    chosen = [e for e in edges if edge_group(e) == group] or list(edges)
+    now = utcnow()
+    keep_region = {e.region for e in chosen if not is_shed(e, now)}
+    return [e for e in chosen if not is_shed(e, now) or e.region not in keep_region]
+
+
 def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
-    """Return the full desired set of rrsets for the zone (SOA excluded)."""
+    """Return the full desired set of rrsets for the zone (SOA excluded).
+
+    edges: every online edge; the site's group and load shedding are applied here.
+    """
     domain = site.domain
+    edges = dns_edges(site, edges)
     grouped: dict[tuple[str, str], dict] = {}
 
     def add(name: str, rtype: str, ttl: int, content: str):

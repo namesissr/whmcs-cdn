@@ -74,7 +74,9 @@ def job_edges(db):
         return
     # the DNS settings and the record format are part of the state: changing GEOIP_ENABLED,
     # GEO_* or upgrading the controller rewrites every zone on the next tick
-    current = ",".join(f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}" for e in online_edges(db)) + "|" + dns_signature()
+    # group and load shedding decide which edges answer (dnsbuild.dns_edges): part of the state too
+    current = ",".join(f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}:{e.group}:{int(dnsbuild.is_shed(e))}"
+                       for e in online_edges(db)) + "|" + dns_signature()
     dirty = db.get(State, DNS_DIRTY_KEY) is not None
     if current == _state(db, "online_edges") and not dirty:
         return

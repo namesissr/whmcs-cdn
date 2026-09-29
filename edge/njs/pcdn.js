@@ -7,6 +7,7 @@
 // Exports:
 //   verdict  js_set $pcdn_verdict  — "ok" | "<action>:<source>:<rule>"
 //   upstream js_set $pcdn_upstream — "host:port" chosen from a load-balancer pool
+//   tunnelUpstream js_set $pcdn_tn_upstream — same for the pool of a tunnel path ($pcdn_tn_pool)
 //   imgW/imgH/imgQ js_set          — image resize parameters ("" = no resize)
 //   deny / verify / captcha        — js_content handlers for /__pcdn/*
 //   health                         — js_periodic origin health checker
@@ -258,6 +259,8 @@ function fieldValue(ctx, field, name) {
 function prepSite(id, s) {
     const P = { id: id, domain: s.domain, secret: String(s.secret || ''), hosts: (s.hosts || []).map(wildHost) };
     P.blocked = (s.blocked_ips || []).map(cidr).filter(Boolean);
+    // tunnel path prefixes (nginx "location ^~" on the same normalised $uri)
+    P.tunnel = (s.tunnel_paths || []).map(String).filter(function (p) { return p.charAt(0) === '/' && p.length > 1; });
     P.minTls13 = s.min_tls === '1.3';
 
     const fw = s.firewall || {};
@@ -317,6 +320,11 @@ Object.keys(SITES).forEach(function (id) {
 });
 
 function siteOf(r) { const id = r.variables.pcdn_site; return id ? S[id] || null : null; }
+
+function inTunnel(site, uri) {
+    for (let i = 0; i < site.tunnel.length; i++) if (String(uri).indexOf(site.tunnel[i]) === 0) return true;
+    return false;
+}
 
 // ------------------------------------------------------------------ request context
 
@@ -382,6 +390,7 @@ function evaluate(r) {
 
     if (site.minTls13 && r.variables.ssl_protocol && r.variables.ssl_protocol !== 'TLSv1.3') return 'block:firewall:min_tls';
     for (let i = 0; i < site.blocked.length; i++) if (inCidr(ctx.ip, site.blocked[i])) return 'block:firewall:blocked_ips';
+    if (site.tunnel.length && inTunnel(site, ctx.path)) return tunnelVerdict(ctx, site);
 
     // firewall: first matching rule wins; allow short-circuits everything; log continues
     let matched = false;
@@ -410,6 +419,23 @@ function evaluate(r) {
         if (v.indexOf('log:') !== 0) return v;
         if (!logged) logged = v;
     }
+    return logged || 'ok';
+}
+
+// Tunnel paths (VPN streams): firewall allow/block/log rules and the default action only.
+// Challenge / captcha rules, hotlink, rate limits, DDoS and WAF are skipped: a VPN client
+// cannot solve a challenge and binary stream payloads only produce WAF false positives.
+function tunnelVerdict(ctx, site) {
+    let logged = null;
+    for (let i = 0; i < site.fwRules.length; i++) {
+        const rule = site.fwRules[i];
+        if (rule.action === 'challenge' || rule.action === 'captcha') continue;
+        if (!rule.conds.every(function (c) { return c(ctx); })) continue;
+        if (rule.action === 'log') { if (!logged) logged = 'log:firewall:' + rule.id; continue; }
+        if (rule.action === 'allow') return logged || 'ok';
+        return 'block:firewall:' + rule.id;
+    }
+    if (site.fwDefault === 'block') return 'block:firewall:default';
     return logged || 'ok';
 }
 
@@ -528,8 +554,11 @@ function isUp(site, pool, o) {
     return (ngx.shared.pcdn_hc.get(hcKey(site, pool, o)) || 0) < HC_FALL;
 }
 
-function upstream(r) {
-    const site = siteOf(r), pool = site ? site.pools[r.variables.pcdn_pool] : null;
+function upstream(r) { return pick(r, r.variables.pcdn_pool); }
+function tunnelUpstream(r) { return pick(r, r.variables.pcdn_tn_pool); }
+
+function pick(r, poolName) {
+    const site = siteOf(r), pool = site ? site.pools[poolName] : null;
     if (!pool || !pool.origins.length) return '127.0.0.1:9';   // discard port -> 502, never an open proxy
     let cand = pool.origins.filter(function (o) { return !o.backup && isUp(site, pool, o); });
     if (!cand.length) cand = pool.origins.filter(function (o) { return o.backup && isUp(site, pool, o); });
@@ -598,7 +627,7 @@ async function health() {
 
 function imgParams(r) {
     const site = siteOf(r);
-    if (!site || !site.image || !/\.(?:jpe?g|png|gif|webp)$/i.test(r.uri)) return null;
+    if (!site || !site.image || !/\.(?:jpe?g|png|gif|webp)$/i.test(r.uri) || inTunnel(site, r.uri)) return null;
     const dim = function (v) {
         if (!/^\d{1,5}$/.test(String(v || ''))) return '-';
         return String(Math.min(site.image.max, Math.max(1, +v)));
@@ -808,4 +837,4 @@ function captcha(r) {
     grant(r, site, 'cap', back);
 }
 
-export default { verdict, upstream, imgW, imgH, imgQ, deny, verify, captcha, health };
+export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health };

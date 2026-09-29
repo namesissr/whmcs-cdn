@@ -156,3 +156,31 @@ def test_pool_selection(tmp_path):
                                 {"kind": "upstream", "site": "1", "pool": "main", "n": 400}])[-1]
     assert set(res) == {"10.0.0.1:80", "10.0.0.2:80"}  # everything down: fail open to the primaries
     assert run(tmp_path, [{"kind": "upstream", "site": "1", "pool": "nope", "n": 1}])[0] == {"127.0.0.1:9": 1}
+
+
+def test_tunnel_paths_only_see_firewall_block_allow_log(tmp_path):
+    waf = {"mode": "block", "paranoia": 1, "groups": ALL_GROUPS, "exclusions": [], "off_paths": []}
+    rules = [{"id": "chal", "action": "challenge", "conditions": [{"field": "path", "op": "starts_with", "value": "/"}]},
+             {"id": "watch", "action": "log", "conditions": [{"field": "header", "name": "X-W", "op": "eq", "value": "1"}]},
+             {"id": "bad", "action": "block", "conditions": [{"field": "country", "op": "in", "value": ["RU"]}]}]
+    rl = [{"id": "all", "path_re": "^/.*$", "methods": [], "requests": 1, "period": 60, "action": "block", "block_seconds": 60}]
+    common = dict(waf=waf, ratelimit=rl, ddos={"mode": "js"}, firewall={"default_action": "allow", "rules": rules},
+                  hotlink={"enabled": True, "extensions": ["png"], "allowed_referers": [], "allow_empty": False},
+                  tunnel_paths=["/vpn", "/grpc.Svc"])
+    build(tmp_path, {"1": site(**common),
+                     "2": site(**dict(common, firewall={"default_action": "block", "rules": rules}),
+                               blocked_ips=["10.0.0.0/8"])})
+    sqli = "id=1%27+or+%271%27%3D%271"
+    res = run(tmp_path, [
+        {"kind": "verdict", "site": "1", "uri": "/vpn/x.png", "args": sqli, "extra": {"headers": {"User-Agent": "sqlmap"}}},
+        {"kind": "verdict", "site": "1", "uri": "/vpn", "args": sqli},
+        {"kind": "verdict", "site": "1", "uri": "/grpc.Svc/Tun"},
+        {"kind": "verdict", "site": "1", "uri": "/vpn", "extra": {"headers": {"X-W": "1"}}},
+        {"kind": "verdict", "site": "1", "uri": "/vpn", "extra": {"vars": {"pcdn_country": "RU"}}},
+        {"kind": "verdict", "site": "1", "uri": "/other"},              # normal path: challenged
+        {"kind": "verdict", "site": "1", "uri": "/vp"},                 # not a prefix match
+        {"kind": "verdict", "site": "2", "uri": "/vpn"},                # default_action block still applies
+        {"kind": "verdict", "site": "2", "uri": "/vpn", "extra": {"vars": {"remote_addr": "10.1.2.3"}}},
+    ])
+    assert res == ["ok", "ok", "ok", "log:firewall:watch", "block:firewall:bad", "challenge:firewall:chal",
+                   "challenge:firewall:chal", "block:firewall:default", "block:firewall:blocked_ips"]

@@ -34,11 +34,16 @@ def test_upgrade_empty_database_matches_models(any_engine):
 
 
 def test_baseline_is_the_pre_migration_schema(any_engine):
-    """Revision 0001 == what create_all produced before migrations; only 0002's change differs."""
+    """Revision 0001 == what create_all produced before migrations; only later revisions differ."""
     migrate.upgrade(any_engine, "0001")
     diff = _diff(any_engine)
-    assert len(diff) == 1, diff
-    (op,) = diff[0]
+    # 0003: edge group / capacity / metrics columns
+    added = sorted(d[3].name for d in diff if isinstance(d, tuple) and d[0] == "add_column" and d[2] == "edges")
+    assert added == ["capacity_mbps", "group", "load_high", "metrics", "metrics_at", "shed"], diff
+    rest = [d for d in diff if not (isinstance(d, tuple) and d[0] == "add_column")]
+    assert len(rest) == 1, diff
+    (op,) = rest[0]
+    # 0002: sites.secret String(64) -> Text
     assert op[0] == "modify_type" and op[2:4] == ("sites", "secret")
 
 
@@ -52,6 +57,8 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
             " ssl_allowed, rate_limit_rps, features, config, blocked_ips, secret, dnssec_enabled, ssl_status,"
             " created_at, updated_at) VALUES ('legacy.com', 'active', false, false, '[]', 0, 100, true, 0, '{}',"
             " '{}', '[]', :s, false, 'none', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"), {"s": "ab" * 32})
+        c.execute(text("INSERT INTO edges (name, ipv4, region, token_hash, enabled, created_at)"
+                       " VALUES ('ir-1', '5.160.1.10', 'home', 'h', true, CURRENT_TIMESTAMP)"))
     with any_engine.connect() as c:
         assert migrate.is_legacy(c)
 
@@ -59,6 +66,9 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
     assert _diff(any_engine) == []
     with any_engine.connect() as c:
         assert c.execute(text("SELECT domain, secret FROM sites")).one() == ("legacy.com", "ab" * 32)
+        # 0003 fills in the new edge columns of existing edges
+        assert tuple(c.execute(text('SELECT "group", capacity_mbps, shed, load_high, metrics FROM edges')).one()) \
+            == ("general", 0, False, 0, None)
         assert not migrate.is_legacy(c)
 
 
