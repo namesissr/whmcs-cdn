@@ -108,13 +108,25 @@ def _public(ip: str) -> bool:
         return False
 
 
-def _resolve(host: str, port: int) -> str:
+def _resolve(host: str, port: int) -> list[str]:
+    """Public addresses of host, IPv4 first (the controller's network often has no IPv6)."""
     infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    ips = [info[4][0] for info in infos]
+    ips = list(dict.fromkeys(info[4][0] for info in infos))
+    public = sorted((ip for ip in ips if _public(ip)), key=lambda ip: ":" in ip)
+    if not public:
+        raise ValueError("آدرس سرور اصلی عمومی نیست" if ips else "نام میزبان پیدا نشد")
+    return public[:3]
+
+
+def _connect(ips: list[str], port: int) -> socket.socket:
+    """First address that accepts the connection; the last error when none does."""
+    last: Exception | None = None
     for ip in ips:
-        if _public(ip):
-            return ip
-    raise ValueError("آدرس سرور اصلی عمومی نیست" if ips else "نام میزبان پیدا نشد")
+        try:
+            return socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
+        except OSError as e:
+            last = e
+    raise last  # type: ignore[misc]
 
 
 def probe(target: dict) -> dict:
@@ -122,9 +134,9 @@ def probe(target: dict) -> dict:
     host = target["address"].strip("[]")
     start = time.monotonic()
     try:
-        ip = _resolve(host, target["port"])
+        ips = _resolve(host, target["port"])
         start = time.monotonic()
-        with socket.create_connection((ip, target["port"]), timeout=CONNECT_TIMEOUT) as sock:
+        with _connect(ips, target["port"]) as sock:
             if target.get("tls"):
                 ctx = ssl_lib.create_default_context()
                 if not target.get("verify"):

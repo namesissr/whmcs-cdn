@@ -483,3 +483,31 @@ def test_tunnel_check_refuses_private_addresses(client, monkeypatch):
     client.delete(f"{S}/records/{client.get(f'{S}/records').json()[0]['id']}")
     (res,) = client.post(f"{S}/tunnel/check").json()["results"]
     assert res["ok"] is False and "پروکسی" in res["error"]
+
+
+def test_probe_tries_every_address(monkeypatch):
+    """A dual-stack origin whose first address is unreachable (e.g. localhost -> ::1 first) is still reachable."""
+    monkeypatch.setattr(tunnel, "_public", lambda ip: True)
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def fake(host, p, *a, **k):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", p, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.2", p)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p))]
+    monkeypatch.setattr(tunnel.socket, "getaddrinfo", fake)
+    try:
+        # IPv4 first; a refused address (nothing listens on 127.0.0.2) falls through to the next one
+        assert tunnel._resolve("dual.example", port) == ["127.0.0.2", "127.0.0.1", "::1"]
+        with tunnel._connect(["127.0.0.2", "127.0.0.1"], port) as s:
+            assert s.getpeername()[0] == "127.0.0.1"
+        assert tunnel.probe({"address": "dual.example", "port": port})["ok"]
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        closed_port = closed.getsockname()[1]
+        closed.close()
+        assert "رد شد" in tunnel.probe({"address": "dual.example", "port": closed_port})["error"]
+    finally:
+        srv.close()
