@@ -62,7 +62,8 @@ def note_resume(db, now: datetime | None = None):
 
 def dns_signature() -> str:
     return ";".join([dnsbuild.BUILD_VERSION, str(settings.geoip_enabled), ",".join(settings.geo_home_countries),
-                     settings.geo_no_ecs_pool, ",".join(settings.geo_no_ecs_resolvers), settings.geo_unknown_pool,
+                     settings.geo_no_ecs_pool, ",".join(settings.geo_no_ecs_resolvers),
+                     ",".join(settings.geo_no_ecs_countries), settings.geo_unknown_pool,
                      settings.lua_selector, str(settings.edge_probe), settings.health_url,
                      str(settings.geo_log)])
 

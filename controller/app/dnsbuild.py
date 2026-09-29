@@ -62,7 +62,9 @@ def home_test() -> str:
     resolvers = _cidrs(settings.geo_no_ecs_resolvers)
     if settings.geo_no_ecs_pool in ("home", "global") and resolvers:
         val = "true" if settings.geo_no_ecs_pool == "home" else "false"
-        lua += f" if ecswho==nil and netmask({_lua_list(resolvers)}) then home={val} end"
+        only = [c.lower() for c in settings.geo_no_ecs_countries if len(c) == 2 and c.isalpha()]
+        where = (" and (" + " or ".join(f"c=='{c}'" for c in only) + ")") if only else ""
+        lua += f" if ecswho==nil{where} and netmask({_lua_list(resolvers)}) then home={val} end"
     return lua
 
 

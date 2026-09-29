@@ -43,6 +43,13 @@ def test_lua_geo_policies(monkeypatch):
     assert "pickrandom({'8.8.4.4'})" in dnsbuild.lua_expression(["5.5.5.5"], ["8.8.4.4"])
 
 
+def test_lua_no_ecs_countries(monkeypatch):
+    monkeypatch.setattr(settings, "geoip_enabled", True)
+    monkeypatch.setattr(settings, "geo_no_ecs_countries", ["DE", "bg", "x1"])
+    expr = dnsbuild.lua_expression(["5.5.5.5"], ["8.8.4.4"])
+    assert "if ecswho==nil and (c=='de' or c=='bg') and netmask({'173.245.48.0/20'" in expr and "x1" not in expr
+
+
 def test_lua_ipv6_follows_the_ipv4_pool(monkeypatch):
     """An IPv4-only home pool must not hand Iranian visitors the foreign IPv6 edges."""
     monkeypatch.setattr(settings, "geoip_enabled", True)

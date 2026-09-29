@@ -54,6 +54,10 @@ class Settings:
         "74.63.16.0/20", "74.80.64.0/18", "9.9.9.0/24", "149.112.112.0/24", "149.112.149.0/24",
         "2620:fe::/48", "2620:171::/32",
     ])
+    # optional: apply GEO_NO_ECS_POOL only when such a resolver answers from one of these countries
+    # (where Iranian traffic lands, e.g. DE,BG,TR); its users in other countries follow their location
+    geo_no_ecs_countries: list[str] = field(
+        default_factory=lambda: [c.upper() for c in _raw_list("GEO_NO_ECS_COUNTRIES")])
     # visitors whose country is unknown to the database: home | global
     geo_unknown_pool: str = field(default_factory=lambda: (os.getenv("GEO_UNKNOWN_POOL") or "home").strip().lower())
     # log every GeoDNS decision in the PowerDNS log ("pcdn-geo ..."): for diagnosing a location
