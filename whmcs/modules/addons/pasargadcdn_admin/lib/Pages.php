@@ -282,13 +282,14 @@ final class Pages
     public static function dashboard(): string
     {
         $ping = self::ping();
-        $ov = $edges = $events = $sites = null;
+        $ov = $edges = $events = $sites = $alerts = null;
         if ($ping['ok']) {
-            $r = self::fetch(['/api/v1/overview', '/api/v1/edges', '/api/v1/events?limit=8', '/api/v1/sites']);
+            $r = self::fetch(['/api/v1/overview', '/api/v1/edges', '/api/v1/events?limit=8', '/api/v1/sites', '/api/v1/alerts/status']);
             $ov = self::ok($r['/api/v1/overview']) ? $r['/api/v1/overview']['data'] : null;
             $edges = self::ok($r['/api/v1/edges']) ? $r['/api/v1/edges']['data'] : null;
             $events = self::ok($r['/api/v1/events?limit=8']) ? $r['/api/v1/events?limit=8']['data'] : null;
             $sites = self::ok($r['/api/v1/sites']) ? $r['/api/v1/sites']['data'] : null;
+            $alerts = self::ok($r['/api/v1/alerts/status']) ? $r['/api/v1/alerts/status']['data'] : null;
         }
         $counts = Data::statusCounts();
         $h = '';
@@ -370,8 +371,11 @@ final class Pages
             . View::card('هشدارهای پیکربندی', $wh, '', '', 'warn') . '</div>';
 
         // edges health
-        $h .= View::card('سلامت نودها', $edges === null ? '<p class="pcdna-muted">فهرست نودها در دسترس نیست.</p>' : self::edgeTable($edges, false),
-            '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'edges']) . '">مدیریت نودها</a>', '', 'server');
+        $healthBody = $edges === null ? '<p class="pcdna-muted">فهرست نودها در دسترس نیست.</p>'
+            : self::healthSummary($edges, $alerts) . self::edgeTable($edges, false);
+        $h .= View::card('سلامت نودها', $healthBody,
+            '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::url(['page' => 'edges', 'view' => 'availability']) . '">' . View::icon('activity') . '<span>گزارش در دسترس‌بودن</span></a>'
+            . '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'edges']) . '">مدیریت نودها</a>', '', 'server');
 
         // top sites + latest events
         $byDomain = Data::servicesByDomain();
@@ -470,13 +474,103 @@ final class Pages
         return $h . '</div>';
     }
 
-    private static function edgeTable(array $edges, bool $actions): string
+    /** Colour token for an availability percentage (token palette only). */
+    public static function uptimeTone(float $pct): string
+    {
+        if ($pct >= 99.9) {
+            return 'ok';
+        }
+        if ($pct >= 99.0) {
+            return 'brand';
+        }
+        if ($pct >= 95.0) {
+            return 'warn';
+        }
+        return 'bad';
+    }
+
+    /**
+     * 24h + 30d availability of an edge (from the edge object's `uptime`), plus an
+     * optional 30-day daily sparkline when the caller supplies the daily series.
+     */
+    private static function uptimeCell(array $e, ?array $days = null): string
+    {
+        $up = is_array($e['uptime'] ?? null) ? $e['uptime'] : null;
+        if ($up === null) {
+            return '<span class="pcdna-muted pcdna-small">بدون داده</span>';
+        }
+        $h24 = (float) ($up['h24'] ?? 0);
+        $d30 = (float) ($up['d30'] ?? 0);
+        $h = '<div class="pcdna-uptime" data-uptime-h24="' . View::n($h24, 2) . '" data-uptime-d30="' . View::n($d30, 2) . '">'
+            . '<div class="pcdna-uptime-row"><span class="pcdna-small pcdna-muted">۲۴ ساعت</span>'
+            . View::badge(View::n($h24, 2) . '٪', self::uptimeTone($h24), ' title="در دسترس‌بودن ۲۴ ساعت گذشته"') . '</div>'
+            . '<div class="pcdna-uptime-row"><span class="pcdna-small pcdna-muted">۳۰ روز</span>'
+            . View::badge(View::n($d30, 2) . '٪', self::uptimeTone($d30), ' title="در دسترس‌بودن ۳۰ روز گذشته"') . '</div>';
+        if ($days) {
+            $h .= self::uptimeSpark($days);
+        }
+        return $h . '</div>';
+    }
+
+    /** Compact inline-SVG bar sparkline of daily uptime (last 30 days), token colours only. */
+    public static function uptimeSpark(array $days): string
+    {
+        $days = array_slice(array_values(array_filter($days, 'is_array')), -30);
+        $n = count($days);
+        if ($n === 0) {
+            return '';
+        }
+        $bw = 3;
+        $gap = 1;
+        $hgt = 24;
+        $w = $n * ($bw + $gap);
+        $bars = '';
+        foreach ($days as $i => $d) {
+            $v = (float) ($d['uptime'] ?? 0);
+            $ratio = max(0.0, min(1.0, ($v - 90.0) / 10.0)); // 90..100% mapped to the visible range
+            $bh = max(2.0, round($ratio * ($hgt - 2), 1));
+            $var = $v >= 99.5 ? '--a-ok' : ($v >= 98.0 ? '--a-warn' : '--a-bad');
+            $x = $i * ($bw + $gap);
+            $bars .= '<rect x="' . $x . '" y="' . round($hgt - $bh, 1) . '" width="' . $bw . '" height="' . $bh . '" rx="1" fill="var(' . $var . ')">'
+                . '<title>' . View::e((string) ($d['day'] ?? '') . ' — ' . View::n($v, 2) . '٪') . '</title></rect>';
+        }
+        return '<svg class="pcdna-spark" width="' . $w . '" height="' . $hgt . '" viewBox="0 0 ' . $w . ' ' . $hgt
+            . '" role="img" aria-label="نمودار در دسترس‌بودن ۳۰ روز اخیر" preserveAspectRatio="none">' . $bars . '</svg>';
+    }
+
+    /** Health-warning badges for an edge row (disk/memory/high load) surfaced from the latest heartbeat. */
+    private static function edgeWarnBadges(array $e): string
+    {
+        if (!self::edgeOnline($e)) {
+            return '';
+        }
+        $m = is_array($e['metrics'] ?? null) ? $e['metrics'] : [];
+        $l = self::edgeLoad($e);
+        $b = '';
+        if (empty($e['shed']) && $l['pct'] !== null && $l['pct'] > 80) {
+            $b .= View::badge('بار بالا', 'warn', ' title="بیش از ۸۰٪ ظرفیت" data-warn="load"');
+        }
+        if (isset($m['disk_pct']) && (float) $m['disk_pct'] >= 85) {
+            $b .= View::badge('دیسک ' . View::n((float) $m['disk_pct'], 0) . '٪', 'bad', ' title="فضای دیسک کش/nginx رو به اتمام است" data-warn="disk"');
+        }
+        if (isset($m['mem_pct']) && (float) $m['mem_pct'] >= 90) {
+            $b .= View::badge('حافظه ' . View::n((float) $m['mem_pct'], 0) . '٪', 'bad', ' title="مصرف حافظه نود بالاست" data-warn="mem"');
+        }
+        return $b !== '' ? '<div class="pcdna-badges pcdna-edge-warns">' . $b . '</div>' : '';
+    }
+
+    /**
+     * @param array $edges edge objects
+     * @param bool $actions render the per-row action menu
+     * @param array|null $series map of edge id => daily uptime rows for the inline sparkline
+     */
+    private static function edgeTable(array $edges, bool $actions, ?array $series = null): string
     {
         if (!$edges) {
             return View::emptyState('هنوز نودی ثبت نشده است', 'برای شروع، از صفحه «نودها» اولین نود را اضافه کنید.', 'server');
         }
         $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-edges"><thead><tr><th>نام / IP</th><th>منطقه / گروه</th><th>وضعیت</th>'
-            . '<th>بار لحظه‌ای</th><th>آخرین ارتباط</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
+            . '<th>بار لحظه‌ای</th><th>در دسترس‌بودن</th><th>آخرین ارتباط</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
         foreach ($edges as $e) {
             $online = self::edgeOnline($e);
             $fresh = !empty($e['enabled']) && empty($e['last_seen_at']);
@@ -490,7 +584,8 @@ final class Pages
                 . '<div class="pcdna-small pcdna-muted">' . View::ltr($e['ipv4'] ?? '') . (!empty($e['ipv6']) ? '<br>' . View::ltr($e['ipv6']) : '') . '</div></td>'
                 . '<td><span class="pcdna-badges">' . (($e['region'] ?? '') === 'home' ? View::badge('ایران', 'brand') : View::badge('خارج', 'violet'))
                 . View::badge($gl, $gt === 'violet' ? 'violet' : 'muted', ' data-group="' . View::e($e['group'] ?? 'general') . '"') . '</span></td>'
-                . '<td>' . $status . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
+                . '<td>' . $status . self::edgeWarnBadges($e) . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
+                . '<td class="pcdna-uptime-cell">' . self::uptimeCell($e, $series[$id] ?? null) . '</td>'
                 . '<td title="' . View::e($e['last_seen_at'] ?? '') . '">' . View::e(View::ago($e['last_seen_at'] ?? null))
                 . (!empty($e['applied_version']) ? '<div class="pcdna-small pcdna-muted" title="نسخه تنظیمات اعمال‌شده">' . View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') . '</div>' : '') . '</td>';
             if ($actions) {
@@ -514,7 +609,7 @@ final class Pages
             }
             $h .= '</tr>';
             if ($err !== '') {
-                $h .= '<tr class="pcdna-errrow"><td colspan="' . ($actions ? 6 : 5) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
+                $h .= '<tr class="pcdna-errrow"><td colspan="' . ($actions ? 7 : 6) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
                     . '<code dir="ltr" title="' . View::e(View::clip($err, 600)) . '">' . View::e(View::clip($err, 300)) . '</code></td></tr>';
             }
         }
@@ -861,8 +956,11 @@ final class Pages
 
     // ------------------------------------------------------------------ 3. edges
 
-    public static function edges(?array $newToken = null, array $old = []): string
+    public static function edges(?array $newToken = null, array $old = [], array $get = []): string
     {
+        if (($get['view'] ?? '') === 'availability') {
+            return self::availability();
+        }
         $ping = self::ping();
         $h = '';
         $ctlUrl = Env::controllerUrl();
@@ -884,6 +982,7 @@ final class Pages
         foreach ((array) $edges as $e) {
             $online += self::edgeOnline($e) ? 1 : 0;
         }
+        $series = $edges !== null ? self::uptimeSeries($edges) : null;
         if ($edges !== null) {
             foreach (self::saturated($edges) as $e) {
                 $h .= View::alert(!empty($e['shed']) ? 'bad' : 'warn', 'نود ' . View::ltr($e['name'] ?? '') . (!empty($e['shed'])
@@ -893,8 +992,9 @@ final class Pages
             $h .= View::card('گروه‌های نود', self::groupCards($edges), '', '', 'activity');
         }
         $h .= View::card('نودهای CDN' . ($edges !== null ? ' (' . View::n($online) . ' آنلاین از ' . View::n(count($edges)) . ')' : ''),
-            $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error'])) : self::edgeTable($edges, true),
-            '', 'pcdna-flush', 'server');
+            $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error'])) : self::edgeTable($edges, true, $series),
+            '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'edges', 'view' => 'availability']) . '">' . View::icon('activity') . '<span>گزارش در دسترس‌بودن</span></a>',
+            'pcdna-flush', 'server');
 
         $form = '<form method="post" action="' . View::url(['page' => 'edges']) . '" class="pcdna-form" autocomplete="off">' . View::csrf()
             . '<input type="hidden" name="a" value="edge_add"><div class="pcdna-form-grid">'
@@ -918,6 +1018,155 @@ final class Pages
             . '(به شرط ماندن نود دیگری در همان گروه و منطقه) و زیر ۷۵٪ برمی‌گردد.</li></ul>';
         $h .= '<div class="pcdna-grid-2">' . View::card('افزودن نود جدید', $form, '', '', 'plus') . View::card('منطقه‌ها، گروه‌ها و وضعیت نودها', $regions, '', '', 'info') . '</div>';
         return $h;
+    }
+
+    /**
+     * Daily uptime series per edge (last 30 days) — one parallel controller call per edge
+     * (GET /api/v1/edges/{id}/uptime?days=30). Returns [id => [{day, uptime}...]].
+     */
+    public static function uptimeSeries(array $edges): array
+    {
+        $paths = [];
+        $byPath = [];
+        foreach ($edges as $e) {
+            $id = (int) ($e['id'] ?? 0);
+            if ($id > 0) {
+                $p = '/api/v1/edges/' . $id . '/uptime?days=30';
+                $paths[] = $p;
+                $byPath[$p] = $id;
+            }
+        }
+        if (!$paths) {
+            return [];
+        }
+        $out = [];
+        foreach (self::fetch($paths) as $p => $r) {
+            if (self::ok($r) && is_array($r['data']['days'] ?? null)) {
+                $out[$byPath[$p]] = $r['data']['days'];
+            }
+        }
+        return $out;
+    }
+
+    /** Node-health summary block for the dashboard «سلامت نودها» card. */
+    public static function healthSummary(array $edges, ?array $alerts): string
+    {
+        $total = count($edges);
+        $enabled = 0;
+        $online = 0;
+        $problem = [];
+        foreach ($edges as $e) {
+            if (!is_array($e)) {
+                continue;
+            }
+            $enabled += !empty($e['enabled']) ? 1 : 0;
+            $online += self::edgeOnline($e) ? 1 : 0;
+        }
+        $sat = self::saturated($edges);
+        $shed = array_filter($edges, function ($e) {
+            return is_array($e) && !empty($e['shed']);
+        });
+        $offline = $enabled - $online;
+        $worst = self::worstUptime($edges);
+
+        $tiles = '<div class="pcdna-health-tiles">';
+        $onlineTone = $online === 0 && $enabled > 0 ? 'bad' : ($online < $enabled ? 'warn' : 'ok');
+        $tiles .= '<div class="pcdna-health-tile pcdna-t-' . $onlineTone . '" data-health="online"><span class="pcdna-health-n">' . View::n($online)
+            . '<small> / ' . View::n($enabled) . '</small></span><span class="pcdna-health-l">نود آنلاین از فعال</span></div>';
+        $degraded = count($sat);
+        $tiles .= '<div class="pcdna-health-tile ' . ($degraded ? 'pcdna-t-warn' : 'pcdna-t-ok') . '" data-health="degraded"><span class="pcdna-health-n">'
+            . View::n($degraded) . '</span><span class="pcdna-health-l">نود پرِبار / اشباع</span></div>';
+        if ($worst !== null) {
+            $tiles .= '<div class="pcdna-health-tile pcdna-t-' . self::uptimeTone($worst['d30']) . '" data-health="worst"><span class="pcdna-health-n">'
+                . View::n($worst['d30'], 2) . '٪</span><span class="pcdna-health-l">کمترین در دسترس‌بودن ۳۰ روز'
+                . ($worst['name'] !== '' ? ' · ' . View::ltr($worst['name']) : '') . '</span></div>';
+        }
+        if ($alerts !== null) {
+            $open = (int) ($alerts['open'] ?? 0);
+            $crit = (int) ($alerts['critical'] ?? 0);
+            $tiles .= '<div class="pcdna-health-tile ' . ($crit ? 'pcdna-t-bad' : ($open ? 'pcdna-t-warn' : 'pcdna-t-ok')) . '" data-health="alerts" data-alerts-open="' . $open . '">'
+                . '<span class="pcdna-health-n">' . View::n($open) . ($crit ? ' <small>(' . View::n($crit) . ' بحرانی)</small>' : '')
+                . '</span><span class="pcdna-health-l">هشدار باز کنترلر</span></div>';
+        }
+        $tiles .= '</div>';
+
+        $notes = [];
+        if ($offline > 0) {
+            $notes[] = View::n($offline) . ' نود فعال آفلاین است';
+        }
+        if (count($shed)) {
+            $notes[] = View::n(count($shed)) . ' نود به‌دلیل اشباع از DNS خارج شده';
+        }
+        return $tiles . ($notes ? '<p class="pcdna-small pcdna-muted pcdna-health-notes">' . implode(' · ', $notes) . '</p>' : '');
+    }
+
+    /** Worst enabled edge by 30-day availability: ['name' => .., 'd30' => float] or null. */
+    public static function worstUptime(array $edges): ?array
+    {
+        $worst = null;
+        foreach ($edges as $e) {
+            if (!is_array($e) || empty($e['enabled']) || !is_array($e['uptime'] ?? null)) {
+                continue;
+            }
+            $d30 = (float) ($e['uptime']['d30'] ?? 100);
+            if ($worst === null || $d30 < $worst['d30']) {
+                $worst = ['name' => (string) ($e['name'] ?? ''), 'd30' => $d30];
+            }
+        }
+        return $worst;
+    }
+
+    /** Availability report: sortable table of nodes with 24h/30d uptime, last-seen and a 30-day sparkline. */
+    public static function availability(): string
+    {
+        $ping = self::ping();
+        $back = '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::url(['page' => 'edges']) . '">' . View::icon('server') . '<span>بازگشت به نودها</span></a>';
+        if (!$ping['ok']) {
+            return $back . self::ctlError($ping);
+        }
+        $r = self::fetch(['/api/v1/edges']);
+        $edges = self::ok($r['/api/v1/edges']) ? (array) $r['/api/v1/edges']['data'] : null;
+        if ($edges === null) {
+            return $back . View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error']));
+        }
+        if (!$edges) {
+            return $back . View::card('در دسترس‌بودن نودها', View::emptyState('هنوز نودی ثبت نشده است', 'برای شروع، از صفحه «نودها» اولین نود را اضافه کنید.', 'server'), '', '', 'activity');
+        }
+        $series = self::uptimeSeries($edges);
+        $h = View::alert('info', 'در دسترس‌بودن هر نود بر اساس ضربان‌های ثبت‌شده در کنترلر است. ستون‌ها با کلیک روی سرتیتر مرتب می‌شوند؛ نوار پایین، ۳۰ روز اخیر را روز‌به‌روز نشان می‌دهد.');
+        $t = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-sortable pcdna-avail" data-sortable="1"><thead><tr>'
+            . '<th data-sort="text" aria-sort="none">نام / IP</th>'
+            . '<th data-sort="text">وضعیت</th>'
+            . '<th data-sort="num" class="pcdna-num">۲۴ ساعت</th>'
+            . '<th data-sort="num" class="pcdna-num" data-sort-default="asc" aria-sort="ascending">۳۰ روز</th>'
+            . '<th data-sort="num" class="pcdna-num">آخرین ارتباط</th>'
+            . '<th>۳۰ روز اخیر</th></tr></thead><tbody>';
+        // default sort: worst 30-day uptime first
+        usort($edges, function ($a, $b) {
+            return ((float) ($a['uptime']['d30'] ?? 100)) <=> ((float) ($b['uptime']['d30'] ?? 100));
+        });
+        foreach ($edges as $e) {
+            $id = (int) ($e['id'] ?? 0);
+            $online = self::edgeOnline($e);
+            $fresh = !empty($e['enabled']) && empty($e['last_seen_at']);
+            $status = empty($e['enabled']) ? View::badge('غیرفعال', 'muted') : ($online ? View::badge('آنلاین', 'ok')
+                : ($fresh ? View::badge('در انتظار نصب', 'warn') : View::badge('آفلاین', 'bad')));
+            $up = is_array($e['uptime'] ?? null) ? $e['uptime'] : ['h24' => 0, 'd30' => 0];
+            $h24 = (float) ($up['h24'] ?? 0);
+            $d30 = (float) ($up['d30'] ?? 0);
+            $seen = $e['last_seen_at'] ?? null;
+            $seenTs = $seen ? strtotime((string) $seen) : 0;
+            $t .= '<tr data-edge="' . $id . '">'
+                . '<td data-sort-value="' . View::e((string) ($e['name'] ?? '')) . '"><strong>' . View::ltr($e['name'] ?? '') . '</strong>'
+                . '<div class="pcdna-small pcdna-muted">' . View::ltr($e['ipv4'] ?? '') . '</div></td>'
+                . '<td data-sort-value="' . ($online ? 2 : (empty($e['enabled']) ? 0 : 1)) . '">' . $status . self::edgeWarnBadges($e) . '</td>'
+                . '<td class="pcdna-num" data-sort-value="' . View::n($h24, 2) . '">' . View::badge(View::n($h24, 2) . '٪', self::uptimeTone($h24)) . '</td>'
+                . '<td class="pcdna-num" data-sort-value="' . View::n($d30, 2) . '">' . View::badge(View::n($d30, 2) . '٪', self::uptimeTone($d30)) . '</td>'
+                . '<td class="pcdna-num" data-sort-value="' . (int) $seenTs . '" title="' . View::e((string) $seen) . '">' . View::e(View::ago($seen)) . '</td>'
+                . '<td class="pcdna-spark-cell">' . (isset($series[$id]) ? self::uptimeSpark($series[$id]) : '<span class="pcdna-muted pcdna-small">—</span>') . '</td></tr>';
+        }
+        $t .= '</tbody></table></div>';
+        return View::card('در دسترس‌بودن نودها', $h . $t, $back, 'pcdna-flush', 'activity');
     }
 
     // ------------------------------------------------------------------ 4. plans

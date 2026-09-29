@@ -72,7 +72,7 @@ final class Admin
                 $body = Pages::sites($get);
                 break;
             case 'edges':
-                $body = Pages::edges($state['token'] ?? null, $state['old'] ?? []);
+                $body = Pages::edges($state['token'] ?? null, $state['old'] ?? [], $get);
                 break;
             case 'plans':
                 $body = Pages::plans($state);

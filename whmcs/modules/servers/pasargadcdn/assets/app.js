@@ -594,6 +594,31 @@
     return (M[kind] || {})[mode] || [mode || '—', 'muted'];
   }
 
+  // High-level service-health signal for the client. Derived ONLY from the
+  // customer's own site status / over-quota / SSL — no per-edge internals or
+  // IPs are exposed here (the client app has no safe per-site edge signal).
+  function serviceHealth() {
+    var s = S.site, ssl = s.ssl || {}, st = s.status;
+    if (st === 'active') {
+      if (ssl.status === 'failed') return { key: 'degraded', tone: 'warning', icon: 'clock', label: 'اختلال موقت؛ در حال ترمیم', note: 'صدور گواهی SSL ناموفق بود؛ سایت روی HTTP در دسترس است و سیستم به‌طور خودکار دوباره تلاش می‌کند.' };
+      return { key: 'healthy', tone: 'success', icon: 'checkCircle', label: 'سرویس فعال و سالم', note: 'دامنه شما از طریق شبکه CDN سرویس می‌گیرد.' };
+    }
+    if (st === 'over_quota') return { key: 'degraded', tone: 'warning', icon: 'clock', label: 'اختلال موقت؛ در حال ترمیم', note: 'ترافیک این ماه به سقف رسیده است؛ پس از شارژ کیف پول یا تمدید، سرویس خودکار وصل می‌شود.' };
+    if (st === 'suspended') return { key: 'suspended', tone: 'danger', icon: 'ban', label: 'سرویس معلق است', note: 'برای فعال‌سازی مجدد با پشتیبانی در تماس باشید.' };
+    if (st === 'pending_ns') return { key: 'pending', tone: 'muted', icon: 'clock', label: 'در حال راه‌اندازی', note: 'پس از تغییر نیم‌سرورها، سرویس فعال می‌شود.' };
+    return { key: 'unknown', tone: 'muted', icon: 'clock', label: 'در حال بررسی وضعیت', note: '' };
+  }
+
+  function serviceStatus() {
+    var hh = serviceHealth();
+    return h('div', { className: 'pcdn-svc-status pcdn-tone-' + hh.tone, 'data-svc-health': hh.key, role: 'status' },
+      h('span', { className: 'pcdn-svc-dot', 'aria-hidden': 'true' }),
+      icon(hh.icon),
+      h('div', { className: 'pcdn-svc-text' },
+        h('span', { className: 'pcdn-svc-label', text: hh.label }),
+        hh.note ? h('span', { className: 'pcdn-svc-note', text: hh.note }) : null));
+  }
+
   function renderOverview() {
     var site = S.site, f = features(), plan = site.plan || {}, u = site.usage_month || {}, ssl = site.ssl || {}, cfg = site.config || {};
     var out = [];
@@ -610,6 +635,7 @@
           h('li', { className: ssl.status === 'active' ? 'is-ok' : ssl.status === 'failed' ? 'is-bad' : 'is-warn' }, icon(ssl.status === 'active' ? 'lock' : 'unlock'),
             h('span', { text: ssl.status === 'active' ? 'SSL فعال' + (ssl.expires_at ? ' تا ' + P.date(ssl.expires_at, { dateStyle: 'medium' }) : '') : ssl.status === 'pending' ? 'SSL در حال صدور' : ssl.status === 'failed' ? 'صدور SSL ناموفق' : 'SSL هنوز صادر نشده' })),
           h('li', { className: 'is-ok' }, icon('server'), h('span', { text: num((site.records || []).length) + ' رکورد DNS' }))),
+        serviceStatus(),
         h('a', { className: 'pcdn-link', href: 'https://' + site.domain + '/', target: '_blank', rel: 'noopener noreferrer', 'data-ro-ok': '1' },
           h('span', { text: 'باز کردن سایت' }), icon('external'))),
       spark);

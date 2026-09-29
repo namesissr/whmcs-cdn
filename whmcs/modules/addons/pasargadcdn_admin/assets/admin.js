@@ -166,4 +166,41 @@
       });
     });
   }
+
+  // Sortable tables (availability report). Progressive enhancement over the
+  // server-rendered order; clicking a header re-orders the rows client-side.
+  function sortValue(td, kind) {
+    if (!td) return kind === 'num' ? 0 : '';
+    var raw = td.getAttribute('data-sort-value');
+    if (raw === null) raw = td.textContent || '';
+    return kind === 'num' ? (parseFloat(toLatin(raw)) || 0) : String(raw).trim();
+  }
+  Array.prototype.forEach.call(root.querySelectorAll('table.pcdna-sortable'), function (table) {
+    var heads = table.tHead ? table.tHead.rows[0].cells : [];
+    var body = table.tBodies[0];
+    if (!body) return;
+    Array.prototype.forEach.call(heads, function (th, col) {
+      var kind = th.getAttribute('data-sort');
+      if (!kind) return;
+      th.classList.add('pcdna-th-sort');
+      th.setAttribute('role', 'button');
+      th.setAttribute('tabindex', '0');
+      function apply(dir) {
+        var rows = Array.prototype.slice.call(body.rows);
+        rows.sort(function (a, b) {
+          var av = sortValue(a.cells[col], kind), bv = sortValue(b.cells[col], kind);
+          var cmp = kind === 'num' ? av - bv : String(av).localeCompare(String(bv), 'fa');
+          return dir === 'asc' ? cmp : -cmp;
+        });
+        rows.forEach(function (r) { body.appendChild(r); });
+        Array.prototype.forEach.call(heads, function (h) { if (h.getAttribute('data-sort')) h.setAttribute('aria-sort', 'none'); });
+        th.setAttribute('aria-sort', dir === 'asc' ? 'ascending' : 'descending');
+      }
+      function toggle() { apply(th.getAttribute('aria-sort') === 'ascending' ? 'desc' : 'asc'); }
+      th.addEventListener('click', toggle);
+      th.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+      });
+    });
+  });
 })();

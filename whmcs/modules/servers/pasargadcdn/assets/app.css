@@ -793,6 +793,18 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-hero-facts .is-ok .pcdn-icon { color: var(--pc-success); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-hero-facts .is-warn .pcdn-icon { color: var(--pc-warning-icon); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-hero-facts .is-bad .pcdn-icon { color: var(--pc-danger); }
+/* service-status indicator (وضعیت سرویس) — subtle, tone-driven, light & dark */
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-status {
+  display: inline-flex; align-items: center; gap: 9px; max-width: 100%;
+  padding: 8px 12px; border-radius: var(--pc-radius-sm, 8px);
+  background: var(--t-bg); border: 1px solid var(--t-bd); color: var(--t-fg);
+}
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-status .pcdn-icon { width: 18px; height: 18px; flex: none; color: var(--t-fg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--t-fg); flex: none; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-status[data-svc-health="healthy"] .pcdn-svc-dot { box-shadow: 0 0 0 3px var(--t-bd); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-label { font-weight: 800; font-size: 13.5px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-svc-note { font-size: 12px; font-weight: 500; color: var(--t-fg); overflow-wrap: anywhere; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-hero-spark { background: var(--pc-surface); border: 1px solid var(--pc-border); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; justify-content: space-between; min-width: 0; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-spark-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--pc-muted); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-spark-head strong { font-size: 18px; color: var(--pc-text); }
