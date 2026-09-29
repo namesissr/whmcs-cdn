@@ -356,6 +356,18 @@ dig +short TXT _pcdn-geo.example.com @NS2_IP +subnet=5.120.10.0/24
 # "ip=5.120.10.0 ecs=yes resolver=... country=ir pool=home"
 ```
 
+**اگر کاربران یک شهر یا ISP خاص هنوز نود خارج می‌گیرند:** در `.env` کنترلر `GEO_LOG=true` بگذارید و `sudo docker compose up -d` بزنید. کنترلر زون‌ها را خودش دوباره می‌نویسد. بعد از آن، PowerDNS هر تصمیم را در لاگ ثبت می‌کند. از آن محل دوباره تست کنید و روی **هر دو** نیم‌سرور لاگ را ببینید:
+```bash
+sudo docker compose logs --since 10m pdns | grep pcdn-geo              # روی سرور پنل
+sudo docker logs --since 10m deploy-pdns-1 2>&1 | grep pcdn-geo         # روی ns2
+# pcdn-geo www.example.com. A resolver=185.x.x.x ecs=- country=de pool=global
+```
+- `resolver`: آدرس resolver آن کاربر.
+- `ecs`: زیرشبکه کاربر، اگر resolver آن را فرستاده باشد.
+- `country`: کشوری که دیتابیس برای این آدرس تشخیص داده است.
+
+اگر resolver یک سرویس عمومی بدون ECS باشد، رنجش را به `GEO_NO_ECS_RESOLVERS` اضافه کنید. آن متغیر را کامل بنویسید، چون جایگزین فهرست پیش‌فرض می‌شود. اگر آدرس ایرانی است ولی کشور اشتباه تشخیص داده شده، آن را در `dns/geo/overrides.txt` بنویسید و `deploy/geoip-update.sh` را روی هر دو سرور اجرا کنید. بعد از بررسی `GEO_LOG` را دوباره `false` کنید.
+
 > **هنگام تست دقت کنید:** اگر VPN یا پروکسی روشن باشد، کاربر از کشور سرور VPN دیده می‌شود و درست است که به نود خارج برود. resolverها جواب را تا `PROXIED_TTL` (پیش‌فرض ۶۰ ثانیه) کش می‌کنند.
 
 اگر `download.db-ip.com` یا `ftp.ripe.net` از سرور در دسترس نبود، `DBIP_URL_BASE` و `RIPE_URL` را به یک آینه (یا `file:///...`) بدهید. اگر فقط فایل RIPE در دسترس نباشد، اسکریپت با هشدار از DB-IP تنها استفاده می‌کند.

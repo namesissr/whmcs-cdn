@@ -84,8 +84,17 @@ def geo_split(home_alive: bool, global_alive: bool) -> bool:
     return settings.geoip_enabled and home_alive and global_alive
 
 
+def _log(rtype: str, pool: str) -> str:
+    """GEO_LOG: one PowerDNS log line per decision (docker compose logs pdns | grep pcdn-geo)."""
+    if not settings.geo_log:
+        return ""
+    return (f" pdnslog('pcdn-geo '..qname:toString()..' {rtype} resolver='..who:toString()"
+            f"..' ecs='..(ecswho and ecswho:toString() or '-')..' country='..countryCode()..' pool='..{pool},"
+            f" pdns.loglevels.Warning)")
+
+
 def lua_expression(home: list[str], global_: list[str],
-                   home_alive: bool | None = None, global_alive: bool | None = None) -> str:
+                   home_alive: bool | None = None, global_alive: bool | None = None, rtype: str = "A") -> str:
     """Build the LUA snippet that answers with the visitor's pool of online edges.
 
     home/global_: the online edges of one address family. *_alive: whether the pool has
@@ -96,7 +105,11 @@ def lua_expression(home: list[str], global_: list[str],
     home_alive = bool(home) if home_alive is None else home_alive
     global_alive = bool(global_) if global_alive is None else global_alive
     if geo_split(home_alive, global_alive):
-        return f";{home_test()} if home then return {_pick(home)} else return {_pick(global_)} end"
+        log = _log(rtype, "(home and 'home' or 'global')")
+        return f";{home_test()}{log} if home then return {_pick(home)} else return {_pick(global_)} end"
+    if settings.geo_log:
+        pool = "'all'" if not settings.geoip_enabled else ("'home-only'" if home_alive else "'global-only'")
+        return f";{_log(rtype, pool).strip()} return {_pick(home + global_)}"
     return f";return {_pick(home + global_)}"
 
 
@@ -186,7 +199,7 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             "A \"" + lua_expression(v4_home, v4_global, home_alive, global_alive) + "\"")
         if have_v6:
             add(name, "LUA", settings.proxied_ttl,
-                "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive) + "\"")
+                "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive, "AAAA") + "\"")
     if proxied_names:
         add(f"{DIAG_LABEL}.{domain}", "LUA", 5, "TXT \"" + diag_expression(home_alive, global_alive) + "\"")
 

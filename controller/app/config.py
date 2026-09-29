@@ -52,6 +52,8 @@ class Settings:
     ])
     # visitors whose country is unknown to the database: home | global
     geo_unknown_pool: str = field(default_factory=lambda: (os.getenv("GEO_UNKNOWN_POOL") or "home").strip().lower())
+    # log every GeoDNS decision in the PowerDNS log ("pcdn-geo ..."): for diagnosing a location
+    geo_log: bool = field(default_factory=lambda: _bool("GEO_LOG", False))
     # periodic check that every nameserver geolocates a home and a foreign subnet correctly
     geo_check_enabled: bool = field(default_factory=lambda: _bool("GEO_CHECK", True))
     geo_check_home_subnet: str = field(default_factory=lambda: os.getenv("GEO_CHECK_HOME_SUBNET") or "2.176.0.0/24")

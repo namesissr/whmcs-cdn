@@ -53,6 +53,17 @@ def test_lua_ipv6_follows_the_ipv4_pool(monkeypatch):
     assert expr.startswith(";return ifurlup(") and "countryCode" not in expr
 
 
+def test_geo_log(monkeypatch):
+    monkeypatch.setattr(settings, "geoip_enabled", True)
+    assert "pdnslog" not in dnsbuild.lua_expression(["5.5.5.5"], ["8.8.4.4"])
+    monkeypatch.setattr(settings, "geo_log", True)
+    expr = dnsbuild.lua_expression(["5.5.5.5"], ["8.8.4.4"], rtype="AAAA")
+    assert "pdnslog('pcdn-geo '..qname:toString()..' AAAA resolver='" in expr
+    assert "pool='..(home and 'home' or 'global')" in expr and expr.index("pdnslog") < expr.index("if home")
+    expr = dnsbuild.lua_expression(["5.5.5.5"], [])
+    assert expr.startswith(";pdnslog(") and "pool='..'home-only'" in expr
+
+
 def test_lua_single_pool():
     expr = dnsbuild.lua_expression(["5.5.5.5"], ["8.8.4.4"])
     assert expr.startswith(";return ifurlup(") and "{{'5.5.5.5','8.8.4.4'}}" in expr
