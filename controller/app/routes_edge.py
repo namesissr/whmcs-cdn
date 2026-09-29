@@ -40,6 +40,9 @@ class Metrics(BaseModel):
     connections: int = Field(0, ge=0, le=1_000_000_000)
     load1: float = Field(0, ge=0, le=1_000_000)
     cpus: int = Field(0, ge=0, le=100_000)
+    # optional; older agents omit them and no disk/memory alert is raised for that edge
+    disk_pct: float | None = Field(default=None, ge=0, le=100)
+    mem_pct: float | None = Field(default=None, ge=0, le=100)
 
 
 class Heartbeat(BaseModel):

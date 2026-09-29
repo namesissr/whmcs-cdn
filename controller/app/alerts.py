@@ -312,7 +312,7 @@ def check_all(db, edges: bool = True) -> None:
 
     edges=False skips the edge checks right after a controller outage (see scheduler).
     """
-    for fn in ((check_edges, check_edge_load) if edges else ()) + (check_certs, check_pdns):
+    for fn in ((check_edges, check_edge_load, check_edge_health) if edges else ()) + (check_certs, check_pdns):
         try:
             fn(db)
         except Exception:  # noqa: BLE001
@@ -323,20 +323,27 @@ def check_edges(db) -> None:
     from .models import Edge
 
     now = utcnow()
-    cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
+    # alert as soon as a node is silent for edge_alert_seconds; it stays in DNS until the
+    # longer edge_offline_seconds, so the message says which of the two has been crossed
+    alert_cutoff = now - timedelta(seconds=settings.edge_alert_seconds)
+    dns_cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
     edges = list(db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)))
     names = {f"edge_offline:{e.id}": e.name for e in edges}
 
     offline, errors = {}, {}
-    online = 0
+    online = 0  # "online" for the all-nodes-down check = still in DNS
     for e in edges:
-        if e.last_seen_at is not None and e.last_seen_at >= cutoff:
+        if e.last_seen_at is not None and e.last_seen_at >= dns_cutoff:
             online += 1
-        elif e.last_seen_at is not None:
+        if e.last_seen_at is not None and e.last_seen_at < alert_cutoff:
+            in_dns = e.last_seen_at >= dns_cutoff
+            silent = int((now - e.last_seen_at).total_seconds())
+            tail = ("هنوز در DNS است؛ اگر تا لحظاتی دیگر گزارش ندهد از پاسخ‌های DNS حذف می‌شود."
+                    if in_dns else "از پاسخ‌های DNS حذف شده است.")
             offline[f"edge_offline:{e.id}"] = (
                 f"نود {e.name} از دسترس خارج شد",
-                f"نود {e.name} ({e.ipv4}) از {e.last_seen_at:%Y-%m-%d %H:%M} UTC گزارشی نفرستاده است "
-                f"(آستانه: {settings.edge_offline_seconds} ثانیه) و از پاسخ‌های DNS حذف شده است.",
+                f"نود {e.name} ({e.ipv4}) حدود {silent} ثانیه است گزارشی نفرستاده "
+                f"(آخرین گزارش: {e.last_seen_at:%Y-%m-%d %H:%M} UTC). {tail}",
                 "warning",
             )
         if e.last_error:
@@ -403,6 +410,44 @@ def check_edge_load(db) -> None:
         return f"بار نود {name} به حالت عادی برگشت."
 
     sync("edge_saturated:", active, normal)
+
+
+def check_edge_health(db) -> None:
+    """edge_health:{id} for sustained high CPU load, or a full disk / memory (agent metrics)."""
+    from .models import Edge
+    from .services import LOAD_ALERT_CHECKS, cpu_ratio, edge_metrics, metrics_fresh
+
+    now = utcnow()
+    active, names = {}, {}
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
+        key = f"edge_health:{e.id}"
+        names[key] = e.name
+        if not metrics_fresh(e, now):
+            continue  # offline / no recent metrics: handled by the offline alert
+        m = edge_metrics(e) or {}
+        problems, severity = [], "warning"
+        ratio = cpu_ratio(m)
+        if ratio is not None and (e.cpu_high or 0) >= LOAD_ALERT_CHECKS:
+            problems.append(f"بار پردازنده بالاست ({m.get('load1')} روی {m.get('cpus')} هسته).")
+        disk = m.get("disk_pct")
+        if disk is not None and disk >= settings.edge_disk_alert:
+            problems.append(f"دیسک {disk:.0f}٪ پر است؛ فضای کش رو به اتمام است.")
+            severity = "critical"
+        mem = m.get("mem_pct")
+        if mem is not None and mem >= settings.edge_mem_alert:
+            problems.append(f"حافظه {mem:.0f}٪ مصرف شده است.")
+        if problems:
+            active[key] = (
+                f"نود {e.name} تحت فشار است",
+                f"نود {e.name} ({e.ipv4}):\n- " + "\n- ".join(problems),
+                severity,
+            )
+
+    def normal(cond):
+        name = names.get(cond["key"])
+        return f"وضعیت نود {name} به حالت عادی برگشت." if name else "نود غیرفعال یا حذف شد؛ هشدار بسته شد."
+
+    sync("edge_health:", active, normal)
 
 
 def check_certs(db) -> None:

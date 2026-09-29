@@ -143,6 +143,22 @@ class Edge(Base):
     shed: Mapped[bool] = mapped_column(Boolean, default=False)
     # consecutive metric reports above services.LOAD_ALERT_PERCENT (edge_saturated alert)
     load_high: Mapped[int] = mapped_column(Integer, default=0)
+    # consecutive metric reports with load1/cpus above EDGE_CPU_ALERT (edge_cpu alert)
+    cpu_high: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class EdgeUptime(Base):
+    """Per-edge, per-hour availability rollup: how many scheduler samples found the edge
+    online (last_seen within EDGE_OFFLINE_SECONDS) out of the total taken that hour."""
+
+    __tablename__ = "edge_uptime"
+    __table_args__ = (UniqueConstraint("edge_id", "hour"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id", ondelete="CASCADE"), index=True)
+    hour: Mapped[datetime] = mapped_column(DateTime, index=True)
+    samples_total: Mapped[int] = mapped_column(Integer, default=0)
+    samples_online: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Purge(Base):

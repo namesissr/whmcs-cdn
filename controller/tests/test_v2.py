@@ -288,7 +288,9 @@ def test_platform_overview_and_events(client):
                     "source": "firewall", "rule": "r1"}]})
     o = client.get("/api/v1/overview").json()
     assert o["sites"] == {"total": 2, "by_status": {"pending_ns": 2}}
-    assert o["edges"] == {"total": 2, "enabled": 2, "online": 1, "with_errors": 0}
+    assert {k: o["edges"][k] for k in ("total", "enabled", "online", "with_errors", "shed")} == \
+        {"total": 2, "enabled": 2, "online": 1, "with_errors": 0, "shed": 0}
+    assert len(o["edges"]["list"]) == 2 and all("uptime" in e for e in o["edges"]["list"])
     assert o["month"]["bytes"] == 5100 and o["month"]["security"] == {"waf": 3}
     assert o["top_sites"][0] == {"domain": "example.com", "bytes": 5000, "requests": 50}
     ev = client.get("/api/v1/events").json()

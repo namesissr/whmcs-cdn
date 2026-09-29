@@ -82,6 +82,14 @@ class Settings:
     acme_sh: str = field(default_factory=lambda: os.getenv("ACME_SH", "/root/.acme.sh/acme.sh"))
 
     edge_offline_seconds: int = field(default_factory=lambda: int(os.getenv("EDGE_OFFLINE_SECONDS", "180")))
+    # an edge silent this long raises the offline *alert* (the node is still in DNS until
+    # EDGE_OFFLINE_SECONDS); keep it >= one heartbeat interval to avoid flapping
+    edge_alert_seconds: int = field(default_factory=lambda: int(os.getenv("EDGE_ALERT_SECONDS", "90")))
+    # CPU: warn when load1/cpus stays above this for LOAD_ALERT_CHECKS heartbeats
+    edge_cpu_alert: float = field(default_factory=lambda: float(os.getenv("EDGE_CPU_ALERT") or 4))
+    # warn when a node reports disk/memory usage above these percentages (needs a recent agent)
+    edge_disk_alert: float = field(default_factory=lambda: float(os.getenv("EDGE_DISK_ALERT") or 90))
+    edge_mem_alert: float = field(default_factory=lambda: float(os.getenv("EDGE_MEM_ALERT") or 95))
     # load shedding (SPEC §7.4): an edge using this % of its capacity_mbps leaves DNS answers
     # (while another edge of its pool stays) and comes back below this value - 15
     edge_shed_percent: float = field(default_factory=lambda: float(os.getenv("EDGE_SHED_PERCENT") or 90))

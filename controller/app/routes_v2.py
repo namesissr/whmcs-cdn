@@ -342,10 +342,18 @@ def overview(db: Session = Depends(get_db)):
     domains = dict(db.execute(select(Site.id, Site.domain)).all())
     online = {e.id for e in online_edges(db)}
     edges = list(db.scalars(select(Edge).order_by(Edge.id)))
+    from . import uptime as up
+    from .services import edge_metrics
+    ups = up.summaries(db)
     return {
         "sites": {"total": sum(by_status.values()), "by_status": dict(by_status)},
         "edges": {"total": len(edges), "enabled": sum(1 for e in edges if e.enabled), "online": len(online),
-                  "with_errors": sum(1 for e in edges if e.last_error)},
+                  "with_errors": sum(1 for e in edges if e.last_error),
+                  "shed": sum(1 for e in edges if e.shed),
+                  "list": [{"id": e.id, "name": e.name, "group": e.group, "enabled": e.enabled,
+                            "online": e.id in online, "shed": e.shed, "capacity_mbps": e.capacity_mbps,
+                            "metrics": edge_metrics(e), "uptime": ups.get(e.id, {"h24": None, "d30": None})}
+                           for e in edges]},
         "month": {"start": start.isoformat() + "Z", "bytes": sum(usage.values()), "requests": sum(requests.values()),
                   "security": dict(security)},
         "top_sites": [{"domain": domains.get(sid, "?"), "bytes": b, "requests": requests[sid]}

@@ -439,18 +439,31 @@ def dns_sync(domain: str, db: Session = Depends(get_db)):
 
 # ------------------------------------------------------------------ edges
 
-def edge_to_dict(e: Edge) -> dict:
+def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
     return {
         "id": e.id, "name": e.name, "ipv4": e.ipv4, "ipv6": e.ipv6, "region": e.region,
         "enabled": e.enabled, "last_seen_at": e.last_seen_at.isoformat() + "Z" if e.last_seen_at else None,
         "applied_version": e.applied_version, "last_error": e.last_error,
         "group": e.group, "capacity_mbps": e.capacity_mbps, "metrics": edge_metrics(e), "shed": e.shed,
+        "uptime": uptime if uptime is not None else {"h24": None, "d30": None},
     }
 
 
 @router.get("/edges")
 def list_edges(db: Session = Depends(get_db)):
-    return [edge_to_dict(e) for e in db.scalars(select(Edge).order_by(Edge.id))]
+    from . import uptime as up
+
+    ups = up.summaries(db)
+    return [edge_to_dict(e, ups.get(e.id)) for e in db.scalars(select(Edge).order_by(Edge.id))]
+
+
+@router.get("/edges/{edge_id}/uptime")
+def edge_uptime(edge_id: int, days: int = 30, db: Session = Depends(get_db)):
+    from . import uptime as up
+
+    if db.get(Edge, edge_id) is None:
+        raise HTTPException(404, "edge not found")
+    return up.daily(db, edge_id, days)
 
 
 @router.post("/edges", status_code=201)

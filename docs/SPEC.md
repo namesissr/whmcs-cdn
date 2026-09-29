@@ -333,18 +333,26 @@ Max 20 000 items and 2 000 events per request.
 - `GET /api/v1/overview` →
 ```json
 {"sites": {"total": 12, "by_status": {"active": 9, "pending_ns": 2, "suspended": 1}},
- "edges": {"total": 3, "enabled": 3, "online": 2, "with_errors": 0},
+ "edges": {"total": 3, "enabled": 3, "online": 2, "with_errors": 0, "shed": 0,
+           "list": [{"id": 1, "name": "ir1", "group": "tunnel", "enabled": true, "online": true, "shed": false,
+                     "capacity_mbps": 1000, "metrics": {...}|null, "uptime": {"h24": 100.0, "d30": 99.8}}]},
  "month": {"start": "2026-09-01T00:00:00Z", "bytes": 0, "requests": 0, "security": {"waf": 0}},
  "top_sites": [{"domain": "example.com", "bytes": 0, "requests": 0}],
  "nameservers": ["ns1.pasargadmizban.com", "ns2.pasargadmizban.com"]}
 ```
 - `GET /api/v1/events?limit=100&source=waf` → like §4 events, newest first, across all sites, each with `"domain"`.
+- `GET /api/v1/edges/{id}/uptime?days=30` → `{"days": [{"day": "YYYY-MM-DD", "uptime": <%>|null}, ...],
+  "overall": <%>|null}` (uptime is null for a day/window with no samples). Availability is sampled every
+  scheduler tick into a per-edge/per-hour rollup; % = online samples / total samples.
 - Existing: `GET /api/v1/sites` (domain, status, external_id), `GET /api/v1/usage?month=YYYY-MM`,
   `GET/POST /api/v1/edges`, `PATCH /api/v1/edges/{id}?enabled=true|false`,
   `POST /api/v1/edges/{id}/rotate-token`, `DELETE /api/v1/edges/{id}`, `GET /api/v1/ping`.
-  Edge object: `{id, name, ipv4, ipv6, region ("home"|"global"), enabled, last_seen_at, applied_version, last_error}`;
+  Edge object: `{id, name, ipv4, ipv6, region ("home"|"global"), enabled, last_seen_at, applied_version,
+  last_error, group, capacity_mbps, metrics, shed, uptime: {"h24": <%>|null, "d30": <%>|null}}`;
   create/rotate responses include `"token"` exactly once. An edge is "online" when last_seen_at is
-  within EDGE_OFFLINE_SECONDS (default 180 s).
+  within EDGE_OFFLINE_SECONDS (default 180 s); the "node offline" alert fires earlier, at
+  EDGE_ALERT_SECONDS. `edge_health:{id}` alerts on sustained high CPU load or (with a recent agent)
+  a full disk/memory.
 
 ---------------------------------------------------------------------------
 ## 7. Tunnel mode (VPN-over-CDN: WebSocket, HTTPUpgrade, gRPC, XHTTP, raw HTTP/2)

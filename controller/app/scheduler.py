@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import delete, or_, select
 
-from . import alerts, dnsbuild, geocheck, nscheck, ssl
+from . import alerts, dnsbuild, geocheck, nscheck, ssl, uptime
 from .config import settings
 from .db import SessionLocal
 from .leader import instance_id, make_elector
@@ -180,9 +180,14 @@ def job_quota(db):
     db.commit()
 
 
+def job_uptime(db):
+    uptime.sample(db)
+
+
 def job_cleanup(db):
     db.execute(delete(Purge).where(Purge.created_at < utcnow() - timedelta(days=2)))
     db.execute(delete(UsageHourly).where(UsageHourly.hour < utcnow() - timedelta(days=400)))
+    uptime.prune(db)
     prune_events(db)
     db.commit()
 
@@ -256,7 +261,7 @@ def job_geo(db, now: datetime | None = None, force: bool = False):
     alerts.sync("geo:", active, lambda c: "مسیریابی کشوری (GeoDNS) دوباره درست کار می‌کند.")
 
 
-JOBS = [job_edges, job_alerts, job_geo, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
+JOBS = [job_edges, job_uptime, job_alerts, job_geo, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
 
 
 def run_once():

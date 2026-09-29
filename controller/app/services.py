@@ -67,14 +67,26 @@ def update_shed(e: Edge, now: datetime | None = None):
         e.shed = False
 
 
+def cpu_ratio(m: dict) -> float | None:
+    """load1 per CPU core, or None when either is missing."""
+    cpus = float(m.get("cpus") or 0)
+    if cpus <= 0 or m.get("load1") is None:
+        return None
+    return float(m.get("load1") or 0) / cpus
+
+
 def record_metrics(e: Edge, metrics: dict, now: datetime | None = None):
-    """Store heartbeat metrics and update the shed flag and the high-load counter. Caller commits."""
+    """Store heartbeat metrics and update the shed flag and the high-load counters. Caller commits."""
     now = now or utcnow()
-    e.metrics = json.dumps(metrics)
+    # drop keys the agent didn't send (disk_pct/mem_pct are optional) so they don't show as 0
+    clean = {k: v for k, v in metrics.items() if v is not None}
+    e.metrics = json.dumps(clean)
     e.metrics_at = now
     update_shed(e, now)
     pct = edge_load_percent(e, now)
     e.load_high = (e.load_high or 0) + 1 if pct is not None and pct > LOAD_ALERT_PERCENT else 0
+    ratio = cpu_ratio(clean)
+    e.cpu_high = (e.cpu_high or 0) + 1 if ratio is not None and ratio > settings.edge_cpu_alert else 0
 
 
 DNS_DIRTY_KEY = "dns_dirty"

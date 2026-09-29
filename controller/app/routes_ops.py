@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from . import alerts, crypto
 from .auth import require_admin
@@ -127,6 +127,23 @@ def deep_health() -> tuple[dict, int]:
                       "failing": bool(state.get("backup:last_failure_at"))}
     if settings.backup_enabled and (b_age is None or b_age > 26 * 3600):
         warnings.append("no successful backup in the last 26 hours")
+
+    # edge availability --------------------------------------------------------
+    db = SessionLocal()
+    try:
+        from . import uptime as up
+        from .models import Edge
+        from .services import online_edges
+        edges = list(db.scalars(select(Edge).where(Edge.enabled.is_(True))))
+        online = len(online_edges(db))
+        ups = up.summaries(db)
+        worst = min((v["d30"] for v in ups.values() if v.get("d30") is not None), default=None)
+        body["edges"] = {"enabled": len(edges), "online": online, "shed": sum(1 for e in edges if e.shed),
+                         "worst_uptime_30d": worst}
+    except Exception:  # noqa: BLE001
+        db.rollback()
+    finally:
+        db.close()
 
     # alerts -------------------------------------------------------------------
     body["alerts"] = {"channels": [n.name for n in alerts.configured_channels()], "open": len(open_alerts),
