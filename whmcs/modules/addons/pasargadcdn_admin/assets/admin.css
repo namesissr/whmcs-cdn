@@ -351,3 +351,33 @@
   .pcdna-desc-grid, .pcdna-dl, .pcdna-dl-3 { grid-template-columns: minmax(0, 1fr); }
   .pcdna-tabs { flex-wrap: nowrap; overflow-x: auto; }
 }
+
+/* ---------- tunnel mode: edge groups, live load, tunnel KPIs */
+.pcdna .pcdna-kpis-tunnel { margin-top: -4px; }
+.pcdna .pcdna-badges { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.pcdna .pcdna-c-bad { color: var(--a-bad); }
+.pcdna .pcdna-c-warn { color: var(--a-warn); }
+.pcdna .pcdna-c-brand { color: var(--a-brand); }
+.pcdna .pcdna-edges td.pcdna-load-cell { white-space: normal; min-width: 145px; }
+.pcdna .pcdna-load { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+.pcdna .pcdna-load .pcdna-badge { align-self: flex-start; margin-top: 2px; }
+.pcdna .pcdna-load-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.pcdna .pcdna-load-pct { font-size: 13px; }
+.pcdna .pcdna-edges tr[data-shed] > td { background: var(--a-bad-50); }
+.pcdna .pcdna-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.pcdna .pcdna-group { border: 1px solid var(--a-border); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.pcdna .pcdna-group-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pcdna .pcdna-group-val { font-size: 17px; font-weight: 800; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pcdna .pcdna-group-val small { font-size: 12px; font-weight: 500; color: var(--a-muted); }
+.pcdna .pcdna-edge-edit .pcdna-menu-list { min-width: 240px; padding: 10px; }
+.pcdna .pcdna-edge-form { display: flex !important; flex-direction: column; gap: 8px; }
+.pcdna .pcdna-edge-form label { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; font-weight: 600; color: var(--a-text-2); white-space: normal; }
+.pcdna .pcdna-edge-form .pcdna-input { width: 100%; }
+.pcdna .pcdna-domain-cell .pcdna-badge { margin-right: 6px; vertical-align: middle; }
+.pcdna .pcdna-subhead { font-size: 13.5px; font-weight: 700; margin: 10px 0 6px; color: var(--a-text); }
+.pcdna .pcdna-subhead:first-of-type { margin-top: 0; }
+.pcdna .pcdna-tn-line { margin-top: 2px; }
+.pcdna .pcdna-matrix select.pcdna-input { width: 100%; min-width: 0; }
+.pcdna .pcdna-edges td.pcdna-load-cell { max-width: 170px; }
+.pcdna .pcdna-load-top { flex-wrap: wrap; }
+.pcdna .pcdna-load .pcdna-num { white-space: normal; }

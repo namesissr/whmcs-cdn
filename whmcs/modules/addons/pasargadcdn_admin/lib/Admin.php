@@ -181,6 +181,8 @@ final class Admin
                 return [[self::orphanDelete(Env::input($post['domain'] ?? ''), Env::input($post['confirm'] ?? ''), $admin)], []];
             case 'edge_add':
                 return self::edgeAdd($post, $admin);
+            case 'edge_edit':
+                return self::edgeEdit($post, $admin);
             case 'edge_toggle':
             case 'edge_rotate':
             case 'edge_delete':
@@ -320,7 +322,8 @@ final class Admin
     private static function edgeAdd(array $post, int $admin): array
     {
         $old = ['name' => Env::input($post['name'] ?? ''), 'ipv4' => Env::input($post['ipv4'] ?? ''),
-            'ipv6' => Env::input($post['ipv6'] ?? ''), 'region' => Env::input($post['region'] ?? '')];
+            'ipv6' => Env::input($post['ipv6'] ?? ''), 'region' => Env::input($post['region'] ?? ''),
+            'group' => Env::input($post['group'] ?? 'general') ?: 'general', 'capacity_mbps' => trim(Env::input($post['capacity_mbps'] ?? ''))];
         $e = [];
         if (!preg_match('/^[A-Za-z0-9_.-]{1,64}$/D', $old['name'])) {
             $e[] = 'نام نود فقط می‌تواند حروف انگلیسی، عدد، نقطه، زیرخط و خط تیره باشد (حداکثر ۶۴).';
@@ -334,12 +337,19 @@ final class Admin
         if (!in_array($old['region'], ['home', 'global'], true)) {
             $e[] = 'منطقه نامعتبر است.';
         }
+        if (!in_array($old['group'], ['general', 'tunnel'], true)) {
+            $e[] = 'گروه نود نامعتبر است.';
+        }
+        $cap = self::capacity($old['capacity_mbps']);
+        if ($cap === null) {
+            $e[] = 'ظرفیت باید عدد صحیح بین ۰ و ۱۰٬۰۰۰٬۰۰۰ مگابیت بر ثانیه باشد.';
+        }
         if ($e) {
             return [array_map(function ($m) {
                 return ['bad', View::e($m)];
             }, $e), ['old' => $old]];
         }
-        $body = ['name' => $old['name'], 'ipv4' => $old['ipv4'], 'region' => $old['region']];
+        $body = ['name' => $old['name'], 'ipv4' => $old['ipv4'], 'region' => $old['region'], 'group' => $old['group'], 'capacity_mbps' => $cap];
         if ($old['ipv6'] !== '') {
             $body['ipv6'] = $old['ipv6'];
         }
@@ -349,11 +359,46 @@ final class Admin
             return [[['bad', View::e('افزودن نود ناموفق بود: ' . $ex->getMessage())]], ['old' => $old]];
         }
         // The token is only rendered in this response — never logged, stored or put in a redirect.
-        Env::log('edge ' . $old['name'] . ' (' . $old['ipv4'] . ', ' . $old['region'] . ') added by admin #' . $admin);
+        Env::log('edge ' . $old['name'] . ' (' . $old['ipv4'] . ', ' . $old['region'] . ', group ' . $old['group'] . ', ' . $cap . ' Mbps) added by admin #' . $admin);
         Pages::reset();
         $token = is_string($r['token'] ?? null) ? $r['token'] : '';
         return [[['ok', 'نود ' . View::ltr($old['name']) . ' ثبت شد.']], $token !== ''
             ? ['token' => ['token' => $token, 'name' => $old['name'], 'title' => 'نود جدید: دستور نصب']] : []];
+    }
+
+    /** '' → 0; digits (Persian digits accepted) within 0..10M → int; else null. */
+    private static function capacity(string $v): ?int
+    {
+        $v = str_replace([',', '٬', ' '], '', strtr($v, ['۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4', '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9']));
+        if ($v === '') {
+            return 0;
+        }
+        return ctype_digit($v) && strlen($v) <= 8 && (int) $v <= 10000000 ? (int) $v : null;
+    }
+
+    /** Group / capacity / region of an edge: PATCH /api/v1/edges/{id} with a JSON body (SPEC §7.4). */
+    private static function edgeEdit(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $group = Env::input($post['group'] ?? '');
+        $region = Env::input($post['region'] ?? '');
+        $cap = self::capacity(trim(Env::input($post['capacity_mbps'] ?? '')));
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        if (!in_array($group, ['general', 'tunnel'], true) || !in_array($region, ['home', 'global'], true) || $cap === null) {
+            return [[['bad', 'گروه، منطقه یا ظرفیت نامعتبر است (ظرفیت: عدد صحیح ۰ تا ۱۰٬۰۰۰٬۰۰۰ مگابیت بر ثانیه).']], []];
+        }
+        try {
+            $r = Env::api(10)->request('PATCH', '/api/v1/edges/' . $id, ['group' => $group, 'capacity_mbps' => $cap, 'region' => $region]);
+        } catch (\Throwable $e) {
+            return [[['bad', View::e('ذخیره تنظیمات نود ناموفق بود: ' . $e->getMessage())]], []];
+        }
+        $name = is_array($r['edge'] ?? null) ? (string) ($r['edge']['name'] ?? '#' . $id) : '#' . $id;
+        Env::log('edge ' . $name . ' set to group ' . $group . ', ' . $cap . ' Mbps, region ' . $region . ' by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'تنظیمات نود ' . View::ltr($name) . ' ذخیره شد (گروه ' . ($group === 'tunnel' ? 'تونل' : 'عمومی') . '، ظرفیت '
+            . ($cap ? View::n($cap) . ' Mbps' : 'نامشخص') . ').']], []];
     }
 
     private static function edgeAction(string $action, int $id, string $enabled, int $admin): array

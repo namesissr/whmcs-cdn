@@ -34,7 +34,7 @@ function pasargadcdn_MetaData()
 
 function pasargadcdn_ConfigOptions()
 {
-    // Order matters: WHMCS stores these as configoption1..14.
+    // Order matters: WHMCS stores these as configoption1..19.
     return [
         'Bandwidth (GB)' => [
             'Type' => 'text', 'Size' => '8', 'Default' => '100',
@@ -61,6 +61,16 @@ function pasargadcdn_ConfigOptions()
         'Max firewall rules' => ['Type' => 'text', 'Size' => '8', 'Default' => '20'],
         'Max rate-limit rules' => ['Type' => 'text', 'Size' => '8', 'Default' => '5'],
         'Max LB pools' => ['Type' => 'text', 'Size' => '8', 'Default' => '3'],
+        // Tunnel mode (SPEC §7): Xray/V2Ray/sing-box over WebSocket, HTTPUpgrade, gRPC, XHTTP, h2.
+        'Tunnel (VPN over CDN)' => ['Type' => 'yesno', 'Default' => '',
+            'Description' => 'حالت تونل: عبور Xray / V2Ray (WebSocket، gRPC، XHTTP، HTTPUpgrade، h2) از CDN'],
+        'Max tunnel paths' => ['Type' => 'text', 'Size' => '8', 'Default' => '10', 'Description' => 'حداکثر مسیر تونل (۰ تا ۵۰)'],
+        'Max tunnel connections' => ['Type' => 'text', 'Size' => '8', 'Default' => '0',
+            'Description' => 'اتصال همزمان تونل هر سایت روی هر نود — 0 یعنی نامحدود'],
+        'Tunnel max Mbps per connection' => ['Type' => 'text', 'Size' => '8', 'Default' => '0',
+            'Description' => 'سقف سرعت هر اتصال تونل (مگابیت بر ثانیه) — 0 یعنی بدون سقف. فعلاً نودها آن را روی جریان‌های تونل اعمال نمی‌کنند'],
+        'Edge group' => ['Type' => 'dropdown', 'Options' => 'general,tunnel', 'Default' => 'general',
+            'Description' => 'پاسخ DNS سایت‌های این محصول از کدام گروه نودها باشد (general = نودهای وب، tunnel = نودهای مخصوص تونل)'],
     ];
 }
 
@@ -71,8 +81,11 @@ function pasargadcdn_ConfigOptions()
  *   Rate Limit Rules, LB Pools            — quantity / text (number)
  *   SSL, WAF, DDoS, Load Balancer, Image Optimization, Custom SSL, DNSSEC
  *                                         — yes/no
+ *   Tunnel Paths, Tunnel Connections, Tunnel Mbps — number; Tunnel — yes/no;
+ *   Edge Group — "general" | "tunnel"
  * Products saved before v2 have empty configoption5..14, i.e. every v2
- * feature off / 0 until the admin ticks them.
+ * feature off / 0 until the admin ticks them; likewise products saved before
+ * tunnel mode (configoption15..19 empty) get tunnel off, group "general".
  */
 function pasargadcdn_plan(array $params): array
 {
@@ -95,6 +108,11 @@ function pasargadcdn_plan(array $params): array
             'max_firewall_rules' => max(0, (int) $opt(12)),
             'max_ratelimit_rules' => max(0, (int) $opt(13)),
             'max_pools' => max(0, (int) $opt(14)),
+            'tunnel' => $opt(15) === 'on',
+            'max_tunnel_paths' => (int) $opt(16),
+            'max_tunnel_connections' => (int) $opt(17),
+            'tunnel_max_mbps' => (int) $opt(18),
+            'edge_group' => $opt(19) === 'tunnel' ? 'tunnel' : 'general',
         ],
     ];
     $co = $params['configoptions'] ?? [];
@@ -103,11 +121,13 @@ function pasargadcdn_plan(array $params): array
         'Rate Limit' => ['rate_limit_rps', 0], 'Page Rules' => ['features.max_page_rules', 0],
         'Firewall Rules' => ['features.max_firewall_rules', 0],
         'Rate Limit Rules' => ['features.max_ratelimit_rules', 0], 'LB Pools' => ['features.max_pools', 0],
+        'Tunnel Paths' => ['features.max_tunnel_paths', 0], 'Tunnel Connections' => ['features.max_tunnel_connections', 0],
+        'Tunnel Mbps' => ['features.tunnel_max_mbps', 0],
     ];
     $flags = [
         'SSL' => 'ssl_allowed', 'WAF' => 'features.waf', 'DDoS' => 'features.ddos',
         'Load Balancer' => 'features.load_balancer', 'Image Optimization' => 'features.image_optimization',
-        'Custom SSL' => 'features.custom_ssl', 'DNSSEC' => 'features.dnssec',
+        'Custom SSL' => 'features.custom_ssl', 'DNSSEC' => 'features.dnssec', 'Tunnel' => 'features.tunnel',
     ];
     $set = function (string $key, $value) use (&$plan) {
         $k = explode('.', $key);
@@ -127,6 +147,15 @@ function pasargadcdn_plan(array $params): array
             $set($key, (bool) $co[$name]);
         }
     }
+    if (isset($co['Edge Group']) && in_array($co['Edge Group'], ['general', 'tunnel'], true)) {
+        $plan['features']['edge_group'] = $co['Edge Group'];
+    }
+    // Controller ranges (SPEC §7.1) — out-of-range values would make Create/ChangePackage fail.
+    $f = &$plan['features'];
+    $f['max_tunnel_paths'] = min(50, max(0, $f['max_tunnel_paths']));
+    $f['max_tunnel_connections'] = min(1000000, max(0, $f['max_tunnel_connections']));
+    $f['tunnel_max_mbps'] = min(100000, max(0, $f['tunnel_max_mbps']));
+    unset($f);
     return $plan;
 }
 
@@ -628,7 +657,26 @@ function pasargadcdn_AdminServicesTabFields(array $params)
         'WAF / DDoS' => $h('WAF: ' . ($s['config']['waf']['mode'] ?? '-') . ' — DDoS: ' . ($s['config']['ddos']['mode'] ?? '-')),
         'DNSSEC' => $h(pasargadcdn_admin_dnssec($params)),
         'امکانات پلن' => $h(pasargadcdn_features_text($s['plan']['features'] ?? [])),
+        'تونل / VPN' => $h(pasargadcdn_tunnel_text($s)),
     ];
+}
+
+/** One-line tunnel state of a site for the admin service tab. */
+function pasargadcdn_tunnel_text(array $s): string
+{
+    if (empty($s['plan']['features']['tunnel'])) {
+        return 'در پلن فعال نیست';
+    }
+    $t = (array) ($s['config']['tunnel'] ?? []);
+    $protos = array_count_values(array_map(function ($p) {
+        return (string) ($p['protocol'] ?? '?');
+    }, array_filter((array) ($t['paths'] ?? []), 'is_array')));
+    $list = [];
+    foreach ($protos as $k => $n) {
+        $list[] = $k . '×' . $n;
+    }
+    return (!empty($t['enabled']) ? 'روشن' : 'خاموش') . ' — ' . count((array) ($t['paths'] ?? [])) . ' مسیر'
+        . ($list ? ' (' . implode(', ', $list) . ')' : '');
 }
 
 function pasargadcdn_e($v): string
@@ -658,8 +706,17 @@ function pasargadcdn_features_text(array $f): string
             $on[] = $label;
         }
     }
-    return (implode(', ', $on) ?: '—') . sprintf(' · page rules %d · firewall %d · rate-limit %d · pools %d',
+    $txt = (implode(', ', $on) ?: '—') . sprintf(' · page rules %d · firewall %d · rate-limit %d · pools %d',
         $f['max_page_rules'] ?? 0, $f['max_firewall_rules'] ?? 0, $f['max_ratelimit_rules'] ?? 0, $f['max_pools'] ?? 0);
+    if (!empty($f['tunnel'])) {
+        $txt .= sprintf(' · tunnel: %d paths, %s conns, %s Mbps', $f['max_tunnel_paths'] ?? 0,
+            !empty($f['max_tunnel_connections']) ? (string) $f['max_tunnel_connections'] : '∞',
+            !empty($f['tunnel_max_mbps']) ? (string) $f['tunnel_max_mbps'] : '∞');
+    }
+    if (($f['edge_group'] ?? 'general') !== 'general') {
+        $txt .= ' · edge group: ' . $f['edge_group'];
+    }
+    return $txt;
 }
 
 // --------------------------------------------------------------- client area
@@ -726,7 +783,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'app.js']),
     ];
 }
 

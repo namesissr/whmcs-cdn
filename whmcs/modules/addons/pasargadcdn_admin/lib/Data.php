@@ -69,6 +69,16 @@ final class Data
             'h.server', 'p.name as product', 'c.firstname', 'c.lastname', 'c.companyname'])->all();
     }
 
+    /** Active services on a product with tunnel mode (configoption15), 0 on any error. */
+    public static function tunnelServices(): int
+    {
+        try {
+            return (int) self::serviceQuery()->where('h.domainstatus', 'Active')->where('p.configoption15', 'on')->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
     public static function statusCounts(): array
     {
         $out = [];

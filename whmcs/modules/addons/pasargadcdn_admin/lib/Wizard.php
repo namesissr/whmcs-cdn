@@ -9,7 +9,7 @@ if (class_exists(__NAMESPACE__ . '\\Wizard', false)) {
 }
 
 /**
- * «راه‌اندازی خودکار محصولات»: product group, four CDN plans with pricing,
+ * «راه‌اندازی خودکار محصولات»: product group, four CDN plans + three tunnel (VPN-over-CDN) plans with pricing,
  * server group, «Origin IP» custom field, upgrade paths and the welcome email.
  *
  * Idempotent: everything is looked up before it is created; existing products,
@@ -38,34 +38,54 @@ final class Wizard
     const SETUP_COL = ['monthly' => 'msetupfee', 'quarterly' => 'qsetupfee', 'semiannually' => 'ssetupfee',
         'annually' => 'asetupfee', 'biennially' => 'bsetupfee', 'triennially' => 'tsetupfee'];
 
-    /** plan field => configoption number */
-    const FLAGS = ['ssl' => 3, 'waf' => 5, 'ddos' => 6, 'lb' => 7, 'image' => 8, 'customssl' => 9, 'dnssec' => 10];
-    const NUMS = ['records' => 2, 'rate' => 4, 'page' => 11, 'fw' => 12, 'rl' => 13, 'pools' => 14];
-    const NUM_MAX = ['bw' => 1000000, 'records' => 100000, 'rate' => 100000, 'page' => 10000, 'fw' => 10000, 'rl' => 10000, 'pools' => 1000];
+    /** plan field => configoption number (19 = edge group, a string) */
+    const FLAGS = ['ssl' => 3, 'waf' => 5, 'ddos' => 6, 'lb' => 7, 'image' => 8, 'customssl' => 9, 'dnssec' => 10, 'tunnel' => 15];
+    const NUMS = ['records' => 2, 'rate' => 4, 'page' => 11, 'fw' => 12, 'rl' => 13, 'pools' => 14, 'tpaths' => 16, 'tconn' => 17, 'tmbps' => 18];
+    const GROUP_OPTION = 19;
+    const EDGE_GROUPS = ['general' => 'عمومی', 'tunnel' => 'تونل'];
+    const NUM_MAX = ['bw' => 1000000, 'records' => 100000, 'rate' => 100000, 'page' => 10000, 'fw' => 10000, 'rl' => 10000, 'pools' => 1000,
+        'tpaths' => 50, 'tconn' => 1000000, 'tmbps' => 100000];
+    /** plan families: upgrade paths are created within a family only */
+    const FAMILIES = ['site' => 'پلن‌های CDN سایت', 'tunnel' => 'پلن‌های تونل / VPN'];
 
     const FIELD_LABELS = [
         'bw' => 'ترافیک ماهانه (GB)', 'records' => 'رکورد DNS', 'rate' => 'محدودیت درخواست هر IP (req/s)',
         'ssl' => 'SSL رایگان', 'waf' => 'WAF', 'ddos' => 'حفاظت DDoS', 'lb' => 'توزیع بار', 'image' => 'بهینه‌سازی تصویر',
         'customssl' => 'گواهی اختصاصی', 'dnssec' => 'DNSSEC', 'page' => 'قوانین صفحه', 'fw' => 'قوانین فایروال',
-        'rl' => 'قوانین محدودیت نرخ', 'pools' => 'استخر توزیع بار',
+        'rl' => 'قوانین محدودیت نرخ', 'pools' => 'استخر توزیع بار', 'tunnel' => 'حالت تونل (VPN)', 'tpaths' => 'مسیر تونل',
+        'tconn' => 'اتصال همزمان هر نود', 'tmbps' => 'سقف سرعت اتصال (Mbps)', 'group' => 'گروه نودها',
     ];
 
+    const NO_TUNNEL = ['tunnel' => 0, 'tpaths' => 0, 'tconn' => 0, 'tmbps' => 0, 'group' => 'general'];
     const PLANS = [
-        'basic' => ['title' => 'پایه', 'name' => 'CDN پایه', 'bw' => 100, 'records' => 50, 'rate' => 0, 'ssl' => 1, 'waf' => 0,
-            'ddos' => 1, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 1, 'page' => 3, 'fw' => 5, 'rl' => 1, 'pools' => 0],
-        'pro' => ['title' => 'حرفه‌ای', 'name' => 'CDN حرفه‌ای', 'bw' => 500, 'records' => 200, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
-            'ddos' => 1, 'lb' => 0, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 10, 'fw' => 20, 'rl' => 5, 'pools' => 0],
-        'business' => ['title' => 'تجاری', 'name' => 'CDN تجاری', 'bw' => 2000, 'records' => 500, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
-            'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 25, 'fw' => 50, 'rl' => 15, 'pools' => 3],
-        'enterprise' => ['title' => 'سازمانی', 'name' => 'CDN سازمانی', 'bw' => 10000, 'records' => 2000, 'rate' => 0, 'ssl' => 1,
-            'waf' => 1, 'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 100, 'fw' => 200, 'rl' => 50, 'pools' => 10],
+        'basic' => ['title' => 'پایه', 'name' => 'CDN پایه', 'family' => 'site', 'bw' => 100, 'records' => 50, 'rate' => 0, 'ssl' => 1, 'waf' => 0,
+            'ddos' => 1, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 1, 'page' => 3, 'fw' => 5, 'rl' => 1, 'pools' => 0] + self::NO_TUNNEL,
+        'pro' => ['title' => 'حرفه‌ای', 'name' => 'CDN حرفه‌ای', 'family' => 'site', 'bw' => 500, 'records' => 200, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
+            'ddos' => 1, 'lb' => 0, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 10, 'fw' => 20, 'rl' => 5, 'pools' => 0] + self::NO_TUNNEL,
+        'business' => ['title' => 'تجاری', 'name' => 'CDN تجاری', 'family' => 'site', 'bw' => 2000, 'records' => 500, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
+            'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 25, 'fw' => 50, 'rl' => 15, 'pools' => 3] + self::NO_TUNNEL,
+        'enterprise' => ['title' => 'سازمانی', 'name' => 'CDN سازمانی', 'family' => 'site', 'bw' => 10000, 'records' => 2000, 'rate' => 0, 'ssl' => 1,
+            'waf' => 1, 'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 100, 'fw' => 200, 'rl' => 50, 'pools' => 10] + self::NO_TUNNEL,
+        // Tunnel (VPN-over-CDN, SPEC §7): priced by traffic like the site plans; answered by the «tunnel» edge group.
+        // No WAF/DDoS (tunnel paths bypass them); firewall block rules and a load-balancer pool are useful.
+        'tunnel_basic' => ['title' => 'تونل پایه', 'name' => 'تونل پایه', 'family' => 'tunnel', 'bw' => 200, 'records' => 20, 'rate' => 0, 'ssl' => 1,
+            'waf' => 0, 'ddos' => 0, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 0, 'page' => 0, 'fw' => 5, 'rl' => 0, 'pools' => 0,
+            'tunnel' => 1, 'tpaths' => 3, 'tconn' => 300, 'tmbps' => 0, 'group' => 'tunnel'],
+        'tunnel_pro' => ['title' => 'تونل حرفه‌ای', 'name' => 'تونل حرفه‌ای', 'family' => 'tunnel', 'bw' => 1000, 'records' => 50, 'rate' => 0, 'ssl' => 1,
+            'waf' => 0, 'ddos' => 0, 'lb' => 1, 'image' => 0, 'customssl' => 0, 'dnssec' => 0, 'page' => 0, 'fw' => 10, 'rl' => 0, 'pools' => 2,
+            'tunnel' => 1, 'tpaths' => 10, 'tconn' => 2000, 'tmbps' => 0, 'group' => 'tunnel'],
+        'tunnel_unlimited' => ['title' => 'تونل نامحدود', 'name' => 'تونل نامحدود', 'family' => 'tunnel', 'bw' => 5000, 'records' => 100, 'rate' => 0, 'ssl' => 1,
+            'waf' => 0, 'ddos' => 0, 'lb' => 1, 'image' => 0, 'customssl' => 0, 'dnssec' => 0, 'page' => 0, 'fw' => 20, 'rl' => 0, 'pools' => 5,
+            'tunnel' => 1, 'tpaths' => 30, 'tconn' => 0, 'tmbps' => 0, 'group' => 'tunnel'],
     ];
 
     /** Default monthly price per plan by currency kind. */
     const BASE_PRICE = [
-        'irt' => ['basic' => 150000, 'pro' => 450000, 'business' => 1200000, 'enterprise' => 4500000],
-        'irr' => ['basic' => 1500000, 'pro' => 4500000, 'business' => 12000000, 'enterprise' => 45000000],
-        'usd' => ['basic' => 5, 'pro' => 15, 'business' => 40, 'enterprise' => 150],
+        'irt' => ['basic' => 150000, 'pro' => 450000, 'business' => 1200000, 'enterprise' => 4500000,
+            'tunnel_basic' => 250000, 'tunnel_pro' => 950000, 'tunnel_unlimited' => 3900000],
+        'irr' => ['basic' => 1500000, 'pro' => 4500000, 'business' => 12000000, 'enterprise' => 45000000,
+            'tunnel_basic' => 2500000, 'tunnel_pro' => 9500000, 'tunnel_unlimited' => 39000000],
+        'usd' => ['basic' => 5, 'pro' => 15, 'business' => 40, 'enterprise' => 150, 'tunnel_basic' => 8, 'tunnel_pro' => 30, 'tunnel_unlimited' => 120],
     ];
     const BASE_OVERAGE = ['irt' => 3000, 'irr' => 30000, 'usd' => 0.1];
 
@@ -122,6 +142,16 @@ final class Wizard
     {
         $li = [];
         $li[] = $p['bw'] > 0 ? self::fa($p['bw']) . ' گیگابایت ترافیک ماهانه' : 'ترافیک ماهانه نامحدود';
+        if (!empty($p['tunnel'])) {
+            $li[] = 'تونل VPN پشت CDN برای Xray / V2Ray / sing-box: gRPC، XHTTP، WebSocket، HTTPUpgrade و HTTP/2';
+            $li[] = 'تا ' . self::fa($p['tpaths']) . ' مسیر تونل با پیکربندی آماده سرور و کلاینت (لینک و QR)';
+            // tmbps is not advertised: the edges cannot enforce a per-stream rate on tunnel traffic yet.
+            $li[] = $p['tconn'] > 0 ? 'تا ' . self::fa($p['tconn']) . ' اتصال همزمان روی هر نود' : 'اتصال همزمان نامحدود';
+            if (($p['group'] ?? 'general') === 'tunnel') {
+                $li[] = 'نودهای اختصاصی تونل داخل ایران با توزیع بار خودکار';
+            }
+            $li[] = 'آی‌پی سرور شما پنهان می‌ماند؛ صفحه استتار و محدودسازی کشور';
+        }
         $li[] = 'تا ' . self::fa($p['records']) . ' رکورد DNS روی نیم‌سرورهای پاسارگاد';
         if ($p['ssl']) {
             $li[] = 'SSL رایگان Let\'s Encrypt (دامنه و wildcard) با تمدید خودکار';
@@ -253,20 +283,23 @@ final class Wizard
         $any = false;
         foreach (self::PLANS as $key => $defaults) {
             $p = (array) ($post['plan'][$key] ?? []);
-            $row = ['title' => $defaults['title'], 'enabled' => !empty($p['enabled'])];
+            $row = ['title' => $defaults['title'], 'family' => $defaults['family'], 'enabled' => !empty($p['enabled'])];
             $row['name'] = $str($p['name'] ?? '', 100);
             $row['desc'] = Env::input($p['desc'] ?? '');
             if (strlen($row['desc']) > 20000) {
                 $e[] = 'توضیحات پلن ' . $defaults['title'] . ' بیش از حد طولانی است.';
             }
+            $badNum = [];
             foreach (array_merge(['bw' => 0], self::NUMS) as $f => $_) {
-                $v = $numv($p[$f] ?? '');
+                // tunnel limits may be absent (forms from before tunnel mode): 0
+                $v = $numv($p[$f] ?? (in_array($f, ['tpaths', 'tconn', 'tmbps'], true) ? '0' : ''));
                 if (!ctype_digit($v) || (int) $v > self::NUM_MAX[$f]) {
                     if ($row['enabled']) {
                         $e[] = 'مقدار «' . self::FIELD_LABELS[$f] . '» در پلن ' . $defaults['title'] . ' باید عدد صحیح بین ۰ و '
                             . View::n(self::NUM_MAX[$f]) . ' باشد.';
                     }
                     $v = '0';
+                    $badNum[$f] = true;
                 }
                 $row[$f] = (int) $v;
             }
@@ -278,6 +311,12 @@ final class Wizard
             }
             if (!$row['lb']) {
                 $row['pools'] = 0;
+            }
+            $row['group'] = array_key_exists((string) ($p['group'] ?? ''), self::EDGE_GROUPS) ? (string) $p['group'] : 'general';
+            if (!$row['tunnel']) {
+                $row['tpaths'] = $row['tconn'] = $row['tmbps'] = 0;
+            } elseif ($row['enabled'] && $row['tpaths'] < 1 && empty($badNum['tpaths'])) {
+                $e[] = 'پلن ' . $defaults['title'] . ' حالت تونل دارد؛ دست‌کم یک مسیر تونل مجاز کنید.';
             }
             $row['prices'] = [];
             foreach ($currencies as $c) {
@@ -361,16 +400,17 @@ final class Wizard
         return (int) ceil($bw * (100 + (int) $in['overage_allow']) / 100);
     }
 
-    /** configoption1..14 for a plan. */
+    /** configoption1..19 for a plan. */
     public static function configOptions(array $p, array $in): array
     {
         $o = ['configoption1' => (string) self::hardCap($p, $in)];
         foreach (self::NUMS as $f => $n) {
-            $o['configoption' . $n] = (string) (int) $p[$f];
+            $o['configoption' . $n] = (string) (int) ($p[$f] ?? 0);
         }
         foreach (self::FLAGS as $f => $n) {
-            $o['configoption' . $n] = $p[$f] ? 'on' : '';
+            $o['configoption' . $n] = !empty($p[$f]) ? 'on' : '';
         }
+        $o['configoption' . self::GROUP_OPTION] = ($p['group'] ?? 'general') === 'tunnel' ? 'tunnel' : 'general';
         ksort($o, SORT_NATURAL);
         return $o;
     }
@@ -570,7 +610,7 @@ final class Wizard
                 continue;
             }
             $prod = self::findProduct($key, $p['name'], $gid);
-            $found[] = $prod ? (int) $prod->id : 0;
+            $found[self::familyOf($key)][] = $prod ? (int) $prod->id : 0;
             $cap = self::hardCap($p, $in);
             $detail = self::FIELD_LABELS['bw'] . ': ' . ($p['bw'] > 0 ? View::n($p['bw']) : 'نامحدود');
             if ($in['billing'] === 'prepaid' && $p['bw'] > 0) {
@@ -578,6 +618,10 @@ final class Wizard
             } elseif ($in['overage'] && $p['bw'] > 0) {
                 $detail .= ' — ترافیک اضافه هر GB ' . View::n($in['overage_price'], 4) . ' (ذخیره: ' . View::n($perMb, 4) . ' هر MB)'
                     . ' — سقف قطع روی CDN: ' . View::n($cap) . ' GB';
+            }
+            if (!empty($p['tunnel'])) {
+                $detail .= ' — تونل: ' . View::n($p['tpaths']) . ' مسیر، ' . ($p['tconn'] ? View::n($p['tconn']) . ' اتصال هر نود' : 'اتصال نامحدود')
+                    . '، ' . ($p['tmbps'] ? View::n($p['tmbps']) . ' Mbps' : 'بدون سقف سرعت') . '، گروه نود ' . ($p['group'] ?? 'general');
             }
             $steps[] = ['op' => $prod ? ($in['update'] ? 'update' : 'skip') : 'create', 'kind' => 'محصول', 'label' => $p['name'],
                 'detail' => ($prod ? 'محصول موجود #' . (int) $prod->id . ($in['update'] ? ' به‌روزرسانی می‌شود' : ' دست نمی‌خورد') . ' — ' : '') . $detail,
@@ -597,16 +641,23 @@ final class Wizard
             $steps[] = ['op' => $field ? 'skip' : 'create', 'kind' => 'فیلد سفارشی', 'label' => 'Origin IP — ' . $p['name'],
                 'detail' => $field ? 'از قبل وجود دارد' : 'فیلد متنی اختیاری با اعتبارسنجی IPv4 در فرم سفارش'];
         }
-        $n = count(array_filter($in['plans'], function ($p) {
-            return $p['enabled'];
-        }));
-        if ($n > 1) {
-            $missing = in_array(0, $found, true) ? 1 : self::missingPaths($found);
-            $steps[] = ['op' => $missing ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => 'ارتقا/تنزل بین ' . View::n($n) . ' پلن',
+        foreach ($found as $fam => $ids) {
+            $n = count($ids);
+            if ($n < 2) {
+                continue;
+            }
+            $missing = in_array(0, $ids, true) ? 1 : self::missingPaths($ids);
+            $steps[] = ['op' => $missing ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => 'ارتقا/تنزل بین ' . View::n($n) . ' پلن — ' . self::FAMILIES[$fam],
                 'detail' => 'مسیرهای موجود حفظ و فقط مسیرهای جاافتاده اضافه می‌شوند (' . (Env::hasTable('tblproduct_upgrade_products')
                     ? 'tblproduct_upgrade_products' : 'tblproducts.upgradepackages') . ')'];
         }
         return $steps;
+    }
+
+    /** Family of a plan key ('site' | 'tunnel'). */
+    public static function familyOf(string $key): string
+    {
+        return self::PLANS[$key]['family'] ?? 'site';
     }
 
     /**
@@ -786,10 +837,16 @@ final class Wizard
             }
         }
 
-        // upgrade / downgrade paths between the wizard products
-        $added = self::upgradePaths(array_values($pids));
-        if (count($pids) > 1) {
-            $out[] = ['op' => $added ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => View::n($added) . ' مسیر جدید', 'link' => ''];
+        // upgrade / downgrade paths between the wizard products of the same family (site plans, tunnel plans)
+        $byFamily = [];
+        foreach ($pids as $key => $pid) {
+            $byFamily[self::familyOf($key)][] = $pid;
+        }
+        foreach ($byFamily as $fam => $ids) {
+            if (count($ids) > 1) {
+                $added = self::upgradePaths($ids);
+                $out[] = ['op' => $added ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => View::n($added) . ' مسیر جدید — ' . self::FAMILIES[$fam], 'link' => ''];
+            }
         }
         return $out;
     }

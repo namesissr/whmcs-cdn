@@ -25,15 +25,15 @@ class ClientApi
 {
     const MAX_BODY = 262144; // 256 KB
 
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages';
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel';
 
     /** method => [sub-path regex relative to /api/v1/sites/{domain}, ...] */
     const ROUTES = [
         'GET' => [
             '', 'config/(?:' . self::SECTIONS . ')', 'records', 'records/export', 'dnssec',
-            'analytics', 'events', 'usage',
+            'analytics', 'events', 'usage', 'tunnel/stats',
         ],
-        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl'],
+        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check'],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom'],
         'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom'],
     ];
@@ -43,6 +43,7 @@ class ClientApi
         'analytics' => ['period' => '/^(24h|7d|30d)$/D'],
         'events' => ['limit' => '/^([1-9][0-9]{0,2}|1000)$/D'],
         'usage' => ['days' => '/^([1-9][0-9]{0,2})$/D'],
+        'tunnel/stats' => ['hours' => '/^(24|168|720)$/D'],
     ];
 
     /**

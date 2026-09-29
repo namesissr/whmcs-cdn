@@ -2,7 +2,7 @@
  * Pasargad CDN — client-area app shell (vanilla JS, no dependencies).
  *
  * Script order (see templates/clientarea.tpl): ui.js → pages.js → reports.js →
- * tutorials.js → app.js. Boot data comes from <script id="pcdn-boot"> (see
+ * tutorials.js → tunnel.js → app.js. Boot data comes from <script id="pcdn-boot"> (see
  * pasargadcdn_ClientArea); every call goes through api.php, which pins the
  * request to this service's domain. Data only reaches the DOM through
  * textContent / createElement.
@@ -57,6 +57,7 @@
   var NAV = [
     { title: 'شروع', items: ['overview', 'help'] },
     { title: 'DNS', items: ['dns', 'dnssec'] },
+    { title: 'تونل', items: ['tunnel'] },
     { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'pools'] },
     { title: 'امنیت', items: ['firewall', 'waf', 'ddos', 'ratelimit', 'hotlink'] },
     { title: 'SSL و هدرها', items: ['ssl', 'headers', 'errorpages'] },
@@ -125,7 +126,8 @@
     headers: { request: [], response: [] },
     hotlink: { enabled: false, extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'mp4'], allowed_referers: [], allow_empty: true },
     image: { enabled: false, quality: 85, max_width: 2000 },
-    errorpages: { '5xx': null, '4xx': null }
+    errorpages: { '5xx': null, '4xx': null },
+    tunnel: { enabled: false, paths: [], idle_timeout: 3600, per_connection_mbps: 0, max_connections_per_ip: 0, allowed_countries: [], fallback: 'origin' }
   };
   function config(section) {
     var c = S.site && S.site.config && S.site.config[section];
@@ -379,6 +381,7 @@
       h('h3', { text: p.title + ' در پلن فعلی شما فعال نیست' }),
       h('p', { text: p.upsell || p.desc || '' }),
       p.guide && p.guide.what ? h('p', { className: 'pcdn-muted', text: p.guide.what }) : null,
+      p.upsellMore ? p.upsellMore() : null,
       h('div', { className: 'pcdn-row-actions' },
         h('a', { className: 'pcdn-btn pcdn-btn-primary', href: UPGRADE_URL, 'data-ro-ok': '1' }, icon('sparkles'), h('span', { text: 'ارتقای پلن' })),
         p.guide && p.guide.tut ? tutLink(p.guide.tut, 'بیشتر بدانید') : null));
@@ -432,6 +435,10 @@
     if (plan.ssl_allowed || f.custom_ssl) steps.push({ id: 'ssl', title: 'SSL صادر شد', done: ssl.status === 'active' });
     if (f.waf || f.ddos) {
       steps.push({ id: 'security', title: 'امنیت را فعال کنید', done: (!!f.waf && (cfg.waf || {}).mode && cfg.waf.mode !== 'off') || (!!f.ddos && (cfg.ddos || {}).mode && cfg.ddos.mode !== 'off') });
+    }
+    if (f.tunnel) {
+      var tn = cfg.tunnel || {};
+      steps.push({ id: 'tunnel', title: 'تونل (VPN) را راه‌اندازی کنید', done: !!tn.enabled && Array.isArray(tn.paths) && tn.paths.length > 0 });
     }
     steps.push({ id: 'realip', title: 'آی‌پی واقعی بازدیدکننده را روی سرور تنظیم کنید', done: P.store('realip-' + SID) === '1' });
     return steps;
@@ -500,6 +507,10 @@
       }
       if (f.waf) acts.push(P.btn('تنظیمات WAF', { icon: 'shield', onclick: function () { go('waf'); } }));
       acts.push(tutLink('waf', 'درباره WAF'));
+    } else if (st.id === 'tunnel') {
+      out.push(h('p', { text: 'پلن شما حالت تونل دارد: سرور Xray / V2Ray خود را با gRPC، XHTTP یا WebSocket پشت CDN قرار دهید. یک مسیر مخفی بسازید، تونل را روشن کنید و پیکربندی آماده سرور و کلاینت را کپی کنید.' }));
+      acts.push(P.btn('تنظیم تونل', { kind: st.done ? '' : 'primary', icon: 'tunnel', onclick: function () { go('tunnel'); } }));
+      acts.push(tutLink('tunnel', 'آموزش راه‌اندازی VPN'));
     } else if (st.id === 'realip') {
       out.push(h('p', { text: 'پشت CDN، سرور شما آی‌پی سرورهای CDN را می‌بیند. با چند خط تنظیم (nginx، Apache، وردپرس و ...) آی‌پی واقعی بازدیدکنندگان در لاگ‌ها و افزونه‌های امنیتی ثبت می‌شود.' }));
       acts.push(P.btn('مشاهده آموزش', { kind: st.done ? '' : 'primary', icon: 'book', onclick: function () { go('help', 'realip'); } }));
@@ -771,7 +782,7 @@
         h('div', null, h('dt', { text: 'قوانین فایروال / صفحه / نرخ' }), h('dd', { text: num(f.max_firewall_rules || 0) + ' / ' + num(f.max_page_rules || 0) + ' / ' + num(f.max_ratelimit_rules || 0) }))),
       h('div', { className: 'pcdn-feats' },
         feat(plan.ssl_allowed, 'SSL رایگان'), feat(f.waf, 'WAF'), feat(f.ddos, 'DDoS'), feat(f.load_balancer && f.max_pools > 0, 'توزیع بار'),
-        feat(f.image_optimization, 'بهینه‌سازی تصویر'), feat(f.custom_ssl, 'گواهی اختصاصی'), feat(f.dnssec, 'DNSSEC'))
+        feat(f.image_optimization, 'بهینه‌سازی تصویر'), feat(f.custom_ssl, 'گواهی اختصاصی'), feat(f.dnssec, 'DNSSEC'), feat(f.tunnel, 'تونل / VPN'))
     ]);
     return c;
   }

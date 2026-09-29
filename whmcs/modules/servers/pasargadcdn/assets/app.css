@@ -107,6 +107,9 @@
   --pc-t-srv-fg: #be185d; --pc-t-srv-bg: #fde7f1;
   --pc-t-caa-fg: #b4400d; --pc-t-caa-bg: #ffeddf;
   --pc-t-ns-fg: #475569; --pc-t-ns-bg: #e9edf3;
+  /* QR code: always dark modules on a light field so phone cameras can read it */
+  --pc-qr-fg: #0f172a;
+  --pc-qr-bg: #ffffff;
   /* charts */
   --pc-c-req: #2563eb;
   --pc-c-hit: #0d9488;
@@ -277,6 +280,8 @@
   --pc-tip-label: #d5dbe5;
   --pc-tip-border: #3a465b;
   --pc-code-bg: #0b111d;
+  --pc-qr-fg: #0b111d;
+  --pc-qr-bg: #eef2f7;
   --pc-code-head: #151d2c;
   --pc-code-border: #2a3447;
   --pc-code-fg: #e2e8f0;
@@ -1117,6 +1122,61 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-evcard .pcdn-ev-req { background: var(--pc-surface-2); border-radius: 8px; padding: 6px 8px; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-evcard-foot:empty { display: none; }
 :is(#pcdn-app, #pcdn-layer).pcdn .pcdn-evcard-foot .pcdn-btn { width: 100%; }
+
+/* ---------- tunnel / VPN (tunnel.js) */
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-proto { display: inline-block; font-family: var(--pc-mono); font-size: 11.5px; font-weight: 700; padding: 1px 8px; border-radius: 6px; white-space: nowrap; color: var(--pc-t-def-fg); background: var(--pc-t-def-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-grpc { color: var(--pc-t-a-fg); background: var(--pc-t-a-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-xhttp { color: var(--pc-t-mx-fg); background: var(--pc-t-mx-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-ws { color: var(--pc-t-cname-fg); background: var(--pc-t-cname-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-httpupgrade { color: var(--pc-t-alias-fg); background: var(--pc-t-alias-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-h2 { color: var(--pc-t-caa-fg); background: var(--pc-t-caa-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-pathval { max-width: 100%; overflow-wrap: anywhere; word-break: break-all; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-path .pcdn-sentence { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-path .pcdn-rule-ctl { gap: 4px; }
+#pcdn-app.pc-narrow .pcdn-tn-path .pcdn-tn-cfg { margin-left: auto; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-pathrow { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-pathrow > .pcdn-field { flex: 1; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-pathrow > .pcdn-btn { flex: none; margin-top: 30px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-cc { display: flex; flex-direction: column; gap: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-note { font-size: 12.5px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-reslist { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--pc-border); border-radius: 10px; padding: 10px 12px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res.is-bad { border-color: var(--pc-danger-100); background: var(--pc-danger-50); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res-icon { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; flex: none; color: var(--t-fg); background: var(--t-bg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res-icon .pcdn-icon { width: 17px; height: 17px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res-head .pcdn-vchip { overflow-wrap: anywhere; word-break: break-all; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res.is-ok .pcdn-tn-res-msg { color: var(--pc-success); font-weight: 600; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-res.is-bad .pcdn-tn-res-msg { color: var(--pc-danger); font-weight: 600; overflow-wrap: anywhere; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-byproto h4 { font-size: 13.5px; font-weight: 700; margin: 0 0 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-upsell { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; text-align: right; max-width: 60ch; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-upsell li { display: flex; gap: 10px; align-items: baseline; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-upsell .pcdn-tn-proto { min-width: 96px; text-align: center; flex: none; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-share { display: flex; gap: 16px; align-items: flex-start; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-share-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-config h4 { font-size: 14px; font-weight: 800; margin: 0 0 4px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-config section { display: flex; flex-direction: column; gap: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-config section.pcdn-tn-share { flex-direction: row; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-link { display: flex; align-items: flex-start; gap: 6px; background: var(--pc-surface-2); border: 1px solid var(--pc-border); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-link code { flex: 1; min-width: 0; font-family: var(--pc-mono); font-size: 12px; line-height: 1.6; color: var(--pc-text); overflow-wrap: anywhere; word-break: break-all; text-align: left; max-height: 7.2em; overflow-y: auto; }
+:is(#pcdn-app, #pcdn-layer).pcdn .pcdn-tn-link .pcdn-copy { flex: none; white-space: nowrap; width: auto; height: 30px; padding: 0 10px; gap: 6px; display: inline-flex; align-items: center; border: 1px solid var(--pc-border); background: var(--pc-surface); color: var(--pc-link); font-size: 12.5px; font-weight: 600; font-family: var(--pc-font); }
+:is(#pcdn-app, #pcdn-layer).pcdn .pcdn-tn-link .pcdn-copy .pcdn-icon { grid-area: auto; }
+:is(#pcdn-app, #pcdn-layer).pcdn .pcdn-tn-link .pcdn-copy .pcdn-copy-ok { display: none; }
+:is(#pcdn-app, #pcdn-layer).pcdn .pcdn-tn-link .pcdn-copy.is-done .pcdn-icon:first-child { opacity: 1; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-link { flex-direction: column; align-items: stretch; }
+:is(#pcdn-app, #pcdn-layer).pcdn .pcdn-tn-link .pcdn-copy { align-self: flex-start; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-qr { flex: none; padding: 8px; border-radius: 12px; border: 1px solid var(--pc-border); background: var(--pc-qr-bg); line-height: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-qr svg { display: block; width: 200px; height: 200px; max-width: 100%; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-cfg-ctl { grid-template-columns: 1fr; }
+@media (max-width: 640px) {
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-config section.pcdn-tn-share { flex-direction: column-reverse; align-items: stretch; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-qr { align-self: center; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-pathrow { flex-wrap: wrap; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-pathrow > .pcdn-btn { margin: 0; }
+}
+#pcdn-app.pc-narrow .pcdn-tn-pathrow { flex-wrap: wrap; }
+#pcdn-app.pc-narrow .pcdn-tn-pathrow > .pcdn-btn { margin: 0; }
 
 /* ---------- motion preferences */
 @media (prefers-reduced-motion: reduce) {

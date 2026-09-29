@@ -321,8 +321,26 @@ final class Pages
             . ($cutN ? '<br><span class="pcdna-err" data-cut-credit="' . $cutN . '">' . View::n($cutN) . ' قطع به‌دلیل اعتبار</span>' : ''));
         $h .= '</div>';
 
+        // tunnel mode: tunnel services (WHMCS) + live load of the tunnel edge group
+        $tn = Data::tunnelServices();
+        if ($tn > 0 || ($edges && self::groupTotals($edges)['tunnel']['edges'] > 0)) {
+            $gt = $edges ? self::groupTotals($edges)['tunnel'] : null;
+            $h .= '<div class="pcdna-kpis pcdna-kpis-tunnel" data-tunnel-kpis="1">'
+                . View::kpi('zap', 'violet', 'سرویس‌های تونل فعال', View::n($tn), 'پلن‌های تونل / VPN در WHMCS')
+                . View::kpi('server', $gt && $gt['online'] > 0 ? 'ok' : 'bad', 'نودهای گروه تونل', $gt ? View::n($gt['online']) . ' <small>از ' . View::n($gt['edges']) . '</small>' : $na,
+                    $gt && $gt['online'] === 0 ? 'بدون نود تونل: سایت‌های تونل به همه نودها می‌روند' : 'آنلاین')
+                . View::kpi('activity', 'brand', 'ترافیک لحظه‌ای تونل', $gt ? View::e('↓' . self::mbps($gt['rx']) . ' ↑' . self::mbps($gt['tx'])) : $na,
+                    $gt && $gt['cap'] > 0 ? 'ظرفیت ' . View::e(self::mbps($gt['cap'])) . ' (' . View::n(max($gt['rx'], $gt['tx']) * 100 / $gt['cap']) . '٪)' : '')
+                . View::kpi('users', 'brand', 'اتصال‌های همزمان تونل', $gt ? View::n($gt['conns']) : $na, 'مجموع نودهای گروه تونل')
+                . '</div>';
+        }
+
         // warnings
         $warn = self::warnings($ping, $ov, $sites);
+        foreach (self::saturated((array) $edges) as $e) {
+            $warn[] = [!empty($e['shed']) ? 'bad' : 'warn', 'نود ' . View::ltr($e['name'] ?? '') . (!empty($e['shed']) ? ' اشباع شده و موقتاً از DNS خارج است.' : ' بیش از ۸۰٪ ظرفیت بار دارد.')
+                . ' <a href="' . View::url(['page' => 'edges']) . '">نودها</a>'];
+        }
         $wh = '';
         if ($warn) {
             $wh .= '<ul class="pcdna-warnlist">';
@@ -393,28 +411,98 @@ final class Pages
         return $t !== false && time() - $t <= 180;
     }
 
+    const EDGE_GROUPS = ['general' => ['عمومی', 'muted'], 'tunnel' => ['تونل', 'violet']];
+
+    /**
+     * Load of an edge from its latest heartbeat metrics (SPEC §7.4).
+     * @return array ['pct' => float|null (max(rx,tx) / capacity), 'peak' => Mbps, 'fresh' => bool, 'm' => metrics|null]
+     */
+    public static function edgeLoad(array $e): array
+    {
+        $m = is_array($e['metrics'] ?? null) ? $e['metrics'] : null;
+        $t = $m && !empty($m['at']) ? strtotime((string) $m['at']) : false;
+        $fresh = $m !== null && $t !== false && time() - $t <= 180;
+        $peak = $m ? max((float) ($m['rx_mbps'] ?? 0), (float) ($m['tx_mbps'] ?? 0)) : 0.0;
+        $cap = (int) ($e['capacity_mbps'] ?? 0);
+        return ['pct' => $fresh && $cap > 0 ? $peak * 100 / $cap : null, 'peak' => $peak, 'fresh' => $fresh, 'm' => $m];
+    }
+
+    /** Edges that are shed from DNS or above 80 % of their capacity. */
+    public static function saturated(array $edges): array
+    {
+        return array_values(array_filter($edges, function ($e) {
+            if (!is_array($e) || empty($e['enabled'])) {
+                return false;
+            }
+            $l = self::edgeLoad($e);
+            return !empty($e['shed']) || ($l['pct'] !== null && $l['pct'] > 80);
+        }));
+    }
+
+    private static function mbps($v): string
+    {
+        $v = (float) $v;
+        return $v >= 1000 ? View::n($v / 1000, 1) . ' Gbps' : View::n($v, $v < 10 ? 1 : 0) . ' Mbps';
+    }
+
+    private static function loadCell(array $e): string
+    {
+        $l = self::edgeLoad($e);
+        $m = $l['m'];
+        if (!$m) {
+            return '<span class="pcdna-muted pcdna-small">بدون گزارش بار</span>';
+        }
+        $cap = (int) ($e['capacity_mbps'] ?? 0);
+        $pct = $l['pct'];
+        $tone = !empty($e['shed']) || ($pct !== null && $pct >= 90) ? 'bad' : ($pct !== null && $pct > 80 ? 'warn' : 'brand');
+        $h = '<div class="pcdna-load" data-load="' . ($pct === null ? '' : (int) round($pct)) . '">'
+            . '<div class="pcdna-load-top"><span class="pcdna-num" dir="ltr">↓' . View::e(self::mbps($m['rx_mbps'] ?? 0)) . ' ↑' . View::e(self::mbps($m['tx_mbps'] ?? 0)) . '</span>'
+            . ($pct !== null ? '<strong class="pcdna-load-pct pcdna-c-' . $tone . '">' . View::n($pct, 0) . '٪</strong>' : '') . '</div>'
+            . ($cap > 0 ? View::meter(min(1, $l['peak'] / $cap), $tone) : '')
+            . '<div class="pcdna-small pcdna-muted">' . View::n($m['connections'] ?? 0) . ' اتصال · بار ' . View::n($m['load1'] ?? 0, 1)
+            . (!empty($m['cpus']) ? '/' . View::n($m['cpus']) : '') . ' · ' . ($cap > 0 ? 'ظرفیت ' . View::e(self::mbps($cap)) : 'ظرفیت نامشخص')
+            . ' · ' . View::e(View::ago($m['at'] ?? null)) . '</div>';
+        if (!empty($e['shed'])) {
+            $h .= View::badge('خارج از DNS (اشباع)', 'bad', ' title="بار این نود از آستانه گذشته و تا کاهش بار در پاسخ DNS قرار نمی‌گیرد" data-shed="1"');
+        } elseif (!$l['fresh']) {
+            $h .= View::badge('گزارش قدیمی', 'muted');
+        }
+        return $h . '</div>';
+    }
+
     private static function edgeTable(array $edges, bool $actions): string
     {
         if (!$edges) {
             return View::emptyState('هنوز نودی ثبت نشده است', 'برای شروع، از صفحه «نودها» اولین نود را اضافه کنید.', 'server');
         }
-        $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-edges"><thead><tr><th>نام</th><th>منطقه</th><th>IP</th><th>وضعیت</th>'
-            . '<th>آخرین ارتباط</th><th>نسخه تنظیمات</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
+        $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-edges"><thead><tr><th>نام / IP</th><th>منطقه / گروه</th><th>وضعیت</th>'
+            . '<th>بار لحظه‌ای</th><th>آخرین ارتباط</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
         foreach ($edges as $e) {
             $online = self::edgeOnline($e);
             $fresh = !empty($e['enabled']) && empty($e['last_seen_at']);
             $status = empty($e['enabled']) ? View::badge('غیرفعال', 'muted') : ($online ? View::badge('آنلاین', 'ok')
                 : ($fresh ? View::badge('در انتظار نصب', 'warn', ' title="agent هنوز به کنترلر وصل نشده است"') : View::badge('آفلاین', 'bad')));
             $err = trim((string) ($e['last_error'] ?? ''));
-            $h .= '<tr' . (!empty($e['enabled']) && !$online && !$fresh ? ' class="is-bad"' : '') . ($err !== '' ? ' data-has-error="1"' : '') . '><td><strong>' . View::ltr($e['name'] ?? '') . '</strong></td>'
-                . '<td>' . (($e['region'] ?? '') === 'home' ? View::badge('ایران', 'brand') : View::badge('خارج', 'violet')) . '</td>'
-                . '<td>' . View::ltr($e['ipv4'] ?? '') . (!empty($e['ipv6']) ? '<br>' . View::ltr($e['ipv6'], 'pcdna-small') : '') . '</td>'
-                . '<td>' . $status . '</td><td title="' . View::e($e['last_seen_at'] ?? '') . '">' . View::e(View::ago($e['last_seen_at'] ?? null)) . '</td>'
-                . '<td>' . (!empty($e['applied_version']) ? View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') : '—') . '</td>';
+            [$gl, $gt] = self::EDGE_GROUPS[$e['group'] ?? 'general'] ?? [(string) ($e['group'] ?? ''), 'muted'];
+            $id = (int) ($e['id'] ?? 0);
+            $h .= '<tr data-edge="' . $id . '"' . (!empty($e['enabled']) && !$online && !$fresh ? ' class="is-bad"' : '') . ($err !== '' ? ' data-has-error="1"' : '')
+                . (!empty($e['shed']) ? ' data-shed="1"' : '') . '><td><strong>' . View::ltr($e['name'] ?? '') . '</strong>'
+                . '<div class="pcdna-small pcdna-muted">' . View::ltr($e['ipv4'] ?? '') . (!empty($e['ipv6']) ? '<br>' . View::ltr($e['ipv6']) : '') . '</div></td>'
+                . '<td><span class="pcdna-badges">' . (($e['region'] ?? '') === 'home' ? View::badge('ایران', 'brand') : View::badge('خارج', 'violet'))
+                . View::badge($gl, $gt === 'violet' ? 'violet' : 'muted', ' data-group="' . View::e($e['group'] ?? 'general') . '"') . '</span></td>'
+                . '<td>' . $status . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
+                . '<td title="' . View::e($e['last_seen_at'] ?? '') . '">' . View::e(View::ago($e['last_seen_at'] ?? null))
+                . (!empty($e['applied_version']) ? '<div class="pcdna-small pcdna-muted" title="نسخه تنظیمات اعمال‌شده">' . View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') . '</div>' : '') . '</td>';
             if ($actions) {
-                $id = (int) ($e['id'] ?? 0);
                 $q = ['page' => 'edges'];
                 $h .= '<td class="pcdna-actions">'
+                    . '<details class="pcdna-menu pcdna-edge-edit"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="ویرایش نود ' . View::e($e['name'] ?? '') . '" title="گروه، ظرفیت و منطقه">'
+                    . View::icon('sliders') . '</summary><div class="pcdna-menu-list"><form method="post" action="' . View::url($q) . '" class="pcdna-edge-form">' . View::csrf()
+                    . '<input type="hidden" name="a" value="edge_edit"><input type="hidden" name="id" value="' . $id . '">'
+                    . '<label><span>گروه</span>' . View::select('group', ['general' => 'عمومی (سایت‌ها)', 'tunnel' => 'تونل (VPN)'], $e['group'] ?? 'general') . '</label>'
+                    . '<label><span>ظرفیت (Mbps، ۰ = نامشخص)</span><input class="pcdna-input" name="capacity_mbps" dir="ltr" inputmode="numeric" value="' . (int) ($e['capacity_mbps'] ?? 0) . '"></label>'
+                    . '<label><span>منطقه</span>' . View::select('region', ['home' => 'ایران (home)', 'global' => 'خارج (global)'], $e['region'] ?? 'home') . '</label>'
+                    . '<button type="submit" class="pcdna-btn pcdna-btn-sm pcdna-btn-primary">' . View::icon('check') . '<span>ذخیره</span></button></form></div></details>'
                     . View::postButton($q, 'edge_toggle', ['id' => $id, 'enabled' => empty($e['enabled']) ? '1' : '0'],
                         empty($e['enabled']) ? 'فعال‌سازی' : 'غیرفعال‌سازی', 'pcdna-btn pcdna-btn-sm pcdna-btn-icon',
                         empty($e['enabled']) ? '' : 'نود «' . ($e['name'] ?? '') . '» از DNS خارج شود؟ ترافیک به نودهای دیگر می‌رود.', 'power')
@@ -426,11 +514,57 @@ final class Pages
             }
             $h .= '</tr>';
             if ($err !== '') {
-                $h .= '<tr class="pcdna-errrow"><td colspan="' . ($actions ? 7 : 6) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
+                $h .= '<tr class="pcdna-errrow"><td colspan="' . ($actions ? 6 : 5) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
                     . '<code dir="ltr" title="' . View::e(View::clip($err, 600)) . '">' . View::e(View::clip($err, 300)) . '</code></td></tr>';
             }
         }
         return $h . '</tbody></table></div>';
+    }
+
+    /** Per-group totals of online edges: [group => [online, edges, rx, tx, cap, conns]]. */
+    public static function groupTotals(array $edges): array
+    {
+        $out = [];
+        foreach (array_keys(self::EDGE_GROUPS) as $g) {
+            $out[$g] = ['online' => 0, 'edges' => 0, 'rx' => 0.0, 'tx' => 0.0, 'cap' => 0, 'conns' => 0, 'shed' => 0];
+        }
+        foreach ($edges as $e) {
+            if (!is_array($e) || empty($e['enabled'])) {
+                continue;
+            }
+            $g = isset($out[$e['group'] ?? 'general']) ? ($e['group'] ?? 'general') : 'general';
+            $out[$g]['edges']++;
+            if (!self::edgeOnline($e)) {
+                continue;
+            }
+            $out[$g]['online']++;
+            $out[$g]['shed'] += !empty($e['shed']) ? 1 : 0;
+            $l = self::edgeLoad($e);
+            if ($l['fresh']) {
+                $out[$g]['rx'] += (float) ($l['m']['rx_mbps'] ?? 0);
+                $out[$g]['tx'] += (float) ($l['m']['tx_mbps'] ?? 0);
+                $out[$g]['conns'] += (int) ($l['m']['connections'] ?? 0);
+            }
+            $out[$g]['cap'] += (int) ($e['capacity_mbps'] ?? 0);
+        }
+        return $out;
+    }
+
+    private static function groupCards(array $edges): string
+    {
+        $h = '<div class="pcdna-groups">';
+        foreach (self::groupTotals($edges) as $g => $t) {
+            [$label] = self::EDGE_GROUPS[$g];
+            $peak = max($t['rx'], $t['tx']);
+            $h .= '<div class="pcdna-group" data-group-card="' . $g . '"><div class="pcdna-group-head">' . View::badge('گروه ' . $label, $g === 'tunnel' ? 'violet' : 'muted')
+                . '<span class="pcdna-small pcdna-muted">' . View::n($t['online']) . ' آنلاین از ' . View::n($t['edges']) . ' نود فعال'
+                . ($t['shed'] ? ' · <span class="pcdna-c-bad">' . View::n($t['shed']) . ' خارج از DNS</span>' : '') . '</span></div>'
+                . '<div class="pcdna-group-val"><span dir="ltr">↓' . View::e(self::mbps($t['rx'])) . ' ↑' . View::e(self::mbps($t['tx'])) . '</span>'
+                . ($t['cap'] > 0 ? '<small>از ظرفیت ' . View::e(self::mbps($t['cap'])) . '</small>' : '') . '</div>'
+                . ($t['cap'] > 0 ? View::meter(min(1, $peak / $t['cap']), $peak / $t['cap'] > .8 ? 'warn' : 'brand') : '')
+                . '<div class="pcdna-small pcdna-muted">' . View::n($t['conns']) . ' اتصال همزمان</div></div>';
+        }
+        return $h . '</div>';
     }
 
     private static function eventTable(array $events, array $byDomain, bool $compact): string
@@ -616,9 +750,16 @@ final class Pages
                 $menu .= View::postButton($q, 'create', ['service' => $sid], 'ساخت روی CDN (ModuleCreate)', 'pcdna-menu-item', 'سایت ' . $domain . ' روی کنترلر ساخته شود؟', 'plus');
             }
             $menu .= '<a class="pcdna-menu-item" href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '">' . View::icon('external') . '<span>صفحه سرویس در WHMCS</span></a>';
+            $tunnel = '';
+            if ($det && !empty($det['plan']['features']['tunnel'])) {
+                $tc = (array) ($det['config']['tunnel'] ?? []);
+                $np = count((array) ($tc['paths'] ?? []));
+                $tunnel = View::badge(!empty($tc['enabled']) ? 'تونل · ' . View::n($np) . ' مسیر' : 'تونل خاموش', !empty($tc['enabled']) ? 'violet' : 'muted',
+                    ' data-tunnel="' . (!empty($tc['enabled']) ? 'on' : 'off') . '" title="' . View::e('حالت تونل (VPN) — گروه نود: ' . ($det['plan']['features']['edge_group'] ?? 'general')) . '"');
+            }
             $t .= '<tr data-service="' . $sid . '"><td class="pcdna-domain-cell"><a class="pcdna-domain" href="' . self::manageUrl($sid) . '">' . View::ltr($domain !== '' ? $domain : '—') . '</a>'
                 . '<div class="pcdna-small pcdna-muted"><a href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '" title="صفحه سرویس در WHMCS">#' . View::n($sid) . '</a> · '
-                . View::e($svc->product) . '</div></td>'
+                . View::e($svc->product) . '</div>' . ($tunnel !== '' ? '<div class="pcdna-tn-line">' . $tunnel . '</div>' : '') . '</td>'
                 . '<td class="pcdna-client" data-label="مشتری"><a href="' . View::e(Data::clientUrl((int) $svc->userid)) . '">' . View::e(Data::clientName($svc)) . '</a></td>'
                 . '<td data-label="WHMCS / سررسید">' . self::whmcsBadge((string) $svc->domainstatus) . '<div class="pcdna-small pcdna-muted pcdna-nowrap" title="سررسید بعدی">' . View::e(View::date($svc->nextduedate)) . '</div></td>'
                 . '<td data-label="وضعیت CDN">' . $cdnCell . '</td><td data-label="NS">' . $ns . '</td><td data-label="SSL">' . $ssl . '</td><td class="pcdna-traffic" data-label="ترافیک این ماه">' . $traffic . '</td>'
@@ -743,6 +884,14 @@ final class Pages
         foreach ((array) $edges as $e) {
             $online += self::edgeOnline($e) ? 1 : 0;
         }
+        if ($edges !== null) {
+            foreach (self::saturated($edges) as $e) {
+                $h .= View::alert(!empty($e['shed']) ? 'bad' : 'warn', 'نود ' . View::ltr($e['name'] ?? '') . (!empty($e['shed'])
+                    ? ' اشباع شده و موقتاً از پاسخ DNS خارج است؛ ترافیک به نودهای دیگر همان گروه می‌رود. ظرفیت اضافه کنید یا نود جدید به این گروه بیاورید.'
+                    : ' بیش از ۸۰٪ ظرفیت خود بار دارد.'));
+            }
+            $h .= View::card('گروه‌های نود', self::groupCards($edges), '', '', 'activity');
+        }
         $h .= View::card('نودهای CDN' . ($edges !== null ? ' (' . View::n($online) . ' آنلاین از ' . View::n(count($edges)) . ')' : ''),
             $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error'])) : self::edgeTable($edges, true),
             '', 'pcdna-flush', 'server');
@@ -754,13 +903,20 @@ final class Pages
             . '<label><span>IPv4 عمومی</span><input class="pcdna-input" name="ipv4" dir="ltr" required maxlength="15" placeholder="5.160.10.20" value="' . View::e($old['ipv4'] ?? '') . '"></label>'
             . '<label><span>IPv6 (اختیاری)</span><input class="pcdna-input" name="ipv6" dir="ltr" maxlength="45" placeholder="2a01:…" value="' . View::e($old['ipv6'] ?? '') . '"></label>'
             . '<label><span>منطقه</span>' . View::select('region', ['home' => 'ایران (home)', 'global' => 'خارج از ایران (global)'], $old['region'] ?? 'home') . '</label>'
+            . '<label><span>گروه</span>' . View::select('group', ['general' => 'عمومی (سایت‌ها)', 'tunnel' => 'تونل (VPN)'], $old['group'] ?? 'general') . '</label>'
+            . '<label><span>ظرفیت پهنای باند (Mbps)</span><input class="pcdna-input" name="capacity_mbps" dir="ltr" inputmode="numeric" maxlength="8" placeholder="1000" value="' . View::e($old['capacity_mbps'] ?? '') . '">'
+            . '<small>۰ یا خالی = نامشخص (بدون خروج خودکار از DNS)</small></label>'
             . '</div><div class="pcdna-form-actions"><button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('plus') . '<span>افزودن نود و ساخت توکن</span></button></div></form>';
         $regions = '<ul class="pcdna-bullets"><li><strong>ایران (home):</strong> نودهای داخل ایران. با GeoDNS، کاربران ایرانی ابتدا به این نودها هدایت می‌شوند؛ '
             . 'ترافیک داخلی ارزان‌تر است و در قطعی اینترنت بین‌الملل، سایت برای کاربران داخل در دسترس می‌ماند.</li>'
             . '<li><strong>خارج (global):</strong> نودهای خارج از ایران برای بازدیدکنندگان خارجی و به‌عنوان پشتیبان وقتی همه نودهای ایران از دسترس خارج شوند.</li>'
             . '<li>بدون GeoDNS همه نودهای سالم به‌صورت تصادفی در پاسخ DNS قرار می‌گیرند. نود «آنلاین» یعنی در ۳ دقیقه اخیر با کنترلر ارتباط داشته است.</li>'
-            . '<li>غیرفعال کردن نود آن را برای نگهداری از DNS خارج می‌کند؛ «توکن جدید» توکن فعلی را باطل می‌کند.</li></ul>';
-        $h .= '<div class="pcdna-grid-2">' . View::card('افزودن نود جدید', $form, '', '', 'plus') . View::card('منطقه‌ها و وضعیت نودها', $regions, '', '', 'info') . '</div>';
+            . '<li>غیرفعال کردن نود آن را برای نگهداری از DNS خارج می‌کند؛ «توکن جدید» توکن فعلی را باطل می‌کند.</li>'
+            . '<li><strong>گروه:</strong> سایت‌های پلن‌های تونل (VPN) فقط به نودهای گروه «تونل» و بقیه سایت‌ها فقط به نودهای «عمومی» هدایت می‌شوند؛ '
+            . 'اگر گروهی نود آنلاین نداشته باشد، همه نودها پاسخ می‌دهند. ترافیک سنگین تونل‌ها این‌طور روی سایت‌های معمولی اثر نمی‌گذارد.</li>'
+            . '<li><strong>ظرفیت و بار:</strong> نودها هر دقیقه ترافیک ورودی/خروجی، تعداد اتصال و بار CPU را گزارش می‌کنند. نودی که به ۹۰٪ ظرفیت برسد موقتاً از DNS خارج می‌شود '
+            . '(به شرط ماندن نود دیگری در همان گروه و منطقه) و زیر ۷۵٪ برمی‌گردد.</li></ul>';
+        $h .= '<div class="pcdna-grid-2">' . View::card('افزودن نود جدید', $form, '', '', 'plus') . View::card('منطقه‌ها، گروه‌ها و وضعیت نودها', $regions, '', '', 'info') . '</div>';
         return $h;
     }
 
@@ -786,7 +942,7 @@ final class Pages
         if ($products) {
             $h .= self::productCards($products, $pricing, $currencies);
         } else {
-            $h .= View::alert('info', 'هنوز محصولی با ماژول Pasargad CDN وجود ندارد. با فرم زیر چهار پلن آماده (پایه، حرفه‌ای، تجاری، سازمانی) را با قیمت، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا بسازید.');
+            $h .= View::alert('info', 'هنوز محصولی با ماژول Pasargad CDN وجود ندارد. با فرم زیر چهار پلن سایت (پایه، حرفه‌ای، تجاری، سازمانی) و سه پلن تونل / VPN (تونل پایه، حرفه‌ای، نامحدود) را با قیمت، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا بسازید.');
         }
         $h .= self::wizardForm($state['input'] ?? Wizard::defaults($currencies), $currencies, (array) ($state['errors'] ?? []), !$products || !empty($state['errors']));
         return $h;
@@ -826,6 +982,10 @@ final class Pages
                 . '<div><dt>رکورد DNS</dt><dd>' . View::n($plan['max_records'] ?? 0) . '</dd></div>'
                 . '<div><dt>قوانین فایروال / صفحه / نرخ</dt><dd>' . View::n($f['max_firewall_rules'] ?? 0) . ' / ' . View::n($f['max_page_rules'] ?? 0) . ' / ' . View::n($f['max_ratelimit_rules'] ?? 0) . '</dd></div>'
                 . '<div><dt>استخر توزیع بار</dt><dd>' . View::n($f['max_pools'] ?? 0) . '</dd></div>'
+                . (!empty($f['tunnel']) ? '<div data-tunnel="1"><dt>تونل / VPN</dt><dd>' . View::n($f['max_tunnel_paths'] ?? 0) . ' مسیر · '
+                    . (!empty($f['max_tunnel_connections']) ? View::n($f['max_tunnel_connections']) . ' اتصال هر نود' : 'اتصال نامحدود') . ' · '
+                    . (!empty($f['tunnel_max_mbps']) ? View::n($f['tunnel_max_mbps']) . ' Mbps' : 'بدون سقف سرعت') . '</dd></div>' : '')
+                . '<div><dt>گروه نودها</dt><dd>' . (($f['edge_group'] ?? 'general') === 'tunnel' ? View::badge('تونل', 'violet') : View::badge('عمومی', 'muted')) . '</dd></div>'
                 . '<div><dt>گروه سرور</dt><dd>' . ((int) $p->servergroup > 0 ? View::e($p->servergroup_name ?: '#' . (int) $p->servergroup) : View::badge('تنظیم نشده', 'bad')) . '</dd></div>'
                 . '<div><dt>راه‌اندازی</dt><dd>' . View::e(self::AUTOSETUP[(string) $p->autosetup] ?? (string) $p->autosetup) . '</dd></div>'
                 . '<div><dt>ایمیل خوش‌آمد</dt><dd>' . (!empty($p->welcomeemail) ? View::e($emails[(int) $p->welcomeemail] ?? '#' . (int) $p->welcomeemail) : View::badge('ندارد', 'warn')) . '</dd></div>'
@@ -835,7 +995,7 @@ final class Pages
                 . '</dl><div class="pcdna-feats">' . $feat($plan['ssl_allowed'] ?? false, 'SSL رایگان') . $feat($f['waf'] ?? false, 'WAF')
                 . $feat($f['ddos'] ?? false, 'DDoS') . $feat(($f['load_balancer'] ?? false) && ($f['max_pools'] ?? 0) > 0, 'توزیع بار')
                 . $feat($f['image_optimization'] ?? false, 'بهینه‌سازی تصویر') . $feat($f['custom_ssl'] ?? false, 'گواهی اختصاصی')
-                . $feat($f['dnssec'] ?? false, 'DNSSEC') . '</div>';
+                . $feat($f['dnssec'] ?? false, 'DNSSEC') . $feat($f['tunnel'] ?? false, 'تونل / VPN') . '</div>';
             $body .= '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-prices"><thead><tr><th>ارز</th><th>ماهانه</th><th>سه‌ماهه</th><th>شش‌ماهه</th><th>سالانه</th></tr></thead><tbody>';
             foreach ($currencies as $c) {
                 $row = $pricing[$pid][(int) $c->id] ?? null;
@@ -858,7 +1018,7 @@ final class Pages
     private static function wizardForm(array $in, array $currencies, array $errors, bool $open): string
     {
         $h = '<details class="pcdna-card pcdna-wizard" id="wizard"' . ($open ? ' open' : '') . '><summary class="pcdna-card-head"><h3>' . View::icon('wand')
-            . '<span>راه‌اندازی خودکار محصولات</span></h3><span class="pcdna-muted pcdna-small">گروه، ۴ پلن، قیمت‌ها، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا — قابل اجرای مجدد</span></summary><div class="pcdna-card-body">';
+            . '<span>راه‌اندازی خودکار محصولات</span></h3><span class="pcdna-muted pcdna-small">گروه، ۴ پلن سایت + ۳ پلن تونل، قیمت‌ها، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا — قابل اجرای مجدد</span></summary><div class="pcdna-card-body">';
         foreach ($errors as $e) {
             $h .= View::alert('bad', View::e($e));
         }
@@ -912,32 +1072,50 @@ final class Pages
             . self::check('email_update', $in['email_update'], 'به‌روزرسانی: اگر قالبی با این نام‌ها وجود دارد متن آن بازنویسی شود')
             . '</div></fieldset>';
 
-        // feature matrix
-        $h .= '<fieldset class="pcdna-fieldset"><legend>امکانات پلن‌ها</legend><div class="pcdna-table-wrap"><table class="pcdna-table pcdna-matrix"><thead><tr><th></th>';
-        foreach (Wizard::PLANS as $key => $d) {
-            $p = $in['plans'][$key];
-            $h .= '<th><label class="pcdna-check"><input type="checkbox" name="plan[' . $key . '][enabled]" value="1"' . ($p['enabled'] ? ' checked' : '') . '><span>'
-                . View::e($d['title']) . '</span></label></th>';
-        }
-        $h .= '</tr></thead><tbody><tr><th>نام محصول</th>';
-        foreach (Wizard::PLANS as $key => $d) {
-            $h .= '<td><input class="pcdna-input" name="plan[' . $key . '][name]" maxlength="100" value="' . View::e($in['plans'][$key]['name']) . '" aria-label="نام محصول ' . View::e($d['title']) . '"></td>';
-        }
-        $h .= '</tr>';
-        foreach (['bw', 'records', 'ssl', 'rate', 'waf', 'ddos', 'lb', 'image', 'customssl', 'dnssec', 'page', 'fw', 'rl', 'pools'] as $f) {
-            $h .= '<tr><th>' . View::e(Wizard::FIELD_LABELS[$f]) . '</th>';
-            foreach (Wizard::PLANS as $key => $d) {
-                $v = $in['plans'][$key][$f];
-                $nm = 'plan[' . $key . '][' . $f . ']';
-                $aria = ' aria-label="' . View::e(Wizard::FIELD_LABELS[$f] . ' — ' . $d['title']) . '"';
-                $h .= '<td>' . (isset(Wizard::FLAGS[$f])
-                        ? '<label class="pcdna-switch"><input type="checkbox" name="' . $nm . '" value="1"' . ($v ? ' checked' : '') . $aria . '><span></span></label>'
-                        : '<input class="pcdna-input pcdna-input-num" name="' . $nm . '" dir="ltr" inputmode="numeric" value="' . (int) $v . '"' . $aria . '>') . '</td>';
+        // feature matrix, one table per plan family (site plans, tunnel plans)
+        $h .= '<fieldset class="pcdna-fieldset"><legend>امکانات پلن‌ها</legend>';
+        foreach (Wizard::FAMILIES as $fam => $famLabel) {
+            $keys = array_keys(array_filter(Wizard::PLANS, function ($d) use ($fam) {
+                return $d['family'] === $fam;
+            }));
+            $h .= '<h4 class="pcdna-subhead">' . View::e($famLabel) . '</h4>'
+                . '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-matrix" data-family="' . $fam . '"><thead><tr><th></th>';
+            foreach ($keys as $key) {
+                $p = $in['plans'][$key];
+                $h .= '<th><label class="pcdna-check"><input type="checkbox" name="plan[' . $key . '][enabled]" value="1"' . ($p['enabled'] ? ' checked' : '') . '><span>'
+                    . View::e(Wizard::PLANS[$key]['title']) . '</span></label></th>';
+            }
+            $h .= '</tr></thead><tbody><tr><th>نام محصول</th>';
+            foreach ($keys as $key) {
+                $h .= '<td><input class="pcdna-input" name="plan[' . $key . '][name]" maxlength="100" value="' . View::e($in['plans'][$key]['name']) . '" aria-label="نام محصول ' . View::e(Wizard::PLANS[$key]['title']) . '"></td>';
             }
             $h .= '</tr>';
+            $fields = $fam === 'tunnel'
+                ? ['bw', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group', 'records', 'ssl', 'lb', 'pools', 'fw', 'rate', 'waf', 'ddos', 'image', 'customssl', 'dnssec', 'page', 'rl']
+                : ['bw', 'records', 'ssl', 'rate', 'waf', 'ddos', 'lb', 'image', 'customssl', 'dnssec', 'page', 'fw', 'rl', 'pools', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group'];
+            foreach ($fields as $f) {
+                $h .= '<tr data-field="' . $f . '"><th>' . View::e(Wizard::FIELD_LABELS[$f]) . '</th>';
+                foreach ($keys as $key) {
+                    $v = $in['plans'][$key][$f] ?? 0;
+                    $nm = 'plan[' . $key . '][' . $f . ']';
+                    $aria = ' aria-label="' . View::e(Wizard::FIELD_LABELS[$f] . ' — ' . Wizard::PLANS[$key]['title']) . '"';
+                    if ($f === 'group') {
+                        $h .= '<td>' . View::select($nm, Wizard::EDGE_GROUPS, (string) $v, $aria) . '</td>';
+                        continue;
+                    }
+                    $h .= '<td>' . (isset(Wizard::FLAGS[$f])
+                            ? '<label class="pcdna-switch"><input type="checkbox" name="' . $nm . '" value="1"' . ($v ? ' checked' : '') . $aria . '><span></span></label>'
+                            : '<input class="pcdna-input pcdna-input-num" name="' . $nm . '" dir="ltr" inputmode="numeric" value="' . (int) $v . '"' . $aria . '>') . '</td>';
+                }
+                $h .= '</tr>';
+            }
+            $h .= '</tbody></table></div>';
         }
-        $h .= '</tbody></table></div><p class="pcdna-muted pcdna-small">ترافیک ۰ یعنی نامحدود. استخر توزیع بار فقط وقتی «توزیع بار» روشن باشد اعمال می‌شود. '
-            . 'این مقادیر در Module Settings محصول (configoption1..14) ذخیره می‌شوند و با ChangePackage روی سرویس‌های موجود اعمال می‌شوند.</p></fieldset>';
+        $h .= '<p class="pcdna-muted pcdna-small">ترافیک ۰ یعنی نامحدود. استخر توزیع بار فقط وقتی «توزیع بار» روشن باشد اعمال می‌شود. '
+            . 'پلن‌های تونل برای Xray / V2Ray پشت CDN هستند (ترافیک آپلود و دانلود هر دو حساب می‌شود) و با «گروه نودها = تونل» فقط به نودهای گروه تونل (صفحه «نودها») هدایت می‌شوند؛ '
+            . 'اگر نود آنلاینی در آن گروه نباشد، همه نودها پاسخ می‌دهند. «اتصال همزمان هر نود» ۰ یعنی نامحدود (هر جریان WebSocket/gRPC یک اتصال است). '
+            . '«سقف سرعت اتصال» ۰ یعنی بدون سقف و فعلاً روی جریان‌های تونل اعمال نمی‌شود. مسیر ارتقا فقط بین پلن‌های هم‌خانواده ساخته می‌شود. '
+            . 'این مقادیر در Module Settings محصول (configoption1..19) ذخیره می‌شوند و با ChangePackage روی سرویس‌های موجود اعمال می‌شوند.</p></fieldset>';
 
         // prices
         $h .= '<fieldset class="pcdna-fieldset"><legend>قیمت‌ها</legend><p class="pcdna-muted pcdna-small">خانه خالی یعنی آن دوره پرداخت غیرفعال است (در WHMCS با ‎-1 ذخیره می‌شود). '

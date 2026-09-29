@@ -161,6 +161,8 @@
       })));
   }
 
+  P.charts = { bar: barChart, area: areaChart, COLORS: COLORS };
+
   /** Horizontal bar list: [[label, value, sublabel?]]. */
   function barList(rows, o) {
     o = o || {};
