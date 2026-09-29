@@ -12,6 +12,8 @@
 #   --http-port N      public HTTP port (default 80)
 #   --https-port N     public HTTPS port (default 443)
 #   --no-geoip         do not download the DB-IP country database (country rules never match)
+#   --upgrade          update an installed edge in place: controller, token, ports, IPv6 and cache
+#                      size are read from /etc/pcdn/agent.conf (--controller/--token still override)
 #   --distro-nginx     accepted for compatibility (the distro nginx is always used now)
 set -euo pipefail
 
@@ -22,6 +24,7 @@ CACHE_SIZE=10g
 HTTP_PORT=80
 HTTPS_PORT=443
 GEOIP=yes
+UPGRADE=no
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 while [ $# -gt 0 ]; do
@@ -34,11 +37,22 @@ while [ $# -gt 0 ]; do
     --http-port) HTTP_PORT="$2"; shift 2 ;;
     --https-port) HTTPS_PORT="$2"; shift 2 ;;
     --no-geoip) GEOIP=no; shift ;;
+    --upgrade) UPGRADE=yes; shift ;;
     *) echo "unknown option: $1"; exit 1 ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
+if [ "$UPGRADE" = yes ]; then
+  [ -f /etc/pcdn/agent.conf ] || { echo "--upgrade: /etc/pcdn/agent.conf not found (not installed yet?)"; exit 1; }
+  conf() { sed -n "s/^$1=//p" /etc/pcdn/agent.conf | tail -1; }
+  [ -n "$CONTROLLER" ] || CONTROLLER="$(conf CONTROLLER_URL)"
+  [ -n "$TOKEN" ] || TOKEN="$(conf EDGE_TOKEN)"
+  v="$(conf LISTEN_IPV6)"; [ -n "$v" ] && IPV6="$v"
+  v="$(conf CACHE_MAX_SIZE)"; [ -n "$v" ] && CACHE_SIZE="$v"
+  v="$(conf HTTP_PORT)"; [ -n "$v" ] && HTTP_PORT="$v"
+  v="$(conf HTTPS_PORT)"; [ -n "$v" ] && HTTPS_PORT="$v"
+fi
 [ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || { echo "usage: $0 --controller URL --token TOKEN"; exit 1; }
 [ -f /etc/debian_version ] || { echo "only Ubuntu 24.04 (or a Debian derivative with njs >= 0.8.1) is supported"; exit 1; }
 case "$HTTP_PORT$HTTPS_PORT" in *[!0-9]*) echo "ports must be numeric"; exit 1 ;; esac
