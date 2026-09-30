@@ -540,6 +540,16 @@
 .pcdna-log-warn .pcdna-log-msg, .pcdna-log-warning .pcdna-log-msg { color: #7a4f00; background: #fff9ee; }
 .pcdna-edge-upgrade .pcdna-menu-list { padding: 10px 12px; }
 .pcdna-edge-upgrade .pcdna-menu-list .pcdna-copy { margin-top: 6px; }
+
+/* multi-address edges (SPEC §12): per-node «آدرس‌ها» panel */
+.pcdna-has-addrs { position: relative; }
+.pcdna-addr-dot { position: absolute; top: 4px; left: 4px; width: 7px; height: 7px; border-radius: 50%; background: var(--a-bad); box-shadow: 0 0 0 2px #fff; }
+.pcdna-addrs td { white-space: nowrap; vertical-align: top; }
+.pcdna-addrs tr[data-primary] > td { background: var(--a-surface-2); }
+.pcdna .pcdna-addr-edit .pcdna-menu-list { min-width: 240px; padding: 10px; }
+.pcdna .pcdna-addr-edit .pcdna-menu-list .pcdna-edge-form { display: flex !important; }
+.pcdna-addrs .pcdna-clip { max-width: 220px; }
+
 @media (max-width: 760px) {
   .pcdna-log-line { flex-wrap: wrap; }
   .pcdna-log-t { flex-basis: 100%; }

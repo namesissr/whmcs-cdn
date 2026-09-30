@@ -102,8 +102,8 @@ final class Admin
                 $body = Pages::dashboard();
         }
         // After a POST, the browser URL is replaced with the GET URL so a refresh never re-submits.
-        $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'q' => $get['q'] ?? null,
-            'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
+        $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'id' => $get['id'] ?? null,
+            'q' => $get['q'] ?? null, 'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
         return Pages::layout($page, $body, $flash, $clean);
     }
 
@@ -198,6 +198,14 @@ final class Admin
             case 'edge_rotate':
             case 'edge_delete':
                 return self::edgeAction($action, (int) ($post['id'] ?? 0), (string) ($post['enabled'] ?? ''), $admin);
+            case 'edge_addr_add':
+                return self::edgeAddrAdd($post, $admin);
+            case 'edge_addr_edit':
+                return self::edgeAddrEdit($post, $admin);
+            case 'edge_addr_toggle':
+                return self::edgeAddrToggle($post, $admin);
+            case 'edge_addr_delete':
+                return self::edgeAddrDelete($post, $admin);
             case 'wizard_preview':
             case 'wizard_edit':
             case 'wizard_apply':
@@ -514,6 +522,125 @@ final class Admin
         } catch (\Throwable $e) {
             return [[['bad', View::e('عملیات روی نود ناموفق بود: ' . $e->getMessage())]], []];
         }
+    }
+
+    // ------------------------------------------------------------------ §12 multi-address edges & health-based failover
+    //
+    // Address management + visibility of the AUTOMATIC health-based failover. The active address is
+    // chosen automatically by the controller's health probe; there is deliberately NO "force/switch to
+    // this IP now" action here — only add / edit / enable-for-maintenance / disable / remove.
+
+    /** True when $ip is a valid public address of the given family ('4'|'6'). */
+    private static function validPublicIp(string $ip, string $family): bool
+    {
+        if ($family === '6') {
+            return (bool) filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
+        }
+        return (bool) filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+
+    /** Add an additional address to a node: POST /api/v1/edges/{id}/addresses {family, ip, label?}. */
+    private static function edgeAddrAdd(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $family = Env::input($post['family'] ?? '');
+        $ip = Env::input($post['ip'] ?? '');
+        $label = View::clip(Env::input($post['label'] ?? ''), 64);
+        $e = [];
+        if ($id <= 0) {
+            $e[] = 'شناسه نود نامعتبر است.';
+        }
+        if (!in_array($family, ['4', '6'], true)) {
+            $e[] = 'نسخهٔ IP نامعتبر است (۴ یا ۶).';
+        } elseif (!self::validPublicIp($ip, $family)) {
+            $e[] = $family === '6' ? 'IPv6 معتبر نیست.' : 'IPv4 باید یک آدرس عمومی معتبر باشد.';
+        }
+        if ($e) {
+            return [array_map(function ($m) {
+                return ['bad', View::e($m)];
+            }, $e), []];
+        }
+        $body = ['family' => (int) $family, 'ip' => $ip];
+        if ($label !== '') {
+            $body['label'] = $label;
+        }
+        try {
+            Env::api(10)->post('/api/v1/edges/' . $id . '/addresses', $body);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('افزودن آدرس ناموفق بود: ' . $ex->getMessage())]], []];
+        }
+        Env::log('edge #' . $id . ' additional address ' . $ip . ' (IPv' . $family . ') added by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'آدرس ' . View::ltr($ip) . ' افزوده شد؛ پس از اولین بررسی سلامت به‌صورت خودکار در DNS اعلام می‌شود.']], []];
+    }
+
+    /** Edit/rename an additional address: PATCH /api/v1/edges/{id}/addresses/{aid} {ip?, label?}. */
+    private static function edgeAddrEdit(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $aid = (int) ($post['aid'] ?? 0);
+        $ip = Env::input($post['ip'] ?? '');
+        $family = Env::input($post['family'] ?? '');
+        $label = View::clip(Env::input($post['label'] ?? ''), 64);
+        if ($id <= 0 || $aid <= 0) {
+            return [[['bad', 'شناسه آدرس نامعتبر است.']], []];
+        }
+        $body = [];
+        if ($ip !== '') {
+            $fam = in_array($family, ['4', '6'], true) ? $family : (strpos($ip, ':') !== false ? '6' : '4');
+            if (!self::validPublicIp($ip, $fam)) {
+                return [[['bad', $fam === '6' ? 'IPv6 معتبر نیست.' : 'IPv4 باید یک آدرس عمومی معتبر باشد.']], []];
+            }
+            $body['ip'] = $ip;
+        }
+        // label is always sent so it can also be cleared
+        $body['label'] = $label;
+        try {
+            Env::api(10)->request('PATCH', '/api/v1/edges/' . $id . '/addresses/' . $aid, $body);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('ویرایش آدرس ناموفق بود: ' . $ex->getMessage())]], []];
+        }
+        Env::log('edge #' . $id . ' address #' . $aid . ' edited by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'آدرس به‌روزرسانی شد.']], []];
+    }
+
+    /** Enable/disable an additional address for maintenance: PATCH …/addresses/{aid} {enabled}. */
+    private static function edgeAddrToggle(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $aid = (int) ($post['aid'] ?? 0);
+        $on = (string) ($post['enabled'] ?? '') === '1';
+        if ($id <= 0 || $aid <= 0) {
+            return [[['bad', 'شناسه آدرس نامعتبر است.']], []];
+        }
+        try {
+            Env::api(10)->request('PATCH', '/api/v1/edges/' . $id . '/addresses/' . $aid, ['enabled' => $on]);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('تغییر وضعیت آدرس ناموفق بود: ' . $ex->getMessage())]], []];
+        }
+        Env::log('edge #' . $id . ' address #' . $aid . ' ' . ($on ? 'enabled' : 'disabled for maintenance') . ' by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', $on ? 'آدرس فعال شد؛ پس از تأیید سلامت دوباره به‌صورت خودکار در DNS اعلام می‌شود.'
+            : 'آدرس برای نگهداری غیرفعال و بی‌درنگ از DNS خارج شد.']], []];
+    }
+
+    /** Remove an additional address: DELETE /api/v1/edges/{id}/addresses/{aid} (the primary cannot be deleted). */
+    private static function edgeAddrDelete(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $aid = (int) ($post['aid'] ?? 0);
+        if ($id <= 0 || $aid <= 0) {
+            return [[['bad', 'شناسه آدرس نامعتبر است.']], []];
+        }
+        try {
+            Env::api(10)->delete('/api/v1/edges/' . $id . '/addresses/' . $aid);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('حذف آدرس ناموفق بود: ' . $ex->getMessage())]], []];
+        }
+        Env::log('edge #' . $id . ' address #' . $aid . ' removed by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'آدرس حذف شد.']], []];
     }
 
     private static function wizard(string $action, array $post, int $admin): array

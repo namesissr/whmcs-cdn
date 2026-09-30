@@ -622,7 +622,21 @@ final class Pages
                     . ' href="' . View::url(['page' => 'edges', 'view' => 'logs', 'id' => $id]) . '" title="لاگ‌ها'
                     . (!empty($e['logs_at']) ? ' (آخرین گزارش: ' . View::e(View::ago($e['logs_at'])) . ')' : '') . '" aria-label="لاگ‌های نود ' . View::e($e['name'] ?? '') . '">'
                     . View::icon('info') . (!empty($e['has_logs']) ? '<span class="pcdna-log-dot" aria-hidden="true"></span>' : '') . '<span class="pcdna-sr">لاگ‌ها</span></a>';
-                $h .= '<td class="pcdna-actions">' . $logsLink . $up
+                // «آدرس‌ها» — on-demand panel: primary + additional addresses with per-address health (SPEC §12.5).
+                $addrs = is_array($e['addresses'] ?? null) ? array_filter($e['addresses'], 'is_array') : [];
+                $addrCount = count($addrs);
+                $addrDown = false;
+                foreach ($addrs as $a) {
+                    if (($a['probe_ok'] ?? null) === false || (isset($a['advertised']) && !$a['advertised'] && !empty($a['enabled']))) {
+                        $addrDown = true;
+                        break;
+                    }
+                }
+                $addrLink = '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-icon' . ($addrDown ? ' pcdna-has-addrs' : '') . '" data-addresses="' . $id . '"'
+                    . ' href="' . View::url(['page' => 'edges', 'view' => 'addresses', 'id' => $id]) . '" title="آدرس‌ها'
+                    . ($addrCount ? ' (' . View::n($addrCount) . ' آدرس اضافی)' : '') . '" aria-label="آدرس‌های نود ' . View::e($e['name'] ?? '') . '">'
+                    . View::icon('globe') . ($addrDown ? '<span class="pcdna-addr-dot" aria-hidden="true"></span>' : '') . '<span class="pcdna-sr">آدرس‌ها</span></a>';
+                $h .= '<td class="pcdna-actions">' . $addrLink . $logsLink . $up
                     . '<details class="pcdna-menu pcdna-edge-edit"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="ویرایش نود ' . View::e($e['name'] ?? '') . '" title="گروه، ظرفیت و منطقه">'
                     . View::icon('sliders') . '</summary><div class="pcdna-menu-list"><form method="post" action="' . View::url($q) . '" class="pcdna-edge-form">' . View::csrf()
                     . '<input type="hidden" name="a" value="edge_edit"><input type="hidden" name="id" value="' . $id . '">'
@@ -1006,6 +1020,9 @@ final class Pages
         if (($get['view'] ?? '') === 'logs') {
             return self::edgeLogs((int) ($get['id'] ?? 0));
         }
+        if (($get['view'] ?? '') === 'addresses') {
+            return self::edgeAddresses((int) ($get['id'] ?? 0));
+        }
         $ping = self::ping();
         $h = '';
         $ctlUrl = Env::controllerUrl();
@@ -1173,6 +1190,227 @@ final class Pages
     const LOG_LEVELS = ['crit' => ['bad', 'بحرانی'], 'critical' => ['bad', 'بحرانی'], 'error' => ['bad', 'خطا'],
         'err' => ['bad', 'خطا'], 'warn' => ['warn', 'هشدار'], 'warning' => ['warn', 'هشدار'],
         'notice' => ['muted', 'اطلاع'], 'info' => ['muted', 'اطلاع']];
+
+    // ------------------------------------------------------------------ §12 multi-address edges & health-based failover
+
+    /**
+     * Per-node «آدرس‌ها» panel (SPEC §12.5): the PRIMARY address(es) and any ADDITIONAL addresses,
+     * each with per-address health (سالم / در حال بررسی / قطع) and whether it is currently advertised
+     * in DNS. Failover is AUTOMATIC and health-based — this panel only manages addresses; there is no
+     * "force/switch to this IP now" control. Fetched on demand, like the logs view; degrades gracefully
+     * when the controller does not yet expose the addresses endpoint.
+     */
+    public static function edgeAddresses(int $id): string
+    {
+        $back = '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::url(['page' => 'edges']) . '">' . View::icon('server') . '<span>بازگشت به نودها</span></a>';
+        if ($id <= 0) {
+            return $back . View::alert('bad', 'شناسه نود نامعتبر است.');
+        }
+        $ping = self::ping();
+        if (!$ping['ok']) {
+            return $back . self::ctlError($ping);
+        }
+        $addrPath = '/api/v1/edges/' . $id . '/addresses';
+        $r = self::fetch([$addrPath, '/api/v1/edges']);
+        $edges = self::ok($r['/api/v1/edges']) ? (array) $r['/api/v1/edges']['data'] : [];
+        $edge = null;
+        foreach ($edges as $e) {
+            if (is_array($e) && (int) ($e['id'] ?? 0) === $id) {
+                $edge = $e;
+                break;
+            }
+        }
+        if ($edge === null) {
+            return $back . View::alert('bad', 'نودی با این شناسه پیدا نشد.');
+        }
+        $name = (string) ($edge['name'] ?? ('#' . $id));
+        $title = 'آدرس‌های نود ' . $name;
+        $addrOk = self::ok($r[$addrPath]);
+        $addrData = $addrOk ? (array) $r[$addrPath]['data'] : null;
+        $code = (int) ($r[$addrPath]['code'] ?? 0);
+        // Feature-detect: the node exists but the addresses endpoint is absent (older controller) → 404.
+        $featureMissing = !$addrOk && $code === 404;
+        $rows = self::addressRows($addrData, $edge);
+
+        $note = View::alert('info', '<strong>جابه‌جایی خودکار است.</strong> آدرس فعال به‌صورت خودکار بر اساس سلامت انتخاب می‌شود '
+            . '(کنترلر دسترس‌پذیری هر آدرس را دوره‌ای بررسی می‌کند)؛ آدرس سالم در DNS اعلام و آدرس قطع‌شده به‌صورت خودکار کنار گذاشته می‌شود. '
+            . 'در این صفحه فقط آدرس‌ها را مدیریت می‌کنید (افزودن، ویرایش/تغییر برچسب، فعال/غیرفعال برای نگهداری، حذف)؛ '
+            . 'هیچ گزینه‌ای برای «انتخاب دستی آدرس فعال» وجود ندارد.');
+        if (!$addrOk) {
+            $note .= View::alert('warn', $featureMissing
+                ? 'مدیریت آدرس‌های اضافی روی نسخهٔ فعلی کنترلر در دسترس نیست؛ فقط آدرس اصلی نمایش داده می‌شود. برای فعال‌سازی چند-آدرسی، کنترلر را به‌روزرسانی کنید.'
+                : 'دریافت کامل فهرست آدرس‌ها ناموفق بود: ' . View::e((string) ($r[$addrPath]['error'] ?? 'خطای نامشخص')) . ' — فقط آدرس اصلی نمایش داده می‌شود.');
+        }
+        $manage = $addrOk;
+        $body = $note . self::addressTable($rows, $id, $manage);
+        if ($manage) {
+            $body .= self::addressAddForm($id);
+        }
+        return View::card($title, $body, $back, '', 'globe');
+    }
+
+    /** Health of an address from its probe result: [label, tone]. null = never probed yet. */
+    public static function addrHealth($probeOk): array
+    {
+        if ($probeOk === true) {
+            return ['سالم', 'ok'];
+        }
+        if ($probeOk === false) {
+            return ['قطع', 'bad'];
+        }
+        return ['در حال بررسی', 'warn'];
+    }
+
+    /** Normalise one address (from the controller, or synthesised) into a stable render shape. */
+    private static function normAddr(array $a, bool $primary): array
+    {
+        $ip = (string) ($a['ip'] ?? '');
+        $fam = (int) ($a['family'] ?? 0);
+        if ($fam !== 4 && $fam !== 6) {
+            $fam = strpos($ip, ':') !== false ? 6 : 4;
+        }
+        $enabled = array_key_exists('enabled', $a) ? (bool) $a['enabled'] : true;
+        $probeOk = array_key_exists('probe_ok', $a) ? $a['probe_ok'] : null;
+        if ($probeOk !== true && $probeOk !== false) {
+            $probeOk = null;
+        }
+        $adv = array_key_exists('advertised', $a) ? (bool) $a['advertised'] : ($enabled && $probeOk !== false);
+        return ['id' => isset($a['id']) && is_numeric($a['id']) ? (int) $a['id'] : null, 'family' => $fam, 'ip' => $ip,
+            'label' => (string) ($a['label'] ?? ''), 'enabled' => $enabled, 'probe_ok' => $probeOk,
+            'probe_at' => $a['probe_at'] ?? null, 'probe_error' => (string) ($a['probe_error'] ?? ''),
+            'advertised' => $adv, 'primary' => $primary];
+    }
+
+    /**
+     * Unified, defensively-parsed address list: primary row(s) first, then additional addresses.
+     * Reads `primary` as a single dict, a list, or an {ipv4,ipv6} pair; falls back to the edge object's
+     * own ipv4/ipv6 + probe when the controller returns no usable `primary` (e.g. feature not present).
+     */
+    private static function addressRows(?array $addrData, array $edge): array
+    {
+        $rows = [];
+        $primList = [];
+        $primary = is_array($addrData['primary'] ?? null) ? $addrData['primary'] : null;
+        if ($primary !== null) {
+            if (isset($primary['ip']) || isset($primary['family'])) {
+                $primList[] = $primary;
+            } elseif (array_is_list($primary)) {
+                foreach ($primary as $p) {
+                    if (is_array($p)) {
+                        $primList[] = $p;
+                    }
+                }
+            } else {
+                if (!empty($primary['ipv4'])) {
+                    $primList[] = ['family' => 4, 'ip' => $primary['ipv4']] + $primary;
+                }
+                if (!empty($primary['ipv6'])) {
+                    $primList[] = ['family' => 6, 'ip' => $primary['ipv6']] + $primary;
+                }
+            }
+        }
+        if (!$primList) {
+            $probe = is_array($edge['probe'] ?? null) ? $edge['probe'] : [];
+            $pk = array_key_exists('ok', $probe) ? $probe['ok'] : ($edge['probe_ok'] ?? null);
+            $pat = $probe['at'] ?? ($edge['probe_at'] ?? null);
+            $en = !empty($edge['enabled']);
+            if (!empty($edge['ipv4'])) {
+                $primList[] = ['family' => 4, 'ip' => $edge['ipv4'], 'probe_ok' => $pk, 'probe_at' => $pat, 'enabled' => $en];
+            }
+            if (!empty($edge['ipv6'])) {
+                $primList[] = ['family' => 6, 'ip' => $edge['ipv6'], 'probe_ok' => $pk, 'probe_at' => $pat, 'enabled' => $en];
+            }
+        }
+        foreach ($primList as $p) {
+            if (is_array($p)) {
+                $rows[] = self::normAddr($p, true);
+            }
+        }
+        $add = is_array($addrData['addresses'] ?? null) ? $addrData['addresses'] : [];
+        foreach ($add as $a) {
+            if (is_array($a) && empty($a['primary'])) {
+                $rows[] = self::normAddr($a, false);
+            }
+        }
+        return $rows;
+    }
+
+    /** Renders the address table: IP, family, label, per-address health, DNS/advertise state, actions. */
+    private static function addressTable(array $rows, int $id, bool $manage): string
+    {
+        if (!$rows) {
+            return View::emptyState('آدرسی برای نمایش نیست', 'این نود آدرس قابل نمایشی ندارد.', 'globe');
+        }
+        $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-addrs"><thead><tr>'
+            . '<th>آدرس</th><th>نسخه</th><th>برچسب</th><th>سلامت</th><th>وضعیت در DNS</th>'
+            . ($manage ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
+        foreach ($rows as $a) {
+            $primary = !empty($a['primary']);
+            [$hl, $ht] = self::addrHealth($a['probe_ok']);
+            $fam = (int) $a['family'];
+            if (!$a['enabled']) {
+                $dns = View::badge('غیرفعال (نگهداری)', 'muted', ' title="برای نگهداری غیرفعال شده و در DNS اعلام نمی‌شود"');
+            } elseif (!empty($a['advertised'])) {
+                $dns = View::badge('در DNS', 'ok', ' title="هم‌اکنون در پاسخ DNS اعلام می‌شود"');
+            } else {
+                $dns = View::badge('خارج از DNS', 'bad', ' title="به‌دلیل قطعی، به‌صورت خودکار از DNS کنار گذاشته شده است"');
+            }
+            $h .= '<tr data-addr="' . ($a['id'] ?? '') . '"' . ($primary ? ' data-primary="1"' : '') . '>'
+                . '<td><strong>' . View::ltr($a['ip']) . '</strong>'
+                . ($primary ? ' ' . View::badge('اصلی', 'brand', ' title="آدرس اصلی و هویتی نود"') : '') . '</td>'
+                . '<td>' . View::badge('IPv' . ($fam === 6 ? '6' : '4'), 'violet') . '</td>'
+                . '<td>' . ($a['label'] !== '' ? View::e($a['label']) : '<span class="pcdna-muted">—</span>') . '</td>'
+                . '<td><span title="' . View::e($a['probe_at'] ? 'آخرین بررسی: ' . View::ago($a['probe_at']) : 'هنوز بررسی نشده است') . '">' . View::badge($hl, $ht) . '</span>'
+                . ($a['probe_error'] !== '' ? '<div class="pcdna-small pcdna-muted pcdna-clip" dir="ltr" title="' . View::e(View::clip($a['probe_error'], 300)) . '">' . View::e(View::clip($a['probe_error'], 80)) . '</div>' : '') . '</td>'
+                . '<td>' . $dns . '</td>';
+            if ($manage) {
+                $h .= '<td class="pcdna-actions">' . ($primary ? self::primaryHint() : self::addrActions($id, $a)) . '</td>';
+            }
+            $h .= '</tr>';
+        }
+        return $h . '</tbody></table></div>';
+    }
+
+    /** The primary is the node's identity address: point at the existing edit-node form (don't duplicate it). */
+    private static function primaryHint(): string
+    {
+        return '<span class="pcdna-small pcdna-muted">برای اصلاح، نود را از «ویرایش نود» در فهرست نودها تغییر دهید.</span>';
+    }
+
+    /** Per-address actions for an ADDITIONAL address: edit/rename, enable/disable for maintenance, remove. */
+    private static function addrActions(int $id, array $a): string
+    {
+        $aid = (int) $a['id'];
+        $q = ['page' => 'edges', 'view' => 'addresses', 'id' => $id];
+        $fam = (int) $a['family'];
+        $edit = '<details class="pcdna-menu pcdna-addr-edit"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="ویرایش آدرس ' . View::e($a['ip']) . '" title="ویرایش آدرس و برچسب">'
+            . View::icon('sliders') . '</summary><div class="pcdna-menu-list"><form method="post" action="' . View::url($q) . '" class="pcdna-edge-form">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_addr_edit"><input type="hidden" name="id" value="' . $id . '"><input type="hidden" name="aid" value="' . $aid . '"><input type="hidden" name="family" value="' . $fam . '">'
+            . '<label><span>آدرس IPv' . ($fam === 6 ? '6' : '4') . '</span><input class="pcdna-input" name="ip" dir="ltr" maxlength="45" value="' . View::e($a['ip']) . '"></label>'
+            . '<label><span>برچسب (اختیاری)</span><input class="pcdna-input" name="label" maxlength="64" value="' . View::e($a['label']) . '" placeholder="مثلاً لینک دوم"></label>'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-sm pcdna-btn-primary">' . View::icon('check') . '<span>ذخیره</span></button></form></div></details>';
+        $toggle = View::postButton($q, 'edge_addr_toggle', ['id' => $id, 'aid' => $aid, 'enabled' => $a['enabled'] ? '0' : '1'],
+            $a['enabled'] ? 'غیرفعال‌سازی برای نگهداری' : 'فعال‌سازی', 'pcdna-btn pcdna-btn-sm pcdna-btn-icon',
+            $a['enabled'] ? 'آدرس «' . $a['ip'] . '» برای نگهداری غیرفعال شود؟ بی‌درنگ از DNS خارج می‌شود.' : '', 'power');
+        $del = View::postButton($q, 'edge_addr_delete', ['id' => $id, 'aid' => $aid],
+            'حذف آدرس', 'pcdna-btn pcdna-btn-sm pcdna-btn-icon pcdna-btn-danger',
+            'آدرس «' . $a['ip'] . '» برای همیشه حذف شود؟', 'trash');
+        return $edit . $toggle . $del;
+    }
+
+    /** Add-an-additional-address form (family + IP + optional label). */
+    private static function addressAddForm(int $id): string
+    {
+        $form = '<form method="post" action="' . View::url(['page' => 'edges', 'view' => 'addresses', 'id' => $id]) . '" class="pcdna-form" autocomplete="off">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_addr_add"><input type="hidden" name="id" value="' . $id . '"><div class="pcdna-form-grid">'
+            . '<label><span>نسخهٔ IP</span>' . View::select('family', ['4' => 'IPv4', '6' => 'IPv6'], '4') . '</label>'
+            . '<label><span>آدرس IP عمومی</span><input class="pcdna-input" name="ip" dir="ltr" required maxlength="45" placeholder="5.160.1.12" value="">'
+            . '<small>یک آدرس عمومی معتبر متناسب با نسخهٔ انتخاب‌شده</small></label>'
+            . '<label><span>برچسب (اختیاری)</span><input class="pcdna-input" name="label" maxlength="64" placeholder="مثلاً لینک دوم" value=""></label>'
+            . '</div><div class="pcdna-form-actions"><button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('plus') . '<span>افزودن آدرس</span></button></div></form>'
+            . '<p class="pcdna-muted pcdna-small">آدرس جدید بلافاصله فعال می‌شود و پس از اولین بررسی سلامت به‌صورت خودکار در DNS اعلام می‌شود. آدرس اصلی نود در این فهرست فقط برای مشاهده است؛ برای اصلاح آن، نود را از فهرست نودها ویرایش کنید.</p>';
+        return View::card('افزودن آدرس اضافی', $form, '', '', 'plus');
+    }
 
     /**
      * Daily uptime series per edge (last 30 days) — one parallel controller call per edge
