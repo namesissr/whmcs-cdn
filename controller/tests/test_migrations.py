@@ -42,6 +42,9 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "edges")
     assert added == ["capacity_mbps", "cpu_high", "group", "load_high", "metrics", "metrics_at",
                      "probe_at", "probe_error", "probe_fail", "probe_ms", "probe_ok", "shed"], diff
+    # 0006: purges.prefixes / everything
+    purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
+    assert purge_added == ["everything", "prefixes"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates
     tables = {d[1].name for d in flat if d[0] == "add_table"}
     assert {"edge_uptime", "incidents", "incident_updates"} <= tables, diff

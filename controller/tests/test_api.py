@@ -132,10 +132,24 @@ def test_purge_and_settings(client):
     client.post("/api/v1/sites", json={"domain": "example.com", "origin_ip": "93.184.216.34"})
     token = add_edge(client)
     assert client.post("/api/v1/sites/example.com/purge", json={"urls": ["/relative"]}).status_code == 422
+    # prefixes: must be a path or full URL, at most 200 chars, up to 20
+    assert client.post("/api/v1/sites/example.com/purge",
+                       json={"prefixes": ["blog/"]}).status_code == 422
+    assert client.post("/api/v1/sites/example.com/purge",
+                       json={"prefixes": ["/" + "x" * 200]}).status_code == 422
+    assert client.post("/api/v1/sites/example.com/purge",
+                       json={"prefixes": ["/p%d/" % i for i in range(21)]}).status_code == 422
     client.post("/api/v1/sites/example.com/purge", json={"urls": []})
     client.post("/api/v1/sites/example.com/purge", json={"urls": ["https://example.com/a.css"]})
+    r = client.post("/api/v1/sites/example.com/purge",
+                    json={"prefixes": ["/blog/", "https://example.com/img/"], "everything": False})
+    assert r.json()["queued"] == 2
+    client.post("/api/v1/sites/example.com/purge", json={"everything": True})
     p = edge_get(client, token, "/edge/v1/purges?after=0").json()
-    assert [x["urls"] for x in p] == [[], ["https://example.com/a.css"]]
+    assert [x["urls"] for x in p] == [[], ["https://example.com/a.css"], [], []]
+    assert p[2]["prefixes"] == ["/blog/", "https://example.com/img/"] and p[2]["everything"] is False
+    assert p[3]["everything"] is True and p[3]["prefixes"] == []
+    assert all("prefixes" in x and "everything" in x for x in p)
     assert edge_get(client, token, f"/edge/v1/purges?after={p[-1]['id']}").json() == []
 
     r = client.patch("/api/v1/sites/example.com/settings",

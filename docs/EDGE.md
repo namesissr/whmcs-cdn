@@ -87,7 +87,13 @@ tick is therefore rendered as `max(pool timeout) + 1` seconds.
 
 Key `$scheme://$host$request_uri`, or `$scheme://$host$pcdn_path` (no query) when
 `ignore_query`; purges remove both variants of a URL, so purging `/a.css?v=1` also drops
-`/a.css`. `standard` honours origin headers on dynamic paths and force-caches static
+`/a.css`. A purge item may also carry `prefixes` and `everything`: `everything` (or the legacy
+empty `urls`) wipes the whole site cache dir; a `prefix` (`/blog/` for any host, or
+`https://ex.com/img/` to pin the host) is applied by scanning the site's cache files and reading
+each file's `KEY: <scheme>://<host><uri>` header line, deleting the files whose key path starts
+with the prefix. Exact URLs keep the fast hashed-key delete. The scan is capped at
+`PURGE_SCAN_MAX` files (default 500000); past the cap it falls back to a full-site purge, and it
+never raises. `standard` honours origin headers on dynamic paths and force-caches static
 extensions (as v1); `aggressive` / page-rule `everything` cache 200/206/301 for `edge_ttl`
 ignoring Cache-Control/Expires, **but never store a response carrying Set-Cookie** (it would
 leak one visitor's session). `bypass_cookies` → `proxy_cache_bypass` + `proxy_no_cache` on
@@ -261,7 +267,9 @@ the next tick; the agent never stops for metrics.
 
 v1 keys plus `HTTP_PORT` (80), `HTTPS_PORT` (443), `RESIZE_PORT` (8089), `RESOLVER`
 (`1.1.1.1 8.8.8.8`), `GEOIP_DB`, `NJS_FILE`, `BASE_TEMPLATE`, `CA_BUNDLE` (origin_verify),
-`DICT_SIZE` (rate-limit/DDoS counter zone, 32m), `HEARTBEAT_INTERVAL` (60 s).
+`DICT_SIZE` (rate-limit/DDoS counter zone, 32m), `HEARTBEAT_INTERVAL` (60 s),
+`PURGE_SCAN_MAX` (max cache files scanned per prefix purge before falling back to a full-site
+purge, 500000).
 
 ## Usage / events
 

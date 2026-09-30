@@ -350,5 +350,7 @@ def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str])
     return t
 
 
-def queue_purge(db: Session, site: Site, urls: list[str]):
-    db.add(Purge(site_id=site.id, urls=json.dumps(urls)))
+def queue_purge(db: Session, site: Site, urls: list[str],
+                prefixes: list[str] | None = None, everything: bool = False):
+    db.add(Purge(site_id=site.id, urls=json.dumps(urls),
+                 prefixes=json.dumps(prefixes or []), everything=everything))

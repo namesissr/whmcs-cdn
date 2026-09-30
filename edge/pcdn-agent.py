@@ -49,6 +49,8 @@ DEFAULTS = {
     "CACHE_MAX_SIZE": "10g",
     "CACHE_KEYS_ZONE": "5m",
     "CACHE_INACTIVE": "7d",
+    # cap on cache files scanned for a prefix purge; beyond it, fall back to a full-site purge
+    "PURGE_SCAN_MAX": "500000",
     "NGINX_TEST_CMD": "nginx -t -q",
     "NGINX_RELOAD_CMD": "nginx -s reload",
     "NGINX_USER": "www-data",
@@ -863,18 +865,97 @@ def cache_file(cache_dir: str, site_id: int, key: str) -> str:
     return os.path.join(cache_dir, str(site_id), h[-1], h[-3:-1], h)
 
 
+def wipe_cache(base: str) -> int:
+    """Delete the whole site cache dir contents (everything / legacy empty-urls purge)."""
+    removed = 0
+    if os.path.isdir(base):
+        for name in os.listdir(base):
+            shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _prefix_target(prefix: str) -> tuple[str | None, str] | None:
+    """A purge prefix -> (host_or_None, path). '/blog/' matches any host; a full URL pins the host."""
+    if prefix.startswith(("http://", "https://")):
+        m = re.match(r"^https?://([^/?#]+)([^#]*)", prefix)
+        if not m:
+            return None
+        host, path = m.group(1).lower(), m.group(2) or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        return host, path
+    return (None, prefix) if prefix.startswith("/") else None
+
+
+def _cache_key_host_path(key: str) -> tuple[str, str] | None:
+    """Split a cache KEY '<scheme>://<host><uri>' into (host, path)."""
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/]*)(.*)$", key)
+    if not m:
+        return None
+    return m.group(1).lower(), m.group(2) or "/"
+
+
+def _read_cache_key(path: str) -> str | None:
+    """nginx writes a 'KEY: <scheme>://<host><uri>' line near the top of every cache file."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16384)
+    except OSError:
+        return None
+    i = head.find(b"\nKEY: ")
+    if i < 0:
+        return None
+    j = head.find(b"\n", i + 6)
+    if j < 0:
+        return None
+    return head[i + 6:j].decode("latin-1", "replace")
+
+
+def purge_prefixes(base: str, prefixes: list[str], scan_max: int) -> tuple[int, bool]:
+    """Scan the site's cache files and delete those whose KEY path starts with a prefix.
+    Returns (removed, overflow); overflow=True means the scan cap was hit."""
+    targets = [t for t in (_prefix_target(p) for p in prefixes) if t]
+    if not targets or not os.path.isdir(base):
+        return 0, False
+    removed = scanned = 0
+    for root, _dirs, files in os.walk(base):
+        for name in files:
+            scanned += 1
+            if scanned > scan_max:
+                return removed, True
+            fpath = os.path.join(root, name)
+            key = _read_cache_key(fpath)
+            if key is None:
+                continue
+            hp = _cache_key_host_path(key)
+            if hp is None:
+                continue
+            khost, kpath = hp
+            for phost, ppath in targets:
+                if phost is not None and khost != phost:
+                    continue
+                if kpath.startswith(ppath):
+                    try:
+                        os.remove(fpath)
+                        removed += 1
+                    except OSError:
+                        pass
+                    break
+    return removed, False
+
+
 def do_purge(item: dict, cfg: dict) -> int:
     sid = int(item["site_id"])
     base = os.path.join(cfg["CACHE_DIR"], str(sid))
     urls = item.get("urls") or []
+    prefixes = item.get("prefixes") or []
+    everything = bool(item.get("everything"))
+    # whole-site wipe: explicit `everything`, or the legacy empty-urls request (no prefixes either)
+    if everything or (not urls and not prefixes):
+        return wipe_cache(base)
     removed = 0
-    if not urls:
-        if os.path.isdir(base):
-            for name in os.listdir(base):
-                shutil.rmtree(os.path.join(base, name), ignore_errors=True)
-                removed += 1
-        return removed
-    for url in urls:
+    for url in urls:  # exact URLs keep the fast hashed-key delete
         m = re.match(r"^https?://([^/?#]+)([^#]*)", url)
         if not m:
             continue
@@ -890,6 +971,13 @@ def do_purge(item: dict, cfg: dict) -> int:
                     removed += 1
                 except FileNotFoundError:
                     pass
+    if prefixes:
+        scan_max = _int(cfg.get("PURGE_SCAN_MAX"), 500000, 1, 10 ** 9)
+        n, overflow = purge_prefixes(base, prefixes, scan_max)
+        if overflow:  # too many files to scan safely -> fall back to a full-site purge
+            log.warning("purge scan cap %d exceeded for site %s; falling back to full purge", scan_max, sid)
+            return wipe_cache(base)
+        removed += n
     return removed
 
 
@@ -1252,7 +1340,8 @@ class Agent:
             return
         for it in items or []:
             n = do_purge(it, self.cfg)
-            log.info("purge %s %s -> %d entries", it["domain"], it["urls"] or "ALL", n)
+            what = "ALL" if it.get("everything") else (it["urls"] or it.get("prefixes") or "ALL")
+            log.info("purge %s %s -> %d entries", it["domain"], what, n)
             self.state["purge_id"] = it["id"]
 
     def push_usage(self):

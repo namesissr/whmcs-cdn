@@ -175,6 +175,8 @@ class Purge(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
     urls: Mapped[str] = mapped_column(Text, default="[]")  # empty list = purge everything
+    prefixes: Mapped[str] = mapped_column(Text, default="[]")  # path prefixes, optional scheme+host
+    everything: Mapped[bool] = mapped_column(Boolean, default=False)  # explicit whole-cache purge
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

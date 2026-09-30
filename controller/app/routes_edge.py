@@ -69,7 +69,8 @@ def purges(after: int = 0, edge: Edge = Depends(require_edge), db: Session = Dep
         select(Purge, Site.domain).join(Site, Site.id == Purge.site_id)
         .where(Purge.id > after).order_by(Purge.id).limit(500)
     ).all()
-    return [{"id": p.id, "domain": d, "site_id": p.site_id, "urls": json.loads(p.urls)} for p, d in rows]
+    return [{"id": p.id, "domain": d, "site_id": p.site_id, "urls": json.loads(p.urls),
+             "prefixes": json.loads(p.prefixes), "everything": p.everything} for p, d in rows]
 
 
 Counts = dict[str, int]

@@ -112,6 +112,8 @@ class RecordIn(BaseModel):
 
 class PurgeIn(BaseModel):
     urls: list[str] = []
+    prefixes: list[str] = []
+    everything: bool = False
 
 
 class EdgeIn(BaseModel):
@@ -297,14 +299,23 @@ def request_ssl(domain: str, db: Session = Depends(get_db)):
 def purge(domain: str, body: PurgeIn, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     urls = [u.strip() for u in body.urls if u.strip()]
-    if len(urls) > 100:
-        bad(ValidationError("حداکثر ۱۰۰ آدرس در هر درخواست"))
+    prefixes = [p.strip() for p in body.prefixes if p.strip()]
+    if len(urls) + len(prefixes) > 100:
+        bad(ValidationError("حداکثر ۱۰۰ مورد در هر درخواست"))
+    if len(prefixes) > 20:
+        bad(ValidationError("حداکثر ۲۰ پیشوند در هر درخواست"))
     for u in urls:
         if not u.startswith(("http://", "https://")):
             bad(ValidationError(f"آدرس باید کامل باشد: {u}"))
-    queue_purge(db, site, urls)
+    for p in prefixes:
+        if len(p) > 200:
+            bad(ValidationError(f"پیشوند باید حداکثر ۲۰۰ نویسه باشد: {p}"))
+        # a prefix is a path ("/blog/") or a full address ("https://ex.com/img/")
+        if not (p.startswith("/") or p.startswith(("http://", "https://"))):
+            bad(ValidationError(f"پیشوند باید با / یا آدرس کامل شروع شود: {p}"))
+    queue_purge(db, site, urls, prefixes, body.everything)
     db.commit()
-    return {"ok": True, "queued": len(urls) or "all"}
+    return {"ok": True, "queued": (len(urls) + len(prefixes)) or "all"}
 
 
 @router.get("/sites/{domain}/usage")

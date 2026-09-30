@@ -273,6 +273,8 @@ def env(tmp_path_factory):
              ratelimit={"rules": [{"id": "api", "enabled": True, "path": "/api/*", "methods": [], "requests": 2,
                                    "period": 60, "action": "challenge", "block_seconds": 60}]},
              errorpages={"5xx": None, "4xx": "<html><body>PCDN-CUSTOM-4XX</body></html>"}),
+        site(119, "purge.test", A, cache={"enabled": True, "level": "standard", "edge_ttl": 3600,
+                                          "browser_ttl": 0, "ignore_query": False}),
     ]
 
     agent.bootstrap(cfg)
@@ -535,6 +537,59 @@ def test_ignore_query_cache_key_and_purge(env):
     removed = agent.do_purge({"site_id": 109, "urls": ["http://iq.test/style.css?whatever"]}, env.cfg)
     assert removed == 1
     assert env.req("iq.test", "/style.css?c=3").headers["x-cache"] == "MISS"
+
+
+def _cache_files(env):
+    return [p for p in (pathlib.Path(env.cfg["CACHE_DIR"]) / "119").rglob("*") if p.is_file()]
+
+
+def test_prefix_and_everything_purge(env):
+    # populate the cache through real nginx; each cacheable response lands on disk as a cache file.
+    # (post-purge x-cache is unreliable here: nginx's per-worker open_file_cache can keep serving a
+    # deleted file's fd, so purge effects are verified against the on-disk cache files instead.)
+    def cf(path):
+        return pathlib.Path(agent.cache_file(env.cfg["CACHE_DIR"], 119, f"http://purge.test{path}"))
+
+    def prime(path):
+        assert env.req("purge.test", path).status == 200
+        assert wait_for(cf(path).exists), f"{path} not cached"
+        return cf(path)
+
+    blog_a, blog_b = prime("/blog/a.css"), prime("/blog/b.css")
+    img_c, keep = prime("/img/c.css"), prime("/keep.css")
+
+    # the nginx KEY header line format is exactly "KEY: <scheme>://<host><uri>"
+    assert b"\nKEY: http://purge.test/blog/a.css\n" in blog_a.read_bytes()
+    assert agent._read_cache_key(str(keep)) == "http://purge.test/keep.css"
+
+    # prefix purge removes only the matching paths, leaves the others
+    assert agent.do_purge({"site_id": 119, "prefixes": ["/blog/"]}, env.cfg) == 2
+    assert not blog_a.exists() and not blog_b.exists()
+    assert img_c.exists() and keep.exists()
+
+    # a host-pinned prefix naming another host matches nothing here; the right host does match
+    assert agent.do_purge({"site_id": 119, "prefixes": ["https://other.test/img/"]}, env.cfg) == 0
+    assert img_c.exists()
+    assert agent.do_purge({"site_id": 119, "prefixes": ["http://purge.test/img/"]}, env.cfg) == 1
+    assert not img_c.exists()
+
+    # exact URL purge still works on the fast hashed-key path
+    assert keep.exists()
+    assert agent.do_purge({"site_id": 119, "urls": ["http://purge.test/keep.css"]}, env.cfg) == 1
+    assert not keep.exists()
+
+    # a scan that exceeds PURGE_SCAN_MAX falls back to a full-site purge
+    for path in ("/x1.css", "/x2.css", "/x3.css"):
+        prime(path)
+    assert _cache_files(env)
+    agent.do_purge({"site_id": 119, "prefixes": ["/none/"]}, dict(env.cfg, PURGE_SCAN_MAX="1"))
+    assert _cache_files(env) == []
+
+    # everything purge wipes whatever is left
+    prime("/again.css")
+    assert _cache_files(env)
+    agent.do_purge({"site_id": 119, "everything": True}, env.cfg)
+    assert _cache_files(env) == []
 
 
 # ----------------------------------------------------------------- hotlink / headers / TLS / errors / images

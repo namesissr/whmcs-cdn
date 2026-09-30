@@ -300,6 +300,63 @@ def analytics(domain: str, period: str = "24h", db: Session = Depends(get_db)):
     }
 
 
+@router.get("/analytics")
+def platform_analytics(period: str = "24h", db: Session = Depends(get_db)):
+    """Same shape as the per-site analytics, aggregated across ALL sites (SPEC §9.1)."""
+    if period not in PERIODS:
+        bad(ValidationError("period باید 24h، 7d یا 30d باشد"))
+    now = utcnow().replace(minute=0, second=0, microsecond=0)
+    since = now - PERIODS[period] + timedelta(hours=1)
+    hourly = period == "24h"
+    rows = db.scalars(select(UsageHourly).where(UsageHourly.hour >= since))
+
+    totals = {"requests": 0, "bytes": 0, "cache_hits": 0,
+              "status": {k: 0 for k in ("2xx", "3xx", "4xx", "5xx")},
+              "security": {k: 0 for k in ("waf", "firewall", "ratelimit", "challenge", "ddos", "hotlink")}}
+    buckets: dict[str, dict] = {}
+    sec_buckets: Counter = Counter()
+    countries = Counter()
+    site_requests, site_bytes = Counter(), Counter()
+    for row in rows:  # one bounded pass over the window
+        key = row.hour.strftime("%Y-%m-%dT%H:00:00Z") if hourly else row.hour.strftime("%Y-%m-%dT00:00:00Z")
+        b = buckets.setdefault(key, {"t": key, "requests": 0, "bytes": 0, "cache_hits": 0})
+        b["requests"] += row.requests
+        b["bytes"] += row.bytes
+        b["cache_hits"] += row.cache_hits
+        totals["requests"] += row.requests
+        totals["bytes"] += row.bytes
+        totals["cache_hits"] += row.cache_hits
+        site_requests[row.site_id] += row.requests
+        site_bytes[row.site_id] += row.bytes
+        d = _loads(row.details)
+        for k, v in d.get("status", {}).items():
+            totals["status"][k] = totals["status"].get(k, 0) + int(v)
+        for k, v in d.get("security", {}).items():
+            totals["security"][k] = totals["security"].get(k, 0) + int(v)
+            sec_buckets[key] += int(v)
+        countries.update({k: int(v) for k, v in d.get("countries", {}).items()})
+
+    # zero-filled series so charts have a point per hour/day
+    series, security_series = [], []
+    step = timedelta(hours=1) if hourly else timedelta(days=1)
+    t = since if hourly else since.replace(hour=0)
+    while t <= now:
+        key = t.strftime("%Y-%m-%dT%H:00:00Z") if hourly else t.strftime("%Y-%m-%dT00:00:00Z")
+        series.append(buckets.get(key, {"t": key, "requests": 0, "bytes": 0, "cache_hits": 0}))
+        security_series.append({"t": key, "events": sec_buckets.get(key, 0)})
+        t += step
+    domains = dict(db.execute(select(Site.id, Site.domain)).all())
+    return {
+        "period": period,
+        "totals": totals,
+        "series": series,
+        "countries": [{"code": k, "requests": v} for k, v in countries.most_common(20)],
+        "sites": [{"domain": domains.get(sid, "?"), "requests": r, "bytes": site_bytes[sid]}
+                  for sid, r in site_requests.most_common(20)],
+        "security_series": security_series,
+    }
+
+
 @router.get("/sites/{domain}/events")
 def events(domain: str, limit: int = 100, db: Session = Depends(get_db)):
     site = get_site(db, domain)

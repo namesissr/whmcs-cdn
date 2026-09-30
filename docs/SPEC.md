@@ -506,3 +506,92 @@ customers a public status page, and let the operator post incidents.
   - `PATCH /api/v1/incidents/{id}` {title?, body?, severity?, status?}.
   Resolving (`status: resolved`) sets updated_at; resolved incidents drop off `/status.json` after 10.
 - WHMCS admin: an "وضعیت و رخدادها" page to create/update/resolve incidents and see the public status.
+
+---------------------------------------------------------------------------
+## 9. CDN features wave 2: platform analytics + prefix/everything purge
+
+### 9.1 Platform-wide analytics (admin)
+`GET /api/v1/analytics?period=24h|7d|30d` (admin key) → same shape as §4 site analytics but
+aggregated across ALL sites, plus `sites` (top sites by requests):
+```json
+{"period": "24h",
+ "totals": {"requests": 0, "bytes": 0, "cache_hits": 0,
+            "status": {"2xx":0,"3xx":0,"4xx":0,"5xx":0},
+            "security": {"waf":0,"firewall":0,"ratelimit":0,"challenge":0,"ddos":0,"hotlink":0}},
+ "series": [{"t":"…Z","requests":0,"bytes":0,"cache_hits":0}],   // hourly for 24h, daily otherwise
+ "countries": [{"code":"IR","requests":0}],   // top 20
+ "sites": [{"domain":"example.com","requests":0,"bytes":0}],     // top 20
+ "security_series": [{"t":"…Z","events":0}]}                     // total security events per bucket
+```
+Computed from UsageHourly (same store the per-site analytics uses); one pass, bounded.
+
+### 9.2 Purge by prefix / everything
+`POST /api/v1/sites/{d}/purge` body extends: `{"urls": [...], "prefixes": ["/blog/", "https://ex.com/img/"],
+"everything": false}`. `everything:true` purges the whole site cache (already the `urls:[]` behaviour).
+`prefixes` are path prefixes (with optional scheme+host); each ≤ 200, up to 20.
+- Purge object / `/edge/v1/purges` item gains `prefixes: [...]` and `everything: bool`.
+- Edge `do_purge`: for `everything` (or empty urls with everything flag) wipe the site cache dir
+  (existing behaviour). For `prefixes`, scan the site's cache files, read each file's `KEY:` header
+  line (nginx writes `KEY: <scheme>://<host><uri>` near the top of every cache file) and delete files
+  whose key path starts with a requested prefix (match against the path part, host optional). Bounded:
+  cap files scanned at `PURGE_SCAN_MAX` (default 500000); if exceeded, fall back to a full-site purge
+  and report it. Never raises. Exact-URL purges keep the existing fast hashed-key delete.
+- The controller counts a prefix/everything purge toward the same 100-item limit and validates prefixes
+  like URLs (Persian errors).
+
+---------------------------------------------------------------------------
+## 10. Wave 3: customer API, smart usage, reseller, billing & email
+
+### 10.1 Customer API (per-service key)
+- New model `ApiKey` (id, site_id FK, key_hash, name, scopes JSON, last_used_at, created_at,
+  revoked bool). Migration 0007. A site may have up to 5 keys.
+- Admin/customer (through the WHMCS proxy) manages keys:
+  `GET /api/v1/sites/{d}/apikeys`, `POST /api/v1/sites/{d}/apikeys {name, scopes}` → returns the
+  plaintext key ONCE (prefix `pcdn_` + 40 hex), `DELETE /api/v1/sites/{d}/apikeys/{id}`.
+- A NEW public API surface `/capi/v1/*` authenticated by `Authorization: Bearer pcdn_...` (NOT the
+  admin key). The key resolves to its site; every call is scoped to that site only. Scopes:
+  `purge`, `stats`, `dns`. Endpoints:
+  - `POST /capi/v1/purge {urls?, prefixes?, everything?}` (scope purge) — same as §9.2 for that site.
+  - `GET /capi/v1/analytics?period=` , `GET /capi/v1/events?limit=` (scope stats) — §4 for that site.
+  - `GET/POST/PATCH/DELETE /capi/v1/records...` and `GET/PUT /capi/v1/config/{section}` (scope dns) —
+    the same record/section operations as the admin API, restricted to that site.
+  Rate-limited per key (`CAPI_RATE`, default 60/min, 429 on excess). `last_used_at` updated. A revoked
+  or unknown key → 401. Never exposes other sites. Errors: JSON `{"detail": "..."}` (English or Persian).
+- Docs: `docs/API.md` (Persian + English) with examples (curl) for each scope.
+
+### 10.2 Smart usage alerts + upgrade suggestion (WHMCS)
+- The prepaid engine already buys traffic / cuts at cap. Add, without changing billing correctness:
+  - A per-service usage-forecast: from the last N days' daily usage, estimate days-to-cap; when a
+    service is predicted to exhaust its month's included traffic early (configurable threshold), send
+    ONE Persian "پیش‌بینی اتمام ترافیک" email and show a banner in the client app.
+  - Upgrade suggestion: when a service buys traffic (top-up) more than K times in a month, or its
+    usage exceeds its plan's included traffic by a margin, show a client-app suggestion to move to a
+    bigger plan (with the WHMCS upgrade link) and, optionally, an admin flag on the service list.
+  - All new emails go through the same WHMCS mail path; dedupe so a customer isn't spammed (once per
+    service per month per alert type, tracked in the module's state table).
+
+### 10.3 Live-er usage in the client app
+- The client overview + a usage page show current-month used/included/remaining with a live-updating
+  bar, today's usage, and a small forecast line ("با این روند، ترافیک شما حدود X روز دیگر تمام می‌شود").
+  Uses existing analytics/usage data; no new controller endpoint required beyond §4/§9.
+
+### 10.4 Billing & invoices
+- Clearer Persian invoice/line-item descriptions for traffic top-ups (date range, GB, rate) and a
+  client "صورت‌حساب و مصرف" statement view combining top-ups + usage. Admin usage report gains a
+  per-service revenue column (sum of top-up invoices) and CSV export of it.
+
+### 10.5 Reseller (WHMCS)
+- A WHMCS client can be marked a **reseller** (admin toggles it; stored in the module's state/table).
+- Resellers get a dedicated client-area panel (a page in the CDN client module, shown only to reseller
+  accounts) to provision and manage CDN sites for their OWN end-customers: create a site (domain +
+  origin), manage its DNS/config/cache/tunnel exactly like a normal service, and see per-site usage.
+  Each reseller sub-site is a controller Site tagged with the reseller's WHMCS client id and a free-text
+  end-customer label; it does NOT create a separate WHMCS login.
+- Wholesale billing: reseller sites bill the reseller's wallet at a configurable wholesale GB rate
+  (admin sets a global reseller rate and/or per-reseller override). The prepaid engine's buy-traffic /
+  cut-at-cap logic applies to the reseller's aggregate wallet. Resellers see a rolled-up usage & cost
+  report across all their sub-sites, and per-sub-customer breakdown.
+- Admin: a reseller list (clients flagged reseller), their sub-site counts, usage and wholesale
+  revenue; set/override the wholesale rate; enable/disable a reseller.
+- Guardrails: a reseller can only see/manage its own sub-sites; nothing crosses tenants. Limits:
+  max sub-sites per reseller (configurable). All Persian UI.

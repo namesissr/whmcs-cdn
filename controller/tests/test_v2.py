@@ -271,6 +271,34 @@ def test_analytics_and_events(client):
     assert client.get(f"{S}/events").json() == []
 
 
+def test_platform_analytics(client):
+    site(client)
+    client.post("/api/v1/sites", json={"domain": "other.org"})
+    token = add_edge(client)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    client.post("/edge/v1/usage", headers={"Authorization": f"Bearer {token}"}, json={
+        "items": [
+            {"host": "example.com", "hour": now.isoformat(), "bytes": 1000, "requests": 10, "cache_hits": 6,
+             "status": {"2xx": 8, "4xx": 2}, "countries": {"IR": 9, "DE": 1}, "security": {"waf": 2}},
+            {"host": "other.org", "hour": now.isoformat(), "bytes": 500, "requests": 5, "cache_hits": 1,
+             "countries": {"IR": 5}, "security": {"firewall": 3, "ratelimit": 1}},
+        ]})
+    a = client.get("/api/v1/analytics?period=24h").json()
+    assert a["period"] == "24h"
+    assert a["totals"]["requests"] == 15 and a["totals"]["bytes"] == 1500 and a["totals"]["cache_hits"] == 7
+    assert a["totals"]["status"]["2xx"] == 8 and a["totals"]["status"]["4xx"] == 2
+    assert a["totals"]["security"] == {"waf": 2, "firewall": 3, "ratelimit": 1, "challenge": 0, "ddos": 0, "hotlink": 0}
+    assert a["countries"][0] == {"code": "IR", "requests": 14}
+    assert a["sites"][0] == {"domain": "example.com", "requests": 10, "bytes": 1000}
+    assert {s["domain"] for s in a["sites"]} == {"example.com", "other.org"}
+    assert len(a["series"]) == 24 and a["series"][-1]["requests"] == 15
+    assert len(a["security_series"]) == 24 and a["security_series"][-1]["events"] == 6
+    assert sum(b["events"] for b in a["security_series"]) == 6
+    assert len(client.get("/api/v1/analytics?period=7d").json()["security_series"]) in (7, 8)
+    assert client.get("/api/v1/analytics?period=1y").status_code == 422
+    assert client.get("/api/v1/analytics", headers={"Authorization": "Bearer x"}).status_code == 401
+
+
 def test_platform_overview_and_events(client):
     site(client)
     client.post("/api/v1/sites", json={"domain": "other.org"})

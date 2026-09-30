@@ -188,6 +188,51 @@ def test_purge(tmp_path):
     assert not p.exists()
 
 
+def _fake_cache_file(base, key, body=b"data"):
+    # nginx cache files carry a binary header then a "KEY: <scheme>://<host><uri>" line; the
+    # prefix scan reads that line, so the on-disk name/location need not match the key's hash
+    h = hashlib.md5(key.encode()).hexdigest()
+    d = pathlib.Path(base) / h[-1] / h[-3:-1]
+    d.mkdir(parents=True, exist_ok=True)
+    fp = d / h
+    fp.write_bytes(b"\x00" * 40 + b"\nKEY: " + key.encode() + b"\nHTTP/1.1 200 OK\r\n\r\n" + body)
+    return fp
+
+
+def test_purge_prefixes_synthetic(tmp_path):
+    cfg = make_cfg(tmp_path)
+    base = os.path.join(cfg["CACHE_DIR"], "7")
+    assert agent._read_cache_key(str(_fake_cache_file(base, "https://example.com/k"))) == "https://example.com/k"
+
+    blog = _fake_cache_file(base, "https://example.com/blog/post-1")
+    blog2 = _fake_cache_file(base, "http://example.com/blog/post-2")
+    other_host = _fake_cache_file(base, "https://other.com/blog/x")
+    img = _fake_cache_file(base, "https://example.com/img/logo.png")
+    root = _fake_cache_file(base, "https://example.com/index.html")
+
+    # a host-less prefix matches any host/scheme by path
+    assert agent.do_purge({"site_id": 7, "prefixes": ["/blog/"]}, cfg) == 3
+    assert not blog.exists() and not blog2.exists() and not other_host.exists()
+    assert img.exists() and root.exists()
+
+    # a host-pinned prefix only matches that host
+    other_img = _fake_cache_file(base, "https://other.com/img/a")
+    assert agent.do_purge({"site_id": 7, "prefixes": ["https://example.com/img/"]}, cfg) == 1
+    assert not img.exists() and other_img.exists()
+
+    # everything wipes the whole site dir (even with urls present)
+    _fake_cache_file(base, "https://example.com/still/here")
+    assert agent.do_purge({"site_id": 7, "everything": True, "urls": ["https://example.com/x"]}, cfg) >= 1
+    assert not any(pathlib.Path(base).iterdir())
+
+    # a scan that blows past PURGE_SCAN_MAX falls back to a full-site purge
+    for i in range(6):
+        _fake_cache_file(base, f"https://example.com/keep/{i}")
+    cfg["PURGE_SCAN_MAX"] = "2"
+    assert agent.do_purge({"site_id": 7, "prefixes": ["/nomatch/"]}, cfg) >= 1
+    assert not any(pathlib.Path(base).iterdir())
+
+
 def test_usage_reader_handles_rotation(tmp_path):
     log = tmp_path / "access.log"
     lines = [
