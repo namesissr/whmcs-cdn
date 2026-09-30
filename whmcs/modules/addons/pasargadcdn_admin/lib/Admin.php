@@ -72,7 +72,7 @@ final class Admin
                 $body = Pages::sites($get);
                 break;
             case 'edges':
-                $body = Pages::edges($state['token'] ?? null, $state['old'] ?? [], $get);
+                $body = Pages::edges($state['token'] ?? null, $state['old'] ?? [], $get, $state['batch'] ?? []);
                 break;
             case 'plans':
                 $body = Pages::plans($state);
@@ -190,6 +190,8 @@ final class Admin
                 return [[self::orphanDelete(Env::input($post['domain'] ?? ''), Env::input($post['confirm'] ?? ''), $admin)], []];
             case 'edge_add':
                 return self::edgeAdd($post, $admin);
+            case 'edge_batch':
+                return self::edgeBatch($post, $admin);
             case 'edge_edit':
                 return self::edgeEdit($post, $admin);
             case 'edge_toggle':
@@ -384,7 +386,58 @@ final class Admin
         Pages::reset();
         $token = is_string($r['token'] ?? null) ? $r['token'] : '';
         return [[['ok', 'نود ' . View::ltr($old['name']) . ' ثبت شد.']], $token !== ''
-            ? ['token' => ['token' => $token, 'name' => $old['name'], 'title' => 'نود جدید: دستور نصب']] : []];
+            ? ['token' => ['token' => $token, 'name' => $old['name'], 'title' => 'نود جدید: دستور نصب',
+                'region' => $old['region'], 'role' => $old['group'] === 'tunnel' ? 'tunnel' : 'general']] : []];
+    }
+
+    /** Batch add: POST /api/v1/edges/batch → N edges each with a one-time token + ready install one-liner (SPEC §11.1). */
+    private static function edgeBatch(array $post, int $admin): array
+    {
+        $old = ['count' => trim(Env::input($post['count'] ?? '')), 'region' => Env::input($post['region'] ?? ''),
+            'group' => Env::input($post['group'] ?? 'general') ?: 'general',
+            'name_prefix' => trim(Env::input($post['name_prefix'] ?? '')), 'capacity_mbps' => trim(Env::input($post['capacity_mbps'] ?? ''))];
+        $e = [];
+        $count = self::capacity($old['count']);
+        if ($count === null || $count < 1 || $count > 50) {
+            $e[] = 'تعداد باید عددی بین ۱ تا ۵۰ باشد.';
+        }
+        if (!in_array($old['region'], ['home', 'global'], true)) {
+            $e[] = 'منطقه نامعتبر است.';
+        }
+        if (!in_array($old['group'], ['general', 'tunnel'], true)) {
+            $e[] = 'نقش (گروه) نود نامعتبر است.';
+        }
+        if ($old['name_prefix'] !== '' && !preg_match('/^[A-Za-z0-9_.-]{1,48}$/D', $old['name_prefix'])) {
+            $e[] = 'پیشوند نام فقط می‌تواند حروف انگلیسی، عدد، نقطه، زیرخط و خط تیره باشد (حداکثر ۴۸).';
+        }
+        $cap = self::capacity($old['capacity_mbps']);
+        if ($cap === null) {
+            $e[] = 'ظرفیت باید عدد صحیح بین ۰ و ۱۰٬۰۰۰٬۰۰۰ مگابیت بر ثانیه باشد.';
+        }
+        if ($e) {
+            return [array_map(function ($m) {
+                return ['bad', View::e($m)];
+            }, $e), ['batch' => ['old' => $old]]];
+        }
+        $body = ['count' => $count, 'region' => $old['region'], 'group' => $old['group'], 'capacity_mbps' => $cap];
+        if ($old['name_prefix'] !== '') {
+            $body['name_prefix'] = $old['name_prefix'];
+        }
+        try {
+            $r = Env::api(20)->post('/api/v1/edges/batch', $body);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('افزودن گروهی نودها ناموفق بود: ' . $ex->getMessage())]], ['batch' => ['old' => $old]]];
+        }
+        $rows = is_array($r) ? array_values(array_filter($r, 'is_array')) : [];
+        if (!$rows) {
+            return [[['bad', 'کنترلر نودی نساخت؛ دوباره تلاش کنید.']], ['batch' => ['old' => $old]]];
+        }
+        // Tokens are only rendered in this response — never logged, stored or redirected.
+        Env::log('batch of ' . count($rows) . ' edges (' . $old['region'] . ', group ' . $old['group'] . ', ' . $cap . ' Mbps'
+            . ($old['name_prefix'] !== '' ? ', prefix ' . $old['name_prefix'] : '') . ') added by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', View::n(count($rows)) . ' نود ساخته شد؛ دستورهای نصب یک‌بار در پایین نمایش داده می‌شوند.']],
+            ['batch' => ['rows' => $rows]]];
     }
 
     /** '' → 0; digits (Persian digits accepted) within 0..10M → int; else null. */
@@ -430,9 +483,13 @@ final class Admin
         try {
             $api = Env::api(10);
             $name = '#' . $id;
+            $region = 'home';
+            $role = 'general';
             foreach ($api->get('/api/v1/edges') as $e) {
                 if ((int) ($e['id'] ?? 0) === $id) {
                     $name = (string) $e['name'];
+                    $region = ($e['region'] ?? '') === 'global' ? 'global' : 'home';
+                    $role = ($e['group'] ?? '') === 'tunnel' ? 'tunnel' : 'general';
                 }
             }
             if ($action === 'edge_toggle') {
@@ -452,7 +509,8 @@ final class Admin
             Env::log('edge ' . $name . ' token rotated by admin #' . $admin);
             $token = is_string($r['token'] ?? null) ? $r['token'] : '';
             return [[['ok', 'توکن نود ' . View::ltr($name) . ' عوض شد؛ توکن قبلی دیگر کار نمی‌کند.']],
-                $token !== '' ? ['token' => ['token' => $token, 'name' => $name, 'title' => 'توکن جدید نود']] : []];
+                $token !== '' ? ['token' => ['token' => $token, 'name' => $name, 'title' => 'توکن جدید نود',
+                    'region' => $region, 'role' => $role]] : []];
         } catch (\Throwable $e) {
             return [[['bad', View::e('عملیات روی نود ناموفق بود: ' . $e->getMessage())]], []];
         }

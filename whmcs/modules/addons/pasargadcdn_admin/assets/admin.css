@@ -526,3 +526,21 @@
   .pcdna-analytics-bar { justify-content: center; }
   .pcdna .pcdna-seg-item { min-width: 0; padding: 6px 12px; }
 }
+
+/* node ops (Wave 4 §11): per-node logs + upgrade hint */
+.pcdna-has-logs { position: relative; }
+.pcdna-log-dot { position: absolute; top: 4px; left: 4px; width: 7px; height: 7px; border-radius: 50%; background: var(--a-warn); box-shadow: 0 0 0 2px #fff; }
+.pcdna-logs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.pcdna-log-line { display: flex; align-items: baseline; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--a-border); }
+.pcdna-log-line:last-child { border-bottom: 0; }
+.pcdna-log-line .pcdna-log-lvl, .pcdna-log-line > .pcdna-badge { flex: 0 0 auto; }
+.pcdna-log-msg { flex: 1 1 auto; overflow-wrap: anywhere; background: var(--a-surface-2); border-radius: 6px; padding: 2px 8px; font-size: 12.5px; }
+.pcdna-log-t { flex: 0 0 auto; white-space: nowrap; }
+.pcdna-log-crit .pcdna-log-msg, .pcdna-log-error .pcdna-log-msg, .pcdna-log-err .pcdna-log-msg { color: #8e1515; background: #fff8f8; }
+.pcdna-log-warn .pcdna-log-msg, .pcdna-log-warning .pcdna-log-msg { color: #7a4f00; background: #fff9ee; }
+.pcdna-edge-upgrade .pcdna-menu-list { padding: 10px 12px; }
+.pcdna-edge-upgrade .pcdna-menu-list .pcdna-copy { margin-top: 6px; }
+@media (max-width: 760px) {
+  .pcdna-log-line { flex-wrap: wrap; }
+  .pcdna-log-t { flex-basis: 100%; }
+}

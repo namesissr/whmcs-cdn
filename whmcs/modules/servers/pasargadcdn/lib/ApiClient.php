@@ -218,6 +218,9 @@ class ApiClient
             return $text;
         }
         $text = (string) preg_replace('/"(token|key)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        // One-time edge tokens can also appear embedded in install/bootstrap one-liner strings
+        // (e.g. the batch response's `install`), so mask the token value wherever it occurs.
+        $text = (string) preg_replace('/edge_[0-9a-f]{16,}/', 'edge_***', $text);
         return (string) preg_replace('/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/s', '***PRIVATE KEY***', $text);
     }
 

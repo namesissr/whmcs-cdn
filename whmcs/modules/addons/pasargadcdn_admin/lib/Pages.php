@@ -426,6 +426,16 @@ final class Pages
         return $t !== false && time() - $t <= 180;
     }
 
+    /**
+     * True when the node reports a bundle version that is behind the controller's current bundle
+     * (SPEC §11.1). If either version is unknown, returns false so no badge is shown.
+     */
+    public static function edgeOutdated(array $e, ?string $bundle): bool
+    {
+        $running = trim((string) ($e['bundle_version'] ?? ''));
+        return $bundle !== null && $bundle !== '' && $running !== '' && $running !== $bundle;
+    }
+
     const EDGE_GROUPS = ['general' => ['عمومی', 'muted'], 'tunnel' => ['تونل', 'violet']];
 
     /**
@@ -575,7 +585,7 @@ final class Pages
      * @param bool $actions render the per-row action menu
      * @param array|null $series map of edge id => daily uptime rows for the inline sparkline
      */
-    private static function edgeTable(array $edges, bool $actions, ?array $series = null): string
+    private static function edgeTable(array $edges, bool $actions, ?array $series = null, ?string $bundle = null, string $ctlUrl = ''): string
     {
         if (!$edges) {
             return View::emptyState('هنوز نودی ثبت نشده است', 'برای شروع، از صفحه «نودها» اولین نود را اضافه کنید.', 'server');
@@ -598,10 +608,21 @@ final class Pages
                 . '<td>' . $status . self::edgeWarnBadges($e) . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
                 . '<td class="pcdna-uptime-cell">' . self::uptimeCell($e, $series[$id] ?? null) . '</td>'
                 . '<td title="' . View::e($e['last_seen_at'] ?? '') . '">' . View::e(View::ago($e['last_seen_at'] ?? null))
-                . (!empty($e['applied_version']) ? '<div class="pcdna-small pcdna-muted" title="نسخه تنظیمات اعمال‌شده">' . View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') . '</div>' : '') . '</td>';
+                . (!empty($e['applied_version']) ? '<div class="pcdna-small pcdna-muted" title="نسخه تنظیمات اعمال‌شده">' . View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') . '</div>' : '')
+                . (self::edgeOutdated($e, $bundle) ? '<div class="pcdna-small"><span class="pcdna-badge pcdna-t-warn" data-outdated="1" title="نسخهٔ در حال اجرا: ' . View::e(substr((string) $e['bundle_version'], 0, 12)) . ' — نسخهٔ فعلی بسته: ' . View::e(substr((string) $bundle, 0, 12)) . '">به‌روزرسانی موجود است</span></div>' : '')
+                . '</td>';
             if ($actions) {
                 $q = ['page' => 'edges'];
-                $h .= '<td class="pcdna-actions">'
+                $up = self::edgeOutdated($e, $bundle)
+                    ? '<details class="pcdna-menu pcdna-edge-upgrade"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="ارتقای نود ' . View::e($e['name'] ?? '') . '" title="به‌روزرسانی نود">'
+                        . View::icon('activity') . '</summary><div class="pcdna-menu-list"><p class="pcdna-small pcdna-muted">این دستور را روی سرور نود اجرا کنید تا بستهٔ edge به نسخهٔ فعلی به‌روزرسانی شود (بدون تغییر توکن یا تنظیمات):</p>'
+                        . View::copyable(self::upgradeCmd($ctlUrl), 'کپی دستور ارتقا') . '</div></details>'
+                    : '';
+                $logsLink = '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-icon' . (!empty($e['has_logs']) ? ' pcdna-has-logs' : '') . '" data-logs="' . $id . '"'
+                    . ' href="' . View::url(['page' => 'edges', 'view' => 'logs', 'id' => $id]) . '" title="لاگ‌ها'
+                    . (!empty($e['logs_at']) ? ' (آخرین گزارش: ' . View::e(View::ago($e['logs_at'])) . ')' : '') . '" aria-label="لاگ‌های نود ' . View::e($e['name'] ?? '') . '">'
+                    . View::icon('info') . (!empty($e['has_logs']) ? '<span class="pcdna-log-dot" aria-hidden="true"></span>' : '') . '<span class="pcdna-sr">لاگ‌ها</span></a>';
+                $h .= '<td class="pcdna-actions">' . $logsLink . $up
                     . '<details class="pcdna-menu pcdna-edge-edit"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="ویرایش نود ' . View::e($e['name'] ?? '') . '" title="گروه، ظرفیت و منطقه">'
                     . View::icon('sliders') . '</summary><div class="pcdna-menu-list"><form method="post" action="' . View::url($q) . '" class="pcdna-edge-form">' . View::csrf()
                     . '<input type="hidden" name="a" value="edge_edit"><input type="hidden" name="id" value="' . $id . '">'
@@ -977,27 +998,35 @@ final class Pages
 
     // ------------------------------------------------------------------ 3. edges
 
-    public static function edges(?array $newToken = null, array $old = [], array $get = []): string
+    public static function edges(?array $newToken = null, array $old = [], array $get = [], array $batch = []): string
     {
         if (($get['view'] ?? '') === 'availability') {
             return self::availability();
+        }
+        if (($get['view'] ?? '') === 'logs') {
+            return self::edgeLogs((int) ($get['id'] ?? 0));
         }
         $ping = self::ping();
         $h = '';
         $ctlUrl = Env::controllerUrl();
         if ($newToken) {
-            $cmd = 'sudo ./install.sh --controller ' . $ctlUrl . ' --token ' . $newToken['token'];
+            $cmd = self::installCmd($ctlUrl, (string) $newToken['token'], (string) ($newToken['region'] ?? 'home'), (string) ($newToken['role'] ?? 'general'));
             $h .= '<section class="pcdna-card pcdna-token" data-token-panel="1"><header class="pcdna-card-head"><h3>' . View::icon('key') . '<span>'
                 . View::e($newToken['title']) . '</span></h3></header><div class="pcdna-card-body">'
                 . View::alert('warn', '<strong>این توکن فقط همین یک بار نمایش داده می‌شود</strong> و جایی ذخیره یا ثبت نمی‌شود. همین حالا آن را کپی کنید.')
                 . '<p class="pcdna-label">توکن نود ' . View::ltr($newToken['name']) . '</p>' . View::copyable($newToken['token'], 'کپی توکن')
-                . '<p class="pcdna-label">دستور نصب روی سرور نود (در پوشه <code dir="ltr">edge</code> مخزن پروژه):</p>' . View::copyable($cmd, 'کپی دستور')
+                . '<p class="pcdna-label">دستور نصب تک‌خطی روی سرور نود (فقط این را اجرا کنید — بوت‌استرپ بستهٔ edge را از کنترلر می‌گیرد و نصب می‌کند):</p>' . View::copyable($cmd, 'کپی دستور')
                 . '<p class="pcdna-muted">پس از اجرای دستور، حداکثر یک دقیقه بعد نود «آنلاین» می‌شود و در پاسخ DNS سایت‌ها قرار می‌گیرد.</p></div></section>';
+        }
+        if ($batch) {
+            $h .= self::batchResult($batch, $ctlUrl);
         }
         if (!$ping['ok']) {
             return $h . self::ctlError($ping);
         }
-        $r = self::fetch(['/api/v1/edges']);
+        $r = self::fetch(['/api/v1/edges', '/edge/version']);
+        $bundle = self::ok($r['/edge/version']) && is_string($r['/edge/version']['data']['version'] ?? null)
+            ? (string) $r['/edge/version']['data']['version'] : null;
         $edges = self::ok($r['/api/v1/edges']) ? (array) $r['/api/v1/edges']['data'] : null;
         $online = 0;
         foreach ((array) $edges as $e) {
@@ -1013,7 +1042,7 @@ final class Pages
             $h .= View::card('گروه‌های نود', self::groupCards($edges), '', '', 'activity');
         }
         $h .= View::card('نودهای CDN' . ($edges !== null ? ' (' . View::n($online) . ' آنلاین از ' . View::n(count($edges)) . ')' : ''),
-            $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error'])) : self::edgeTable($edges, true, $series),
+            $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error'])) : self::edgeTable($edges, true, $series, $bundle, $ctlUrl),
             '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'edges', 'view' => 'availability']) . '">' . View::icon('activity') . '<span>گزارش در دسترس‌بودن</span></a>',
             'pcdna-flush', 'server');
 
@@ -1038,8 +1067,112 @@ final class Pages
             . '<li><strong>ظرفیت و بار:</strong> نودها هر دقیقه ترافیک ورودی/خروجی، تعداد اتصال و بار CPU را گزارش می‌کنند. نودی که به ۹۰٪ ظرفیت برسد موقتاً از DNS خارج می‌شود '
             . '(به شرط ماندن نود دیگری در همان گروه و منطقه) و زیر ۷۵٪ برمی‌گردد.</li></ul>';
         $h .= '<div class="pcdna-grid-2">' . View::card('افزودن نود جدید', $form, '', '', 'plus') . View::card('منطقه‌ها، گروه‌ها و وضعیت نودها', $regions, '', '', 'info') . '</div>';
+        $bold = $batch['old'] ?? [];
+        $batchForm = '<form method="post" action="' . View::url(['page' => 'edges']) . '" class="pcdna-form" autocomplete="off">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_batch"><div class="pcdna-form-grid">'
+            . '<label><span>تعداد نود</span><input class="pcdna-input" name="count" dir="ltr" inputmode="numeric" required min="1" max="50" type="number" placeholder="5" value="' . View::e($bold['count'] ?? '') . '">'
+            . '<small>۱ تا ۵۰ نود در یک درخواست</small></label>'
+            . '<label><span>منطقه</span>' . View::select('region', ['home' => 'ایران (home)', 'global' => 'خارج از ایران (global)'], $bold['region'] ?? 'home') . '</label>'
+            . '<label><span>نقش (گروه)</span>' . View::select('group', ['general' => 'عمومی (سایت‌ها)', 'tunnel' => 'تونل (VPN)'], $bold['group'] ?? 'general') . '</label>'
+            . '<label><span>پیشوند نام (اختیاری)</span><input class="pcdna-input" name="name_prefix" dir="ltr" maxlength="48" pattern="[A-Za-z0-9_.\-]{1,48}" placeholder="ir-thr" value="' . View::e($bold['name_prefix'] ?? '') . '">'
+            . '<small>نام‌ها به‌صورت <code dir="ltr">پیشوند-۱</code>، <code dir="ltr">پیشوند-۲</code> … ساخته می‌شوند</small></label>'
+            . '<label><span>ظرفیت پهنای باند (Mbps)</span><input class="pcdna-input" name="capacity_mbps" dir="ltr" inputmode="numeric" maxlength="8" placeholder="1000" value="' . View::e($bold['capacity_mbps'] ?? '') . '">'
+            . '<small>روی همهٔ نودهای این دسته اعمال می‌شود</small></label>'
+            . '</div><div class="pcdna-form-actions"><button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('plus') . '<span>افزودن گروهی و ساخت توکن‌ها</span></button></div></form>'
+            . '<p class="pcdna-muted pcdna-small">پس از ثبت، برای هر نود یک دستور نصب تک‌خطی آماده نمایش داده می‌شود که فقط همان یک بار قابل مشاهده است. IP هر نود پس از اولین ارتباط با کنترلر ثبت می‌شود.</p>';
+        $h .= View::card('افزودن گروهی نودها', $batchForm, '', '', 'server');
         return $h;
     }
+
+    /** Bootstrap one-command install for a node (SPEC §11.1): downloads the bundle from the controller and runs it. */
+    public static function installCmd(string $ctlUrl, string $token, string $region = 'home', string $role = 'general'): string
+    {
+        $ctl = $ctlUrl !== '' ? $ctlUrl : 'https://<controller>';
+        $region = $region === 'global' ? 'global' : 'home';
+        $role = $role === 'tunnel' ? 'tunnel' : 'general';
+        return 'curl -fsSL ' . $ctl . '/edge/bootstrap.sh | sudo bash -s -- --controller ' . $ctl . ' --token ' . $token
+            . ' --region ' . $region . ' --role ' . $role;
+    }
+
+    /** Re-run bootstrap with --upgrade on an existing node to pull the current bundle (SPEC §11.1). */
+    public static function upgradeCmd(string $ctlUrl): string
+    {
+        $ctl = $ctlUrl !== '' ? $ctlUrl : 'https://<controller>';
+        return 'curl -fsSL ' . $ctl . '/edge/bootstrap.sh | sudo bash -s -- --controller ' . $ctl . ' --upgrade';
+    }
+
+    /** Rendered result of a batch add: one copyable one-liner per new node (shown once). */
+    private static function batchResult(array $batch, string $ctlUrl): string
+    {
+        $rows = $batch['rows'] ?? null;
+        if (!is_array($rows) || !$rows) {
+            return '';
+        }
+        $body = View::alert('warn', '<strong>این توکن‌ها فقط همین یک بار نمایش داده می‌شوند</strong> و جایی ذخیره نمی‌شوند. دستورها را همین حالا کپی و روی هر سرور اجرا کنید.');
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $name = (string) ($row['name'] ?? ($row['edge']['name'] ?? ''));
+            $cmd = is_string($row['install'] ?? null) && $row['install'] !== ''
+                ? (string) $row['install']
+                : self::installCmd($ctlUrl, (string) ($row['token'] ?? ''),
+                    (string) ($row['region'] ?? ($row['edge']['region'] ?? 'home')),
+                    (($row['group'] ?? ($row['edge']['group'] ?? 'general')) === 'tunnel') ? 'tunnel' : 'general');
+            $body .= '<p class="pcdna-label">نود ' . View::ltr($name) . '</p>' . View::copyable($cmd, 'کپی دستور');
+        }
+        return '<section class="pcdna-card pcdna-token" data-batch-panel="1"><header class="pcdna-card-head"><h3>' . View::icon('server')
+            . '<span>دستورهای نصب نودهای جدید</span></h3></header><div class="pcdna-card-body">' . $body . '</div></section>';
+    }
+
+    /** Per-node centralized logs view (SPEC §11.2): GET /api/v1/edges/{id}/logs, newest-first, level-coloured. */
+    public static function edgeLogs(int $id): string
+    {
+        $back = '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::url(['page' => 'edges']) . '">' . View::icon('server') . '<span>بازگشت به نودها</span></a>';
+        if ($id <= 0) {
+            return $back . View::alert('bad', 'شناسه نود نامعتبر است.');
+        }
+        $ping = self::ping();
+        if (!$ping['ok']) {
+            return $back . self::ctlError($ping);
+        }
+        $path = '/api/v1/edges/' . $id . '/logs';
+        $r = self::fetch([$path]);
+        if (!self::ok($r[$path])) {
+            $code = (int) ($r[$path]['code'] ?? 0);
+            return $back . View::alert('bad', $code === 404 ? 'نودی با این شناسه پیدا نشد.'
+                : 'دریافت لاگ‌های نود ناموفق بود: ' . View::e((string) ($r[$path]['error'] ?? 'خطای نامشخص')));
+        }
+        $data = (array) $r[$path]['data'];
+        $name = (string) ($data['name'] ?? ('#' . $id));
+        $lines = is_array($data['lines'] ?? null) ? $data['lines'] : [];
+        $at = $data['logs_at'] ?? null;
+        $title = 'لاگ‌های نود ' . $name;
+        if (!$lines) {
+            return View::card($title, View::emptyState('لاگی گزارش نشده', 'این نود تاکنون خط خطا یا هشداری به کنترلر نفرستاده است. agent فقط خطوط WARN/ERROR/crit را می‌فرستد.', 'info'), $back, '', 'server');
+        }
+        $intro = View::alert('info', 'تازه‌ترین خطوط خطا و هشدار گزارش‌شده توسط این نود (فقط عملیاتی؛ بدون IP بازدیدکننده، توکن یا کلید). '
+            . ($at ? 'آخرین گزارش: <span title="' . View::e((string) $at) . '">' . View::e(View::ago($at)) . '</span>.' : ''));
+        $body = '<ul class="pcdna-logs">';
+        foreach (array_reverse($lines) as $ln) {
+            if (!is_array($ln)) {
+                continue;
+            }
+            $level = strtolower((string) ($ln['level'] ?? 'info'));
+            [$tone, $lbl] = self::LOG_LEVELS[$level] ?? ['muted', $level];
+            $t = $ln['t'] ?? null;
+            $body .= '<li class="pcdna-log-line pcdna-log-' . View::e($level) . '" data-level="' . View::e($level) . '">'
+                . View::badge($lbl, $tone, ' data-lvl="' . View::e($level) . '"')
+                . '<code class="pcdna-log-msg" dir="ltr">' . View::e((string) ($ln['msg'] ?? '')) . '</code>'
+                . '<span class="pcdna-log-t pcdna-muted pcdna-small" title="' . View::e((string) $t) . '">' . View::e(View::ago($t)) . '</span></li>';
+        }
+        $body .= '</ul>';
+        return View::card($title, $intro . $body, $back, 'pcdna-flush', 'server');
+    }
+
+    const LOG_LEVELS = ['crit' => ['bad', 'بحرانی'], 'critical' => ['bad', 'بحرانی'], 'error' => ['bad', 'خطا'],
+        'err' => ['bad', 'خطا'], 'warn' => ['warn', 'هشدار'], 'warning' => ['warn', 'هشدار'],
+        'notice' => ['muted', 'اطلاع'], 'info' => ['muted', 'اطلاع']];
 
     /**
      * Daily uptime series per edge (last 30 days) — one parallel controller call per edge
