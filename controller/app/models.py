@@ -44,6 +44,10 @@ class Site(Base):
 
     features: Mapped[str] = mapped_column(Text, default="{}")  # plan feature flags, see sections.DEFAULT_FEATURES
 
+    # reseller tag: a sub-site owned by a reseller's WHMCS client (set by WHMCS), see SPEC §10.5
+    reseller_client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True, default=None)
+    reseller_label: Mapped[str | None] = mapped_column(String(120), nullable=True, default=None)
+
     # customer settings: JSON document of sections (see sections.SECTIONS / SPEC §2)
     config: Mapped[str] = mapped_column(Text, default="{}")
     blocked_ips: Mapped[str] = mapped_column(Text, default="[]")

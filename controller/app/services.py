@@ -165,6 +165,8 @@ def site_to_dict(db: Session, site: Site) -> dict:
         "id": site.id,
         "domain": site.domain,
         "external_id": site.external_id,
+        "reseller_client_id": site.reseller_client_id,
+        "reseller_label": site.reseller_label,
         "status": site.effective_status,
         "ns_verified": site.ns_verified_at is not None,
         "ns_found": json.loads(site.ns_found or "[]"),

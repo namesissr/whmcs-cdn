@@ -85,6 +85,23 @@ class SiteCreate(BaseModel):
     external_id: str | None = None
     origin_ip: str | None = None  # optional: creates proxied @ and www records
     plan: Plan = Plan()
+    # reseller sub-site tag (SPEC §10.5), set by WHMCS
+    reseller_client_id: int | None = Field(default=None, ge=1)
+    reseller_label: str | None = None
+
+
+class ResellerIn(BaseModel):
+    """Set or clear the reseller tag on a site; pass null to clear a field."""
+    model_config = ConfigDict(extra="forbid")
+    reseller_client_id: int | None = Field(default=None, ge=1)
+    reseller_label: str | None = None
+
+
+def _clean_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+    label = label.strip()[:120]
+    return label or None
 
 
 class SiteSettings(BaseModel):
@@ -172,7 +189,9 @@ def create_site(body: SiteCreate, db: Session = Depends(get_db)):
         bad(e)
     if db.scalar(select(Site).where(Site.domain == domain)):
         raise HTTPException(409, "این دامنه قبلاً ثبت شده است")
-    site = Site(domain=domain, external_id=body.external_id)
+    site = Site(domain=domain, external_id=body.external_id,
+                reseller_client_id=body.reseller_client_id,
+                reseller_label=_clean_label(body.reseller_label))
     apply_plan(site, body.plan)
     if origin:
         site.records = [
@@ -186,10 +205,21 @@ def create_site(body: SiteCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/sites")
-def list_sites(db: Session = Depends(get_db)):
+def list_sites(reseller: int | None = None, db: Session = Depends(get_db)):
+    stmt = select(Site).order_by(Site.id)
+    if reseller is not None:
+        # rolled-up report for one reseller (SPEC §10.5): only its sub-sites
+        stmt = stmt.where(Site.reseller_client_id == reseller)
+        return [
+            {"domain": s.domain, "reseller_label": s.reseller_label, "status": s.effective_status,
+             "bandwidth_limit_gb": s.bandwidth_limit_gb, "over_quota": s.over_quota,
+             "suspended": s.suspended}
+            for s in db.scalars(stmt)
+        ]
     return [
-        {"domain": s.domain, "status": s.effective_status, "external_id": s.external_id}
-        for s in db.scalars(select(Site).order_by(Site.id))
+        {"domain": s.domain, "status": s.effective_status, "external_id": s.external_id,
+         "reseller_client_id": s.reseller_client_id, "reseller_label": s.reseller_label}
+        for s in db.scalars(stmt)
     ]
 
 
@@ -208,6 +238,20 @@ def update_plan(domain: str, plan: Plan, db: Session = Depends(get_db)):
     db.commit()
     if sections.features_of(site)["edge_group"] != group:
         sync_site_dns(db, site)  # the site is now answered by the other group of edges
+    return site_to_dict(db, site)
+
+
+@router.patch("/sites/{domain}/reseller")
+def update_reseller(domain: str, body: ResellerIn, db: Session = Depends(get_db)):
+    """Set or clear the reseller tag on a site (SPEC §10.5). Only provided fields change;
+    pass an explicit null to clear one."""
+    site = get_site(db, domain)
+    fields = body.model_fields_set
+    if "reseller_client_id" in fields:
+        site.reseller_client_id = body.reseller_client_id
+    if "reseller_label" in fields:
+        site.reseller_label = _clean_label(body.reseller_label)
+    db.commit()
     return site_to_dict(db, site)
 
 
