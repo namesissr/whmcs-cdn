@@ -152,10 +152,14 @@ location ^~ "/my-secret-service" {
 * **Origin.** `origin` of the path, else `pool` (the same njs pool selection and health checks as
   hosts, through `js_set $pcdn_tn_upstream` reading `$pcdn_tn_pool`), else the host's own origin
   (record address or pool, host protocol). IP-literal origins of `xhttp` / `grpc` / `h2` paths get
-  an `upstream pcdn_tn_<site>_<n> { server …; keepalive 16; }` block (separate blocks for HTTP/1.1
-  and HTTP/2 so a cached connection never changes protocol); hostnames and pools stay variables
-  so they are resolved at request time (`resolver`), without keepalive. Upgraded `ws` /
-  `httpupgrade` connections are never reused, so they never use an upstream block.
+  an `upstream pcdn_tn_<site>_<n> { server …; keepalive <TUNNEL_KEEPALIVE, default 64>;
+  keepalive_timeout 300s; keepalive_requests 1000000; keepalive_time 1h; }` block (separate blocks
+  for HTTP/1.1 and HTTP/2 so a cached connection never changes protocol). A warm pool of idle
+  connections to the VPN origin removes the cross-border TCP+TLS handshake from the next
+  stream/request, and the high `keepalive_requests`/`keepalive_time` stop a long VPN session from
+  recycling a working upstream connection mid-use. Hostnames and pools stay variables so they are
+  resolved at request time (`resolver`), without keepalive. Upgraded `ws` / `httpupgrade`
+  connections are never reused, so they never use an upstream block.
 * **Security.** Firewall **block** rules, `default_action: block`, `blocked_ips` and `min_tls`
   still apply; `allow` and `log` rules work as usual. njs (`tunnelVerdict`) skips firewall
   challenge/captcha rules, hotlink, rate-limit rules, the DDoS challenge and the WAF for URIs
@@ -238,7 +242,9 @@ the next tick; the agent never stops for metrics.
   `tcp_tw_reuse`, `tcp_fin_timeout 15`, `tcp_slow_start_after_idle 0`, `tcp_mtu_probing 1`,
   64 MB `rmem_max`/`wmem_max` and `tcp_rmem`/`tcp_wmem` maxima, `tcp_notsent_lowat 128k`,
   keepalive 300 s / 30 s × 5 (dead VPN peers are noticed; `proxy_socket_keepalive` /
-  `grpc_socket_keepalive` use it towards origins), `fs.file-max` / `fs.nr_open` 2 M.
+  `grpc_socket_keepalive` use it towards origins), `tcp_no_metrics_save 1` and `tcp_sack 1` so a
+  bad congestion window from the lossy cross-border path is not cached onto the next connection,
+  `fs.file-max` / `fs.nr_open` 2 M.
   `tcp_bbr` is loaded now and at boot (`/etc/modules-load.d/pcdn-bbr.conf`).
   `/etc/sysctl.d/99-pcdn-conntrack.conf` (`nf_conntrack_max` 1 M, established timeout 1 day) is
   written only when conntrack is loaded.

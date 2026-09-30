@@ -56,6 +56,9 @@ DEFAULTS = {
     "POLL_INTERVAL": "20",
     "USAGE_INTERVAL": "60",
     "HEARTBEAT_INTERVAL": "60",
+    # idle upstream connections kept per worker to each tunnel origin (gRPC/h2/XHTTP): a warm
+    # connection removes a TCP+TLS round-trip from the border on the next stream/request
+    "TUNNEL_KEEPALIVE": "64",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -533,9 +536,14 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         if (h2, hp) not in tn_upstreams:
             name = f"pcdn_tn_{sid}_{len(tn_upstreams)}"
             tn_upstreams[(h2, hp)] = name
-            # one server: never marked down (max_fails=0); idle keepalive connections are reused
-            out.append(f"upstream {name} {{\n    server {hp} max_fails=0;\n    keepalive 16;\n"
-                       f"    keepalive_timeout 60s;\n}}")
+            # one server: never marked down (max_fails=0). A warm pool of idle keepalive
+            # connections to the VPN origin removes the TCP+TLS handshake across the border from
+            # the next stream; keepalive_requests/keepalive_time keep long VPN sessions from
+            # recycling a working upstream connection mid-use.
+            ka = _int(cfg.get("TUNNEL_KEEPALIVE"), 64, 1, 4096)
+            out.append(f"upstream {name} {{\n    server {hp} max_fails=0;\n    keepalive {ka};\n"
+                       f"    keepalive_timeout 300s;\n    keepalive_requests 1000000;\n"
+                       f"    keepalive_time 1h;\n}}")
         return tn_upstreams[(h2, hp)]
 
     def tunnel_loc(p, proto, pool, target):

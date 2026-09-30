@@ -168,6 +168,10 @@ net.ipv4.tcp_notsent_lowat = 131072
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
+# the cross-border path is lossy; don't cache a bad congestion window onto the next connection,
+# and recover faster from tail losses on long-lived tunnel streams
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_sack = 1
 fs.file-max = 2097152
 fs.nr_open = 2097152
 EOF

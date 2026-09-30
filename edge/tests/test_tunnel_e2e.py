@@ -154,7 +154,7 @@ def test_rendered_config(tn):
     assert "proxy_read_timeout 90s;" in conf and "grpc_read_timeout 90s;" in conf and "grpc_send_timeout 90s;" in conf
     assert "client_max_body_size 0;" in conf and "tcp_nodelay on;" in conf and "limit_req_dry_run on;" in conf
     assert "grpc_pass grpc://pcdn_tn_201_" in conf  # IP-literal origin -> keepalive upstream
-    assert "keepalive 16;" in conf
+    assert "keepalive 64;" in conf and "keepalive_requests 1000000;" in conf
     assert "proxy_pass http://$pcdn_tn_target;" in conf  # hostname / pool origin -> resolved per request
     assert "limit_conn pcdn_tn_site 100;" in conf and "limit_conn pcdn_tn_ip 50;" in conf
     lim = (tn.tmp / "pcdn/sites/205.conf").read_text()

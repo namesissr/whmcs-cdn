@@ -402,7 +402,7 @@ def test_tunnel_render(tmp_path):
     assert "set $pcdn_tn grpc;" in g and "if ($pcdn_tcc_7 = 0) { return 403; }" in g
     assert "grpc_pass grpc://pcdn_tn_7_0;" in g and "grpc_set_header X-A \"1\";" in g and "grpc_read_timeout 7200s;" in g
     assert "limit_conn pcdn_tn_site 500;" in g and "limit_conn pcdn_tn_ip 8;" in g and "limit_rate" not in g
-    assert "upstream pcdn_tn_7_0 {\n    server 127.0.0.1:18080 max_fails=0;\n    keepalive 16;" in text
+    assert "upstream pcdn_tn_7_0 {\n    server 127.0.0.1:18080 max_fails=0;\n    keepalive 64;" in text
     w = loc("/ws")
     assert 'set $pcdn_tn_target "vpn.example.net:8443";' in w and "proxy_pass https://$pcdn_tn_target;" in w
     assert "proxy_ssl_name vpn.example.net;" in w and "proxy_ssl_verify on;" in w
