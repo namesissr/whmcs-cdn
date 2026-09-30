@@ -24,6 +24,7 @@ final class Wizard
     const EMAIL_NAME = 'Pasargad CDN Welcome';
     const EMAIL_EXHAUSTED = 'Pasargad CDN Traffic Exhausted';
     const EMAIL_WARNING = 'Pasargad CDN Traffic Warning';
+    const EMAIL_FORECAST = 'Pasargad CDN Traffic Forecast';
     const BILLING = [
         'prepaid' => 'پیش‌پرداخت از کیف پول (پیشنهادی)',
         'overage' => 'فاکتور ترافیک اضافه در پایان ماه',
@@ -532,6 +533,15 @@ final class Wizard
                 . "{else}<p>پس از اتمام، بسته‌های {\$cdn_block_gb} گیگابایتی (هر بسته {\$cdn_block_price}) خودکار از کیف پول خریده می‌شوند، "
                 . "اما اعتبار فعلی شما ({\$cdn_credit}) برای یک بسته کافی نیست. برای جلوگیری از قطع سرویس، دست‌کم {\$cdn_needed} شارژ کنید.</p>\n"
                 . $btn . "{/if}")],
+            self::EMAIL_FORECAST => ['پیش‌بینی اتمام ترافیک سرویس CDN دامنه {$service_domain}', $wrap(
+                "<p>{\$client_name} عزیز، سلام</p>\n"
+                . "<p>طبق روند مصرف این ماه، پیش‌بینی می‌شود ترافیک پلن سرویس <strong>{\$service_product_name}</strong> برای دامنه "
+                . "<strong dir=\"ltr\">{\$service_domain}</strong> حدود <strong>{\$cdn_days_left} روز دیگر</strong> تمام شود "
+                . "(تاکنون {\$cdn_used_gb} از {\$cdn_plan_gb} گیگابایت مصرف شده و حدود {\$cdn_remaining_gb} گیگابایت باقی مانده است).</p>\n"
+                . "<p>برای جلوگیری از قطعی، می‌توانید اعتبار کیف پول را شارژ کنید تا پس از اتمام ترافیک پلن، بسته‌های ترافیک خودکار خریده شوند، "
+                . "یا برای صرفه‌جویی، پلن را به یک پلن با ترافیک بیشتر ارتقا دهید.</p>\n"
+                . $btn
+                . '<p><a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}">مدیریت سرویس و ارتقای پلن</a></p>')],
         ];
     }
 
@@ -591,7 +601,8 @@ final class Wizard
         if ($in['email']) {
             $what = [self::EMAIL_NAME => 'قالب خوش‌آمدگویی فارسی با نیم‌سرورها: ' . implode('، ', self::nameservers()),
                 self::EMAIL_EXHAUSTED => 'اطلاع‌رسانی قطع سرویس به‌دلیل اتمام ترافیک و کافی نبودن اعتبار (حداکثر یک بار در ماه)',
-                self::EMAIL_WARNING => 'هشدار ۹۰٪ ترافیک وقتی اعتبار برای بسته بعدی کافی نیست'];
+                self::EMAIL_WARNING => 'هشدار ۹۰٪ ترافیک وقتی اعتبار برای بسته بعدی کافی نیست',
+                self::EMAIL_FORECAST => 'پیش‌بینی اتمام زودهنگام ترافیک پلن بر اساس روند مصرف (حداکثر یک بار در ماه)'];
             foreach ($what as $name => $desc) {
                 $tpl = self::findEmail($name);
                 $steps[] = ['op' => $tpl ? ($in['email_update'] ? 'update' : 'skip') : 'create', 'kind' => 'قالب ایمیل',

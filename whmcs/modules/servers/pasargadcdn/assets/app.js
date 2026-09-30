@@ -30,6 +30,8 @@
   var BILL = boot.billing && Number(boot.billing.included_gb) > 0 ? boot.billing : null;
   // Prepaid wallet: cap = plan + blocks bought this month from the client's credit balance.
   var WALLET = boot.wallet && typeof boot.wallet === 'object' && Number(boot.wallet.plan_gb) > 0 ? boot.wallet : null;
+  // §10.2 smart-usage: forecast / upgrade suggestion markers the prepaid engine set this month.
+  var SUGGEST = boot.suggest && typeof boot.suggest === 'object' && (boot.suggest.forecast || boot.suggest.upgrade) ? boot.suggest : null;
   var ADDFUNDS_URL = ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
   function money(v) {
     v = Number(v) || 0;
@@ -61,7 +63,8 @@
     { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'pools'] },
     { title: 'امنیت', items: ['firewall', 'waf', 'ddos', 'ratelimit', 'hotlink'] },
     { title: 'SSL و هدرها', items: ['ssl', 'headers', 'errorpages'] },
-    { title: 'گزارش‌ها', items: ['analytics', 'events'] }
+    { title: 'گزارش‌ها', items: ['analytics', 'events', 'usage'] },
+    { title: 'توسعه‌دهندگان', items: ['apikeys'] }
   ];
   var pages = P.pages = P.pages || {};
   function page(id) { return pages[id] || pages.overview; }
@@ -619,6 +622,27 @@
         hh.note ? h('span', { className: 'pcdn-svc-note', text: hh.note }) : null));
   }
 
+  // §10.2 dismissible forecast / upgrade suggestion banner (markers set by the prepaid engine).
+  function suggestBanner() {
+    if (!SUGGEST) return null;
+    var key = 'suggest-' + SID + '-' + (SUGGEST.month || '');
+    if (P.store(key) === '1') return null;
+    var lines = [];
+    if (SUGGEST.forecast) lines.push(h('p', { text: 'طبق روند مصرف، پیش‌بینی می‌شود ترافیک این ماه زودتر از پایان ماه تمام شود. برای جلوگیری از قطعی، اعتبار کیف پول را شارژ کنید یا پلن بزرگ‌تری بگیرید.' }));
+    if (SUGGEST.upgrade) lines.push(h('p', { text: 'مصرف شما به‌طور مداوم از ترافیک پلن فراتر رفته است. یک پلن بزرگ‌تر معمولاً ارزان‌تر از خرید بسته‌های ترافیک اضافه تمام می‌شود.' }));
+    var dismiss = h('button', { type: 'button', className: 'pcdn-btn pcdn-btn-ghost pcdn-btn-sm pcdn-suggest-dismiss', 'aria-label': 'بستن پیشنهاد', 'data-ro-ok': '1',
+      onclick: function () { P.store(key, '1'); var b = document.querySelector('[data-suggest]'); if (b && b.parentNode) b.parentNode.removeChild(b); } }, icon('x'), h('span', { text: 'بستن' }));
+    return h('div', { className: 'pcdn-alert pcdn-alert-warning pcdn-suggest', role: 'note', 'data-suggest': SUGGEST.upgrade ? 'upgrade' : 'forecast' },
+      icon('sparkles'),
+      h('div', { className: 'pcdn-alert-body' },
+        h('strong', { text: SUGGEST.upgrade ? 'پیشنهاد ارتقای پلن' : 'پیش‌بینی اتمام ترافیک' }),
+        lines,
+        h('div', { className: 'pcdn-banner-actions' },
+          h('a', { className: 'pcdn-btn pcdn-btn-primary pcdn-btn-sm pcdn-suggest-upgrade', href: UPGRADE_URL, 'data-ro-ok': '1' }, icon('sparkles'), h('span', { text: 'مشاهده پلن‌ها' })),
+          goLink('usage', 'مصرف زنده'),
+          dismiss)));
+  }
+
   function renderOverview() {
     var site = S.site, f = features(), plan = site.plan || {}, u = site.usage_month || {}, ssl = site.ssl || {}, cfg = site.config || {};
     var out = [];
@@ -642,6 +666,8 @@
     out.push(hero);
 
     var hint = h('div', { className: 'pcdn-hint-slot' });
+    var sug = suggestBanner();
+    if (sug) hint.appendChild(sug);
     out.push(hint);
 
     var pr = setupProgress();
@@ -686,6 +712,17 @@
           tutLink('troubleshoot', 'راهنمای عیب‌یابی ۵۰۲ / ۵۰۴')], { icon: 'warn' }));
       }
     });
+    // §10.3 forecast line on the overview: computed client-side from the daily series.
+    if (limit > 0 && P.usageForecastLine) {
+      ensureAnalytics('7d').then(function (res) {
+        if (S.page !== 'overview' || !res.ok) return;
+        var line = P.usageForecastLine((res.data && res.data.series) || [], usedGb, limit);
+        var kpi = root.querySelector('[data-kpi="traffic"]');
+        if (line && kpi && !kpi.querySelector('[data-forecast]')) {
+          kpi.appendChild(h('div', { className: 'pcdn-kpi-forecast', 'data-forecast': '1' }, icon('activity'), h('span', { text: line })));
+        }
+      });
+    }
     return out;
   }
 
@@ -1334,7 +1371,7 @@
     S: S, go: go, features: features, config: config, setConfig: setConfig, putSection: putSection, sectionForm: sectionForm,
     lockWrites: lockWrites, tutLink: tutLink, goLink: goLink, edgeIps: edgeIps, reloadSite: reloadSite, renderMain: renderMain,
     upgradeUrl: UPGRADE_URL, modeLabel: modeLabel, ensureAnalytics: ensureAnalytics, secTotal: secTotal, serviceId: SID,
-    reduced: reduced, updateSaveBar: updateSaveBar
+    reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL
   };
 
   // ------------------------------------------------------------------ boot

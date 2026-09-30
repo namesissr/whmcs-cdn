@@ -574,6 +574,35 @@ function pasargadcdn_wallet(array $params): ?array
 }
 
 /**
+ * §10.2 smart-usage banner facts for the client app: the deduped forecast /
+ * upgrade markers the prepaid engine set for THIS service in the current month
+ * (mod_pasargadcdn_notices). null when there is nothing to show.
+ */
+function pasargadcdn_suggest(array $params): ?array
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    if ($sid <= 0) {
+        return null;
+    }
+    try {
+        if (!Capsule::schema()->hasTable('mod_pasargadcdn_notices')) {
+            return null;
+        }
+        $month = pasargadcdn_month();
+        $kinds = Capsule::table('mod_pasargadcdn_notices')->where('service_id', $sid)->where('month', $month)
+            ->whereIn('kind', ['forecast', 'upgrade'])->pluck('kind')->all();
+    } catch (\Throwable $e) {
+        return null;
+    }
+    $forecast = in_array('forecast', $kinds, true);
+    $upgrade = in_array('upgrade', $kinds, true);
+    if (!$forecast && !$upgrade) {
+        return null;
+    }
+    return ['month' => $month, 'forecast' => $forecast, 'upgrade' => $upgrade];
+}
+
+/**
  * Plan to send to the controller: pasargadcdn_plan() plus this month's paid
  * top-ups for prepaid products (so Create/ChangePackage/Unsuspend never
  * undo traffic the customer already paid for).
@@ -757,6 +786,7 @@ function pasargadcdn_ClientArea(array $params)
     }
     $boot['billing'] = pasargadcdn_billing($params);
     $boot['wallet'] = pasargadcdn_wallet($params);
+    $boot['suggest'] = pasargadcdn_suggest($params);
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base);
     return [
@@ -783,7 +813,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'app.js']),
     ];
 }
 

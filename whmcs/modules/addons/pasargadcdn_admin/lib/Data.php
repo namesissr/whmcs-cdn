@@ -145,6 +145,29 @@ final class Data
             ->get(['t.*', 'h.domain', 'c.firstname', 'c.lastname', 'c.companyname', 'cu.code as currency_code'])->all();
     }
 
+    /**
+     * §10.2 smart-usage markers for $month: [service_id => ['forecast' => bool, 'upgrade' => bool]].
+     * Read-only view of the deduped notices the prepaid engine sets.
+     */
+    public static function suggestFlags(string $month): array
+    {
+        if (!Env::hasTable(Env::NOTICES)) {
+            return [];
+        }
+        $out = [];
+        try {
+            foreach (Capsule::table(Env::NOTICES)->where('month', $month)->whereIn('kind', ['forecast', 'upgrade'])
+                         ->get(['service_id', 'kind']) as $r) {
+                $o = $out[(int) $r->service_id] ?? ['forecast' => false, 'upgrade' => false];
+                $o[(string) $r->kind] = true;
+                $out[(int) $r->service_id] = $o;
+            }
+        } catch (\Throwable $e) {
+            return [];
+        }
+        return $out;
+    }
+
     /** service id => ['gb' => paid GB, 'amount' => paid amount, 'code' => currency, 'invoices' => [ids]] for $month. */
     public static function topupSums(string $month): array
     {

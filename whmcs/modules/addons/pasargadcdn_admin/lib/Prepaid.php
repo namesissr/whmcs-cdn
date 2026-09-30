@@ -33,6 +33,7 @@ final class Prepaid
     const ITEM_TYPE = 'PasargadCdnTopup';
     const TPL_EXHAUSTED = 'Pasargad CDN Traffic Exhausted';
     const TPL_WARNING = 'Pasargad CDN Traffic Warning';
+    const TPL_FORECAST = 'Pasargad CDN Traffic Forecast';
     const WARN_RATIO = 0.9;
     /** services at ≥ 70 % of their cap (or cut) have their usage rate tracked */
     const OBSERVE_RATIO = 0.7;
@@ -287,6 +288,90 @@ final class Prepaid
                 self::maybeWarn($c, $used, $newCap, $t);
             }
         }
+        // §10.2 smart usage: forecast alert + upgrade suggestion. Read-only w.r.t. billing:
+        // runs after all buy/cut decisions and only writes deduped notice markers + emails.
+        self::suggest($cands, $usage, $tops, $month);
+    }
+
+    // ------------------------------------------------------------------ §10.2 smart usage alerts
+
+    /** Addon setting as a bounded integer. */
+    private static function cfgInt(string $key, int $default, int $min, int $max): int
+    {
+        $v = Env::setting($key, '');
+        if ($v === '' || !is_numeric($v)) {
+            return $default;
+        }
+        return max($min, min($max, (int) $v));
+    }
+
+    /** Addon setting as a bounded float. */
+    private static function cfgFloat(string $key, float $default, float $min, float $max): float
+    {
+        $v = Env::setting($key, '');
+        if ($v === '' || !is_numeric($v)) {
+            return $default;
+        }
+        return max($min, min($max, (float) $v));
+    }
+
+    /**
+     * Per-service usage forecast + upgrade suggestion. Never touches the cap or the wallet.
+     *  - forecast: from the month's average daily rate so far, project the day the plan's
+     *    INCLUDED traffic runs out; if that lands ≥ forecast_margin_days before month end,
+     *    send ONE «پیش‌بینی اتمام ترافیک» email (deduped per service/month) and flag the banner.
+     *  - upgrade: when the service bought more than upgrade_topups blocks this month, or its
+     *    usage exceeds included traffic by upgrade_over_ratio, set a deduped marker (no email).
+     */
+    private static function suggest(array $cands, array $usage, array $tops, string $month): void
+    {
+        try {
+            $ts = self::now();
+            if (gmdate('Y-m', $ts) !== $month) {
+                return; // only forecast the running month
+            }
+            $elapsed = (int) gmdate('j', $ts);
+            $daysInMonth = (int) gmdate('t', $ts);
+            $marginDays = self::cfgInt('forecast_margin_days', 5, 1, 28);
+            $kTop = self::cfgInt('upgrade_topups', 3, 0, 1000);
+            $overRatio = self::cfgFloat('upgrade_over_ratio', 1.5, 1.0, 100.0);
+            $forecastEmail = Env::enabled('forecast_email', true);
+            foreach ($usage as $sid => $site) {
+                if (!isset($cands[$sid])) {
+                    continue;
+                }
+                $c = $cands[$sid];
+                $plan = (float) $c->pp['plan_gb'];
+                $used = (float) ($site['bytes'] ?? 0) / 1073741824;
+                $t = $tops[$sid] ?? ['paid_gb' => 0, 'blocks' => 0];
+                // upgrade suggestion (marker only) — repeated top-ups or well over the included plan
+                if ($plan > 0 && ((int) $t['blocks'] > $kTop || $used >= $plan * $overRatio)) {
+                    self::notice($c, 'upgrade', [], false);
+                }
+                // forecast (email + banner) — projected to exhaust the INCLUDED plan early
+                if ($forecastEmail && $plan > 0 && $used > 0 && $used < $plan && $elapsed >= 2) {
+                    $projDay = $elapsed * $plan / $used; // day of month the included traffic hits zero
+                    if ($projDay <= $daysInMonth - $marginDays && $projDay > $elapsed) {
+                        $daysLeft = max(1, (int) ceil($projDay - $elapsed));
+                        self::notice($c, 'forecast', self::forecastVars($c, $used, $plan, $daysLeft), true);
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            self::$report['errors'][] = 'suggest: ' . $e->getMessage();
+            Env::log('prepaid: usage forecast pass failed: ' . $e->getMessage());
+        }
+    }
+
+    /** Template variables for the «پیش‌بینی اتمام ترافیک» email. */
+    private static function forecastVars($c, float $used, float $plan, int $daysLeft): array
+    {
+        return [
+            'cdn_used_gb' => View::n($used, 1),
+            'cdn_plan_gb' => View::n($plan),
+            'cdn_remaining_gb' => View::n(max(0.0, $plan - $used), 1),
+            'cdn_days_left' => View::n($daysLeft),
+        ];
     }
 
     /**
@@ -663,7 +748,7 @@ final class Prepaid
         if (!$email) {
             return;
         }
-        $tpl = $kind === 'exhausted' ? self::TPL_EXHAUSTED : self::TPL_WARNING;
+        $tpl = ['exhausted' => self::TPL_EXHAUSTED, 'forecast' => self::TPL_FORECAST][$kind] ?? self::TPL_WARNING;
         $r = Env::localApi('SendEmail', ['messagename' => $tpl, 'id' => (int) $c->id, 'customvars' => base64_encode(serialize($vars))]);
         Env::log('prepaid: «' . $tpl . '» email for service #' . (int) $c->id . ' — ' . (($r['result'] ?? '') === 'success' ? 'sent' : 'failed: ' . ($r['message'] ?? '')), (int) $c->userid);
     }

@@ -739,6 +739,8 @@ final class Pages
         }
 
         $co = Data::configOptions($rows);
+        // §10.2 smart-usage: services the prepaid engine flagged for an upgrade suggestion this month.
+        $flags = Data::suggestFlags(\function_exists('pasargadcdn_month') ? \pasargadcdn_month() : gmdate('Y-m'));
         // Per-site details (NS / SSL) for the visible rows only, in parallel.
         $details = [];
         if ($usage !== null) {
@@ -862,9 +864,17 @@ final class Pages
                 $tunnel = View::badge(!empty($tc['enabled']) ? 'تونل · ' . View::n($np) . ' مسیر' : 'تونل خاموش', !empty($tc['enabled']) ? 'violet' : 'muted',
                     ' data-tunnel="' . (!empty($tc['enabled']) ? 'on' : 'off') . '" title="' . View::e('حالت تونل (VPN) — گروه نود: ' . ($det['plan']['features']['edge_group'] ?? 'general')) . '"');
             }
+            $fl = $flags[$sid] ?? null;
+            $suggest = '';
+            if ($fl && !empty($fl['upgrade'])) {
+                $suggest = View::badge('پیشنهاد ارتقا', 'violet', ' data-suggest="upgrade" title="مصرف این سرویس به‌طور مداوم از ترافیک پلن فراتر رفته — پیشنهاد ارتقای پلن به مشتری نمایش داده می‌شود"');
+            } elseif ($fl && !empty($fl['forecast'])) {
+                $suggest = View::badge('پیش‌بینی اتمام', 'warn', ' data-suggest="forecast" title="طبق روند مصرف، ترافیک این ماه زودتر از پایان ماه تمام می‌شود"');
+            }
             $t .= '<tr data-service="' . $sid . '"><td class="pcdna-domain-cell"><a class="pcdna-domain" href="' . self::manageUrl($sid) . '">' . View::ltr($domain !== '' ? $domain : '—') . '</a>'
                 . '<div class="pcdna-small pcdna-muted"><a href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '" title="صفحه سرویس در WHMCS">#' . View::n($sid) . '</a> · '
-                . View::e($svc->product) . '</div>' . ($tunnel !== '' ? '<div class="pcdna-tn-line">' . $tunnel . '</div>' : '') . '</td>'
+                . View::e($svc->product) . '</div>' . ($tunnel !== '' ? '<div class="pcdna-tn-line">' . $tunnel . '</div>' : '')
+                . ($suggest !== '' ? '<div class="pcdna-tn-line">' . $suggest . '</div>' : '') . '</td>'
                 . '<td class="pcdna-client" data-label="مشتری"><a href="' . View::e(Data::clientUrl((int) $svc->userid)) . '">' . View::e(Data::clientName($svc)) . '</a></td>'
                 . '<td data-label="WHMCS / سررسید">' . self::whmcsBadge((string) $svc->domainstatus) . '<div class="pcdna-small pcdna-muted pcdna-nowrap" title="سررسید بعدی">' . View::e(View::date($svc->nextduedate)) . '</div></td>'
                 . '<td data-label="وضعیت CDN">' . $cdnCell . '</td><td data-label="NS">' . $ns . '</td><td data-label="SSL">' . $ssl . '</td><td class="pcdna-traffic" data-label="ترافیک این ماه">' . $traffic . '</td>'

@@ -31,11 +31,11 @@ class ClientApi
     const ROUTES = [
         'GET' => [
             '', 'config/(?:' . self::SECTIONS . ')', 'records', 'records/export', 'dnssec',
-            'analytics', 'events', 'usage', 'tunnel/stats',
+            'analytics', 'events', 'usage', 'tunnel/stats', 'apikeys',
         ],
-        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check'],
+        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys'],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom'],
-        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom'],
+        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}'],
     ];
 
     /** Query parameters the client may pass, per sub-path, with their allowed values. */
