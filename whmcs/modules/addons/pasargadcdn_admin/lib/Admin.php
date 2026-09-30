@@ -17,7 +17,7 @@ if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
  */
 final class Admin
 {
-    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'events', 'status', 'settings', 'manage', 'api'];
+    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'settings', 'manage', 'api'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -82,6 +82,9 @@ final class Admin
                 break;
             case 'usage':
                 $body = Pages::usage($get);
+                break;
+            case 'resellers':
+                $body = Pages::resellers($get, $state);
                 break;
             case 'events':
                 $body = Pages::events($get);
@@ -203,6 +206,12 @@ final class Admin
                 return self::incidentUpdate($post, $admin);
             case 'incident_resolve':
                 return self::incidentResolve((int) ($post['id'] ?? 0), $admin);
+            case 'reseller_flag':
+                return [[self::resellerFlag($post, $admin)], []];
+            case 'reseller_save':
+                return [[self::resellerSave($post, $admin)], []];
+            case 'reseller_settings':
+                return [[self::resellerSettings($post, $admin)], []];
             case 'save_server':
                 $sid = (int) ($post['server'] ?? 0);
                 if ($sid !== 0 && !Env::serverById($sid)) {
@@ -547,6 +556,74 @@ final class Admin
         Env::log('incident #' . $id . ' updated to ' . $status . ' by admin #' . $admin);
         Pages::reset();
         return [[['ok', 'به‌روزرسانی رخداد #' . View::n($id) . ' ثبت شد.']], []];
+    }
+
+    // ------------------------------------------------------------------ §10.5 resellers
+
+    private static function resellerFlag(array $post, int $admin): array
+    {
+        $q = Env::input($post['client'] ?? '');
+        if ($q === '') {
+            return ['bad', 'شناسه، ایمیل یا نام مشتری را وارد کنید.'];
+        }
+        $uid = Resellers::resolveClient($q);
+        if ($uid <= 0) {
+            return ['bad', 'مشتری یافت نشد یا بیش از یک نتیجه داشت؛ شناسه عددی یا ایمیل دقیق را وارد کنید.'];
+        }
+        Resellers::flag($uid);
+        Pages::reset();
+        Env::log('client #' . $uid . ' flagged as reseller by admin #' . $admin, $uid);
+        return ['ok', 'مشتری #' . View::n($uid) . ' به‌عنوان نماینده فعال شد.'];
+    }
+
+    private static function resellerSave(array $post, int $admin): array
+    {
+        $uid = (int) ($post['userid'] ?? 0);
+        if ($uid <= 0) {
+            return ['bad', 'شناسه نماینده نامعتبر است.'];
+        }
+        $rateRaw = trim(str_replace([',', '٬'], '', Env::input($post['rate'] ?? '')));
+        $rate = null;
+        if ($rateRaw !== '') {
+            if (!is_numeric($rateRaw) || (float) $rateRaw < 0) {
+                return ['bad', 'قیمت هر گیگابایت نامعتبر است (خالی = نرخ سراسری).'];
+            }
+            $rate = (float) $rateRaw;
+        }
+        $maxRaw = trim(Env::input($post['max_sites'] ?? '0'));
+        if ($maxRaw !== '' && !ctype_digit($maxRaw)) {
+            return ['bad', 'حداکثر تعداد سایت باید عدد صحیح باشد (۰ = پیش‌فرض سراسری).'];
+        }
+        $max = (int) $maxRaw;
+        $enabled = in_array(strtolower(Env::input($post['enabled'] ?? '0')), ['1', 'on', 'yes', 'true'], true);
+        $note = Env::input($post['note'] ?? '');
+        if (!Resellers::save($uid, $rate, $max, $enabled, $note)) {
+            return ['bad', 'نماینده یافت نشد.'];
+        }
+        Pages::reset();
+        Env::log('reseller #' . $uid . ' updated by admin #' . $admin . ' (rate '
+            . ($rate === null ? 'global' : (string) $rate) . ', max ' . $max . ', ' . ($enabled ? 'enabled' : 'disabled') . ')', $uid);
+        return ['ok', 'تنظیمات نماینده #' . View::n($uid) . ' ذخیره شد.'];
+    }
+
+    private static function resellerSettings(array $post, int $admin): array
+    {
+        $rateRaw = trim(str_replace([',', '٬'], '', Env::input($post['reseller_rate'] ?? '')));
+        if ($rateRaw !== '' && (!is_numeric($rateRaw) || (float) $rateRaw < 0)) {
+            return ['bad', 'قیمت عمده هر گیگابایت نامعتبر است.'];
+        }
+        $maxRaw = trim(Env::input($post['reseller_max_sites'] ?? ''));
+        if ($maxRaw !== '' && !ctype_digit($maxRaw)) {
+            return ['bad', 'حداکثر زیرسایت باید عدد صحیح باشد.'];
+        }
+        Env::saveSetting('reseller_rate', $rateRaw);
+        Env::saveSetting('reseller_max_sites', $maxRaw === '' ? '0' : $maxRaw);
+        if (function_exists('pasargadcdn_addon_settings')) {
+            \pasargadcdn_addon_settings(true);
+        }
+        Pages::reset();
+        Env::log('reseller global settings saved by admin #' . $admin . ' (rate ' . ($rateRaw ?: 'unset') . ', max ' . ($maxRaw ?: '0') . ')');
+        return ['ok', 'تنظیمات سراسری نمایندگی ذخیره شد.'];
     }
 
     /** Quick resolve: posts a "resolved" update so it lands in the timeline too. */

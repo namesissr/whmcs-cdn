@@ -33,7 +33,14 @@ $str = function ($v) {
     return is_string($v) ? $v : '';
 };
 $query = $_GET;
-unset($query['id'], $query['path']);
+unset($query['id'], $query['path'], $query['rsid'], $query['rop']);
+
+// Reseller context (SPEC §10.5) — gathered server-side from the request; the logged-in
+// client id decides ownership. A reseller-site id selects one of the client's OWN sub-sites
+// (ClientApi resolves its domain from mod_pasargadcdn_reseller_sites), and a reseller op is a
+// reseller-level action (list / create / delete / report). The domain is never trusted from input.
+$rsid = ctype_digit((string) ($_GET['rsid'] ?? '')) ? (int) $_GET['rsid'] : 0;
+$rop = $str($_GET['rop'] ?? '');
 
 [$code, $data] = ClientApi::handle([
     'method' => $method,
@@ -44,6 +51,8 @@ unset($query['id'], $query['path']);
     'csrf' => (string) ($_SERVER['HTTP_X_PCDN_CSRF'] ?? ''),
     'session_csrf' => (string) ($_SESSION['pasargadcdn_csrf'] ?? ''),
     'client_id' => pasargadcdn_api_client_id(),
+    'reseller_site_id' => $rsid,
+    'reseller_op' => $rop,
 ]);
 
 http_response_code($code);

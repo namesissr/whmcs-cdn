@@ -121,6 +121,20 @@ function pasargadcdn_admin_config()
                 'Default' => 'yes',
                 'Description' => 'پیش از ثبت سفارش CDN، از کنترلر می‌پرسد دامنه قبلاً ثبت نشده باشد (حداکثر ۵ ثانیه؛ در صورت قطعی کنترلر سفارش مسدود نمی‌شود)',
             ],
+            'reseller_rate' => [
+                'FriendlyName' => 'قیمت عمده هر گیگابایت نمایندگان',
+                'Type' => 'text',
+                'Size' => '12',
+                'Default' => '',
+                'Description' => 'قیمت پیش‌فرض هر گیگابایت برای نمایندگان (ارز پیش‌فرض WHMCS)؛ برای هر نماینده قابل بازنویسی است',
+            ],
+            'reseller_max_sites' => [
+                'FriendlyName' => 'حداکثر زیرسایت هر نماینده',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '20',
+                'Description' => 'سقف پیش‌فرض تعداد زیرسایت‌هایی که هر نماینده می‌تواند بسازد (۰ = نامحدود)؛ برای هر نماینده قابل بازنویسی است',
+            ],
             'reserved' => [
                 'FriendlyName' => 'دامنه‌های رزرو',
                 'Type' => 'text',
@@ -165,6 +179,7 @@ function pasargadcdn_admin_output($vars)
     require_once __DIR__ . '/lib/Data.php';
     require_once __DIR__ . '/lib/Wizard.php';
     require_once __DIR__ . '/lib/WidgetData.php';
+    require_once __DIR__ . '/lib/Resellers.php';
     require_once __DIR__ . '/lib/Pages.php';
     require_once __DIR__ . '/lib/Admin.php';
     echo PasargadCdn\Admin\Admin::output(is_array($vars) ? $vars : [], $_GET, $_POST,
@@ -175,7 +190,8 @@ function pasargadcdn_admin_sidebar($vars)
 {
     $link = htmlspecialchars((string) ($vars['modulelink'] ?? 'addonmodules.php?module=pasargadcdn_admin'), ENT_QUOTES, 'UTF-8');
     $items = ['dashboard' => 'داشبورد', 'sites' => 'سایت‌ها', 'edges' => 'نودها', 'plans' => 'پلن‌ها و قیمت‌گذاری',
-        'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'events' => 'رویدادهای امنیتی', 'status' => 'وضعیت و رخدادها', 'settings' => 'تنظیمات و سلامت'];
+        'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'resellers' => 'نمایندگان', 'events' => 'رویدادهای امنیتی',
+        'status' => 'وضعیت و رخدادها', 'settings' => 'تنظیمات و سلامت'];
     $h = '<span class="header"><i class="fas fa-bolt"></i> CDN پاسارگاد</span><ul class="menu" dir="rtl" style="text-align:right">';
     foreach ($items as $page => $label) {
         $h .= '<li><a href="' . $link . '&amp;page=' . $page . '">' . $label . '</a></li>';

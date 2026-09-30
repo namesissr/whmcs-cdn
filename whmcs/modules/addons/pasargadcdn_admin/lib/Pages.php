@@ -24,6 +24,7 @@ final class Pages
         'plans' => ['پلن‌ها و قیمت‌گذاری', 'tag'],
         'analytics' => ['آنالیتیکس', 'chart'],
         'usage' => ['گزارش مصرف', 'wallet'],
+        'resellers' => ['نمایندگان', 'users'],
         'events' => ['رویدادهای امنیتی', 'shield'],
         'status' => ['وضعیت و رخدادها', 'activity'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
@@ -2400,6 +2401,122 @@ final class Pages
                 : 'روشن است؛ اعتبار موجود هنگام صدور فاکتور تمدید خودکار اعمال می‌شود'),
             'System Settings → Payment → Credit: «Automatically apply any available credit … when generating invoices» را روشن کنید (اختیاری).'];
         return $out;
+    }
+
+    // ------------------------------------------------------------------ §10.5 resellers
+
+    public static function resellers(array $get, array $state = []): string
+    {
+        $usage = Resellers::usageByDomain(); // null when the controller is down
+        $list = Resellers::listAll($usage);
+        $month = \pasargadcdn_month();
+
+        // KPIs
+        $totalSites = 0;
+        $totalGb = 0.0;
+        $rev = [];
+        foreach ($list as $r) {
+            $totalSites += (int) $r['sites'];
+            $totalGb += (float) $r['gb'];
+            foreach ($r['revenue'] as $code => $amt) {
+                $rev[$code] = ($rev[$code] ?? 0.0) + $amt;
+            }
+        }
+        $revTxt = [];
+        foreach ($rev as $code => $amt) {
+            if ($amt > 0) {
+                $revTxt[] = View::n($amt, $amt >= 100 ? 0 : 2) . ' <small>' . View::e($code) . '</small>';
+            }
+        }
+        $active = count(array_filter($list, function ($r) {
+            return $r['enabled'];
+        }));
+        $h = '<div class="pcdna-kpis">'
+            . View::kpi('users', 'brand', 'نمایندگان فعال', View::n($active), View::n(count($list)) . ' نماینده ثبت‌شده')
+            . View::kpi('globe', 'violet', 'زیرسایت‌ها', View::n($totalSites), 'مجموع سایت‌های همه نمایندگان')
+            . View::kpi('activity', 'brand', 'مصرف این ماه', $usage === null ? '<span class="pcdna-muted">—</span>' : View::gb($totalGb), $usage === null ? 'کنترلر در دسترس نیست' : 'مجموع زیرسایت‌ها')
+            . View::kpi('wallet', 'ok', 'درآمد عمده این ماه', $revTxt ? implode('<br>', $revTxt) : '<span class="pcdna-muted">۰</span>', 'خرید ترافیک پرداخت‌شده نمایندگان')
+            . '</div>';
+        if ($usage === null) {
+            $h .= View::alert('warn', 'ارتباط با کنترلر برای مصرف لحظه‌ای برقرار نشد؛ بقیه اطلاعات از داده محلی نمایش داده می‌شود.');
+        }
+
+        // global settings
+        $gform = '<form method="post" action="' . View::url(['page' => 'resellers']) . '" class="pcdna-form pcdna-form-inline">' . View::csrf()
+            . '<input type="hidden" name="a" value="reseller_settings">'
+            . '<label class="pcdna-inline-label"><span>قیمت عمده هر گیگابایت (پیش‌فرض)</span>'
+            . '<input class="pcdna-input" name="reseller_rate" dir="ltr" inputmode="decimal" value="' . View::e(Resellers::globalRate()) . '" placeholder="مثلاً 2000"></label>'
+            . '<label class="pcdna-inline-label"><span>حداکثر زیرسایت هر نماینده (۰ = نامحدود)</span>'
+            . '<input class="pcdna-input" name="reseller_max_sites" dir="ltr" inputmode="numeric" value="' . View::e(Resellers::globalMaxSites()) . '"></label>'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-primary">ذخیره</button></form>'
+            . '<p class="pcdna-muted pcdna-small">این مقادیر پیش‌فرض همه نمایندگان است و برای هر نماینده در جدول زیر قابل بازنویسی است. قیمت به ارز پیش‌فرض WHMCS.</p>';
+        $h .= View::card('تنظیمات سراسری نمایندگی', $gform, '', '', 'settings');
+
+        // add / flag a reseller
+        $aform = '<form method="post" action="' . View::url(['page' => 'resellers']) . '" class="pcdna-form pcdna-form-inline">' . View::csrf()
+            . '<input type="hidden" name="a" value="reseller_flag">'
+            . '<label class="pcdna-inline-label"><span>مشتری (شناسه، ایمیل یا نام)</span>'
+            . '<input class="pcdna-input" name="client" value="" placeholder="#123 یا user@example.com"></label>'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('check') . '<span>ثبت به‌عنوان نماینده</span></button></form>';
+        $h .= View::card('افزودن نماینده', $aform, '', '', 'users');
+
+        // list
+        if (!$list) {
+            $h .= View::card('نمایندگان', View::emptyState('هنوز نماینده‌ای ثبت نشده است',
+                'با فرم بالا یک مشتری را به‌عنوان نماینده فعال کنید. نماینده در پنل مشتری خود بخش «نمایندگی» را می‌بیند.', 'users'));
+            return $h . self::resellerPurchases($month);
+        }
+        $t = '<div class="pcdna-table-wrap"><table class="pcdna-table"><thead><tr><th>مشتری</th><th>وضعیت</th><th>زیرسایت</th>'
+            . '<th>مصرف ماه (GB)</th><th>درآمد ماه</th><th>تنظیمات</th></tr></thead><tbody>';
+        foreach ($list as $r) {
+            $uid = (int) $r['userid'];
+            $revCell = [];
+            foreach ($r['revenue'] as $code => $amt) {
+                if ($amt > 0) {
+                    $revCell[] = View::n($amt, $amt >= 100 ? 0 : 2) . ' <small>' . View::e($code) . '</small>';
+                }
+            }
+            $form = '<details class="pcdna-menu"><summary class="pcdna-btn pcdna-btn-sm">' . View::icon('sliders') . '<span>ویرایش</span></summary>'
+                . '<div class="pcdna-menu-list"><form method="post" action="' . View::url(['page' => 'resellers']) . '" class="pcdna-form">' . View::csrf()
+                . '<input type="hidden" name="a" value="reseller_save"><input type="hidden" name="userid" value="' . $uid . '">'
+                . '<label><span>قیمت هر گیگابایت (خالی = سراسری)</span><input class="pcdna-input" name="rate" dir="ltr" inputmode="decimal" value="'
+                . ($r['rate'] !== null ? View::e(rtrim(rtrim(sprintf('%.9f', $r['rate']), '0'), '.')) : '') . '"></label>'
+                . '<label><span>حداکثر زیرسایت (۰ = پیش‌فرض)</span><input class="pcdna-input" name="max_sites" dir="ltr" inputmode="numeric" value="' . (int) $r['max_sites'] . '"></label>'
+                . '<label><span>وضعیت</span>' . View::select('enabled', ['1' => 'فعال', '0' => 'غیرفعال'], $r['enabled'] ? '1' : '0') . '</label>'
+                . '<label><span>یادداشت</span><input class="pcdna-input" name="note" value="' . View::e($r['note']) . '" maxlength="191"></label>'
+                . '<button type="submit" class="pcdna-btn pcdna-btn-sm pcdna-btn-primary">' . View::icon('check') . '<span>ذخیره</span></button></form></div></details>';
+            $t .= '<tr><td><a href="' . View::e(Data::clientUrl($uid)) . '">' . View::e($r['name']) . '</a>'
+                . '<div class="pcdna-small pcdna-muted">' . View::ltr($r['email'] ?: ('#' . $uid)) . '</div></td>'
+                . '<td>' . ($r['enabled'] ? View::badge('فعال', 'ok') : View::badge('غیرفعال', 'muted')) . '</td>'
+                . '<td class="pcdna-num">' . View::n($r['sites']) . ($r['suspended_sites'] > 0 ? '<div class="pcdna-small pcdna-c-bad">' . View::n($r['suspended_sites']) . ' قطع</div>' : '') . '</td>'
+                . '<td class="pcdna-num">' . ($usage === null ? '<span class="pcdna-muted">—</span>' : View::n($r['gb'], 2)) . '</td>'
+                . '<td class="pcdna-num">' . ($revCell ? implode('<br>', $revCell) : '<span class="pcdna-muted">۰</span>') . '</td>'
+                . '<td class="pcdna-actions">' . $form . '</td></tr>';
+        }
+        $t .= '</tbody></table></div>';
+        $h .= View::card('نمایندگان (' . View::n(count($list)) . ')', $t, '', 'pcdna-flush', 'users');
+        return $h . self::resellerPurchases($month);
+    }
+
+    /** Wholesale traffic purchases of the resellers in $month. */
+    public static function resellerPurchases(string $month): string
+    {
+        $list = Resellers::topups($month, 200);
+        if (!$list) {
+            return View::card('خریدهای ترافیک نمایندگان', View::emptyState('در این ماه خرید ترافیکی از کیف پول نمایندگان ثبت نشده است', '', 'wallet'), '', '', 'wallet');
+        }
+        $t = '<div class="pcdna-table-wrap"><table class="pcdna-table"><thead><tr><th>زمان</th><th>نماینده</th><th>حجم</th><th>مبلغ</th><th>فاکتور</th><th>وضعیت</th></tr></thead><tbody>';
+        foreach ($list as $x) {
+            [$st, $tone] = self::TOPUP_STATUS[$x->status] ?? [$x->status, 'muted'];
+            $t .= '<tr><td class="pcdna-nowrap">' . View::e(View::date($x->created_at, true)) . '</td>'
+                . '<td><a href="' . View::e(Data::clientUrl((int) $x->userid)) . '">' . View::e(Data::clientName($x)) . '</a></td>'
+                . '<td class="pcdna-num">' . View::n($x->gb) . ' GB' . ((int) $x->blocks > 1 ? '<div class="pcdna-small pcdna-muted">' . View::n($x->blocks) . ' بسته</div>' : '') . '</td>'
+                . '<td class="pcdna-num">' . View::n($x->amount, (float) $x->amount >= 100 ? 0 : 2) . ' <small>' . View::e($x->currency_code) . '</small></td>'
+                . '<td>' . ($x->invoice_id ? '<a href="invoices.php?action=edit&amp;id=' . (int) $x->invoice_id . '">#' . View::n($x->invoice_id) . '</a>' : '—') . '</td>'
+                . '<td>' . View::badge($st, $tone) . '</td></tr>';
+        }
+        $t .= '</tbody></table></div>';
+        return View::card('خریدهای ترافیک نمایندگان (' . View::n(count($list)) . ')', $t, '', 'pcdna-flush', 'wallet');
     }
 
     public static function settings(): string

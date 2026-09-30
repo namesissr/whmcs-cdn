@@ -20,6 +20,13 @@ if (class_exists(__NAMESPACE__ . '\\ClientApi', false)) {
  * same whitelist, CSRF and domain-from-service rules, but no ownership check
  * and writes are allowed whatever the WHMCS status is; every admin write is
  * recorded with logActivity().
+ *
+ * Reseller mode (SPEC §10.5, 'reseller_site_id' > 0): the same whitelist, CSRF,
+ * query rules and proxy, but the domain is resolved from the reseller's OWN
+ * sub-site row (mod_pasargadcdn_reseller_sites) keyed by (id, userid). A reseller
+ * can only ever reach a sub-site whose userid matches the logged-in client; the
+ * same "not found" answer covers a missing row and one owned by someone else.
+ * 'reseller_op' carries the reseller-level actions (list/create/delete/report).
  */
 class ClientApi
 {
@@ -70,9 +77,40 @@ class ClientApi
         if ($sessionToken === '' || !hash_equals($sessionToken, (string) ($req['csrf'] ?? ''))) {
             return self::fail(403, 'درخواست نامعتبر است، صفحه را دوباره بارگذاری کنید.');
         }
+        // Reseller-level operations (list / create / delete sub-site, rolled-up report).
+        // Not tied to a controller sub-path, so handled before the site whitelist.
+        $rop = (string) ($req['reseller_op'] ?? '');
+        if ($rop !== '') {
+            return self::resellerOp($rop, $req, $clientFactory);
+        }
         if (!self::allowed($method, $path)) {
             return self::fail(404, 'مسیر نامعتبر است.');
         }
+
+        // Reseller mode (SPEC §10.5): manage one of the logged-in client's OWN sub-sites.
+        // The domain is resolved from mod_pasargadcdn_reseller_sites by (id, userid) — never
+        // from client input — so a reseller can only ever reach a sub-site it owns.
+        $rsid = (int) ($req['reseller_site_id'] ?? 0);
+        if ($rsid > 0) {
+            if ($admin) {
+                return self::fail(404, 'سرویس یافت نشد.');
+            }
+            require_once __DIR__ . '/Reseller.php';
+            $clientId = (int) ($req['client_id'] ?? 0);
+            $row = Reseller::ownedSite($clientId, $rsid);
+            // Same answer for "missing" and "not yours".
+            if (!$row) {
+                return self::fail(404, 'سرویس یافت نشد.');
+            }
+            // A sub-site cut by the wallet (suspended) may still be viewed, not written to.
+            if ((int) $row->suspended === 1 && $method !== 'GET') {
+                return self::fail(403, 'این زیرسایت به‌دلیل اتمام اعتبار نمایندگی موقتاً قطع است.');
+            }
+            $domain = \pasargadcdn_domain(['domain' => (string) $row->domain]);
+            $server = Reseller::server();
+            return self::proxy($method, $path, $domain, $server, $req, false, 0, null, $clientFactory);
+        }
+
         $id = (string) ($req['id'] ?? '');
         if (!preg_match('/^[1-9][0-9]{0,9}$/D', $id)) {
             return self::fail(404, 'سرویس یافت نشد.');
@@ -93,6 +131,20 @@ class ClientApi
             return self::fail(403, 'این سرویس فعال نیست.');
         }
 
+        $domain = \pasargadcdn_domain(['domain' => $svc->domain]);
+        $server = Capsule::table('tblservers')->where('id', (int) $svc->server)
+            ->first(['type', 'hostname', 'ipaddress', 'secure', 'port', 'accesshash', 'password']);
+        return self::proxy($method, $path, $domain, $server, $req, $admin, $adminId, $svc, $clientFactory);
+    }
+
+    /**
+     * Shared controller proxy tail: validate body/query/domain/server and forward the
+     * whitelisted call to the controller, returning [status, data]. Used for normal,
+     * admin and reseller-site modes alike (same whitelist, CSRF and rules).
+     */
+    private static function proxy(string $method, string $path, string $domain, $server, array $req,
+                                  bool $admin, int $adminId, $svc, ?callable $clientFactory): array
+    {
         $body = null;
         if ($method === 'POST' || $method === 'PUT') {
             $raw = (string) ($req['body'] ?? '');
@@ -112,14 +164,11 @@ class ClientApi
             return self::fail(400, 'پارامتر نامعتبر است.');
         }
 
-        $domain = \pasargadcdn_domain(['domain' => $svc->domain]);
-        // Defence in depth: the service domain is admin/order data, keep it a plain hostname.
+        // Defence in depth: the domain is admin/order data, keep it a plain hostname.
         if (!preg_match('/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/D', $domain)) {
             return self::fail(404, 'سرویس یافت نشد.');
         }
-        $server = Capsule::table('tblservers')->where('id', (int) $svc->server)
-            ->first(['type', 'hostname', 'ipaddress', 'secure', 'port', 'accesshash', 'password']);
-        if (!$server || $server->type !== 'pasargadcdn') {
+        if (!$server || ($server->type ?? '') !== 'pasargadcdn') {
             return self::fail(502, 'سرور CDN برای این سرویس تنظیم نشده است.');
         }
 
@@ -156,6 +205,78 @@ class ClientApi
             return $code < 300 ? [$code, ['ok' => true]] : self::fail($code, 'درخواست توسط سرور CDN رد شد (HTTP ' . $code . ')');
         }
         return [$code, $data];
+    }
+
+    const RESELLER_OPS = ['list', 'create', 'delete', 'report'];
+
+    /**
+     * Reseller-level operations for the logged-in client (already CSRF-checked). Every op
+     * verifies the client is an enabled reseller and only ever touches its own rows.
+     */
+    private static function resellerOp(string $op, array $req, ?callable $clientFactory): array
+    {
+        require_once __DIR__ . '/Reseller.php';
+        $method = strtoupper((string) ($req['method'] ?? 'GET'));
+        $clientId = (int) ($req['client_id'] ?? 0);
+        if (!in_array($op, self::RESELLER_OPS, true)) {
+            return self::fail(404, 'عملیات نامعتبر است.');
+        }
+        if ($clientId <= 0 || !Reseller::isReseller($clientId)) {
+            // Non-resellers get the same generic answer — the panel is simply absent for them.
+            return self::fail(404, 'یافت نشد.');
+        }
+        $factory = $clientFactory ? function ($server) use ($clientFactory) {
+            return $clientFactory([
+                'serverhostname' => $server->hostname, 'serverip' => $server->ipaddress,
+                'serversecure' => $server->secure, 'serverport' => $server->port,
+                'serveraccesshash' => $server->accesshash,
+                'serverpassword' => (trim((string) ($server->accesshash ?? '')) === '' && function_exists('decrypt'))
+                    ? decrypt($server->password) : '',
+            ]);
+        } : null;
+
+        if ($op === 'list' && $method === 'GET') {
+            $sites = [];
+            foreach (Reseller::sites($clientId) as $r) {
+                $sites[] = ['id' => (int) $r->id, 'domain' => (string) $r->domain, 'label' => (string) $r->label,
+                    'suspended' => (int) $r->suspended === 1];
+            }
+            $cfg = Reseller::config($clientId);
+            return [200, ['sites' => $sites, 'max_sites' => $cfg['max_sites'], 'count' => count($sites)]];
+        }
+        if ($op === 'report' && $method === 'GET') {
+            return [200, Reseller::report($clientId, $factory)];
+        }
+        if ($op === 'create' && $method === 'POST') {
+            $data = self::jsonBody($req);
+            if ($data === null) {
+                return self::fail(400, 'بدنه درخواست باید JSON معتبر باشد.');
+            }
+            [$ok, $res] = Reseller::createSite($clientId, (string) ($data['domain'] ?? ''),
+                (string) ($data['origin_ip'] ?? ''), (string) ($data['label'] ?? ''), $factory);
+            return $ok ? [201, $res] : self::fail(400, is_string($res) ? $res : 'ساخت زیرسایت ناموفق بود.');
+        }
+        if ($op === 'delete' && $method === 'POST') {
+            $data = self::jsonBody($req);
+            $rsid = (int) ($data['id'] ?? 0);
+            [$ok, $msg] = Reseller::deleteSite($clientId, $rsid, $factory);
+            return $ok ? [200, ['ok' => true, 'detail' => $msg]] : self::fail(404, $msg);
+        }
+        return self::fail(405, 'متد مجاز نیست.');
+    }
+
+    /** Decode and re-validate a JSON request body ([] for empty), or null when malformed/oversized. */
+    private static function jsonBody(array $req): ?array
+    {
+        $raw = (string) ($req['body'] ?? '');
+        if (strlen($raw) > self::MAX_BODY) {
+            return null;
+        }
+        if ($raw === '') {
+            return [];
+        }
+        $data = json_decode($raw, true, 64);
+        return is_array($data) ? $data : null;
     }
 
     public static function allowed(string $method, string $path): bool

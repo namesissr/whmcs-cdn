@@ -31,6 +31,8 @@ if (class_exists(__NAMESPACE__ . '\\Prepaid', false)) {
 final class Prepaid
 {
     const ITEM_TYPE = 'PasargadCdnTopup';
+    const RESELLER_ITEM_TYPE = 'PasargadCdnResellerTopup';
+    const TPL_RESELLER_EXHAUSTED = 'Pasargad CDN Reseller Traffic Exhausted';
     const TPL_EXHAUSTED = 'Pasargad CDN Traffic Exhausted';
     const TPL_WARNING = 'Pasargad CDN Traffic Warning';
     const TPL_FORECAST = 'Pasargad CDN Traffic Forecast';
@@ -66,6 +68,15 @@ final class Prepaid
         } catch (\Throwable $e) {
             Env::log('prepaid cron error: ' . $e->getMessage());
         }
+        // §10.5 reseller wholesale billing — a fully independent, additive pass over the
+        // reseller ledger. It never touches the per-service engine above.
+        try {
+            if (self::enabled()) {
+                self::processResellers(null);
+            }
+        } catch (\Throwable $e) {
+            Env::log('reseller prepaid cron error: ' . $e->getMessage());
+        }
     }
 
     /** InvoicePaid: top-up invoices raise the cap; Add Funds invoices re-run the client's services. Never throws. */
@@ -80,8 +91,9 @@ final class Prepaid
                 return (string) $i->type;
             }, $items);
             $topup = in_array(self::ITEM_TYPE, $types, true);
+            $rtopup = in_array(self::RESELLER_ITEM_TYPE, $types, true);
             $funds = in_array('AddFunds', $types, true);
-            if (!$topup && !$funds) {
+            if (!$topup && !$rtopup && !$funds) {
                 return; // ordinary invoice: one query, nothing else
             }
             if (!self::enabled()) {
@@ -91,8 +103,17 @@ final class Prepaid
             if ($topup) {
                 self::markInvoicePaid($invoiceId);
             }
+            if ($rtopup) {
+                self::markResellerInvoicePaid($invoiceId);
+            }
             if ($funds && !self::$running && $items) {
                 self::run((int) $items[0]->userid);
+                // A wallet top-up may also reconnect the client's reseller sub-sites.
+                try {
+                    self::processResellers((int) $items[0]->userid);
+                } catch (\Throwable $e) {
+                    Env::log('reseller InvoicePaid #' . $invoiceId . ' error: ' . $e->getMessage());
+                }
             }
         } catch (\Throwable $e) {
             Env::log('prepaid InvoicePaid #' . $invoiceId . ' error: ' . $e->getMessage());
@@ -107,7 +128,8 @@ final class Prepaid
 
     private static function tables(): void
     {
-        if (!Env::hasTable(Env::TOPUPS) || !Env::hasTable(Env::NOTICES) || !Env::hasTable(Env::USAGE)) {
+        if (!Env::hasTable(Env::TOPUPS) || !Env::hasTable(Env::NOTICES) || !Env::hasTable(Env::USAGE)
+            || !Env::hasTable(Env::RESELLER_TOPUPS) || !Env::hasTable(Env::RESELLER_SITES)) {
             Env::ensureTable();
         }
     }
@@ -801,5 +823,327 @@ final class Prepaid
             }
         }
         return $month;
+    }
+
+    // ==================================================================
+    // §10.5 RESELLER WHOLESALE BILLING — a fully separate, additive ledger.
+    //
+    // Mirrors the per-service buy-traffic / cut-at-cap behaviour above, but
+    // against each reseller's aggregate wallet (no per-site plan): every GB is
+    // billed at the reseller's effective wholesale rate, purchases are recorded
+    // in mod_pasargadcdn_reseller_topups (unique (userid,month,seq) slot so
+    // concurrent runs are idempotent), and when the wallet can't cover usage the
+    // reseller's sub-sites are cut (suspended on the controller + suspended=1
+    // locally) with ONE Persian notice, reconnecting when the wallet is topped up.
+    // None of the code above is touched.
+    // ==================================================================
+
+    /** @var array report of the last reseller run (tests / admin) */
+    public static $rReport = [];
+    /** @var bool re-entrancy guard for the reseller pass */
+    private static $rRunning = false;
+
+    /**
+     * @param int|null $userId only this reseller (Add Funds), or all enabled resellers (cron).
+     * @return array report
+     */
+    public static function processResellers(?int $userId): array
+    {
+        self::$rReport = ['purchases' => [], 'notices' => [], 'cuts' => [], 'reconnects' => [], 'errors' => []];
+        if (self::$rRunning) {
+            return self::$rReport;
+        }
+        if (!Env::loadServerModule()) {
+            return self::$rReport;
+        }
+        self::$rRunning = true;
+        try {
+            // Cheap early-out when the feature is unused: one schema check + one id query, no HTTP.
+            if (!Env::hasTable(Env::RESELLERS)) {
+                return self::$rReport;
+            }
+            $q = Capsule::table(Env::RESELLERS)->where('enabled', 1);
+            if ($userId !== null) {
+                $q->where('userid', $userId);
+            }
+            $ids = array_map('intval', $q->pluck('userid')->all());
+            if (!$ids) {
+                return self::$rReport;
+            }
+            self::tables();
+            $month = \pasargadcdn_month();
+            // one controller usage read for the whole pass: domain => GB
+            $server = \PasargadCdn\Reseller::server();
+            if (!$server) {
+                self::$rReport['errors'][] = 'no server';
+                return self::$rReport;
+            }
+            try {
+                $data = Env::api(15, $server)->get('/api/v1/usage?month=' . $month);
+            } catch (\Throwable $e) {
+                self::$rReport['errors'][] = 'usage: ' . $e->getMessage();
+                Env::log('reseller prepaid: controller usage unavailable (' . $e->getMessage() . ') — nothing bought this run');
+                return self::$rReport;
+            }
+            $usageMap = [];
+            foreach ((array) ($data['sites'] ?? []) as $s) {
+                $d = strtolower((string) ($s['domain'] ?? ''));
+                if ($d !== '') {
+                    $usageMap[$d] = (float) ($s['bytes'] ?? 0) / 1073741824;
+                }
+            }
+            foreach ($ids as $uid) {
+                try {
+                    self::processReseller($uid, $usageMap, $month, $server);
+                } catch (\Throwable $e) {
+                    self::$rReport['errors'][] = 'reseller #' . $uid . ': ' . $e->getMessage();
+                    Env::log('reseller prepaid: client #' . $uid . ' failed: ' . $e->getMessage(), $uid);
+                }
+            }
+        } finally {
+            self::$rRunning = false;
+        }
+        return self::$rReport;
+    }
+
+    private static function processReseller(int $uid, array $usageMap, string $month, $server): void
+    {
+        $cfg = \PasargadCdn\Reseller::config($uid);
+        if (!$cfg['enabled']) {
+            return;
+        }
+        $sites = \PasargadCdn\Reseller::sites($uid);
+        $block = \PasargadCdn\Reseller::blockGb();
+        $maxBlocks = \PasargadCdn\Reseller::maxBlocks();
+        // aggregate current-month usage across the reseller's sub-sites
+        $used = 0.0;
+        foreach ($sites as $s) {
+            $d = strtolower(Env::domain((string) $s->domain));
+            $used += $usageMap[$d] ?? 0.0;
+        }
+        $t = self::resellerMonthTopups($uid, $month);
+        $cap = $t['paid_gb']; // no included plan: cap = traffic bought this month
+        $left = max(0, $maxBlocks - $t['blocks']);
+        $margin = self::margin(max(1.0, (float) $cap), $block);
+        $needCut = $used >= $cap;
+        if ($used < $cap - $margin && !$needCut) {
+            self::reconnectReseller($uid, $sites, $month, $server);
+            return;
+        }
+        $client = Capsule::table('tblclients')->where('id', $uid)->first(['currency']);
+        $currencyId = $client ? (int) $client->currency : 0;
+        $rate = $cfg['rate'];
+        $need = self::blocksNeeded($used, (int) $cap, $block);
+        $bought = 0;
+        $reason = '';
+        $credit = 0.0;
+        $blockPrice = 0.0;
+        if ($rate === null || $rate <= 0) {
+            $reason = 'noprice';
+            self::resellerNotice($uid, 'noprice', [], false);
+        } elseif ($left === 0) {
+            $reason = 'limit';
+        } else {
+            [$credit, $crate] = self::credit($uid, $currencyId);
+            $blockPrice = round($rate * $block * $crate, 2);
+            $afford = $blockPrice > 0 ? (int) floor(($credit + 0.00001) / $blockPrice) : 0;
+            $buy = min($need, $left, $afford);
+            if ($buy > 0) {
+                $bought = self::purchaseReseller($uid, $buy, $blockPrice, $block, $month, $currencyId) ? $buy : 0;
+            }
+            if ($bought < $need) {
+                $reason = ($afford < $need && $left >= $need) ? 'credit' : ($left < $need ? 'limit' : 'credit');
+            }
+        }
+        $newCap = $cap + $bought * $block;
+        if ($used >= $newCap && $reason !== '') {
+            self::cutReseller($uid, $sites, $month, $server, $reason, $used, $newCap, $block, $credit, $blockPrice, $currencyId);
+        } else {
+            self::reconnectReseller($uid, $sites, $month, $server);
+        }
+    }
+
+    /** userid => ['paid_gb', 'blocks'] for the reseller ledger in $month (paid + pending). */
+    private static function resellerMonthTopups(int $uid, string $month): array
+    {
+        $out = ['paid_gb' => 0, 'blocks' => 0];
+        foreach (Capsule::table(Env::RESELLER_TOPUPS)->where('userid', $uid)->where('month', $month)
+                     ->whereIn('status', ['paid', 'pending'])->get(['gb', 'blocks', 'status']) as $r) {
+            if ($r->status === 'paid') {
+                $out['paid_gb'] += (int) $r->gb;
+            }
+            $out['blocks'] += (int) $r->blocks;
+        }
+        return $out;
+    }
+
+    /** GB of paid reseller top-ups for $month. */
+    public static function resellerTopupGb(int $uid, ?string $month = null): int
+    {
+        try {
+            return (int) Capsule::table(Env::RESELLER_TOPUPS)->where('userid', $uid)
+                ->where('month', $month ?: \pasargadcdn_month())->where('status', 'paid')->sum('gb');
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /** Buy $blocks of wholesale traffic for a reseller from their wallet. Mirrors purchase(). */
+    private static function purchaseReseller(int $uid, int $blocks, float $blockPrice, int $block, string $month, int $currencyId): bool
+    {
+        $gb = $blocks * $block;
+        $amount = round($blocks * $blockPrice, 2);
+        $now = date('Y-m-d H:i:s');
+        // claim the next slot; a concurrent run claiming the same slot fails on the unique key
+        $seq = (int) Capsule::table(Env::RESELLER_TOPUPS)->where('userid', $uid)->where('month', $month)->max('seq') + 1;
+        try {
+            $rowId = (int) Capsule::table(Env::RESELLER_TOPUPS)->insertGetId(['userid' => $uid, 'month' => $month,
+                'seq' => $seq, 'blocks' => $blocks, 'gb' => $gb, 'amount' => $amount, 'currency' => $currencyId,
+                'status' => 'pending', 'created_at' => $now, 'updated_at' => $now]);
+        } catch (\Throwable $e) {
+            self::$rReport['errors'][] = 'slot taken for reseller #' . $uid;
+            return false;
+        }
+        $unit = self::currencyUnit($currencyId);
+        $perGb = $gb > 0 ? round($amount / $gb, ($amount / $gb) >= 100 ? 0 : 2) : 0.0;
+        $rateTxt = View::n($perGb, $perGb >= 100 ? 0 : 2) . ($unit !== '' ? ' ' . $unit : '');
+        $desc = 'ترافیک عمده نمایندگی CDN — ' . View::n($gb) . ' گیگابایت — هر گیگابایت ' . $rateTxt
+            . ' — دوره ' . self::monthLabel($month) . ' — تاریخ خرید ' . self::dateLabel();
+        $r = Env::localApi('CreateInvoice', [
+            'userid' => $uid, 'status' => 'Unpaid', 'sendinvoice' => false, 'autoapplycredit' => true,
+            'date' => date('Y-m-d'), 'duedate' => date('Y-m-d'),
+            'itemdescription1' => $desc, 'itemamount1' => $amount, 'itemtaxed1' => false,
+            'notes' => 'Pasargad CDN reseller wholesale traffic — reseller #' . $uid . ' — ' . $gb . ' GB @ ' . View::digits((string) $perGb)
+                . ($unit !== '' ? ' ' . $unit : '') . '/GB — ' . $month,
+        ]);
+        $inv = (int) ($r['invoiceid'] ?? 0);
+        if (($r['result'] ?? '') !== 'success' || $inv <= 0) {
+            Capsule::table(Env::RESELLER_TOPUPS)->where('id', $rowId)->update(['status' => 'failed', 'updated_at' => $now]);
+            Env::log('reseller prepaid: CreateInvoice failed for reseller #' . $uid . ': ' . ($r['message'] ?? ''), $uid);
+            return false;
+        }
+        Capsule::table(Env::RESELLER_TOPUPS)->where('id', $rowId)->update(['invoice_id' => $inv]);
+        Capsule::table('tblinvoiceitems')->where('invoiceid', $inv)->where('type', '')
+            ->update(['type' => self::RESELLER_ITEM_TYPE, 'relid' => $uid]);
+        if (self::invoiceStatus($inv) !== 'Paid') {
+            $bal = self::balance($inv);
+            [$credit] = self::credit($uid, $currencyId);
+            if ($bal > 0 && $credit + 0.00001 >= $bal) {
+                Env::localApi('ApplyCredit', ['invoiceid' => $inv, 'amount' => $bal, 'noemail' => true]);
+            }
+        }
+        if (self::invoiceStatus($inv) !== 'Paid') {
+            Env::localApi('UpdateInvoice', ['invoiceid' => $inv, 'status' => 'Cancelled']);
+            Capsule::table(Env::RESELLER_TOPUPS)->where('id', $rowId)->where('status', 'pending')->update(['status' => 'failed', 'updated_at' => date('Y-m-d H:i:s')]);
+            Env::log('reseller prepaid: invoice #' . $inv . ' for reseller #' . $uid . ' could not be paid from credit — cancelled', $uid);
+            return false;
+        }
+        Capsule::table(Env::RESELLER_TOPUPS)->where('id', $rowId)->whereIn('status', ['pending', 'failed'])
+            ->update(['status' => 'paid', 'updated_at' => date('Y-m-d H:i:s')]);
+        Env::log('reseller prepaid: bought ' . $gb . ' GB for reseller #' . $uid . ' — invoice #' . $inv . ', ' . $amount, $uid);
+        self::$rReport['purchases'][] = ['reseller' => $uid, 'gb' => $gb, 'invoice' => $inv, 'amount' => $amount];
+        return true;
+    }
+
+    /** Reseller top-up invoice paid (by us, autoapplycredit, or later by the client/admin). */
+    public static function markResellerInvoicePaid(int $inv): void
+    {
+        foreach (Capsule::table(Env::RESELLER_TOPUPS)->where('invoice_id', $inv)->whereIn('status', ['pending', 'failed'])->pluck('id')->all() as $id) {
+            Capsule::table(Env::RESELLER_TOPUPS)->where('id', (int) $id)->whereIn('status', ['pending', 'failed'])
+                ->update(['status' => 'paid', 'updated_at' => date('Y-m-d H:i:s')]);
+        }
+    }
+
+    /** Cut a reseller's sub-sites: suspend on the controller + local suspended=1, ONE Persian notice. */
+    private static function cutReseller(int $uid, array $sites, string $month, $server, string $reason,
+                                        float $used, int $cap, int $block, float $credit, float $blockPrice, int $currencyId): void
+    {
+        foreach ($sites as $s) {
+            if ((int) $s->suspended === 1) {
+                continue;
+            }
+            $domain = Env::domain((string) $s->domain);
+            $ok = false;
+            try {
+                if ($server && Env::validHostname($domain)) {
+                    Env::api(15, $server)->post(ApiClient::site($domain) . '/suspend');
+                    $ok = true;
+                }
+            } catch (\Throwable $e) {
+                self::$rReport['errors'][] = 'suspend ' . $domain . ': ' . $e->getMessage();
+                Env::log('reseller prepaid: could not suspend ' . $domain . ' on the controller: ' . $e->getMessage() . ' (retried next cron)', $uid);
+            }
+            if ($ok) {
+                Capsule::table(Env::RESELLER_SITES)->where('id', (int) $s->id)->update(['suspended' => 1, 'updated_at' => date('Y-m-d H:i:s')]);
+                self::$rReport['cuts'][] = ['reseller' => $uid, 'site' => (int) $s->id, 'domain' => $domain];
+            }
+        }
+        self::resellerNotice($uid, 'exhausted', self::resellerVars($uid, $used, $cap, $credit, $blockPrice, $block, $reason, $currencyId));
+    }
+
+    /** Reconnect any locally-suspended sub-sites of a reseller whose wallet now covers usage. */
+    private static function reconnectReseller(int $uid, array $sites, string $month, $server): void
+    {
+        $any = false;
+        foreach ($sites as $s) {
+            if ((int) $s->suspended !== 1) {
+                continue;
+            }
+            $domain = Env::domain((string) $s->domain);
+            try {
+                if ($server && Env::validHostname($domain)) {
+                    Env::api(15, $server)->post(ApiClient::site($domain) . '/unsuspend');
+                }
+                Capsule::table(Env::RESELLER_SITES)->where('id', (int) $s->id)->update(['suspended' => 0, 'updated_at' => date('Y-m-d H:i:s')]);
+                self::$rReport['reconnects'][] = ['reseller' => $uid, 'site' => (int) $s->id, 'domain' => $domain];
+                $any = true;
+            } catch (\Throwable $e) {
+                self::$rReport['errors'][] = 'unsuspend ' . $domain . ': ' . $e->getMessage();
+                Env::log('reseller prepaid: could not reconnect ' . $domain . ' on the controller: ' . $e->getMessage() . ' (retried next cron)', $uid);
+            }
+        }
+        if ($any) {
+            // allow a fresh notice on the next cut this month
+            Env::kvSet('rnotice:' . $uid . ':' . $month . ':exhausted', 0);
+            Env::log('reseller prepaid: reseller #' . $uid . ' sub-sites reconnected after wallet top-up', $uid);
+        }
+    }
+
+    private static function resellerVars(int $uid, float $used, int $cap, float $credit, float $blockPrice, int $block, string $reason, int $currencyId): array
+    {
+        $unit = self::currencyUnit($currencyId);
+        $needed = max(0.0, round($blockPrice - $credit, 2));
+        return [
+            'cdn_reseller_used_gb' => View::n($used, 1),
+            'cdn_reseller_cap_gb' => View::n($cap),
+            'cdn_reseller_block_gb' => View::n($block),
+            'cdn_reseller_block_price' => View::n($blockPrice, $blockPrice >= 100 ? 0 : 2) . ' ' . $unit,
+            'cdn_reseller_credit' => View::n($credit, $credit >= 100 ? 0 : 2) . ' ' . $unit,
+            'cdn_reseller_needed' => View::n($needed, $needed >= 100 ? 0 : 2) . ' ' . $unit,
+            'cdn_reseller_limit_reached' => $reason === 'limit' ? 1 : 0,
+        ];
+    }
+
+    /** One reseller notice per client, month and kind (kv-deduped), then a best-effort email. */
+    private static function resellerNotice(int $uid, string $kind, array $vars, bool $email = true): void
+    {
+        $month = \pasargadcdn_month();
+        $key = 'rnotice:' . $uid . ':' . $month . ':' . $kind;
+        if ((int) Env::kvGet($key, 0) === 1) {
+            return; // already notified this month
+        }
+        Env::kvSet($key, 1);
+        self::$rReport['notices'][] = ['reseller' => $uid, 'kind' => $kind];
+        if ($kind === 'noprice') {
+            Env::log('reseller prepaid: no wholesale per-GB rate for reseller #' . $uid . ' — traffic cannot be billed (set a rate in «نمایندگان» or the global reseller rate)', $uid);
+            return;
+        }
+        if (!$email) {
+            return;
+        }
+        // Best-effort: send a Persian email through the WHMCS mail path if the template exists.
+        $r = Env::localApi('SendEmail', ['messagename' => self::TPL_RESELLER_EXHAUSTED, 'id' => $uid, 'customvars' => base64_encode(serialize($vars))]);
+        Env::log('reseller prepaid: «' . self::TPL_RESELLER_EXHAUSTED . '» notice for reseller #' . $uid . ' — '
+            . (($r['result'] ?? '') === 'success' ? 'sent' : 'email skipped/failed: ' . ($r['message'] ?? '')), $uid);
     }
 }

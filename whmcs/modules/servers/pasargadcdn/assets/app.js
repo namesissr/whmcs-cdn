@@ -34,6 +34,11 @@
   var SUGGEST = boot.suggest && typeof boot.suggest === 'object' && (boot.suggest.forecast || boot.suggest.upgrade) ? boot.suggest : null;
   // §10.4 statement: this service's traffic top-ups (current + previous months) for the «صورت‌حساب و مصرف» page.
   var STATEMENT = boot.statement && typeof boot.statement === 'object' ? boot.statement : null;
+  // §10.5 reseller: this account provisions/manages CDN sub-sites for its own end-customers.
+  var RESELLER = boot.reseller && boot.reseller.enabled && !ADMIN ? boot.reseller : null;
+  var RSITE = null;                  // active reseller sub-site context {id, domain, label} or null
+  var OWN_SITE = boot.site || null;  // the reseller's own service site, to return to after managing a sub-site
+  var OWN_ACTIVE = !!boot.active;
   var ADDFUNDS_URL = ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
   function money(v) {
     v = Number(v) || 0;
@@ -68,6 +73,7 @@
     { title: 'گزارش‌ها', items: ['analytics', 'events', 'usage', 'statement'] },
     { title: 'توسعه‌دهندگان', items: ['apikeys'] }
   ];
+  if (RESELLER) NAV.unshift({ title: 'نمایندگی', items: ['reseller'] });
   var pages = P.pages = P.pages || {};
   function page(id) { return pages[id] || pages.overview; }
   function locked(id) { var p = pages[id]; return !!(p && p.lock && p.lock(features())); }
@@ -348,7 +354,7 @@
     clear(mainEl);
     S.form = null;
     var id = S.page, p = page(id);
-    var banner = null, adminBar = ADMIN ? adminBanner() : null;
+    var banner = null, adminBar = ADMIN ? adminBanner() : (RSITE ? resellerSubBanner() : null);
     if (!S.active) banner = P.alertBox('warning', [h('strong', { text: 'این سرویس فعال نیست. ' }), 'اطلاعات فقط قابل مشاهده است و امکان تغییر تنظیمات وجود ندارد.'], { icon: 'lock' });
     else if (S.site.status === 'suspended') banner = P.alertBox('danger', 'این سرویس در CDN معلق است و بازدیدکنندگان صفحه تعلیق را می‌بینند.');
     else if (S.site.status === 'over_quota' && WALLET) banner = P.alertBox('danger', [
@@ -378,6 +384,45 @@
       h('span', { className: 'pcdn-admin-text', text: 'سرویس #' + SID + (ADMIN.client ? ' — ' + ADMIN.client : '') +
         (ADMIN.status && ADMIN.status !== 'Active' ? ' (وضعیت WHMCS: ' + ADMIN.status + ')' : '') + '. تغییرات شما در گزارش فعالیت WHMCS ثبت می‌شود.' }),
       h('span', { className: 'pcdn-admin-links' }, links));
+  }
+
+  // ------------------------------------------------------------------ §10.5 reseller sub-site context
+
+  /** Banner shown while the reseller manages one of their sub-sites, with a way back to the panel. */
+  function resellerSubBanner() {
+    return h('div', { className: 'pcdn-admin-bar', role: 'note', 'data-reseller-mode': '1' },
+      h('span', { className: 'pcdn-admin-badge' }, icon('shieldCheck'), h('span', { text: 'مدیریت زیرسایت نمایندگی' })),
+      h('span', { className: 'pcdn-admin-text', text: 'زیرسایت ' + (RSITE && RSITE.domain ? RSITE.domain : '') + (RSITE && RSITE.label ? ' — ' + RSITE.label : '') + '. این سایت متعلق به مشتری نهایی شماست.' }),
+      h('span', { className: 'pcdn-admin-links' },
+        h('a', { className: 'pcdn-link', href: '#pcdn=reseller', 'data-ro-ok': '1', onclick: function (e) { e.preventDefault(); exitSubSite(); } }, icon('arrowLeft'), h('span', { text: 'بازگشت به نمایندگی' }))));
+  }
+
+  /** Enter a reseller sub-site: point the whole app at it (api calls carry its id). */
+  function openSubSite(rsid, meta) {
+    P.CFG.rsid = rsid;
+    return api('GET', '').then(function (res) {
+      if (res.ok && res.data && res.data.domain) {
+        S.site = res.data;
+        S.error = null;
+        S.active = res.data.status !== 'suspended';
+        RSITE = { id: rsid, domain: res.data.domain, label: (meta && meta.label) || '' };
+        go('overview', '', { keepScroll: true });
+      } else {
+        P.CFG.rsid = 0;
+        if (P.toast) P.toast((res.data && res.data.detail) || 'بارگذاری زیرسایت ناموفق بود.', 'error');
+      }
+      return res;
+    });
+  }
+
+  /** Leave the sub-site and return to the reseller panel (own service context). */
+  function exitSubSite() {
+    P.CFG.rsid = 0;
+    RSITE = null;
+    S.site = OWN_SITE;
+    S.active = OWN_ACTIVE;
+    S.error = OWN_SITE ? null : 'داده اولیه نامعتبر است';
+    go('reseller', '', { keepScroll: true });
   }
 
   function upgradePanel(p) {
@@ -1367,6 +1412,17 @@
     render: renderDnssec
   };
 
+  // §10.5 reseller panel — registered only for reseller accounts; the page body lives in reseller.js.
+  if (RESELLER) {
+    pages.reseller = {
+      title: 'نمایندگی', icon: 'globe', heading: 'پنل نمایندگی',
+      desc: 'سایت‌های CDN مشتریان نهایی شما: ساخت سایت، گزارش مصرف و هزینه عمده، و مدیریت کامل هر سایت.',
+      render: function (App, body) {
+        return P.reseller ? P.reseller.render(App, body) : h('div', { className: 'pcdn-alert pcdn-alert-danger', text: 'بخش نمایندگی بارگذاری نشد.' });
+      }
+    };
+  }
+
   // ------------------------------------------------------------------ public API for pages.js / reports.js
 
   var A = P.app = {
@@ -1374,7 +1430,8 @@
     lockWrites: lockWrites, tutLink: tutLink, goLink: goLink, edgeIps: edgeIps, reloadSite: reloadSite, renderMain: renderMain,
     upgradeUrl: UPGRADE_URL, modeLabel: modeLabel, ensureAnalytics: ensureAnalytics, secTotal: secTotal, serviceId: SID,
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
-    statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL
+    statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
+    reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; }
   };
 
   // ------------------------------------------------------------------ boot

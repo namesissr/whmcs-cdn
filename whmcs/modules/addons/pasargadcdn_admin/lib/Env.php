@@ -24,6 +24,10 @@ final class Env
     const TOPUPS = 'mod_pasargadcdn_topups';
     const NOTICES = 'mod_pasargadcdn_notices';
     const USAGE = 'mod_pasargadcdn_usage';
+    // Reseller feature (SPEC §10.5) — a fully separate, additive ledger.
+    const RESELLERS = 'mod_pasargadcdn_resellers';
+    const RESELLER_SITES = 'mod_pasargadcdn_reseller_sites';
+    const RESELLER_TOPUPS = 'mod_pasargadcdn_reseller_topups';
     const DEAD_STATUSES = ['Terminated', 'Cancelled', 'Fraud'];
     const DEFAULT_NS = ['ns1.pasargadmizban.com', 'ns2.pasargadmizban.com'];
 
@@ -213,6 +217,55 @@ final class Env
         self::$memo['tbl:' . self::USAGE] = true;
         self::$memo['tbl:' . self::TOPUPS] = true;
         self::$memo['tbl:' . self::NOTICES] = true;
+        // ---- reseller feature (SPEC §10.5) ----------------------------------
+        if (!$schema->hasTable(self::RESELLERS)) {
+            $schema->create(self::RESELLERS, function ($t) {
+                $t->integer('userid')->primary();       // WHMCS client id
+                $t->tinyInteger('enabled')->default(1);
+                $t->decimal('rate', 18, 9)->nullable();  // per-GB wholesale override (null ⇒ global)
+                $t->integer('max_sites')->default(0);    // 0 ⇒ global default
+                $t->string('note', 191)->nullable();
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+            });
+        }
+        if (!$schema->hasTable(self::RESELLER_SITES)) {
+            $schema->create(self::RESELLER_SITES, function ($t) {
+                $t->increments('id');
+                $t->integer('userid');                   // owning reseller client
+                $t->string('domain', 253);
+                $t->string('label', 120);                // free-text end-customer label
+                $t->integer('controller_site_id')->nullable();
+                $t->tinyInteger('suspended')->default(0);
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+                $t->unique('domain', 'mod_pcdn_rsite_domain');
+                $t->index('userid', 'mod_pcdn_rsite_user');
+            });
+        }
+        if (!$schema->hasTable(self::RESELLER_TOPUPS)) {
+            $schema->create(self::RESELLER_TOPUPS, function ($t) {
+                $t->increments('id');
+                $t->integer('userid');
+                $t->char('month', 7);
+                $t->integer('seq');
+                $t->integer('blocks')->default(1);
+                $t->integer('gb');
+                $t->decimal('amount', 16, 2)->default(0);
+                $t->integer('currency')->default(0);
+                $t->integer('invoice_id')->nullable();
+                $t->string('status', 16)->default('pending');
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+                // one row per purchase slot: two concurrent runs can never buy the same slot twice
+                $t->unique(['userid', 'month', 'seq'], 'mod_pcdn_rtopups_slot');
+                $t->index(['month', 'status'], 'mod_pcdn_rtopups_month');
+                $t->index('invoice_id', 'mod_pcdn_rtopups_invoice');
+            });
+        }
+        self::$memo['tbl:' . self::RESELLERS] = true;
+        self::$memo['tbl:' . self::RESELLER_SITES] = true;
+        self::$memo['tbl:' . self::RESELLER_TOPUPS] = true;
     }
 
     // ------------------------------------------------------------------ servers / controller

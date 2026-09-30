@@ -16,10 +16,18 @@ if (!defined('WHMCS')) {
 }
 
 require_once __DIR__ . '/lib/ApiClient.php';
+require_once __DIR__ . '/lib/Reseller.php';
 
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
+use PasargadCdn\Reseller;
 use WHMCS\Database\Capsule;
+
+/** SPEC §10.5 — is this WHMCS client an enabled reseller? Exposed for the client-app bootstrap. */
+function pasargadcdn_is_reseller(int $userid): bool
+{
+    return Reseller::isReseller($userid);
+}
 
 function pasargadcdn_MetaData()
 {
@@ -889,6 +897,17 @@ function pasargadcdn_ClientArea(array $params)
     $boot['wallet'] = pasargadcdn_wallet($params);
     $boot['suggest'] = pasargadcdn_suggest($params);
     $boot['statement'] = pasargadcdn_statement($params);
+    // §10.5 reseller: show the «نمایندگی» panel only to reseller accounts. The SPA fetches
+    // the sub-site list + rolled-up report on demand through api.php (reseller ops).
+    $uid = (int) ($params['userid'] ?? 0);
+    if (Reseller::isReseller($uid)) {
+        $cfg = Reseller::config($uid);
+        $boot['reseller'] = [
+            'enabled' => true,
+            'max_sites' => $cfg['max_sites'],
+            'count' => Reseller::siteCount($uid),
+        ];
+    }
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base);
     return [
@@ -915,7 +934,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'statement.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
     ];
 }
 

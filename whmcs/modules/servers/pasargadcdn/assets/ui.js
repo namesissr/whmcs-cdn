@@ -203,10 +203,13 @@
 
   // ------------------------------------------------------------------ API
 
-  var CFG = { api: '', csrf: '', serviceId: 0 };
+  var CFG = { api: '', csrf: '', serviceId: 0, rsid: 0 };
   function api(method, path, body, query) {
     // The admin-mode endpoint (addonmodules.php?module=…) already has a query string.
     var url = CFG.api + (CFG.api.indexOf('?') >= 0 ? '&' : '?') + 'id=' + encodeURIComponent(CFG.serviceId) + '&path=' + encodeURIComponent(path);
+    // Reseller sub-site context (SPEC §10.5): the server resolves the domain from the reseller's
+    // own sub-site row by this id; an explicit query.rop (reseller op) overrides it server-side.
+    if (CFG.rsid && !(query && query.rop)) url += '&rsid=' + encodeURIComponent(CFG.rsid);
     Object.keys(query || {}).forEach(function (k) { url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
     var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'Accept': 'application/json' } };
     if (body !== undefined) {
