@@ -11,10 +11,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import nscheck, pdns, sections
-from .auth import hash_token, new_token, require_admin
+from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
-from .models import Edge, Record, Site, UsageHourly, utcnow
+from .models import ApiKey, Edge, Record, Site, UsageHourly, utcnow
 from .services import (
     refresh_quota,
     month_start,
@@ -295,9 +295,8 @@ def request_ssl(domain: str, db: Session = Depends(get_db)):
     return {"ok": True, "status": site.ssl_status}
 
 
-@router.post("/sites/{domain}/purge")
-def purge(domain: str, body: PurgeIn, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def purge_site(db: Session, site: Site, body: PurgeIn) -> dict:
+    """Shared purge validation + queueing (SPEC §9.2), used by the admin and customer APIs."""
     urls = [u.strip() for u in body.urls if u.strip()]
     prefixes = [p.strip() for p in body.prefixes if p.strip()]
     if len(urls) + len(prefixes) > 100:
@@ -316,6 +315,11 @@ def purge(domain: str, body: PurgeIn, db: Session = Depends(get_db)):
     queue_purge(db, site, urls, prefixes, body.everything)
     db.commit()
     return {"ok": True, "queued": (len(urls) + len(prefixes)) or "all"}
+
+
+@router.post("/sites/{domain}/purge")
+def purge(domain: str, body: PurgeIn, db: Session = Depends(get_db)):
+    return purge_site(db, get_site(db, domain), body)
 
 
 @router.get("/sites/{domain}/usage")
@@ -353,6 +357,68 @@ def all_usage(month: str | None = None, db: Session = Depends(get_db)):
         out.append({"domain": s.domain, "external_id": s.external_id, "bandwidth_limit_gb": s.bandwidth_limit_gb,
                     "status": s.effective_status, **u})
     return {"month": start.strftime("%Y-%m"), "sites": out}
+
+
+# ------------------------------------------------------------------ customer API keys (SPEC §10.1)
+
+CAPI_SCOPES = ("purge", "stats", "dns")
+MAX_API_KEYS = 5
+
+
+class ApiKeyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(min_length=1)
+
+
+def api_key_dict(k: ApiKey) -> dict:
+    """Public view of an ApiKey — never includes the key itself."""
+    return {
+        "id": k.id, "name": k.name, "scopes": k.scope_list,
+        "last_used_at": k.last_used_at.isoformat() + "Z" if k.last_used_at else None,
+        "created_at": k.created_at.isoformat() + "Z" if k.created_at else None,
+        "revoked": k.revoked,
+    }
+
+
+@router.get("/sites/{domain}/apikeys")
+def list_api_keys(domain: str, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    keys = db.scalars(select(ApiKey).where(ApiKey.site_id == site.id).order_by(ApiKey.id))
+    return [api_key_dict(k) for k in keys]
+
+
+@router.post("/sites/{domain}/apikeys", status_code=201)
+def create_api_key(domain: str, body: ApiKeyIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    scopes = []
+    for s in body.scopes:
+        if s not in CAPI_SCOPES:
+            bad(ValidationError(f"دسترسی نامعتبر: {s} (مجاز: {'، '.join(CAPI_SCOPES)})"))
+        if s not in scopes:
+            scopes.append(s)
+    active = db.scalar(select(func.count(ApiKey.id)).where(
+        ApiKey.site_id == site.id, ApiKey.revoked.is_(False)))
+    if active >= MAX_API_KEYS:
+        raise HTTPException(403, f"حداکثر {MAX_API_KEYS} کلید فعال برای هر سرویس مجاز است")
+    plaintext = new_capi_key()
+    key = ApiKey(site_id=site.id, key_hash=hash_token(plaintext), name=body.name.strip(),
+                 scopes=json.dumps(scopes))
+    db.add(key)
+    db.commit()
+    # the plaintext key is returned ONCE and never stored or shown again
+    return {**api_key_dict(key), "key": plaintext}
+
+
+@router.delete("/sites/{domain}/apikeys/{key_id}")
+def revoke_api_key(domain: str, key_id: int, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    key = db.scalar(select(ApiKey).where(ApiKey.id == key_id, ApiKey.site_id == site.id))
+    if key is None:
+        raise HTTPException(404, "کلید یافت نشد")
+    key.revoked = True
+    db.commit()
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ records
@@ -402,14 +468,13 @@ def _record_or_error(site: Site, body: RecordIn, exclude_id: int | None = None) 
         raise HTTPException(403, str(e))
 
 
-@router.get("/sites/{domain}/records")
-def list_records(domain: str, db: Session = Depends(get_db)):
-    return [record_to_dict(r) for r in get_site(db, domain).records]
+# record handlers factored so the admin and customer APIs share identical validation/logic
+
+def list_records_of(site: Site) -> list[dict]:
+    return [record_to_dict(r) for r in site.records]
 
 
-@router.post("/sites/{domain}/records", status_code=201)
-def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def add_record_of(db: Session, site: Site, body: RecordIn) -> dict:
     if len(site.records) >= site.max_records:
         raise HTTPException(403, f"سقف تعداد رکوردها ({site.max_records}) پر شده است")
     rec = Record(**_record_or_error(site, body))
@@ -418,9 +483,7 @@ def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
     return {**record_to_dict(rec), "dns_error": sync_site_dns(db, site)}
 
 
-@router.put("/sites/{domain}/records/{record_id}")
-def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def update_record_of(db: Session, site: Site, record_id: int, body: RecordIn) -> dict:
     rec = next((r for r in site.records if r.id == record_id), None)
     if rec is None:
         raise HTTPException(404, "record not found")
@@ -430,15 +493,33 @@ def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Dep
     return {**record_to_dict(rec), "dns_error": sync_site_dns(db, site)}
 
 
-@router.delete("/sites/{domain}/records/{record_id}")
-def delete_record(domain: str, record_id: int, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def delete_record_of(db: Session, site: Site, record_id: int) -> dict:
     rec = next((r for r in site.records if r.id == record_id), None)
     if rec is None:
         raise HTTPException(404, "record not found")
     site.records.remove(rec)
     db.commit()
     return {"ok": True, "dns_error": sync_site_dns(db, site)}
+
+
+@router.get("/sites/{domain}/records")
+def list_records(domain: str, db: Session = Depends(get_db)):
+    return list_records_of(get_site(db, domain))
+
+
+@router.post("/sites/{domain}/records", status_code=201)
+def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
+    return add_record_of(db, get_site(db, domain), body)
+
+
+@router.put("/sites/{domain}/records/{record_id}")
+def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Depends(get_db)):
+    return update_record_of(db, get_site(db, domain), record_id, body)
+
+
+@router.delete("/sites/{domain}/records/{record_id}")
+def delete_record(domain: str, record_id: int, db: Session = Depends(get_db)):
+    return delete_record_of(db, get_site(db, domain), record_id)
 
 
 @router.post("/sites/{domain}/dns-sync")

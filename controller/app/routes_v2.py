@@ -37,16 +37,15 @@ def read_config(domain: str, db: Session = Depends(get_db)):
     return sections.all_config(get_site(db, domain))
 
 
-@router.get("/sites/{domain}/config/{section}")
-def read_section(domain: str, section: str, db: Session = Depends(get_db)):
+# section handlers factored so the admin and customer APIs share identical validation/logic
+
+def read_section_of(site: Site, section: str) -> dict:
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
-    return sections.get_section(get_site(db, domain), section)
+    return sections.get_section(site, section)
 
 
-@router.put("/sites/{domain}/config/{section}")
-def write_section(domain: str, section: str, body: dict, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def write_section_of(db: Session, site: Site, section: str, body: dict) -> dict:
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
     pools_in_use = {r.pool for r in site.records if r.pool}
@@ -61,6 +60,16 @@ def write_section(domain: str, section: str, body: dict, db: Session = Depends(g
     sections.store_section(site, section, value)
     db.commit()
     return value
+
+
+@router.get("/sites/{domain}/config/{section}")
+def read_section(domain: str, section: str, db: Session = Depends(get_db)):
+    return read_section_of(get_site(db, domain), section)
+
+
+@router.put("/sites/{domain}/config/{section}")
+def write_section(domain: str, section: str, body: dict, db: Session = Depends(get_db)):
+    return write_section_of(db, get_site(db, domain), section, body)
 
 
 # ------------------------------------------------------------------ tunnel mode (SPEC §7.5)
@@ -250,9 +259,8 @@ def _loads(s: str) -> dict:
         return {}
 
 
-@router.get("/sites/{domain}/analytics")
-def analytics(domain: str, period: str = "24h", db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def site_analytics(db: Session, site: Site, period: str) -> dict:
+    """Per-site analytics (SPEC §4), shared by the admin and customer APIs."""
     if period not in PERIODS:
         bad(ValidationError("period باید 24h، 7d یا 30d باشد"))
     now = utcnow().replace(minute=0, second=0, microsecond=0)
@@ -298,6 +306,11 @@ def analytics(domain: str, period: str = "24h", db: Session = Depends(get_db)):
         "paths": [{"path": k, "requests": v} for k, v in paths.most_common(20)],
         "status_codes": [{"code": int(k), "requests": v} for k, v in codes.most_common(10) if k.isdigit()],
     }
+
+
+@router.get("/sites/{domain}/analytics")
+def analytics(domain: str, period: str = "24h", db: Session = Depends(get_db)):
+    return site_analytics(db, get_site(db, domain), period)
 
 
 @router.get("/analytics")
@@ -357,15 +370,19 @@ def platform_analytics(period: str = "24h", db: Session = Depends(get_db)):
     }
 
 
-@router.get("/sites/{domain}/events")
-def events(domain: str, limit: int = 100, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def site_events(db: Session, site: Site, limit: int) -> list[dict]:
+    """Per-site security events (SPEC §4), shared by the admin and customer APIs."""
     limit = max(1, min(limit, 1000))
     rows = db.scalars(select(SecurityEvent).where(SecurityEvent.site_id == site.id)
                       .order_by(SecurityEvent.ts.desc(), SecurityEvent.id.desc()).limit(limit))
     return [{"t": e.ts.isoformat() + "Z", "ip": e.ip, "country": e.country, "method": e.method, "host": e.host,
              "path": e.path, "action": e.action, "source": e.source, "rule": e.rule, "user_agent": e.user_agent}
             for e in rows]
+
+
+@router.get("/sites/{domain}/events")
+def events(domain: str, limit: int = 100, db: Session = Depends(get_db)):
+    return site_events(db, get_site(db, domain), limit)
 
 
 def prune_events(db: Session, keep: int = 1000):

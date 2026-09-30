@@ -246,6 +246,31 @@ class IncidentUpdate(Base):
     incident: Mapped[Incident] = relationship(back_populates="updates")
 
 
+class ApiKey(Base):
+    """Per-site customer API key (SPEC §10.1). The plaintext key ("pcdn_" + 40 hex) is shown
+    once at creation and never stored; only its SHA-256 hash is kept (like edge tokens)."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    scopes: Mapped[str] = mapped_column(Text, default="[]")  # JSON list, subset of {purge, stats, dns}
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    site: Mapped[Site] = relationship()
+
+    @property
+    def scope_list(self) -> list[str]:
+        try:
+            return list(json.loads(self.scopes or "[]"))
+        except ValueError:
+            return []
+
+
 class State(Base):
     """Small key/value table for scheduler state."""
 

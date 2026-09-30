@@ -145,5 +145,8 @@ class Settings:
     # high availability
     instance_name: str = field(default_factory=lambda: os.getenv("INSTANCE_NAME", ""))
 
+    # customer API (SPEC §10.1): per-key requests allowed per minute (in-process sliding window)
+    capi_rate: int = field(default_factory=lambda: int(os.getenv("CAPI_RATE", "60")))
+
 
 settings = Settings()

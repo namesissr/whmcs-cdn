@@ -45,14 +45,14 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
-    # 0004: the edge_uptime table; 0005: incidents + incident_updates
+    # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys
     tables = {d[1].name for d in flat if d[0] == "add_table"}
-    assert {"edge_uptime", "incidents", "incident_updates"} <= tables, diff
+    assert {"edge_uptime", "incidents", "incident_updates", "api_keys"} <= tables, diff
     # 0002: sites.secret String(64) -> Text
     assert any(d[0] == "modify_type" and d[2:4] == ("sites", "secret") for d in flat), diff
     # nothing else changed between 0001 and head
     other = [d for d in flat if d[0] not in ("add_column", "add_table", "modify_type")
-             and not (d[0] == "add_index" and d[1].table.name in ("edge_uptime", "incident_updates"))]
+             and not (d[0] == "add_index" and d[1].table.name in ("edge_uptime", "incident_updates", "api_keys"))]
     assert other == [], other
 
 
