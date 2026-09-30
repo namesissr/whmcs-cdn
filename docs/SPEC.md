@@ -595,3 +595,60 @@ Computed from UsageHourly (same store the per-site analytics uses); one pass, bo
   revenue; set/override the wholesale rate; enable/disable a reseller.
 - Guardrails: a reseller can only see/manage its own sub-sites; nothing crosses tenants. Limits:
   max sub-sites per reseller (configurable). All Persian UI.
+
+## 11. Scale & operations wave 4: fast node provisioning, centralized logs, runbook
+
+Goal: make adding, upgrading and troubleshooting edge nodes fast and observable, so the
+platform scales to many nodes without hand-work. No anti-filtering scope. All operator/UI
+text Persian; controller code English with Persian log strings where the module already does.
+
+### 11.1 Fast node provisioning
+- **One-command install.** `edge/bootstrap.sh` is a tiny remote installer: given `--controller <url>`
+  and `--token edge_xxx`, it downloads the edge bundle from the controller, unpacks it and runs
+  `install.sh` with the same flags. Target one-liner:
+  `curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- --controller https://<controller> --token edge_xxx`
+  It passes through `--region home|global`, `--role general|tunnel` (maps to the edge group),
+  `--cache-size`, `--http-port`, `--https-port`, `--no-ipv6`, `--no-geoip`, `--upgrade`.
+- **Controller serves the (secret-free) bundle.** `GET /edge/bootstrap.sh` returns the bootstrap
+  script (text/x-shellscript); `GET /edge/bundle.tar.gz` returns a gzip tar of the edge/ tree
+  (agent, nginx/njs/pages templates, install.sh, systemd, geoip updater). No auth — the bundle is
+  the open-source agent and templates and holds NO secrets, keys or tokens. The bundle is read from
+  `EDGE_BUNDLE_DIR` (config; default the image's baked copy of edge/); if it is absent both routes
+  return 404 with a clear message and the admin panel falls back to the manual git/scp instructions.
+  `GET /edge/install?token=...&region=...&role=...` (admin-token authenticated) returns the ready
+  copy-paste one-liner for a specific node.
+- **Batch add.** `POST /api/v1/edges/batch` (admin) creates N edges in one call
+  (`{count, region, group, name_prefix, capacity_mbps}`) and returns each new edge with its
+  one-time token and its install one-liner, so an operator can bring up several nodes at once.
+- **Version signalling.** `GET /edge/version` returns the bundle version (a short hash/mtime string);
+  the agent records the running bundle version and reports it, and the admin panel flags nodes whose
+  running version is behind the controller's current bundle (an "update available" badge). The upgrade
+  itself is the operator re-running bootstrap with `--upgrade` (documented) — no remote code push.
+
+### 11.2 Centralized node logs
+- **Edge model** gains a capped rolling log buffer: `logs` (Text, JSON list of the most recent
+  lines, hard-capped ~16 KiB / ~120 lines, oldest dropped) and `logs_at` (DateTime). Migration adds them.
+- **Agent ships recent problems only.** The agent tails the nginx error log and its own agent log and,
+  on each heartbeat (or when new error/warn lines appear), POSTs the new WARN/ERROR/crit lines
+  (de-duplicated, each line length-capped, at most ~40 per report) to `POST /edge/v1/logs`
+  `{lines: [{t, level, msg}]}`. It never ships access logs, request bodies, IPs of visitors, tokens
+  or keys — operational error/warn text only. Size-capped so a noisy node cannot flood the controller.
+- **Controller** stores them into the edge ring (newest last, capped) and exposes
+  `GET /api/v1/edges/{id}/logs` (admin) → `{name, logs_at, lines:[...]}`. `edge_to_dict` gains a
+  small `logs_at` / `has_logs` hint (not the full lines).
+- **WHMCS admin** Edges page gains a per-node «لاگ‌ها» view (modal or panel) that fetches the lines and
+  shows them newest-first with level colouring; empty state when a node has reported none.
+
+### 11.3 Operator UX (WHMCS admin, Edges page)
+- Each node shows its copy-paste one-command install (with its one-time token, shown once at creation
+  like today) and, for an existing node, the `--upgrade` one-liner and an «به‌روزرسانی موجود است» badge
+  when behind the current bundle version.
+- A «افزودن گروهی» (batch add) form: count + region + role → a list of ready one-liners to copy.
+- Existing add/enable/disable/rotate/delete stay; nothing about billing changes.
+
+### 11.4 Docs (Persian)
+- `docs/NODES.md` — node operations runbook: prerequisites, the one-command install, batch add,
+  region/role, reading node logs, upgrading a node, decommissioning, and a troubleshooting table
+  (node offline, probe failing, config error, saturated/shed, cert issues) cross-linking OPERATIONS.md.
+- `edge/cloud-init.yaml.example` — an unattended first-boot template that runs the one-command install.
+- Update `docs/OPERATIONS.md` and `docs/EDGE.md` to point at the one-command flow and the log view.
