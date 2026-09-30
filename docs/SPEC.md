@@ -652,3 +652,56 @@ text Persian; controller code English with Persian log strings where the module 
   (node offline, probe failing, config error, saturated/shed, cert issues) cross-linking OPERATIONS.md.
 - `edge/cloud-init.yaml.example` — an unattended first-boot template that runs the one-command install.
 - Update `docs/OPERATIONS.md` and `docs/EDGE.md` to point at the one-command flow and the log view.
+
+## 12. Multi-address edges & health-based failover (wave: reliability)
+
+Goal: a node can carry more than one address, and traffic automatically stays on a WORKING address
+so services do not drop when one address of a node stops responding. Failover is driven ONLY by
+health/reachability (the synthetic probe of §8.1), never by any "switch now" control and never by any
+signal of filtering/blocking. This is a redundancy/uptime feature for genuinely unreachable addresses;
+the controller's probe measures reachability from the controller, so it does not act on filtering.
+
+### 12.1 Data model
+- The edge keeps its existing `ipv4` / `ipv6` as its **primary** address (unchanged; editable as today).
+- New table `edge_addresses` for **additional** addresses of the same node:
+  `id, edge_id (FK edges CASCADE, index), family (4|6), ip (unique per family+ip), label (str<=64),
+  enabled (bool, default true), probe_ok (bool|null), probe_ms (int|null), probe_at (dt|null),
+  probe_error (text|null), probe_fail (int, default 0), created_at`.
+- An address (primary or additional) is **advertised** in DNS when it is `enabled` AND
+  (`probe_ok` is true OR `probe_ok` is null, i.e. never probed yet). It is **withdrawn** once its
+  `probe_fail >= PROBE_FAIL_CHECKS` (same threshold as the §8.1 alert), and restored on the next
+  healthy probe. `enabled=false` (operator maintenance) withdraws it immediately.
+
+### 12.2 Health probing (extends §8.1)
+- The scheduler probe job probes EVERY enabled address of every enabled edge (primary + additional),
+  each family, storing per-address `probe_ok/ms/at/error/fail`. The edge-level `probe_ok` stays
+  "any address of the edge answered" (so the existing edge alert semantics are unchanged).
+- A per-address `edge_address_down` alert (dedup/resolve like other alerts) fires when an additional
+  address crosses `PROBE_FAIL_CHECKS` and resolves when it recovers. The primary keeps the existing
+  edge probe alert.
+
+### 12.3 DNS (extends §7.4 / dnsbuild)
+- `edge_pools(edges, family)` collects, per edge, ALL advertised addresses of that family (primary +
+  additional), not just the single primary. Load shedding (`is_shed`) and edge group/region rules are
+  unchanged and apply at the edge level.
+- **Fail-open, always:** if applying health withdrawal would leave a family's pool (for the visitor's
+  region/group) EMPTY, the withdrawal is ignored for that pool and the known addresses are advertised
+  anyway — the zone is never emptied by health state. This mirrors the existing "if none looks healthy,
+  answer anyway" behaviour and must be covered by a test.
+
+### 12.4 Admin API (controller)
+- `GET /api/v1/edges/{id}/addresses` → primary + additional with per-address health.
+- `POST /api/v1/edges/{id}/addresses` `{family, ip, label?}` — add an additional address (validate IP,
+  family match, reject duplicates of any edge's address).
+- `PATCH /api/v1/edges/{id}/addresses/{aid}` `{ip?, label?, enabled?}` — edit/enable/disable.
+- `DELETE /api/v1/edges/{id}/addresses/{aid}` — remove an additional address.
+- Editing the PRIMARY address stays the existing `PATCH /api/v1/edges/{id}` path; document that the
+  primary cannot be deleted (it is the node's identity address).
+- `edge_to_dict` gains `addresses` (list with health) and per-family `advertised` counts.
+
+### 12.5 WHMCS admin (Edges page)
+- Per node, an «آدرس‌ها» panel: shows the primary and any additional addresses with per-address health
+  (سالم / در حال بررسی / قطع) and whether each is currently advertised in DNS. Operator can add an
+  address, edit/rename it, enable/disable it for maintenance, and remove an additional one; correcting
+  the primary uses the existing edit-node form. Persian UI. This is address management + visibility of
+  the automatic health-based failover — there is NO "force this IP now" control.
