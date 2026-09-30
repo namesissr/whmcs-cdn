@@ -210,6 +210,8 @@ final class Admin
             case 'wizard_edit':
             case 'wizard_apply':
                 return self::wizard($action, $post, $admin);
+            case 'tunnel_enable':
+                return [self::enableTunnelExisting($admin), []];
             case 'incident_create':
                 return self::incidentCreate($post, $admin);
             case 'incident_update':
@@ -673,6 +675,137 @@ final class Admin
         Env::cacheDelete(WidgetData::KEY);
         return [[['ok', 'راه‌اندازی انجام شد: ' . View::n($n['create']) . ' مورد ساخته و ' . View::n($n['update']) . ' مورد به‌روزرسانی شد.']],
             ['summary' => $summary]];
+    }
+
+    /**
+     * Bulk-enable tunnel on already-provisioned CDN services after the products are unified
+     * (tunnel included in every plan). For every ACTIVE service on a product whose plan has tunnel on
+     * (configoption15 = on) it re-pushes the plan to the controller — the same PATCH …/plan that
+     * ChangePackage uses — so tunnel goes live immediately, and defensively flips any per-service tunnel
+     * configurable-option override that is still off. Idempotent (safe to re-run), never touches billing.
+     */
+    private static function enableTunnelExisting(int $admin): array
+    {
+        $rows = Data::serviceQuery()->where('h.domainstatus', 'Active')->where('p.configoption15', 'on')
+            ->orderBy('h.id')->get(['h.id', 'h.userid', 'h.packageid', 'h.server', 'h.domain'])->all();
+        if (!$rows) {
+            return [['warn', 'هیچ سرویس فعالی روی محصولی با تونل روشن پیدا نشد. ابتدا محصولات CDN را با «راه‌اندازی خودکار» (حالت به‌روزرسانی) تونل‌دار کنید.']];
+        }
+        $ok = 0;
+        $skip = 0;
+        $fail = 0;
+        $cfg = 0;
+        $errs = [];
+        $products = [];
+        foreach ($rows as $svc) {
+            $sid = (int) $svc->id;
+            $domain = Env::domain((string) $svc->domain);
+            if (!Env::validHostname($domain)) {
+                $skip++;
+                continue;
+            }
+            $pid = (int) $svc->packageid;
+            if (!array_key_exists($pid, $products)) {
+                $products[$pid] = Capsule::table('tblproducts')->where('id', $pid)->first();
+            }
+            $prod = $products[$pid];
+            if (!$prod) {
+                $skip++;
+                continue;
+            }
+            // Target limits come from the product's module settings (configoption15..19), independent of any
+            // per-service configurable-option overrides — so an override cannot keep tunnel off.
+            $prodFeatures = \pasargadcdn_plan(self::serviceParams(0, $prod))['features'];
+            if (empty($prodFeatures['tunnel'])) {
+                $skip++;
+                continue;
+            }
+            $cfg += self::forceTunnelConfigOptions($sid, $prodFeatures);
+            // Push the effective plan (product settings + per-service overrides + prepaid top-ups) so tunnel is live now.
+            $plan = \pasargadcdn_cap_plan(self::serviceParams($sid, $prod));
+            try {
+                Env::api(15, self::serverOf($svc))->patch(ApiClient::site($domain) . '/plan', $plan);
+                $ok++;
+            } catch (\Throwable $e) {
+                $fail++;
+                if (count($errs) < 5) {
+                    $errs[] = View::ltr($domain) . ': ' . $e->getMessage();
+                }
+            }
+        }
+        Env::log('bulk enable tunnel on existing CDN services by admin #' . $admin
+            . ": pushed=$ok, config_options=$cfg, skipped=$skip, failed=$fail");
+        Pages::reset();
+        Env::cacheDelete(WidgetData::KEY);
+        $flash = [];
+        if ($ok > 0) {
+            $flash[] = ['ok', 'تونل روی ' . View::n($ok) . ' سرویس فعال شد (پلن دوباره به کنترلر ارسال شد).'
+                . ($cfg > 0 ? ' ' . View::n($cfg) . ' گزینه سفارشی تونل هم روشن شد.' : '')];
+        }
+        if ($skip > 0) {
+            $flash[] = ['warn', View::n($skip) . ' سرویس رد شد (دامنه نامعتبر یا تونل در پلن آن روشن نیست).'];
+        }
+        if ($fail > 0) {
+            $flash[] = ['bad', 'ارسال پلن ' . View::n($fail) . ' سرویس ناموفق بود: ' . View::e(implode('؛ ', $errs))];
+        }
+        return $flash ?: [['warn', 'هیچ سرویسی به‌روزرسانی نشد.']];
+    }
+
+    /** Module params (product module-settings + per-service configurable options) for the plan computation. */
+    private static function serviceParams(int $sid, $prod): array
+    {
+        $params = ['serviceid' => $sid, 'pid' => (int) $prod->id, 'packageid' => (int) $prod->id, 'configoptions' => []];
+        for ($i = 1; $i <= 24; $i++) {
+            $params['configoption' . $i] = (string) ($prod->{'configoption' . $i} ?? '');
+        }
+        if (function_exists('pasargadcdn_config_options')) {
+            $params['configoptions'] = \pasargadcdn_config_options([$sid])[$sid] ?? [];
+        }
+        return $params;
+    }
+
+    /**
+     * Defensively raise the per-service tunnel configurable-option OVERRIDES (tblhostingconfigoptions) to
+     * match the plan: turn a «Tunnel» yes/no override on and raise «Tunnel Paths/Connections/Mbps» quantity
+     * overrides up to the plan value. A no-op when no such configurable options exist (the usual case, where
+     * the plan lives only in the product's module settings). Returns the number of option rows changed.
+     */
+    private static function forceTunnelConfigOptions(int $sid, array $features): int
+    {
+        $changed = 0;
+        try {
+            if (!Env::hasTable('tblhostingconfigoptions') || !Env::hasTable('tblproductconfigoptions')) {
+                return 0;
+            }
+            $want = [
+                'Tunnel Paths' => (int) ($features['max_tunnel_paths'] ?? 0),
+                'Tunnel Connections' => (int) ($features['max_tunnel_connections'] ?? 0),
+                'Tunnel Mbps' => (int) ($features['tunnel_max_mbps'] ?? 0),
+            ];
+            $rows = Capsule::table('tblhostingconfigoptions as hco')
+                ->join('tblproductconfigoptions as pco', 'pco.id', '=', 'hco.configid')
+                ->where('hco.relid', $sid)
+                ->get(['hco.id', 'hco.qty', 'pco.optionname', 'pco.optiontype']);
+            foreach ($rows as $r) {
+                $name = trim(explode('|', (string) $r->optionname)[0]);
+                $type = (int) $r->optiontype;
+                $cur = (int) $r->qty;
+                $new = null;
+                if ($name === 'Tunnel' && $type === 3 && $cur === 0) {
+                    $new = 1; // yes/no override → on
+                } elseif (isset($want[$name]) && $type === 4 && $cur < $want[$name]) {
+                    $new = $want[$name]; // quantity override → at least the plan value
+                }
+                if ($new !== null && $new !== $cur) {
+                    Capsule::table('tblhostingconfigoptions')->where('id', (int) $r->id)->update(['qty' => $new]);
+                    $changed++;
+                }
+            }
+        } catch (\Throwable $e) {
+            // WHMCS schema differences: skip the config-option write; the controller plan-push still enables tunnel.
+            return $changed;
+        }
+        return $changed;
     }
 
     // ------------------------------------------------------------------ 8. incidents / public status

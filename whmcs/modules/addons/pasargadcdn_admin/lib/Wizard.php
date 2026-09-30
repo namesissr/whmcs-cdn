@@ -9,8 +9,9 @@ if (class_exists(__NAMESPACE__ . '\\Wizard', false)) {
 }
 
 /**
- * «راه‌اندازی خودکار محصولات»: product group, four CDN plans + three tunnel (VPN-over-CDN) plans with pricing,
- * server group, «Origin IP» custom field, upgrade paths and the welcome email.
+ * «راه‌اندازی خودکار محصولات»: product group, four unified CDN plans (each includes tunnel / VPN-over-CDN,
+ * SPEC §7 — no separate tunnel product) with pricing, server group, «Origin IP» custom field, upgrade paths
+ * and the welcome email.
  *
  * Idempotent: everything is looked up before it is created; existing products,
  * prices and the email template are only changed when the admin ticks
@@ -46,8 +47,9 @@ final class Wizard
     const EDGE_GROUPS = ['general' => 'عمومی', 'tunnel' => 'تونل'];
     const NUM_MAX = ['bw' => 1000000, 'records' => 100000, 'rate' => 100000, 'page' => 10000, 'fw' => 10000, 'rl' => 10000, 'pools' => 1000,
         'tpaths' => 50, 'tconn' => 1000000, 'tmbps' => 100000];
-    /** plan families: upgrade paths are created within a family only */
-    const FAMILIES = ['site' => 'پلن‌های CDN سایت', 'tunnel' => 'پلن‌های تونل / VPN'];
+    /** plan families: upgrade paths are created within a family only. All plans are one family now
+     *  (tunnel is included in every CDN plan), but the family plumbing is kept for the upgrade-path grouping. */
+    const FAMILIES = ['site' => 'پلن‌های CDN'];
 
     const FIELD_LABELS = [
         'bw' => 'ترافیک ماهانه (GB)', 'records' => 'رکورد DNS', 'rate' => 'محدودیت درخواست هر IP (req/s)',
@@ -57,36 +59,29 @@ final class Wizard
         'tconn' => 'اتصال همزمان هر نود', 'tmbps' => 'سقف سرعت اتصال (Mbps)', 'group' => 'گروه نودها',
     ];
 
-    const NO_TUNNEL = ['tunnel' => 0, 'tpaths' => 0, 'tconn' => 0, 'tmbps' => 0, 'group' => 'general'];
+    // Tunnel (VPN-over-CDN, SPEC §7) is included in every CDN plan: no separate product, no extra cost —
+    // tunnel traffic is billed from the same plan's bandwidth/wallet. Served by the «general» edge group
+    // (all nodes). Per-tier limits below scale with the plan; prices/overage are unchanged from the CDN-only plans.
     const PLANS = [
         'basic' => ['title' => 'پایه', 'name' => 'CDN پایه', 'family' => 'site', 'bw' => 100, 'records' => 50, 'rate' => 0, 'ssl' => 1, 'waf' => 0,
-            'ddos' => 1, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 1, 'page' => 3, 'fw' => 5, 'rl' => 1, 'pools' => 0] + self::NO_TUNNEL,
+            'ddos' => 1, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 1, 'page' => 3, 'fw' => 5, 'rl' => 1, 'pools' => 0,
+            'tunnel' => 1, 'tpaths' => 3, 'tconn' => 300, 'tmbps' => 0, 'group' => 'general'],
         'pro' => ['title' => 'حرفه‌ای', 'name' => 'CDN حرفه‌ای', 'family' => 'site', 'bw' => 500, 'records' => 200, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
-            'ddos' => 1, 'lb' => 0, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 10, 'fw' => 20, 'rl' => 5, 'pools' => 0] + self::NO_TUNNEL,
+            'ddos' => 1, 'lb' => 0, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 10, 'fw' => 20, 'rl' => 5, 'pools' => 0,
+            'tunnel' => 1, 'tpaths' => 10, 'tconn' => 2000, 'tmbps' => 0, 'group' => 'general'],
         'business' => ['title' => 'تجاری', 'name' => 'CDN تجاری', 'family' => 'site', 'bw' => 2000, 'records' => 500, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
-            'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 25, 'fw' => 50, 'rl' => 15, 'pools' => 3] + self::NO_TUNNEL,
+            'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 25, 'fw' => 50, 'rl' => 15, 'pools' => 3,
+            'tunnel' => 1, 'tpaths' => 20, 'tconn' => 5000, 'tmbps' => 0, 'group' => 'general'],
         'enterprise' => ['title' => 'سازمانی', 'name' => 'CDN سازمانی', 'family' => 'site', 'bw' => 10000, 'records' => 2000, 'rate' => 0, 'ssl' => 1,
-            'waf' => 1, 'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 100, 'fw' => 200, 'rl' => 50, 'pools' => 10] + self::NO_TUNNEL,
-        // Tunnel (VPN-over-CDN, SPEC §7): priced by traffic like the site plans; answered by the «tunnel» edge group.
-        // No WAF/DDoS (tunnel paths bypass them); firewall block rules and a load-balancer pool are useful.
-        'tunnel_basic' => ['title' => 'تونل پایه', 'name' => 'تونل پایه', 'family' => 'tunnel', 'bw' => 200, 'records' => 20, 'rate' => 0, 'ssl' => 1,
-            'waf' => 0, 'ddos' => 0, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 0, 'page' => 0, 'fw' => 5, 'rl' => 0, 'pools' => 0,
-            'tunnel' => 1, 'tpaths' => 3, 'tconn' => 300, 'tmbps' => 0, 'group' => 'tunnel'],
-        'tunnel_pro' => ['title' => 'تونل حرفه‌ای', 'name' => 'تونل حرفه‌ای', 'family' => 'tunnel', 'bw' => 1000, 'records' => 50, 'rate' => 0, 'ssl' => 1,
-            'waf' => 0, 'ddos' => 0, 'lb' => 1, 'image' => 0, 'customssl' => 0, 'dnssec' => 0, 'page' => 0, 'fw' => 10, 'rl' => 0, 'pools' => 2,
-            'tunnel' => 1, 'tpaths' => 10, 'tconn' => 2000, 'tmbps' => 0, 'group' => 'tunnel'],
-        'tunnel_unlimited' => ['title' => 'تونل نامحدود', 'name' => 'تونل نامحدود', 'family' => 'tunnel', 'bw' => 5000, 'records' => 100, 'rate' => 0, 'ssl' => 1,
-            'waf' => 0, 'ddos' => 0, 'lb' => 1, 'image' => 0, 'customssl' => 0, 'dnssec' => 0, 'page' => 0, 'fw' => 20, 'rl' => 0, 'pools' => 5,
-            'tunnel' => 1, 'tpaths' => 30, 'tconn' => 0, 'tmbps' => 0, 'group' => 'tunnel'],
+            'waf' => 1, 'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 100, 'fw' => 200, 'rl' => 50, 'pools' => 10,
+            'tunnel' => 1, 'tpaths' => 30, 'tconn' => 0, 'tmbps' => 0, 'group' => 'general'],
     ];
 
-    /** Default monthly price per plan by currency kind. */
+    /** Default monthly price per plan by currency kind (unchanged — tunnel is included at no extra cost). */
     const BASE_PRICE = [
-        'irt' => ['basic' => 150000, 'pro' => 450000, 'business' => 1200000, 'enterprise' => 4500000,
-            'tunnel_basic' => 250000, 'tunnel_pro' => 950000, 'tunnel_unlimited' => 3900000],
-        'irr' => ['basic' => 1500000, 'pro' => 4500000, 'business' => 12000000, 'enterprise' => 45000000,
-            'tunnel_basic' => 2500000, 'tunnel_pro' => 9500000, 'tunnel_unlimited' => 39000000],
-        'usd' => ['basic' => 5, 'pro' => 15, 'business' => 40, 'enterprise' => 150, 'tunnel_basic' => 8, 'tunnel_pro' => 30, 'tunnel_unlimited' => 120],
+        'irt' => ['basic' => 150000, 'pro' => 450000, 'business' => 1200000, 'enterprise' => 4500000],
+        'irr' => ['basic' => 1500000, 'pro' => 4500000, 'business' => 12000000, 'enterprise' => 45000000],
+        'usd' => ['basic' => 5, 'pro' => 15, 'business' => 40, 'enterprise' => 150],
     ];
     const BASE_OVERAGE = ['irt' => 3000, 'irr' => 30000, 'usd' => 0.1];
 

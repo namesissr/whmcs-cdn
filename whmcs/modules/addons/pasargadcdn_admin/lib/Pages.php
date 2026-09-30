@@ -1581,12 +1581,33 @@ final class Pages
             return (int) $p->id;
         }, $products));
         if ($products) {
+            $h .= self::tunnelBulkCard();
             $h .= self::productCards($products, $pricing, $currencies);
         } else {
-            $h .= View::alert('info', 'هنوز محصولی با ماژول Pasargad CDN وجود ندارد. با فرم زیر چهار پلن سایت (پایه، حرفه‌ای، تجاری، سازمانی) و سه پلن تونل / VPN (تونل پایه، حرفه‌ای، نامحدود) را با قیمت، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا بسازید.');
+            $h .= View::alert('info', 'هنوز محصولی با ماژول Pasargad CDN وجود ندارد. با فرم زیر چهار پلن CDN (پایه، حرفه‌ای، تجاری، سازمانی) — که تونل / VPN در همه‌شان گنجانده شده — را با قیمت، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا بسازید.');
         }
         $h .= self::wizardForm($state['input'] ?? Wizard::defaults($currencies), $currencies, (array) ($state['errors'] ?? []), !$products || !empty($state['errors']));
         return $h;
+    }
+
+    /**
+     * «فعال‌سازی تونل روی سرویس‌های فعلی»: after the products are unified (tunnel included in every CDN plan),
+     * already-provisioned services still show tunnel disabled on the controller until their plan is re-pushed.
+     * This card offers a one-click, idempotent, CSRF-protected bulk push (Admin::action → 'tunnel_enable').
+     */
+    private static function tunnelBulkCard(): string
+    {
+        $n = Data::tunnelServices();
+        if ($n < 1) {
+            return '';
+        }
+        $body = '<p class="pcdna-muted pcdna-small">تونل / VPN اکنون در همه پلن‌های CDN گنجانده شده است. '
+            . 'برای <strong>' . View::n($n) . '</strong> سرویس فعال روی محصولات تونل‌دار، با این دکمه پلن دوباره به کنترلر ارسال می‌شود تا تونل بلافاصله فعال شود. '
+            . 'این کار بی‌خطر و قابل تکرار است، صورتحساب و ترافیک را تغییر نمی‌دهد و در صورت وجود، گزینه‌های سفارشی تونل هر سرویس را هم روشن می‌کند.</p>'
+            . '<form method="post" action="' . View::url(['page' => 'plans']) . '" class="pcdna-form-actions">' . View::csrf()
+            . '<input type="hidden" name="a" value="tunnel_enable">'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('shield') . '<span>فعال‌سازی تونل روی سرویس‌های فعلی</span></button></form>';
+        return View::card('فعال‌سازی تونل روی سرویس‌های موجود', $body, View::badge(View::n($n) . ' سرویس', 'brand'), 'pcdna-tunnel-bulk', 'shield');
     }
 
     private static function productCards(array $products, array $pricing, array $currencies): string
@@ -1659,7 +1680,7 @@ final class Pages
     private static function wizardForm(array $in, array $currencies, array $errors, bool $open): string
     {
         $h = '<details class="pcdna-card pcdna-wizard" id="wizard"' . ($open ? ' open' : '') . '><summary class="pcdna-card-head"><h3>' . View::icon('wand')
-            . '<span>راه‌اندازی خودکار محصولات</span></h3><span class="pcdna-muted pcdna-small">گروه، ۴ پلن سایت + ۳ پلن تونل، قیمت‌ها، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا — قابل اجرای مجدد</span></summary><div class="pcdna-card-body">';
+            . '<span>راه‌اندازی خودکار محصولات</span></h3><span class="pcdna-muted pcdna-small">گروه، ۴ پلن CDN (با تونل گنجانده‌شده)، قیمت‌ها، ایمیل خوش‌آمد، فیلد Origin IP و مسیر ارتقا — قابل اجرای مجدد</span></summary><div class="pcdna-card-body">';
         foreach ($errors as $e) {
             $h .= View::alert('bad', View::e($e));
         }
@@ -1713,7 +1734,7 @@ final class Pages
             . self::check('email_update', $in['email_update'], 'به‌روزرسانی: اگر قالبی با این نام‌ها وجود دارد متن آن بازنویسی شود')
             . '</div></fieldset>';
 
-        // feature matrix, one table per plan family (site plans, tunnel plans)
+        // feature matrix, one table per plan family (a single «CDN» family now — tunnel is included in every plan)
         $h .= '<fieldset class="pcdna-fieldset"><legend>امکانات پلن‌ها</legend>';
         foreach (Wizard::FAMILIES as $fam => $famLabel) {
             $keys = array_keys(array_filter(Wizard::PLANS, function ($d) use ($fam) {
@@ -1731,9 +1752,7 @@ final class Pages
                 $h .= '<td><input class="pcdna-input" name="plan[' . $key . '][name]" maxlength="100" value="' . View::e($in['plans'][$key]['name']) . '" aria-label="نام محصول ' . View::e(Wizard::PLANS[$key]['title']) . '"></td>';
             }
             $h .= '</tr>';
-            $fields = $fam === 'tunnel'
-                ? ['bw', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group', 'records', 'ssl', 'lb', 'pools', 'fw', 'rate', 'waf', 'ddos', 'image', 'customssl', 'dnssec', 'page', 'rl']
-                : ['bw', 'records', 'ssl', 'rate', 'waf', 'ddos', 'lb', 'image', 'customssl', 'dnssec', 'page', 'fw', 'rl', 'pools', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group'];
+            $fields = ['bw', 'records', 'ssl', 'rate', 'waf', 'ddos', 'lb', 'image', 'customssl', 'dnssec', 'page', 'fw', 'rl', 'pools', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group'];
             foreach ($fields as $f) {
                 $h .= '<tr data-field="' . $f . '"><th>' . View::e(Wizard::FIELD_LABELS[$f]) . '</th>';
                 foreach ($keys as $key) {
@@ -1753,10 +1772,11 @@ final class Pages
             $h .= '</tbody></table></div>';
         }
         $h .= '<p class="pcdna-muted pcdna-small">ترافیک ۰ یعنی نامحدود. استخر توزیع بار فقط وقتی «توزیع بار» روشن باشد اعمال می‌شود. '
-            . 'پلن‌های تونل برای Xray / V2Ray پشت CDN هستند (ترافیک آپلود و دانلود هر دو حساب می‌شود) و با «گروه نودها = تونل» فقط به نودهای گروه تونل (صفحه «نودها») هدایت می‌شوند؛ '
-            . 'اگر نود آنلاینی در آن گروه نباشد، همه نودها پاسخ می‌دهند. «اتصال همزمان هر نود» ۰ یعنی نامحدود (هر جریان WebSocket/gRPC یک اتصال است). '
-            . '«سقف سرعت اتصال» ۰ یعنی بدون سقف و فعلاً روی جریان‌های تونل اعمال نمی‌شود. مسیر ارتقا فقط بین پلن‌های هم‌خانواده ساخته می‌شود. '
-            . 'این مقادیر در Module Settings محصول (configoption1..19) ذخیره می‌شوند و با ChangePackage روی سرویس‌های موجود اعمال می‌شوند.</p></fieldset>';
+            . 'حالت تونل (VPN برای Xray / V2Ray پشت CDN) در همه پلن‌های CDN گنجانده شده است؛ هزینه جداگانه‌ای ندارد و ترافیک آپلود و دانلود آن از همان ترافیک/کیف پول پلن حساب می‌شود. '
+            . 'با «گروه نودها = عمومی» تونل از همه نودها سرو می‌شود (پیشنهادی)؛ اگر «تونل» را انتخاب کنید فقط به نودهای گروه تونل هدایت می‌شود و در نبود نود آنلاین همه نودها پاسخ می‌دهند. '
+            . '«اتصال همزمان هر نود» ۰ یعنی نامحدود (هر جریان WebSocket/gRPC یک اتصال است). '
+            . '«سقف سرعت اتصال» ۰ یعنی بدون سقف و فعلاً روی جریان‌های تونل اعمال نمی‌شود. '
+            . 'این مقادیر در Module Settings محصول (configoption1..19) ذخیره می‌شوند؛ برای سرویس‌های موجود با دکمه «فعال‌سازی تونل روی سرویس‌های فعلی» (بالای همین صفحه) یا ChangePackage اعمال می‌شوند.</p></fieldset>';
 
         // prices
         $h .= '<fieldset class="pcdna-fieldset"><legend>قیمت‌ها</legend><p class="pcdna-muted pcdna-small">خانه خالی یعنی آن دوره پرداخت غیرفعال است (در WHMCS با ‎-1 ذخیره می‌شود). '

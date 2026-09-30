@@ -373,6 +373,14 @@ with no buffering, no caching and no security filters in the way.
 ```
 Defaults above apply to existing sites (tunnel off, group general).
 
+**Product packaging (WHMCS):** tunnel is bundled into every shipped CDN plan — the WHMCS
+plans wizard enables `features.tunnel` (with per-tier `max_tunnel_paths`/`max_tunnel_connections`)
+on all CDN plans, all on the `general` edge group (served by every node), and no longer creates a
+separate tunnel product. So buying any CDN service also grants tunnel, with tunnel traffic billed
+from the same plan's bandwidth/wallet — no separate purchase or cost. An admin bulk action turns
+tunnel on for already-provisioned CDN services. `edge_group` stays configurable for operators who
+later want to dedicate `tunnel` nodes; the platform still supports both groups (§7.4).
+
 ### 7.2 Section `tunnel` (requires `features.tunnel`, else PUT → 403 and edge gets `enabled:false`)
 ```json
 {
