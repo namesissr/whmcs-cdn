@@ -1,9 +1,10 @@
 """API polled by edge agents."""
 
+import ipaddress
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, Response
+from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -49,17 +50,103 @@ class Heartbeat(BaseModel):
     applied_version: str | None = None
     error: str | None = Field(default=None, max_length=4000)
     metrics: Metrics | None = None
+    # running edge bundle version (SPEC §11.1); older agents omit it
+    bundle_version: str | None = Field(default=None, max_length=64)
+    # self-registration into the right pool on first contact (SPEC §11.1); older agents omit them
+    region: str | None = Field(default=None, pattern="^(home|global)$")
+    group: str | None = Field(default=None, pattern="^(general|tunnel)$")
+
+
+EDGE_IP_PLACEHOLDER = "0.0.0.0"  # batch-created edges (SPEC §11.1) until the node reports itself
+
+
+def _self_register_ip(edge: Edge, request: Request) -> None:
+    """Fill a batch edge's placeholder IP from the heartbeat's source address, so it enters DNS
+    with a real address (uvicorn runs with --proxy-headers, so this is the node's public IP)."""
+    if edge.ipv4 != EDGE_IP_PLACEHOLDER or request.client is None:
+        return
+    try:
+        ip = ipaddress.ip_address(request.client.host)
+    except ValueError:
+        return
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return
+    if ip.version == 4:
+        edge.ipv4 = str(ip)
+    elif edge.ipv6 is None:
+        edge.ipv6 = str(ip)  # v6-only first contact; the operator can still set the v4 in the panel
 
 
 @router.post("/heartbeat")
-def heartbeat(body: Heartbeat, edge: Edge = Depends(require_edge), db: Session = Depends(get_db)):
+def heartbeat(body: Heartbeat, request: Request, edge: Edge = Depends(require_edge),
+              db: Session = Depends(get_db)):
+    first_contact = edge.last_seen_at is None
     edge.last_seen_at = utcnow()
     edge.applied_version = body.applied_version
     edge.last_error = body.error
+    if body.bundle_version is not None:
+        edge.bundle_version = body.bundle_version
+    # a fresh node reports its region/role once; never override an operator's later panel edit
+    if first_contact:
+        if body.region is not None:
+            edge.region = body.region
+        if body.group is not None:
+            edge.group = body.group
+    _self_register_ip(edge, request)
     if body.metrics is not None:
         # the shed flag changes here; scheduler.job_edges rewrites DNS on its next tick
         record_metrics(edge, body.metrics.model_dump(), edge.last_seen_at)
     db.commit()
+    return {"ok": True}
+
+
+# centralized node logs (SPEC §11.2): the agent ships only recent operational WARN/ERROR/crit
+# lines (nginx error log + its own log). Size-capped so a noisy node cannot flood the controller.
+LOG_LEVELS = {"warn", "error", "crit", "notice", "info"}
+LOG_MAX_LINES_PER_CALL = 40
+LOG_MSG_MAX = 500
+LOG_RING_MAX_LINES = 120
+LOG_RING_MAX_BYTES = 16 * 1024
+
+
+class LogLine(BaseModel):
+    t: str = Field(default="", max_length=40)
+    level: str = "info"
+    msg: str = Field(default="", max_length=4000)
+
+
+class LogsIn(BaseModel):
+    lines: list[LogLine] = Field(default_factory=list, max_length=LOG_MAX_LINES_PER_CALL)
+
+
+def _append_logs(edge: Edge, incoming: list[dict]) -> None:
+    """Append newest-last into the edge's capped ring; drop oldest past the line/byte cap."""
+    try:
+        ring = json.loads(edge.logs) if edge.logs else []
+        if not isinstance(ring, list):
+            ring = []
+    except (ValueError, TypeError):
+        ring = []
+    ring.extend(incoming)
+    # hard line cap first, then byte cap (drop oldest until the serialized ring fits)
+    if len(ring) > LOG_RING_MAX_LINES:
+        ring = ring[-LOG_RING_MAX_LINES:]
+    while len(ring) > 1 and len(json.dumps(ring, ensure_ascii=False).encode("utf-8")) > LOG_RING_MAX_BYTES:
+        ring = ring[1:]
+    edge.logs = json.dumps(ring, ensure_ascii=False)
+    edge.logs_at = utcnow()
+
+
+@router.post("/logs")
+def logs(body: LogsIn, edge: Edge = Depends(require_edge), db: Session = Depends(get_db)):
+    clean = []
+    for ln in body.lines:
+        level = ln.level if ln.level in LOG_LEVELS else "info"
+        msg = (ln.msg or "")[:LOG_MSG_MAX]
+        clean.append({"t": ln.t[:40], "level": level, "msg": msg})
+    if clean:
+        _append_logs(edge, clean)
+        db.commit()
     return {"ok": True}
 
 

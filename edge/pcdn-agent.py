@@ -12,6 +12,7 @@ events. Standard library only, so it runs on any stock Debian/Ubuntu python3.
                           so nginx can start before the first sync)
 """
 
+import collections
 import hashlib
 import json
 import logging
@@ -29,6 +30,34 @@ from datetime import datetime, timezone
 log = logging.getLogger("pcdn-agent")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class LogBuffer(logging.Handler):
+    """Keeps the agent's own recent WARNING+ records so they can be shipped to the controller
+    with the nginx error log (SPEC §11.2). Bounded; never raises into the caller."""
+
+    def __init__(self, maxlen: int = 200):
+        super().__init__(level=logging.WARNING)
+        self.records: collections.deque = collections.deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = {"WARNING": "warn", "ERROR": "error", "CRITICAL": "crit"}.get(record.levelname, "warn")
+            self.records.append({"t": _now_iso(), "level": level, "msg": record.getMessage()})
+        except Exception:  # noqa: BLE001 - logging must never crash the agent
+            pass
+
+    def drain(self) -> list:
+        out = list(self.records)
+        self.records.clear()
+        return out
+
+
+AGENT_LOGS = LogBuffer()
+
 DEFAULTS = {
     "CONTROLLER_URL": "",
     "EDGE_TOKEN": "",
@@ -36,6 +65,13 @@ DEFAULTS = {
     "CACHE_DIR": "/var/cache/pcdn",
     "STATE_FILE": "/var/lib/pcdn/state.json",
     "ACCESS_LOG": "/var/log/nginx/pcdn-access.log",
+    # centralized node logs (SPEC §11.2): the nginx error log the agent tails for WARN/ERROR/crit
+    "ERROR_LOG": "/var/log/nginx/error.log",
+    # running bundle version file written by bootstrap.sh; reported in the heartbeat (SPEC §11.1)
+    "BUNDLE_VERSION_FILE": "/etc/pcdn/bundle.version",
+    # region / role (edge group): reported on first heartbeat so a fresh node self-registers
+    "REGION": "",
+    "GROUP": "",
     "PAGES_DIR": "/usr/share/pcdn/pages",
     "NJS_FILE": "/usr/share/pcdn/njs/pcdn.js",
     "BASE_TEMPLATE": "/usr/share/pcdn/nginx/pcdn-base.conf",
@@ -1135,6 +1171,121 @@ def usage_items(pending: dict) -> list[dict]:
     return [usage_item(k, v) for k, v in pending.items()]
 
 
+# ----------------------------------------------------------------- centralized logs (SPEC §11.2)
+
+LOG_MSG_MAX = 500
+LOG_MAX_PER_REPORT = 40
+LOG_MAX_SCAN = 2 * 1024 * 1024   # bytes of new error-log tail read per cycle
+# nginx error line: "2024/01/02 15:04:05 [error] 1234#0: *5 message ..." (the *N conn id is optional)
+NGINX_ERR_RE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(\w+)\] \d+#\d+: (?:\*\d+ )?(.*)$")
+# map nginx severities to the controller's small level set (warn/error/crit/notice/info)
+NGINX_LEVEL = {"warn": "warn", "error": "error", "crit": "crit", "alert": "crit", "emerg": "crit",
+               "notice": "notice", "info": "info"}
+SHIP_LEVELS = {"warn", "error", "crit"}
+# redaction (defence in depth): never ship visitor IPs, tokens or keys, only operational text
+_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_IPV6 = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\b")
+_SECRET = re.compile(r"\b(?:edge_|pcdn_)[A-Za-z0-9_-]{6,}")
+_CLIENT = re.compile(r"\bclient:\s*\S+")
+
+
+def redact(msg: str) -> str:
+    """Strip anything that could identify a visitor or leak a secret from an error line."""
+    msg = _SECRET.sub("[redacted]", msg)
+    msg = _CLIENT.sub("client: [redacted]", msg)
+    msg = _IPV6.sub("[ip]", msg)
+    msg = _IPV4.sub("[ip]", msg)
+    return msg
+
+
+def parse_error_lines(text: str) -> list[dict]:
+    """Turn raw nginx error-log text into shippable {t, level, msg} for WARN/ERROR/crit only."""
+    out = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        m = NGINX_ERR_RE.match(raw)
+        if m:
+            t, sev, body = m.group(1), m.group(2).lower(), m.group(3)
+            level = NGINX_LEVEL.get(sev)
+            if level not in SHIP_LEVELS:
+                continue
+            out.append({"t": t, "level": level, "msg": redact(body)[:LOG_MSG_MAX]})
+        # lines we cannot classify are dropped (never ship access logs or unknown formats)
+    return out
+
+
+def read_error_log(state: dict, path: str) -> list[dict]:
+    """New WARN/ERROR/crit lines since the last offset (handles rotation/truncation). Fail-soft."""
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, OSError):
+        return []
+    pos = int(state.get("err_pos", 0))
+    prev_inode = state.get("err_inode")
+    text = ""
+    try:
+        if prev_inode not in (None, st.st_ino):
+            # rotated: finish the old file (now .1) then start the new one at 0
+            rotated = path + ".1"
+            try:
+                if os.stat(rotated).st_ino == prev_inode:
+                    text += _read_tail(rotated, pos)
+            except (FileNotFoundError, OSError):
+                pass
+            pos = 0
+        elif st.st_size < pos:
+            pos = 0  # truncated
+        with open(path, "rb") as f:
+            f.seek(pos)
+            chunk = f.read(LOG_MAX_SCAN)
+            state["err_pos"] = f.tell()
+        text += chunk.decode("utf-8", "replace")
+        state["err_inode"] = st.st_ino
+    except OSError as e:
+        log.debug("error-log read: %s", e)
+        return []
+    return parse_error_lines(text)
+
+
+def _read_tail(path: str, pos: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(pos)
+            return f.read(LOG_MAX_SCAN).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def collect_logs(state: dict, cfg: dict) -> list[dict]:
+    """Gather new problem lines (nginx error log + the agent's own), de-duplicated and capped.
+
+    De-dup is against the fingerprints of the last batch so an identical repeating line is not
+    re-sent every cycle. Never raises."""
+    try:
+        lines = read_error_log(state, cfg.get("ERROR_LOG") or "")
+    except Exception as e:  # noqa: BLE001 - log shipping must never break the agent
+        log.debug("collect error log failed: %s", e)
+        lines = []
+    lines.extend(AGENT_LOGS.drain())
+    if not lines:
+        return []
+    seen_prev = set(state.get("logs_seen") or [])
+    out, fps = [], []
+    for ln in lines:
+        fp = f"{ln['level']}|{ln['msg']}"
+        if fp in seen_prev or fp in fps:
+            continue
+        fps.append(fp)
+        out.append(ln)
+    # keep only the newest LOG_MAX_PER_REPORT lines
+    out = out[-LOG_MAX_PER_REPORT:]
+    # remember the fingerprints we just shipped so an identical repeat next cycle is skipped
+    state["logs_seen"] = [f"{ln['level']}|{ln['msg']}" for ln in out][-LOG_MAX_PER_REPORT:]
+    return out
+
+
 # ----------------------------------------------------------------- metrics (heartbeat, SPEC §7.4)
 
 VIRTUAL_IFACES = re.compile(r"^(lo|docker|veth|br-|virbr|cni|flannel|cali|vxlan|tun|tap|wg|kube|dummy)")
@@ -1300,6 +1451,24 @@ def save_state(path: str, state: dict):
     os.replace(tmp, path)
 
 
+def bundle_version(cfg: dict) -> str | None:
+    """The running edge bundle version (SPEC §11.1): the value bootstrap.sh recorded, else a
+    stable hash of the installed agent as a fallback. None when neither is available."""
+    path = cfg.get("BUNDLE_VERSION_FILE") or ""
+    try:
+        if path and os.path.isfile(path):
+            v = open(path, encoding="utf-8").read().strip()
+            if v:
+                return v[:64]
+    except OSError:
+        pass
+    try:  # fallback: hash the running agent file (won't match the controller, but is a stable signal)
+        with open(os.path.abspath(__file__), "rb") as f:
+            return "agent-" + hashlib.sha256(f.read()).hexdigest()[:10]
+    except OSError:
+        return None
+
+
 class Agent:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -1322,14 +1491,14 @@ class Agent:
         self.state["last_error"] = err
         if err:
             log.error(err)
-            self.ctl.call("POST", "/edge/v1/heartbeat",
-                          {"applied_version": self.state.get("version"), "error": err})
+            self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
+                                                                  error=err))
             return
         self.state["etag"] = hdrs.get("ETag") or hdrs.get("etag")
         self.state["version"] = body["version"]
         self.state["render_rev"] = rev
         log.info("applied config %s (%d sites)", body["version"][:12], len(body.get("sites", [])))
-        self.ctl.call("POST", "/edge/v1/heartbeat", {"applied_version": body["version"], "error": None})
+        self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=body["version"], error=None))
 
     def sync_purges(self):
         after = int(self.state.get("purge_id", 0))
@@ -1375,11 +1544,28 @@ class Agent:
             self.net_prev = cur
         return m
 
+    def _hb(self, **over) -> dict:
+        """Base heartbeat body: bundle version + (when configured) region/role, so a fresh node
+        self-registers into the right pool (SPEC §11.1). Overrides fill applied_version/error/metrics."""
+        body: dict = {"bundle_version": bundle_version(self.cfg)}
+        if self.cfg.get("REGION"):
+            body["region"] = self.cfg["REGION"]
+        if self.cfg.get("GROUP"):
+            body["group"] = self.cfg["GROUP"]
+        body.update(over)
+        return body
+
     def heartbeat(self):
         """Periodic heartbeat with load metrics (keeps applied_version / last error as reported)."""
-        self.ctl.call("POST", "/edge/v1/heartbeat", {"applied_version": self.state.get("version"),
-                                                     "error": self.state.get("last_error"),
-                                                     "metrics": self.metrics()})
+        self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
+                                                             error=self.state.get("last_error"),
+                                                             metrics=self.metrics()))
+
+    def ship_logs(self):
+        """Ship new WARN/ERROR/crit lines to the controller (SPEC §11.2). Fail-soft: never raises."""
+        lines = collect_logs(self.state, self.cfg)
+        if lines:
+            self.ctl.call("POST", "/edge/v1/logs", {"lines": lines})
 
     def tick(self):
         for step in (self.sync_config, self.sync_purges):
@@ -1393,6 +1579,10 @@ class Agent:
                 self.last_heartbeat = time.time()
             except Exception as e:  # noqa: BLE001
                 log.error("heartbeat failed: %s", e)
+            try:
+                self.ship_logs()
+            except Exception as e:  # noqa: BLE001 - log shipping must never break the heartbeat
+                log.error("log shipping failed: %s", e)
         if time.time() - self.last_usage >= int(self.cfg["USAGE_INTERVAL"]):
             try:
                 self.push_usage()
@@ -1412,6 +1602,8 @@ class Agent:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # capture the agent's own WARN/ERROR lines so they ship with the nginx error log (SPEC §11.2)
+    logging.getLogger("pcdn-agent").addHandler(AGENT_LOGS)
     cfg = load_config(os.getenv("PCDN_CONFIG", "/etc/pcdn/agent.conf"))
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "bootstrap":

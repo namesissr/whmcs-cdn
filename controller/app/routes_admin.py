@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import nscheck, pdns, sections
+from . import bundle, nscheck, pdns, sections
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
@@ -148,6 +148,16 @@ class EdgePatch(BaseModel):
     group: Literal["general", "tunnel"] | None = None
     capacity_mbps: int | None = Field(default=None, ge=0, le=10_000_000)
     region: str | None = Field(default=None, pattern="^(home|global)$")
+
+
+class EdgeBatchIn(BaseModel):
+    """Batch-create N edges in one call (SPEC §11.1)."""
+    model_config = ConfigDict(extra="forbid")
+    count: int = Field(ge=1, le=50)
+    region: str = Field(default="global", pattern="^(home|global)$")
+    group: Literal["general", "tunnel"] = "general"
+    name_prefix: str = Field(default="edge", pattern=r"^[a-zA-Z0-9_.-]{1,48}$")
+    capacity_mbps: int = Field(default=0, ge=0, le=10_000_000)
 
 
 def apply_plan(site: Site, plan: Plan):
@@ -584,6 +594,11 @@ def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
         "uptime": uptime if uptime is not None else {"h24": None, "d30": None},
         "probe": {"ok": e.probe_ok, "ms": e.probe_ms,
                   "at": e.probe_at.isoformat() + "Z" if e.probe_at else None, "error": e.probe_error},
+        # centralized logs hint (SPEC §11.2): the full lines come from GET /edges/{id}/logs
+        "logs_at": e.logs_at.isoformat() + "Z" if e.logs_at else None,
+        "has_logs": bool(e.logs and e.logs not in ("[]", "null")),
+        # running bundle version (SPEC §11.1); the panel compares it to GET /edge/version
+        "bundle_version": e.bundle_version,
     }
 
 
@@ -604,6 +619,11 @@ def edge_uptime(edge_id: int, days: int = 30, db: Session = Depends(get_db)):
     return up.daily(db, edge_id, days)
 
 
+def _edge_install(edge: Edge, token: str) -> str:
+    """The one-command install one-liner for this node (SPEC §11.1); role == edge group."""
+    return bundle.install_command(token, region=edge.region, role=edge.group)
+
+
 @router.post("/edges", status_code=201)
 def create_edge(body: EdgeIn, db: Session = Depends(get_db)):
     try:
@@ -619,7 +639,41 @@ def create_edge(body: EdgeIn, db: Session = Depends(get_db)):
     db.add(edge)
     db.commit()
     # DNS changes once the edge sends its first heartbeat
-    return {**edge_to_dict(edge), "token": token}
+    return {**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)}
+
+
+@router.post("/edges/batch", status_code=201)
+def batch_create_edges(body: EdgeBatchIn, db: Session = Depends(get_db)):
+    """Create N edges in one call (SPEC §11.1). IPs are unknown at batch time (the node reports
+    itself on first heartbeat); each edge gets a unique name and its one-time token + install
+    one-liner. Names are name_prefix + index, skipping names already taken."""
+    taken = {n for (n,) in db.execute(select(Edge.name)).all()}
+    out = []
+    idx = 1
+    for _ in range(body.count):
+        while f"{body.name_prefix}-{idx}" in taken:
+            idx += 1
+        name = f"{body.name_prefix}-{idx}"
+        taken.add(name)
+        idx += 1
+        token = new_token()
+        # ipv4 is filled in once the node heartbeats; 0.0.0.0 is a harmless placeholder (kept out of
+        # DNS because it is not online). The operator can also set it from the panel.
+        edge = Edge(name=name, ipv4="0.0.0.0", region=body.region, token_hash=hash_token(token),
+                    group=body.group, capacity_mbps=body.capacity_mbps)
+        db.add(edge)
+        db.flush()
+        out.append({**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)})
+    db.commit()
+    return {"edges": out}
+
+
+@router.get("/edges/install")
+def edge_install_oneliner(token: str, region: str = "global", role: str = "general"):
+    """Ready copy-paste one-liner for a specific node/token (SPEC §11.1)."""
+    region = region if region in ("home", "global") else "global"
+    role = role if role in ("general", "tunnel") else "general"
+    return {"command": bundle.install_command(token, region=region, role=role)}
 
 
 @router.post("/edges/{edge_id}/rotate-token")
@@ -660,3 +714,20 @@ def delete_edge(edge_id: int, db: Session = Depends(get_db)):
     db.delete(edge)
     db.commit()
     return {"ok": True, "dns_failed": sync_all_dns(db)}
+
+
+@router.get("/edges/{edge_id}/logs")
+def edge_logs(edge_id: int, db: Session = Depends(get_db)):
+    """Centralized node logs (SPEC §11.2). `lines` are stored newest-last (as the ring keeps
+    them); the UI shows them newest-first. Empty list when the node has reported none."""
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    try:
+        lines = json.loads(edge.logs) if edge.logs else []
+        if not isinstance(lines, list):
+            lines = []
+    except (ValueError, TypeError):
+        lines = []
+    return {"name": edge.name, "logs_at": edge.logs_at.isoformat() + "Z" if edge.logs_at else None,
+            "lines": lines}

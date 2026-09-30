@@ -7,18 +7,22 @@
 #   libnginx-mod-http-js (njs >= 0.8.1), -geoip2, -image-filter, -brotli-filter
 #
 # Options:
+#   --region home|global   edge region / DNS pool (default global)
+#   --role general|tunnel  edge role, maps to the edge group (default general)
 #   --no-ipv6          do not listen on IPv6
 #   --cache-size 50g   max disk used by the cache of each site (default 10g)
 #   --http-port N      public HTTP port (default 80)
 #   --https-port N     public HTTPS port (default 443)
 #   --no-geoip         do not download the DB-IP country database (country rules never match)
-#   --upgrade          update an installed edge in place: controller, token, ports, IPv6 and cache
-#                      size are read from /etc/pcdn/agent.conf (--controller/--token still override)
+#   --upgrade          update an installed edge in place: controller, token, ports, IPv6, cache
+#                      size, region and role are read from /etc/pcdn/agent.conf (flags still override)
 #   --distro-nginx     accepted for compatibility (the distro nginx is always used now)
 set -euo pipefail
 
 CONTROLLER=""
 TOKEN=""
+REGION=""
+ROLE=""
 IPV6=yes
 CACHE_SIZE=10g
 HTTP_PORT=80
@@ -31,6 +35,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --controller) CONTROLLER="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
+    --region) REGION="$2"; shift 2 ;;
+    --role) ROLE="$2"; shift 2 ;;
     --no-ipv6) IPV6=no; shift ;;
     --distro-nginx) shift ;;
     --cache-size) CACHE_SIZE="$2"; shift 2 ;;
@@ -42,12 +48,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+case "${REGION:-}" in ""|home|global) ;; *) echo "--region must be home or global"; exit 1 ;; esac
+case "${ROLE:-}" in ""|general|tunnel) ;; *) echo "--role must be general or tunnel"; exit 1 ;; esac
+
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 if [ "$UPGRADE" = yes ]; then
   [ -f /etc/pcdn/agent.conf ] || { echo "--upgrade: /etc/pcdn/agent.conf not found (not installed yet?)"; exit 1; }
   conf() { sed -n "s/^$1=//p" /etc/pcdn/agent.conf | tail -1; }
   [ -n "$CONTROLLER" ] || CONTROLLER="$(conf CONTROLLER_URL)"
   [ -n "$TOKEN" ] || TOKEN="$(conf EDGE_TOKEN)"
+  [ -n "$REGION" ] || REGION="$(conf REGION)"
+  [ -n "$ROLE" ] || ROLE="$(conf GROUP)"
   v="$(conf LISTEN_IPV6)"; [ -n "$v" ] && IPV6="$v"
   v="$(conf CACHE_MAX_SIZE)"; [ -n "$v" ] && CACHE_SIZE="$v"
   v="$(conf HTTP_PORT)"; [ -n "$v" ] && HTTP_PORT="$v"
@@ -127,7 +138,13 @@ HTTPS_PORT=$HTTPS_PORT
 GEOIP_DB=/usr/share/pcdn/geo/country.mmdb
 NGINX_TEST_CMD=nginx -t -q
 NGINX_RELOAD_CMD=systemctl reload nginx
+ERROR_LOG=/var/log/nginx/error.log
 EOF
+# region / role (maps to the edge group): the agent reports these so a fresh node self-registers
+# into the right pool (SPEC §11.1). Written only when given; the controller already holds them
+# from when the token was minted, and never re-writes them once an operator edits the panel.
+[ -n "$REGION" ] && echo "REGION=$REGION" >> /etc/pcdn/agent.conf
+[ -n "$ROLE" ] && echo "GROUP=$ROLE" >> /etc/pcdn/agent.conf
 umask 022
 
 cat > /etc/logrotate.d/pcdn <<'EOF'

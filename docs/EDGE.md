@@ -241,6 +241,41 @@ version, the last apply error and `metrics`:
 Every part is guarded: an unreadable file gives 0, a failed heartbeat is logged and retried at
 the next tick; the agent never stops for metrics.
 
+The heartbeat also carries `bundle_version` (the running edge bundle version, SPEC §11.1; from
+`BUNDLE_VERSION_FILE` written by `bootstrap.sh`, else a hash of the agent file) and, on the
+**first** contact of a fresh node, `region`/`group` from the config, so the node self-registers
+into the right pool. The controller applies region/group only on first contact and never
+overrides a later operator edit.
+
+## One-command install & bundle (SPEC §11.1)
+
+The controller serves the secret-free edge tree so a node is brought up with one command:
+
+```
+curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- \
+    --controller https://<controller> --token edge_xxx [--region home|global] [--role general|tunnel] ...
+```
+
+`edge/bootstrap.sh` downloads `GET /edge/bundle.tar.gz` (a gzip tar of `edge/` built on the fly
+from `EDGE_BUNDLE_DIR`, excluding `__pycache__`/`*.pyc`/`tests/`), unpacks it and runs `install.sh`
+with the same flags. `GET /edge/version` returns the bundle hash (`bootstrap.sh` records it to
+`/etc/pcdn/bundle.version`). All three routes are unauthenticated and hold no secrets; when
+`EDGE_BUNDLE_DIR` is unset/missing they return 404 and the panel falls back to manual git/scp.
+`install.sh` gains `--region` and `--role` (persisted to `/etc/pcdn/agent.conf` as `REGION` /
+`GROUP`). See `docs/NODES.md` for the operator runbook (batch add, upgrade with `--upgrade`,
+decommission, troubleshooting) and `edge/cloud-init.yaml.example` for unattended first-boot.
+
+## Centralized logs (SPEC §11.2)
+
+On the heartbeat cadence the agent tails the nginx error log (`ERROR_LOG`) and its own WARN/ERROR
+lines and POSTs only new `warn`/`error`/`crit` lines to `POST /edge/v1/logs`
+(`{lines:[{t,level,msg}]}`). It de-duplicates against the last batch, tracks a file offset (with
+rotation/truncation handling like the access log), caps ~40 lines/report and ~500 chars/line, and
+**redacts** IPs, `client:` fields and `edge_`/`pcdn_` tokens — it never ships access logs, request
+bodies, visitor IPs, tokens or keys. Log shipping is fail-soft: it never crashes the agent or
+blocks the heartbeat. The controller keeps a capped ring (~120 lines / ~16 KiB) per edge, exposed
+at `GET /api/v1/edges/{id}/logs`.
+
 ## System tuning (install.sh, idempotent)
 
 * `/etc/sysctl.d/99-pcdn.conf`: BBR + `fq`, `somaxconn` / `tcp_max_syn_backlog` 65535,
@@ -269,7 +304,8 @@ v1 keys plus `HTTP_PORT` (80), `HTTPS_PORT` (443), `RESIZE_PORT` (8089), `RESOLV
 (`1.1.1.1 8.8.8.8`), `GEOIP_DB`, `NJS_FILE`, `BASE_TEMPLATE`, `CA_BUNDLE` (origin_verify),
 `DICT_SIZE` (rate-limit/DDoS counter zone, 32m), `HEARTBEAT_INTERVAL` (60 s),
 `PURGE_SCAN_MAX` (max cache files scanned per prefix purge before falling back to a full-site
-purge, 500000).
+purge, 500000), `ERROR_LOG` (nginx error log tailed for centralized logs, `/var/log/nginx/error.log`),
+`BUNDLE_VERSION_FILE` (`/etc/pcdn/bundle.version`), `REGION` / `GROUP` (reported on first heartbeat).
 
 ## Usage / events
 

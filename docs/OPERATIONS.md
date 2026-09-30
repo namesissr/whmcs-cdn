@@ -696,6 +696,13 @@ docker compose exec controller python -m app.manage drop-unreadable-secrets --ye
 
 ## ۸. پایش سلامت نودها، صفحه وضعیت عمومی و رخدادها (SPEC §8)
 
+> راه‌اندازی، افزودن گروهی، به‌روزرسانی و عیب‌یابی نودها در راهنمای جداگانه‌ی
+> [NODES.md](NODES.md) آمده است: نصب تک‌دستوری
+> (`curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- ...`)، مسیرهای بسته‌ی بدون
+> احراز هویت (`/edge/bootstrap.sh`, `/edge/bundle.tar.gz`, `/edge/version`)، افزودن گروهی
+> (`POST /api/v1/edges/batch`)، به‌روزرسانی با `--upgrade` و مشاهده‌ی لاگ‌های متمرکز نود
+> (`GET /api/v1/edges/{id}/logs` — فقط خطوط `warn`/`error`/`crit`، بدون IP/توکن، SPEC §11).
+
 ### آزمون سلامت مصنوعی (synthetic probes)
 
 هر حدود ۶۰ ثانیه، کنترلر (فقط نمونه leader) خودش از هر نود فعال آدرس

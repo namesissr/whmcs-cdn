@@ -157,6 +157,14 @@ class Edge(Base):
     probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     probe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     probe_fail: Mapped[int] = mapped_column(Integer, default=0)
+    # centralized node logs (SPEC §11.2): a capped rolling buffer of recent WARN/ERROR/crit
+    # lines the agent ships (nginx error log + the agent's own log). JSON list, newest last,
+    # hard-capped (~120 lines / ~16 KiB, oldest dropped). NEVER access logs, IPs, tokens or keys.
+    logs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logs_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # running edge bundle version the agent reports (SPEC §11.1); compared to the controller's
+    # current bundle (GET /edge/version) to flag nodes that are behind ("update available")
+    bundle_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class EdgeUptime(Base):

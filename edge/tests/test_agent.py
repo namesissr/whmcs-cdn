@@ -21,6 +21,8 @@ def make_cfg(tmp_path, **over):
         "CACHE_DIR": str(tmp_path / "cache"),
         "STATE_FILE": str(tmp_path / "state.json"),
         "ACCESS_LOG": str(tmp_path / "access.log"),
+        "ERROR_LOG": str(tmp_path / "error.log"),
+        "BUNDLE_VERSION_FILE": str(tmp_path / "bundle.version"),
         "PAGES_DIR": str(HERE.parent / "pages"),
         "NJS_FILE": str(HERE.parent / "njs/pcdn.js"),
         "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"),
@@ -613,3 +615,70 @@ def test_periodic_heartbeat_carries_metrics(tmp_path, monkeypatch):
     a.ctl = RecordingCtl(fail=True)
     a.last_heartbeat = 0
     a.tick()  # controller down: logged, never raised
+
+
+# ---------------------------------------------------------------- centralized logs (SPEC §11.2)
+
+def test_parse_error_lines_filters_levels():
+    text = (
+        "2026/09/30 10:00:00 [error] 12#0: *5 upstream timed out\n"
+        "2026/09/30 10:00:01 [warn] 12#0: *6 using stale response\n"
+        "2026/09/30 10:00:02 [crit] 12#0: *7 SSL_do_handshake failed\n"
+        "2026/09/30 10:00:03 [notice] 12#0: signal process started\n"   # dropped (not warn+)
+        "2026/09/30 10:00:04 [info] 12#0: something\n"                    # dropped
+        "a malformed line with no timestamp\n"                            # dropped
+    )
+    out = agent.parse_error_lines(text)
+    assert [l["level"] for l in out] == ["error", "warn", "crit"]
+    assert out[0]["msg"] == "upstream timed out"
+
+
+def test_redact_strips_ips_and_tokens():
+    r = agent.redact("connect() to 10.1.2.3:80 failed, client: 8.8.8.8, token edge_abc123def456")
+    assert "10.1.2.3" not in r and "8.8.8.8" not in r
+    assert "edge_abc123def456" not in r and "[ip]" in r
+    r6 = agent.redact("peer 2a01:4f8:abcd:1234::10 closed")
+    assert "2a01:4f8" not in r6 and "[ip]" in r6
+
+
+def test_read_error_log_tracks_offset(tmp_path):
+    p = tmp_path / "error.log"
+    p.write_text("2026/09/30 10:00:00 [error] 1#0: *1 first problem\n")
+    st = {}
+    first = agent.read_error_log(st, str(p))
+    assert [l["msg"] for l in first] == ["first problem"]
+    # nothing new -> empty on the next read (offset advanced)
+    assert agent.read_error_log(st, str(p)) == []
+    # append a new line -> only that one comes back
+    with open(p, "a") as f:
+        f.write("2026/09/30 10:00:05 [warn] 1#0: *2 second problem\n")
+    again = agent.read_error_log(st, str(p))
+    assert [l["msg"] for l in again] == ["second problem"]
+
+
+def test_collect_logs_dedup_and_cap(tmp_path):
+    p = tmp_path / "error.log"
+    lines = "".join(f"2026/09/30 10:00:{i:02d} [error] 1#0: *{i} problem-{i}\n" for i in range(50))
+    p.write_text(lines)
+    cfg = make_cfg(tmp_path)
+    st = {}
+    out = agent.collect_logs(st, cfg)
+    assert len(out) <= agent.LOG_MAX_PER_REPORT  # capped at 40/report
+    # an identical repeating line is not re-sent next cycle
+    with open(p, "a") as f:
+        f.write("2026/09/30 10:01:00 [error] 1#0: *99 problem-49\n")  # same msg text as one just sent
+    out2 = agent.collect_logs(st, cfg)
+    assert all("problem-49" != l["msg"] for l in out2) or out2 == []
+
+
+def test_collect_logs_failsoft_missing_file(tmp_path):
+    cfg = make_cfg(tmp_path, ERROR_LOG=str(tmp_path / "nope.log"))
+    assert agent.collect_logs({}, cfg) == []
+
+
+def test_bundle_version_from_file_and_fallback(tmp_path):
+    cfg = make_cfg(tmp_path)
+    assert agent.bundle_version(cfg).startswith("agent-")  # no file -> agent hash fallback
+    vf = tmp_path / "bundle.version"
+    vf.write_text("deadbeef1234\n")
+    assert agent.bundle_version(cfg) == "deadbeef1234"

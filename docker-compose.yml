@@ -15,6 +15,7 @@ x-controller: &controller
     DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn}
     BACKUP_DIR: /data/backups
     BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+    EDGE_BUNDLE_DIR: /srv/edge         # secret-free edge bundle served for one-command node install (SPEC §11.1)
   depends_on:
     - db
     - pdns
@@ -25,6 +26,7 @@ services:
     volumes:
       - controller-data:/data            # acme.sh home, backups (shared by every replica)
       - pdns-data:/pdns-data:ro          # PowerDNS sqlite DB (zones + DNSSEC keys), read for backups
+      - ./edge:/srv/edge:ro              # secret-free edge bundle served at /edge/bundle.tar.gz (SPEC §11.1)
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
       interval: 15s

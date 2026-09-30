@@ -38,10 +38,12 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     migrate.upgrade(any_engine, "0001")
     diff = _diff(any_engine)
     flat = [d for grp in diff for d in (grp if isinstance(grp, list) else [grp])]
-    # 0003: edge group / capacity / metrics columns; 0004: edges.cpu_high; 0005: probe fields
+    # 0003: edge group / capacity / metrics columns; 0004: edges.cpu_high; 0005: probe fields;
+    # 0009: logs / logs_at / bundle_version (centralized node logs + bundle version)
     added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "edges")
-    assert added == ["capacity_mbps", "cpu_high", "group", "load_high", "metrics", "metrics_at",
-                     "probe_at", "probe_error", "probe_fail", "probe_ms", "probe_ok", "shed"], diff
+    assert added == ["bundle_version", "capacity_mbps", "cpu_high", "group", "load_high", "logs",
+                     "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
+                     "probe_ms", "probe_ok", "shed"], diff
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff

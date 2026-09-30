@@ -17,10 +17,23 @@ def _raw_list(name: str) -> list[str]:
     return [x.strip() for x in os.getenv(name, "").split(",") if x.strip()]
 
 
+def _default_edge_dir() -> str:
+    """The repo's edge/ tree resolved relative to this package: <repo>/edge (controller/app -> ../../edge)."""
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "edge"))
+
+
 @dataclass
 class Settings:
     database_url: str = field(default_factory=lambda: os.getenv("DATABASE_URL", "sqlite:///./cdn.db"))
     admin_api_key: str = field(default_factory=lambda: os.getenv("ADMIN_API_KEY", ""))
+    # Public hostname of the controller API (as in .env.example, CONTROLLER_DOMAIN). Used to build
+    # the one-command edge install one-liner (SPEC §11.1); no scheme, https:// is prepended.
+    controller_domain: str = field(default_factory=lambda: os.getenv("CONTROLLER_DOMAIN", "").strip().rstrip("/"))
+    # directory the controller serves the (secret-free) edge bundle from (SPEC §11.1); default the
+    # repo's edge/ tree resolved relative to this package (<repo>/edge). In the container the image
+    # bakes edge/ there (set EDGE_BUNDLE_DIR to the baked path). Missing -> bundle routes return 404.
+    edge_bundle_dir: str = field(
+        default_factory=lambda: os.getenv("EDGE_BUNDLE_DIR", "").strip() or _default_edge_dir())
 
     # comma separated: every zone is written to all of them (ns1, ns2, ...)
     pdns_api_url: str = field(default_factory=lambda: os.getenv("PDNS_API_URL", "http://pdns:8081"))
