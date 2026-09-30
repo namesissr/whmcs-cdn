@@ -209,6 +209,10 @@
 .pcdna-clip { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--a-mono); font-size: 12px; text-align: left; }
 @media (max-width: 1180px) { .pcdna-clip { max-width: 150px; } }
 .pcdna-prices th, .pcdna-prices td { padding: 6px 12px; }
+/* §10.4 usage report carries an extra «درآمد» (revenue) column — keep all columns within the content width */
+.pcdna-usage th, .pcdna-usage td { padding-left: 8px; padding-right: 8px; }
+.pcdna-usage .pcdna-small { white-space: normal; }
+.pcdna-usage small { font-size: 11px; }
 
 /* ---------- buttons & forms */
 .pcdna .pcdna-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 13px; border-radius: 9px; border: 1px solid var(--a-border-strong);

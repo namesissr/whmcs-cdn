@@ -507,41 +507,54 @@ final class Wizard
     /** name => [subject, HTML body] of the templates the wizard manages. */
     public static function templates(array $ns): array
     {
-        $wrap = function (string $inner) {
-            return '<div dir="rtl" style="text-align:right;font-family:Tahoma,Arial,sans-serif;line-height:1.9;font-size:14px">' . "\n"
-                . $inner . "\n<p>{\$signature}</p>\n</div>";
+        // Branded RTL wrapper: a «پاسارگاد سی‌دی‌ان / پاسارگاد میزبان» header, the message, then a
+        // footer that always names the affected service domain, and the WHMCS signature.
+        $wrap = function (string $inner, string $accent = '#1d5fd6') {
+            return '<div dir="rtl" style="text-align:right;font-family:Tahoma,Arial,sans-serif;line-height:1.9;font-size:14px;color:#1f2933">' . "\n"
+                . '<div style="border-right:4px solid ' . $accent . ';padding:2px 12px;margin:0 0 14px">'
+                . '<div style="font-size:16px;font-weight:bold;color:' . $accent . '">پاسارگاد سی‌دی‌ان</div>'
+                . '<div style="font-size:12px;color:#7b8794">شبکه توزیع محتوا و امنیت وب پاسارگاد میزبان</div></div>' . "\n"
+                . $inner . "\n"
+                . '<p style="margin-top:16px;font-size:12px;color:#7b8794">این پیام درباره سرویس CDN دامنه '
+                . '<strong dir="ltr">{$service_domain}</strong> فرستاده شده است.</p>'
+                . "\n<p>{\$signature}</p>\n</div>";
         };
-        $btn = '<p><a href="{$whmcs_url}clientarea.php?action=addfunds" style="display:inline-block;background:#1d5fd6;color:#fff;'
-            . 'padding:8px 18px;border-radius:8px;text-decoration:none">شارژ کیف پول</a></p>';
+        // Primary call-to-action: charge the wallet. $manage links to the service (upgrade path).
+        $btn = '<p style="margin:14px 0"><a href="{$whmcs_url}clientarea.php?action=addfunds" style="display:inline-block;background:#1d5fd6;'
+            . 'color:#fff;padding:9px 20px;border-radius:8px;text-decoration:none;font-weight:bold">شارژ کیف پول</a></p>';
+        $manage = '<p style="margin:10px 0"><a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}" '
+            . 'style="display:inline-block;background:#eef2ff;color:#1d5fd6;padding:8px 18px;border-radius:8px;text-decoration:none;font-weight:bold">'
+            . 'مدیریت سرویس و ارتقای پلن</a></p>';
         return [
             self::EMAIL_NAME => [self::emailSubject(), self::emailBody($ns)],
-            self::EMAIL_EXHAUSTED => ['ترافیک سرویس CDN شما تمام شد — برای وصل شدن کیف پول را شارژ کنید', $wrap(
+            self::EMAIL_EXHAUSTED => ['ترافیک سرویس CDN دامنه {$service_domain} تمام شد — برای وصل شدن کیف پول را شارژ کنید', $wrap(
                 "<p>{\$client_name} عزیز، سلام</p>\n"
                 . "<p>ترافیک این ماه سرویس <strong>{\$service_product_name}</strong> برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> "
-                . "({\$cdn_used_gb} از {\$cdn_cap_gb} گیگابایت) تمام شده و سایت از طریق CDN سرو نمی‌شود.</p>\n"
-                . "{if \$cdn_limit_reached}<p>سقف خرید خودکار ترافیک این ماه برای سرویس شما پر شده است. برای ادامه، پلن را ارتقا دهید یا با پشتیبانی تماس بگیرید.</p>"
-                . "{else}<p>ترافیک اضافه به‌صورت بسته‌های {\$cdn_block_gb} گیگابایتی (هر بسته {\$cdn_block_price}) از اعتبار کیف پول شما خریده می‌شود. "
+                . "تمام شده است (<strong>{\$cdn_used_gb} از {\$cdn_cap_gb} گیگابایت</strong>) و سایت شما دیگر از طریق CDN پاسارگاد سرو نمی‌شود.</p>\n"
+                . "{if \$cdn_limit_reached}<p>سقف خرید خودکار ترافیک این ماه برای سرویس شما پر شده است. برای ادامه سرویس، پلن را ارتقا دهید یا با پشتیبانی پاسارگاد میزبان تماس بگیرید.</p>\n"
+                . $manage
+                . "{else}<p>ترافیک اضافه به‌صورت بسته‌های <strong>{\$cdn_block_gb} گیگابایتی</strong> (هر بسته {\$cdn_block_price}) خودکار از اعتبار کیف پول شما خریده می‌شود. "
                 . "اعتبار فعلی شما {\$cdn_credit} است؛ با شارژ دست‌کم <strong>{\$cdn_needed}</strong> سرویس ظرف چند ثانیه دوباره وصل می‌شود.</p>\n"
                 . $btn . "{/if}\n"
-                . '<p>برای ترافیک بیشتر در ماه‌های آینده می‌توانید پلن را از ناحیه کاربری ارتقا دهید: '
-                . '<a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}">مدیریت سرویس</a></p>')],
+                . '<p style="font-size:13px;color:#52606d">برای ترافیک بیشتر در ماه‌های آینده می‌توانید پلن را ارتقا دهید: '
+                . '<a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}">مدیریت سرویس</a></p>', '#d64545')],
             self::EMAIL_WARNING => ['هشدار: ترافیک سرویس CDN دامنه {$service_domain} رو به اتمام است', $wrap(
                 "<p>{\$client_name} عزیز، سلام</p>\n"
                 . "<p>از ترافیک این ماه سرویس <strong>{\$service_product_name}</strong> برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> "
-                . "{\$cdn_used_gb} از {\$cdn_cap_gb} گیگابایت مصرف شده است.</p>\n"
-                . "{if \$cdn_limit_reached}<p>سقف خرید خودکار ترافیک این ماه پر شده است؛ پس از اتمام ترافیک، سرویس تا ماه بعد قطع می‌شود مگر اینکه پلن را ارتقا دهید.</p>"
-                . "{else}<p>پس از اتمام، بسته‌های {\$cdn_block_gb} گیگابایتی (هر بسته {\$cdn_block_price}) خودکار از کیف پول خریده می‌شوند، "
-                . "اما اعتبار فعلی شما ({\$cdn_credit}) برای یک بسته کافی نیست. برای جلوگیری از قطع سرویس، دست‌کم {\$cdn_needed} شارژ کنید.</p>\n"
-                . $btn . "{/if}")],
+                . "<strong>{\$cdn_used_gb} از {\$cdn_cap_gb} گیگابایت</strong> مصرف شده است (بیش از ۹۰٪).</p>\n"
+                . "{if \$cdn_limit_reached}<p>سقف خرید خودکار ترافیک این ماه پر شده است؛ پس از اتمام ترافیک، سرویس تا ماه بعد قطع می‌شود مگر اینکه پلن را ارتقا دهید.</p>\n"
+                . $manage
+                . "{else}<p>پس از اتمام، بسته‌های <strong>{\$cdn_block_gb} گیگابایتی</strong> (هر بسته {\$cdn_block_price}) خودکار از کیف پول خریده می‌شوند، "
+                . "اما اعتبار فعلی شما ({\$cdn_credit}) برای یک بسته کافی نیست. برای جلوگیری از قطع سرویس، دست‌کم <strong>{\$cdn_needed}</strong> شارژ کنید.</p>\n"
+                . $btn . "{/if}", '#de911d')],
             self::EMAIL_FORECAST => ['پیش‌بینی اتمام ترافیک سرویس CDN دامنه {$service_domain}', $wrap(
                 "<p>{\$client_name} عزیز، سلام</p>\n"
                 . "<p>طبق روند مصرف این ماه، پیش‌بینی می‌شود ترافیک پلن سرویس <strong>{\$service_product_name}</strong> برای دامنه "
                 . "<strong dir=\"ltr\">{\$service_domain}</strong> حدود <strong>{\$cdn_days_left} روز دیگر</strong> تمام شود "
-                . "(تاکنون {\$cdn_used_gb} از {\$cdn_plan_gb} گیگابایت مصرف شده و حدود {\$cdn_remaining_gb} گیگابایت باقی مانده است).</p>\n"
+                . "(تاکنون <strong>{\$cdn_used_gb} از {\$cdn_plan_gb} گیگابایت</strong> مصرف شده و حدود <strong>{\$cdn_remaining_gb} گیگابایت</strong> باقی مانده است).</p>\n"
                 . "<p>برای جلوگیری از قطعی، می‌توانید اعتبار کیف پول را شارژ کنید تا پس از اتمام ترافیک پلن، بسته‌های ترافیک خودکار خریده شوند، "
-                . "یا برای صرفه‌جویی، پلن را به یک پلن با ترافیک بیشتر ارتقا دهید.</p>\n"
-                . $btn
-                . '<p><a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}">مدیریت سرویس و ارتقای پلن</a></p>')],
+                . "یا برای صرفه‌جویی در بلندمدت، پلن را به یک پلن با ترافیک بیشتر ارتقا دهید.</p>\n"
+                . $btn . $manage, '#1d5fd6')],
         ];
     }
 

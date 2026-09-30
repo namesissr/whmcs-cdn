@@ -32,6 +32,8 @@
   var WALLET = boot.wallet && typeof boot.wallet === 'object' && Number(boot.wallet.plan_gb) > 0 ? boot.wallet : null;
   // §10.2 smart-usage: forecast / upgrade suggestion markers the prepaid engine set this month.
   var SUGGEST = boot.suggest && typeof boot.suggest === 'object' && (boot.suggest.forecast || boot.suggest.upgrade) ? boot.suggest : null;
+  // §10.4 statement: this service's traffic top-ups (current + previous months) for the «صورت‌حساب و مصرف» page.
+  var STATEMENT = boot.statement && typeof boot.statement === 'object' ? boot.statement : null;
   var ADDFUNDS_URL = ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
   function money(v) {
     v = Number(v) || 0;
@@ -63,7 +65,7 @@
     { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'pools'] },
     { title: 'امنیت', items: ['firewall', 'waf', 'ddos', 'ratelimit', 'hotlink'] },
     { title: 'SSL و هدرها', items: ['ssl', 'headers', 'errorpages'] },
-    { title: 'گزارش‌ها', items: ['analytics', 'events', 'usage'] },
+    { title: 'گزارش‌ها', items: ['analytics', 'events', 'usage', 'statement'] },
     { title: 'توسعه‌دهندگان', items: ['apikeys'] }
   ];
   var pages = P.pages = P.pages || {};
@@ -1371,7 +1373,8 @@
     S: S, go: go, features: features, config: config, setConfig: setConfig, putSection: putSection, sectionForm: sectionForm,
     lockWrites: lockWrites, tutLink: tutLink, goLink: goLink, edgeIps: edgeIps, reloadSite: reloadSite, renderMain: renderMain,
     upgradeUrl: UPGRADE_URL, modeLabel: modeLabel, ensureAnalytics: ensureAnalytics, secTotal: secTotal, serviceId: SID,
-    reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL
+    reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
+    statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL
   };
 
   // ------------------------------------------------------------------ boot

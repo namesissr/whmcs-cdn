@@ -573,6 +573,107 @@ function pasargadcdn_wallet(array $params): ?array
     }
 }
 
+/** Persian (Jalali) «MMMM yyyy» label for a YYYY-MM month, or the month itself. */
+function pasargadcdn_month_label(string $month): string
+{
+    if (class_exists('\\IntlDateFormatter')) {
+        $f = new \IntlDateFormatter('fa_IR@calendar=persian', \IntlDateFormatter::NONE, \IntlDateFormatter::NONE,
+            'UTC', \IntlDateFormatter::TRADITIONAL, 'MMMM yyyy');
+        $s = $f->format(strtotime($month . '-15 12:00:00 UTC'));
+        if (is_string($s) && $s !== '') {
+            return $s;
+        }
+    }
+    return $month;
+}
+
+/**
+ * §10.4 «صورت‌حساب و مصرف» statement facts for the client app (read-only): this
+ * service's traffic top-ups over the current and previous months (date, GB,
+ * amount, WHMCS invoice id, status), grouped by month with paid subtotals, plus
+ * the plan's included traffic for the running summary. null on any error.
+ *
+ * Pure DB read of mod_pasargadcdn_topups — never touches billing, caps or credit.
+ */
+function pasargadcdn_statement(array $params): ?array
+{
+    try {
+        $sid = (int) ($params['serviceid'] ?? 0);
+        if ($sid <= 0) {
+            return null;
+        }
+        $row = pasargadcdn_product_row((int) ($params['pid'] ?? $params['packageid'] ?? 0));
+        $co = isset($params['configoptions']) && is_array($params['configoptions']) ? $params['configoptions']
+            : (pasargadcdn_config_options([$sid])[$sid] ?? []);
+        $pp = $row ? pasargadcdn_prepaid($row, $co) : null;
+        $o = $row ? pasargadcdn_overage($row) : null;
+
+        $client = Capsule::table('tblclients')->where('id', (int) ($params['userid'] ?? 0))->first(['currency']);
+        $cur = $client ? Capsule::table('tblcurrencies')->where('id', (int) $client->currency)->first(['code', 'suffix']) : null;
+        $unit = $cur ? (trim((string) $cur->suffix) !== '' ? trim((string) $cur->suffix) : (string) $cur->code) : '';
+
+        // Included traffic this month: prepaid plan GB, else overage included GB, else null (controller limit).
+        $planGb = $pp !== null ? (float) $pp['plan_gb'] : ($o !== null ? (float) $o['included_gb'] : null);
+
+        // The three most recent months, current first.
+        $anchor = strtotime(pasargadcdn_month() . '-01 12:00:00 UTC');
+        $months = [];
+        for ($i = 0; $i < 3; $i++) {
+            $months[] = gmdate('Y-m', strtotime('-' . $i . ' month', $anchor));
+        }
+
+        $topups = [];
+        if (Capsule::schema()->hasTable('mod_pasargadcdn_topups')) {
+            $topups = Capsule::table('mod_pasargadcdn_topups')->where('service_id', $sid)
+                ->whereIn('month', $months)->orderBy('created_at', 'desc')->orderBy('id', 'desc')
+                ->get(['month', 'gb', 'amount', 'blocks', 'status', 'invoice_id', 'created_at'])->all();
+        }
+
+        $byMonth = [];
+        foreach ($months as $m) {
+            $byMonth[$m] = ['month' => $m, 'label' => pasargadcdn_month_label($m), 'bought_gb' => 0, 'spent' => 0.0, 'topups' => []];
+        }
+        $totalGb = 0;
+        $totalSpent = 0.0;
+        foreach ($topups as $t) {
+            $m = (string) $t->month;
+            if (!isset($byMonth[$m])) {
+                continue;
+            }
+            $byMonth[$m]['topups'][] = [
+                'ts' => str_replace(' ', 'T', (string) $t->created_at),
+                'gb' => (int) $t->gb,
+                'amount' => round((float) $t->amount, 2),
+                'invoice_id' => $t->invoice_id ? (int) $t->invoice_id : 0,
+                'status' => (string) $t->status,
+            ];
+            if ($t->status === 'paid') {
+                $byMonth[$m]['bought_gb'] += (int) $t->gb;
+                $byMonth[$m]['spent'] += (float) $t->amount;
+                $totalGb += (int) $t->gb;
+                $totalSpent += (float) $t->amount;
+            }
+        }
+        foreach ($byMonth as &$mm) {
+            $mm['spent'] = round($mm['spent'], 2);
+        }
+        unset($mm);
+
+        return [
+            'currency' => $unit,
+            'plan_gb' => $planGb,
+            'prepaid' => $pp !== null,
+            'current_month' => pasargadcdn_month(),
+            'months' => array_values($byMonth),
+            'total_bought_gb' => $totalGb,
+            'total_spent' => round($totalSpent, 2),
+            'invoice_url' => 'viewinvoice.php?id=',
+        ];
+    } catch (\Throwable $e) {
+        return null;
+    }
+}
+
 /**
  * §10.2 smart-usage banner facts for the client app: the deduped forecast /
  * upgrade markers the prepaid engine set for THIS service in the current month
@@ -787,6 +888,7 @@ function pasargadcdn_ClientArea(array $params)
     $boot['billing'] = pasargadcdn_billing($params);
     $boot['wallet'] = pasargadcdn_wallet($params);
     $boot['suggest'] = pasargadcdn_suggest($params);
+    $boot['statement'] = pasargadcdn_statement($params);
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base);
     return [
@@ -813,7 +915,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'statement.js', 'app.js']),
     ];
 }
 

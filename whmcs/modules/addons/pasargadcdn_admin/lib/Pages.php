@@ -1618,7 +1618,7 @@ final class Pages
             return $h . View::card('', View::emptyState('برای این ماه مصرفی ثبت نشده است', '', 'chart')) . self::purchases($month);
         }
         $t = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-usage"><thead><tr><th>دامنه / محصول</th><th>سرویس / مشتری</th>'
-            . '<th>مصرف (GB)</th><th>پلن + خرید (GB)</th><th>مازاد (GB)</th><th>مبلغ</th></tr></thead><tbody>';
+            . '<th>مصرف (GB)</th><th>پلن + خرید (GB)</th><th>مازاد (GB)</th><th>مبلغ</th><th class="pcdna-num" title="جمع فاکتورهای خرید ترافیک این سرویس در این ماه">درآمد</th></tr></thead><tbody>';
         foreach ($rows as $r) {
             if ($r['prepaid']) {
                 $inv = implode(' ', array_map(function ($id) {
@@ -1640,11 +1640,13 @@ final class Pages
                 . '<td class="pcdna-num">' . View::n($r['used'], 2) . ($r['limit'] > 0 ? View::meter($r['used'] / $r['limit']) : '') . '</td>'
                 . '<td class="pcdna-num">' . $limitCell . '</td>'
                 . '<td class="pcdna-num">' . ($r['over'] > 0 ? '<strong>' . View::n($r['over'], 2) . '</strong>' : '<span class="pcdna-muted">۰</span>') . '</td>'
-                . '<td class="pcdna-num">' . $amountCell . '</td></tr>';
+                . '<td class="pcdna-num">' . $amountCell . '</td>'
+                . '<td class="pcdna-num">' . ($r['bought'] > 0 ? '<strong>' . $money($r['bought']) . '</strong> <small>' . View::e($r['bought_code']) . '</small>' : '<span class="pcdna-muted">۰</span>') . '</td></tr>';
         }
         $t .= '</tbody><tfoot><tr><th colspan="2">جمع</th><th class="pcdna-num">' . View::n($tot['used'], 2) . '</th><th class="pcdna-num">'
             . ($tot['bought_gb'] > 0 ? '<span class="pcdna-bought">+ ' . View::n($tot['bought_gb']) . '</span>' : '') . '</th><th class="pcdna-num">'
-            . View::n($tot['over'], 2) . '</th><th class="pcdna-num">' . (($bought || $amounts) ? implode('<br>', array_merge($bought, $amounts)) : '—') . '</th></tr></tfoot></table></div>';
+            . View::n($tot['over'], 2) . '</th><th class="pcdna-num">' . (($bought || $amounts) ? implode('<br>', array_merge($bought, $amounts)) : '—') . '</th>'
+            . '<th class="pcdna-num">' . ($bought ? implode('<br>', $bought) : '—') . '</th></tr></tfoot></table></div>';
         $h .= View::card('مصرف ' . View::digits($month), $t . '<p class="pcdna-muted pcdna-small pcdna-pad">پیش‌پرداخت: بسته‌های خریداری‌شده از کیف پول با فاکتور پرداخت‌شده ثبت می‌شوند. '
                 . 'حالت فاکتور پایان ماه: مبلغ تخمینی = مازاد × قیمت هر گیگابایت محصول × نرخ ارز مشتری؛ WHMCS مازاد را بر اساس مصرفی که کران روزانه (UsageUpdate) ثبت کرده در پایان ماه فاکتور می‌کند.</p>', '', 'pcdna-flush', 'chart');
         return $h . self::purchases($month);
@@ -1685,13 +1687,14 @@ final class Pages
         $fh = fopen('php://temp', 'w+');
         fwrite($fh, "\xEF\xBB\xBF");
         fputcsv($fh, ['شناسه سرویس', 'مشتری', 'دامنه', 'محصول', 'وضعیت', 'مصرف (GB)', 'سقف ترافیک (GB)', 'مازاد (GB)', 'مبلغ تخمینی', 'ارز', 'درخواست‌ها',
-            'خرید پیش‌پرداخت (GB)', 'مبلغ خرید پیش‌پرداخت', 'فاکتورهای خرید'], ',', '"', '\\');
+            'خرید پیش‌پرداخت (GB)', 'مبلغ خرید پیش‌پرداخت', 'فاکتورهای خرید', 'درآمد خرید ترافیک', 'ارز درآمد'], ',', '"', '\\');
         foreach ($rows as $r) {
             fputcsv($fh, [$r['service'] ?: '', self::csvSafe($r['client']), $r['domain'], self::csvSafe($r['product']), $r['status'],
                 number_format($r['used'], 3, '.', ''), $r['limit'] > 0 ? number_format($r['limit'], 3, '.', '') : '',
                 number_format($r['over'], 3, '.', ''), $r['amount'] === null ? '' : number_format($r['amount'], 2, '.', ''),
                 $r['currency'], $r['requests'], $r['bought_gb'] ?: '', $r['bought'] > 0 ? number_format($r['bought'], 2, '.', '') : '',
-                implode(' ', $r['invoices'])], ',', '"', '\\');
+                implode(' ', $r['invoices']),
+                $r['bought'] > 0 ? number_format($r['bought'], 2, '.', '') : '0', $r['bought'] > 0 ? $r['bought_code'] : ''], ',', '"', '\\');
         }
         rewind($fh);
         $csv = (string) stream_get_contents($fh);

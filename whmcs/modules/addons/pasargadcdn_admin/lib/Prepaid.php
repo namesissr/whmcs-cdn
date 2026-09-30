@@ -470,12 +470,23 @@ final class Prepaid
             return false;
         }
         $domain = Env::domain((string) $c->domain);
-        $desc = 'ترافیک اضافه CDN — ' . View::n($gb) . ' گیگابایت — ' . $domain . ' — ' . self::monthLabel($month);
+        // Per-GB rate in the client's currency, derived from the (unchanged) amount so the text can never
+        // disagree with the invoiced total: amount = blocks × blockPrice, gb = blocks × block_gb.
+        $unit = self::currencyUnit((int) $c->currency);
+        $perGb = $gb > 0 ? round($amount / $gb, ($amount / $gb) >= 100 ? 0 : 2) : 0.0;
+        $rateTxt = View::n($perGb, $perGb >= 100 ? 0 : 2) . ($unit !== '' ? ' ' . $unit : '');
+        // Explicit, human-readable Persian line item: GB purchased, per-GB rate, service domain, covered
+        // period and purchase date. Only the description text changes — never the amount, rate or math.
+        $desc = 'ترافیک اضافه CDN — ' . View::n($gb) . ' گیگابایت — ' . $domain
+            . ' — هر گیگابایت ' . $rateTxt
+            . ' — دوره ' . self::monthLabel($month)
+            . ' — تاریخ خرید ' . self::dateLabel();
         $r = Env::localApi('CreateInvoice', [
             'userid' => (int) $c->userid, 'status' => 'Unpaid', 'sendinvoice' => false, 'autoapplycredit' => true,
             'date' => date('Y-m-d'), 'duedate' => date('Y-m-d'),
             'itemdescription1' => $desc, 'itemamount1' => $amount, 'itemtaxed1' => !empty($c->tax),
-            'notes' => 'Pasargad CDN prepaid traffic — service #' . $sid,
+            'notes' => 'Pasargad CDN prepaid traffic — service #' . $sid . ' — ' . $gb . ' GB @ ' . View::digits((string) $perGb)
+                . ($unit !== '' ? ' ' . $unit : '') . '/GB — ' . $domain . ' — ' . $month,
         ]);
         $inv = (int) ($r['invoiceid'] ?? 0);
         if (($r['result'] ?? '') !== 'success' || $inv <= 0) {
@@ -751,6 +762,32 @@ final class Prepaid
         $tpl = ['exhausted' => self::TPL_EXHAUSTED, 'forecast' => self::TPL_FORECAST][$kind] ?? self::TPL_WARNING;
         $r = Env::localApi('SendEmail', ['messagename' => $tpl, 'id' => (int) $c->id, 'customvars' => base64_encode(serialize($vars))]);
         Env::log('prepaid: «' . $tpl . '» email for service #' . (int) $c->id . ' — ' . (($r['result'] ?? '') === 'success' ? 'sent' : 'failed: ' . ($r['message'] ?? '')), (int) $c->userid);
+    }
+
+    /** Client-currency unit (suffix, else code) for the invoice line item. */
+    private static function currencyUnit(int $currencyId): string
+    {
+        $cur = Capsule::table('tblcurrencies')->where('id', $currencyId)->first(['code', 'suffix']);
+        if (!$cur) {
+            return '';
+        }
+        $s = trim((string) $cur->suffix);
+        return $s !== '' ? $s : (string) $cur->code;
+    }
+
+    /** Persian (Jalali) purchase date for the invoice line item, e.g. «۹ مهر ۱۴۰۵». */
+    public static function dateLabel(?int $ts = null): string
+    {
+        $ts = $ts ?? self::now();
+        if (class_exists('\\IntlDateFormatter')) {
+            $f = new \IntlDateFormatter('fa_IR@calendar=persian', \IntlDateFormatter::NONE, \IntlDateFormatter::NONE,
+                'UTC', \IntlDateFormatter::TRADITIONAL, 'd MMMM yyyy');
+            $s = $f->format($ts);
+            if (is_string($s) && $s !== '') {
+                return $s;
+            }
+        }
+        return View::digits(gmdate('Y-m-d', $ts));
     }
 
     public static function monthLabel(string $month): string
