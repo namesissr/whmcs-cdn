@@ -148,7 +148,7 @@ function pasargadcdn_admin_sidebar($vars)
 {
     $link = htmlspecialchars((string) ($vars['modulelink'] ?? 'addonmodules.php?module=pasargadcdn_admin'), ENT_QUOTES, 'UTF-8');
     $items = ['dashboard' => 'داشبورد', 'sites' => 'سایت‌ها', 'edges' => 'نودها', 'plans' => 'پلن‌ها و قیمت‌گذاری',
-        'usage' => 'گزارش مصرف', 'events' => 'رویدادهای امنیتی', 'status' => 'وضعیت و رخدادها', 'settings' => 'تنظیمات و سلامت'];
+        'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'events' => 'رویدادهای امنیتی', 'status' => 'وضعیت و رخدادها', 'settings' => 'تنظیمات و سلامت'];
     $h = '<span class="header"><i class="fas fa-bolt"></i> CDN پاسارگاد</span><ul class="menu" dir="rtl" style="text-align:right">';
     foreach ($items as $page => $label) {
         $h .= '<li><a href="' . $link . '&amp;page=' . $page . '">' . $label . '</a></li>';

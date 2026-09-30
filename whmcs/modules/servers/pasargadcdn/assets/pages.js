@@ -193,7 +193,7 @@
 
   function purgeCard() {
     var c = P.card({ title: 'پاکسازی کش', icon: 'refresh', id: 'purge', subtitle: 'بعد از تغییر فایل‌های سایت، نسخه قدیمی را از کش حذف کنید.' });
-    var st = { urls: '' };
+    var st = { urls: '', prefixes: '' };
     var one = P.btn('پاکسازی آدرس‌ها', { kind: 'primary', icon: 'refresh', write: true, cls: 'pcdn-purge-urls', onclick: function () {
       var urls = st.urls.split(/\s+/).map(function (x) { return x.trim(); }).filter(Boolean);
       if (!urls.length) { P.toast('حداقل یک آدرس وارد کنید.', 'warn'); return; }
@@ -202,21 +202,37 @@
         P.toast(res.ok ? 'درخواست پاکسازی ' + num(urls.length) + ' آدرس ثبت شد و تا چند ثانیه روی همه سرورها اعمال می‌شود.' : P.errorText(res), res.ok ? 'success' : 'error');
       });
     } });
-    var all = P.btn('پاکسازی کامل', { kind: 'danger-soft', icon: 'trash', write: true, cls: 'pcdn-purge-all', onclick: function () {
-      P.confirm({ title: 'پاکسازی کامل کش', danger: true, ok: 'پاکسازی کامل',
+    var pfx = P.btn('پاک‌سازی بر اساس پیشوند', { kind: 'primary', icon: 'refresh', write: true, cls: 'pcdn-purge-prefixes', onclick: function () {
+      var prefixes = st.prefixes.split(/\s+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!prefixes.length) { P.toast('حداقل یک پیشوند وارد کنید.', 'warn'); return; }
+      if (prefixes.length > 20) { P.toast('حداکثر ۲۰ پیشوند در هر درخواست.', 'warn'); return; }
+      P.busy(pfx, P.api('POST', 'purge', { prefixes: prefixes })).then(function (res) {
+        P.toast(res.ok ? 'درخواست پاک‌سازی ' + num(prefixes.length) + ' پیشوند ثبت شد؛ همه فایل‌های زیر این مسیرها حذف می‌شوند.' : P.errorText(res), res.ok ? 'success' : 'error');
+      });
+    } });
+    var all = P.btn('پاک‌سازی کل کش', { kind: 'danger-soft', icon: 'trash', write: true, cls: 'pcdn-purge-all', onclick: function () {
+      P.confirm({ title: 'پاک‌سازی کل کش', danger: true, ok: 'پاک‌سازی کل کش',
         body: 'همه فایل‌های کش‌شده این دامنه حذف می‌شوند و تا پر شدن دوباره کش، سرور اصلی بار بیشتری دریافت می‌کند. اگر فقط چند فایل تغییر کرده، پاکسازی آدرس‌ها بهتر است.' })
         .then(function (ok) {
           if (!ok) return;
-          P.busy(all, P.api('POST', 'purge', { urls: [] })).then(function (res) {
-            P.toast(res.ok ? 'پاکسازی کامل کش ثبت شد.' : P.errorText(res), res.ok ? 'success' : 'error');
+          P.busy(all, P.api('POST', 'purge', { everything: true })).then(function (res) {
+            P.toast(res.ok ? 'پاک‌سازی کل کش ثبت شد.' : P.errorText(res), res.ok ? 'success' : 'error');
           });
         });
     } });
     append(c.body, [
-      P.field('آدرس‌ها (هر آدرس در یک خط، حداکثر ۱۰۰)', h('textarea', { className: 'pcdn-input pcdn-mono', dir: 'ltr', rows: 3, spellcheck: 'false',
+      P.field('آدرس‌ها (هر آدرس در یک خط، حداکثر ۱۰۰)', h('textarea', { className: 'pcdn-input pcdn-mono pcdn-purge-urls-input', dir: 'ltr', rows: 3, spellcheck: 'false',
         placeholder: 'https://' + domain() + '/css/style.css', oninput: function (e) { st.urls = e.target.value; } }),
       { help: h('span', null, 'نکته: به جای پاکسازی، می‌توانید نسخه را به آدرس فایل اضافه کنید (', ltr('style.css?v=2'), '). ', A().tutLink('cache', 'آموزش کش')) }),
-      h('div', { className: 'pcdn-row-actions' }, one, all)]);
+      h('div', { className: 'pcdn-row-actions' }, one),
+      h('div', { className: 'pcdn-purge-sep' }),
+      P.field('پیشوندهای مسیر (هر پیشوند در یک خط، حداکثر ۲۰)', h('textarea', { className: 'pcdn-input pcdn-mono pcdn-purge-prefixes-input', dir: 'ltr', rows: 2, spellcheck: 'false',
+        placeholder: '/blog/', oninput: function (e) { st.prefixes = e.target.value; } }),
+      { help: h('span', null, 'پاک‌سازی بر اساس پیشوند همه فایل‌های کش‌شده‌ای را که مسیرشان با پیشوند شروع می‌شود حذف می‌کند؛ مثلاً ', ltr('/blog/'), ' کل کش زیر آن مسیر را پاک می‌کند.') }),
+      h('div', { className: 'pcdn-row-actions' }, pfx),
+      h('div', { className: 'pcdn-purge-sep' }),
+      P.field('پاک‌سازی کل کش', h('p', { className: 'pcdn-muted pcdn-purge-all-help', text: 'همه فایل‌های کش‌شده این دامنه یک‌جا حذف می‌شوند. فقط وقتی لازم است که تغییرات گسترده باشد.' })),
+      h('div', { className: 'pcdn-row-actions' }, all)]);
     return c;
   }
 

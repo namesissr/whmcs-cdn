@@ -31,6 +31,13 @@
   --a-violet: #6532c9;
   --a-violet-50: #f3effd;
   --a-radius: 12px;
+  --a-c-req: #1d5fd6;
+  --a-c-hit: #0e7490;
+  --a-c-bytes: #6532c9;
+  --a-c-2xx: #13733a;
+  --a-c-3xx: #1d5fd6;
+  --a-c-4xx: #a24a06;
+  --a-c-5xx: #c11f1f;
   --a-shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 1px 3px rgba(15, 23, 42, .06);
   --a-font: 'PCDN Vazirmatn', Vazirmatn, Tahoma, 'Segoe UI', sans-serif;
   --a-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
@@ -481,3 +488,37 @@
 .pcdna .pcdna-incident-actions > form.pcdna-form { flex: 1 1 320px; min-width: 0; }
 .pcdna .pcdna-incident-actions > form.pcdna-form .pcdna-form-actions { margin-top: 10px; }
 .pcdna .pcdna-incident-actions > form.pcdna-inline { margin-bottom: 2px; }
+
+/* ------------------------------------------------------------------ platform analytics (§9.1) */
+.pcdna-analytics-bar { justify-content: space-between; }
+.pcdna-seg { display: inline-flex; background: var(--a-surface-2); border: 1px solid var(--a-border); border-radius: 10px; padding: 3px; gap: 2px; }
+.pcdna .pcdna-seg-item { display: inline-flex; align-items: center; justify-content: center; min-width: 68px; padding: 6px 14px; border-radius: 8px; font-weight: 600; font-size: 13px; color: var(--a-text-2); white-space: nowrap; }
+.pcdna .pcdna-seg-item:hover { color: var(--a-text); text-decoration: none; }
+.pcdna .pcdna-seg-item.is-active { background: var(--a-surface); color: var(--a-brand-600); box-shadow: var(--a-shadow); }
+.pcdna-chart { width: 100%; overflow: hidden; }
+.pcdna .pcdna-chart-svg { display: block; width: 100%; height: auto; max-width: 100%; }
+.pcdna-chart-grid { stroke: var(--a-border); stroke-width: 1; }
+.pcdna-chart-grid.is-base { stroke: var(--a-border-strong); }
+.pcdna-chart-axis { fill: var(--a-muted); font-size: 11px; font-family: var(--a-font); }
+.pcdna-chart-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 10px; padding: 0 2px; }
+.pcdna-chart-lg { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--a-text-2); }
+.pcdna-chart-lg > strong { color: var(--a-text); font-weight: 700; }
+.pcdna-chart-key { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.pcdna-barlist { display: flex; flex-direction: column; gap: 11px; }
+.pcdna-barlist > li { min-width: 0; }
+.pcdna-barlist-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.pcdna-barlist-label { font-weight: 600; color: var(--a-text-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pcdna-barlist-val { display: inline-flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+.pcdna-barlist-val > strong { font-weight: 700; }
+.pcdna-barlist-val .pcdna-muted { font-size: 12px; }
+.pcdna-barlist-track { display: block; height: 8px; background: var(--a-surface-2); border-radius: 99px; overflow: hidden; }
+.pcdna-barlist-bar { display: block; height: 100%; border-radius: 99px; background: var(--a-brand); min-width: 3px; }
+.pcdna-barlist-bar.pcdna-c-req { background: var(--a-c-req); }
+.pcdna-barlist-bar.pcdna-c-5xx { background: var(--a-c-5xx); }
+.pcdna-barlist-bar.pcdna-c-2xx { background: var(--a-c-2xx); }
+.pcdna-barlist-bar.pcdna-c-3xx { background: var(--a-c-3xx); }
+.pcdna-barlist-bar.pcdna-c-4xx { background: var(--a-c-4xx); }
+@media (max-width: 760px) {
+  .pcdna-analytics-bar { justify-content: center; }
+  .pcdna .pcdna-seg-item { min-width: 0; padding: 6px 12px; }
+}

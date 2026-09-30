@@ -542,6 +542,8 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-iconbtn.is-danger:hover:not(:disabled) { background: var(--pc-danger-50); color: var(--pc-danger); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-iconbtn:disabled { opacity: .35; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-purge-sep { height: 1px; background: var(--pc-border); margin: 16px 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-purge-all-help { margin: 0; font-size: 13px; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-row-btns { display: flex; gap: 2px; justify-content: flex-end; }
 
 :is(#pcdn-app, #pcdn-layer) .pcdn-copy { width: 28px; height: 28px; display: inline-grid; place-items: center; border-radius: 7px; color: var(--pc-muted); flex: none; position: relative; }

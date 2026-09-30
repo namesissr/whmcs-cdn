@@ -22,7 +22,8 @@ final class Pages
         'sites' => ['سایت‌ها', 'globe'],
         'edges' => ['نودها', 'server'],
         'plans' => ['پلن‌ها و قیمت‌گذاری', 'tag'],
-        'usage' => ['گزارش مصرف', 'chart'],
+        'analytics' => ['آنالیتیکس', 'chart'],
+        'usage' => ['گزارش مصرف', 'wallet'],
         'events' => ['رویدادهای امنیتی', 'shield'],
         'status' => ['وضعیت و رخدادها', 'activity'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
@@ -1734,6 +1735,331 @@ final class Pages
         $h .= View::card('رویدادهای امنیتی (' . View::n(count($events)) . ')', ($events ? ($chips !== '' ? '<p class="pcdna-pad">' . $chips . '</p>' : '')
             . self::eventTable($events, Data::servicesByDomain(), false) : View::emptyState('رویدادی با این فیلتر پیدا نشد', '', 'shield')), '', 'pcdna-flush', 'shield');
         return $h;
+    }
+
+    // ------------------------------------------------------------------ 7. platform analytics (SPEC §9.1)
+
+    const PERIODS = ['24h' => '۲۴ ساعت', '7d' => '۷ روز', '30d' => '۳۰ روز'];
+    const SEC_SRC = ['waf' => 'WAF', 'firewall' => 'فایروال', 'ratelimit' => 'محدودیت نرخ', 'challenge' => 'چالش', 'ddos' => 'DDoS', 'hotlink' => 'هات‌لینک'];
+    const STATUS_CLASSES = ['2xx' => ['موفق (2xx)', 'c-2xx'], '3xx' => ['ریدایرکت (3xx)', 'c-3xx'], '4xx' => ['خطای کاربر (4xx)', 'c-4xx'], '5xx' => ['خطای سرور (5xx)', 'c-5xx']];
+
+    /**
+     * «آنالیتیکس»: platform-wide traffic, cache performance, status codes, security
+     * events over time, top countries and top sites. GET /api/v1/analytics?period=.
+     */
+    public static function analytics(array $get): string
+    {
+        $period = in_array($get['period'] ?? '', ['24h', '7d', '30d'], true) ? (string) $get['period'] : '24h';
+        $h = self::analyticsBar($period);
+        $ping = self::ping();
+        if (!$ping['ok']) {
+            return $h . self::ctlError($ping);
+        }
+        $path = '/api/v1/analytics?period=' . $period;
+        $r = self::fetch([$path])[$path];
+        if (!self::ok($r)) {
+            return $h . View::alert('bad', 'دریافت آمار پلتفرم ممکن نشد: ' . View::e((string) $r['error']));
+        }
+        $a = (array) $r['data'];
+        $tot = (array) ($a['totals'] ?? []);
+        $series = array_values(array_filter((array) ($a['series'] ?? []), 'is_array'));
+        $st = (array) ($tot['status'] ?? []);
+        $sec = (array) ($tot['security'] ?? []);
+        $reqs = (int) ($tot['requests'] ?? 0);
+        $hits = (int) ($tot['cache_hits'] ?? 0);
+        $secTotal = 0;
+        foreach ($sec as $v) {
+            $secTotal += (int) $v;
+        }
+
+        // KPI tiles
+        $na = '<span class="pcdna-muted">—</span>';
+        $h .= '<div class="pcdna-kpis" data-analytics-kpis="1">';
+        $h .= View::kpi('chart', 'brand', 'کل درخواست‌ها', self::short($reqs), View::n($reqs) . ' درخواست در این بازه');
+        $h .= View::kpi('activity', 'violet', 'پهنای باند', View::bytes($tot['bytes'] ?? 0), 'حجم ارسال‌شده از همه سایت‌ها');
+        $h .= View::kpi('zap', 'ok', 'نرخ کش', $reqs > 0 ? View::n($hits * 100 / $reqs, 1) . '٪' : $na, self::short($hits) . ' پاسخ از کش');
+        $h .= View::kpi('shield', 'bad', 'رویدادهای امنیتی', View::n($secTotal), 'مسدود یا ثبت‌شده در همه سایت‌ها');
+        $h .= '</div>';
+
+        // traffic over time: requests + cache hits (area) and bytes (bars)
+        $labels = self::seriesLabels($series, $period);
+        if (!$series) {
+            $h .= View::card('ترافیک در طول زمان', View::emptyState('هنوز داده‌ای برای این بازه ثبت نشده است',
+                'پس از تغییر نیم‌سرورهای مشتری‌ها و عبور ترافیک از نودها، آمار اینجا نمایش داده می‌شود.', 'chart'), '', '', 'chart');
+        } else {
+            $reqVals = array_map(function ($p) { return (int) ($p['requests'] ?? 0); }, $series);
+            $hitVals = array_map(function ($p) { return (int) ($p['cache_hits'] ?? 0); }, $series);
+            $byteVals = array_map(function ($p) { return (float) ($p['bytes'] ?? 0); }, $series);
+            $reqChart = self::chart($labels, [
+                ['color' => 'var(--a-c-req)', 'name' => 'کل درخواست‌ها', 'total' => self::short($reqs), 'values' => $reqVals],
+                ['color' => 'var(--a-c-hit)', 'name' => 'پاسخ از کش', 'total' => self::short($hits), 'values' => $hitVals],
+            ], 'area', 'num', 'نمودار درخواست‌ها و پاسخ‌های کش‌شده');
+            $byteChart = self::chart($labels, [
+                ['color' => 'var(--a-c-bytes)', 'name' => 'ترافیک', 'total' => View::bytes($tot['bytes'] ?? 0), 'values' => $byteVals],
+            ], 'bar', 'bytes', 'نمودار ترافیک');
+            $h .= '<div class="pcdna-grid-2">'
+                . View::card('درخواست‌ها و کش', $reqChart, '', '', 'chart')
+                . View::card('ترافیک', $byteChart, '', '', 'activity') . '</div>';
+        }
+
+        // status codes + security over time
+        $statusCard = self::statusBreakdown($st, $reqs);
+        $secSeries = array_values(array_filter((array) ($a['security_series'] ?? []), 'is_array'));
+        if ($secSeries) {
+            $secLabels = self::seriesLabels($secSeries, $period);
+            $secVals = array_map(function ($p) { return (int) ($p['events'] ?? 0); }, $secSeries);
+            $secBody = self::chart($secLabels, [['color' => 'var(--a-c-5xx)', 'name' => 'رویدادهای امنیتی', 'total' => View::n($secTotal), 'values' => $secVals]], 'line', 'num', 'نمودار رویدادهای امنیتی در طول زمان')
+                . self::secSources($sec, $secTotal);
+        } else {
+            $secBody = $secTotal > 0 ? self::secSources($sec, $secTotal)
+                : View::emptyState('رویداد امنیتی ثبت نشده است', 'در این بازه درخواستی مسدود یا ثبت نشده است.', 'shield');
+        }
+        $h .= '<div class="pcdna-grid-2">'
+            . View::card('کدهای وضعیت', $statusCard, '', '', 'activity')
+            . View::card('رویدادهای امنیتی', $secBody, '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'events']) . '">مشاهده رویدادها</a>', '', 'shield')
+            . '</div>';
+
+        // top countries + top sites
+        $countries = array_values(array_filter((array) ($a['countries'] ?? []), 'is_array'));
+        $h .= '<div class="pcdna-grid-2">'
+            . View::card('کشورهای برتر', self::countryBars($countries, $reqs), '', '', 'globe')
+            . View::card('پرترافیک‌ترین سایت‌ها', self::topSites((array) ($a['sites'] ?? [])), '', 'pcdna-flush', 'chart')
+            . '</div>';
+        return $h;
+    }
+
+    /** Period switcher (24h / 7d / 30d) as a segmented control of links. */
+    private static function analyticsBar(string $cur): string
+    {
+        $h = '<div class="pcdna-filters pcdna-analytics-bar" data-analytics-period="' . View::e($cur) . '">'
+            . '<span class="pcdna-inline-label"><span>بازه زمانی</span></span>'
+            . '<div class="pcdna-seg" role="group" aria-label="بازه زمانی">';
+        foreach (self::PERIODS as $k => $lbl) {
+            $on = $k === $cur;
+            $h .= '<a class="pcdna-seg-item' . ($on ? ' is-active' : '') . '" href="' . View::url(['page' => 'analytics', 'period' => $k]) . '"'
+                . ($on ? ' aria-current="true"' : '') . ' data-period="' . View::e($k) . '">' . View::e($lbl) . '</a>';
+        }
+        return $h . '</div></div>';
+    }
+
+    /** Compact number: ۱٫۲ هزار / ۳٫۴ میلیون … using Latin K/M/B suffixes to stay short. */
+    public static function short($v): string
+    {
+        $v = (float) $v;
+        if ($v >= 1e9) {
+            return View::n($v / 1e9, 1) . 'B';
+        }
+        if ($v >= 1e6) {
+            return View::n($v / 1e6, 1) . 'M';
+        }
+        if ($v >= 1e3) {
+            return View::n($v / 1e3, 1) . 'K';
+        }
+        return View::n($v);
+    }
+
+    private static function niceMax($v): float
+    {
+        $v = (float) $v;
+        if ($v <= 0) {
+            return 1.0;
+        }
+        $p = pow(10, floor(log10($v)));
+        $n = $v / $p;
+        $m = $n <= 1 ? 1 : ($n <= 2 ? 2 : ($n <= 2.5 ? 2.5 : ($n <= 5 ? 5 : 10)));
+        return $m * $p;
+    }
+
+    /** X-axis labels: hour of day for 24h, month/day otherwise (Persian digits). */
+    private static function seriesLabels(array $series, string $period): array
+    {
+        $hourly = $period === '24h';
+        $out = [];
+        foreach ($series as $p) {
+            $t = strtotime((string) ($p['t'] ?? ''));
+            $out[] = $t === false ? '' : View::digits($hourly ? gmdate('H:i', $t) : gmdate('m/d', $t));
+        }
+        return $out;
+    }
+
+    private static function axisLabel(string $fmt, float $v): string
+    {
+        return $fmt === 'bytes' ? View::bytes($v) : self::short($v);
+    }
+
+    /**
+     * Static inline-SVG chart (area / bar / line), token colours only, responsive
+     * (viewBox + width:100%). No JS: consistent with the admin's server-rendered style.
+     * @param array $series list of ['color', 'name', 'total', 'values']
+     */
+    private static function chart(array $labels, array $series, string $type, string $axisFmt, string $aria): string
+    {
+        $n = count($labels);
+        $W = 640;
+        $H = 240;
+        $L = 58;
+        $R = 14;
+        $T = 14;
+        $B = 30;
+        $pw = $W - $L - $R;
+        $ph = $H - $T - $B;
+        $vals = [];
+        foreach ($series as $s) {
+            foreach ($s['values'] as $v) {
+                $vals[] = (float) $v;
+            }
+        }
+        $max = self::niceMax($vals ? max($vals) : 0);
+        $y = function ($v) use ($T, $ph, $max) {
+            return round($T + $ph - ($max > 0 ? ((float) $v / $max) * $ph : 0), 1);
+        };
+        $xAt = function ($i) use ($L, $pw, $n) {
+            return round($n > 1 ? $L + $i * $pw / ($n - 1) : $L + $pw / 2, 1);
+        };
+        $svg = '<svg viewBox="0 0 ' . $W . ' ' . $H . '" class="pcdna-chart-svg" preserveAspectRatio="none" role="img" aria-label="' . View::e($aria) . '">';
+        for ($i = 0; $i <= 4; $i++) {
+            $yy = $y($max * $i / 4);
+            $svg .= '<line x1="' . $L . '" x2="' . ($W - $R) . '" y1="' . $yy . '" y2="' . $yy . '" class="pcdna-chart-grid' . ($i === 0 ? ' is-base' : '') . '"/>'
+                . '<text x="' . ($L - 8) . '" y="' . ($yy + 4) . '" text-anchor="end" class="pcdna-chart-axis">' . View::e(self::axisLabel($axisFmt, $max * $i / 4)) . '</text>';
+        }
+        $step = max(1, (int) ceil($n / 7));
+        for ($i = 0; $i < $n; $i++) {
+            if ($i % $step === 0 && $labels[$i] !== '') {
+                $svg .= '<text x="' . $xAt($i) . '" y="' . ($H - 10) . '" text-anchor="middle" class="pcdna-chart-axis">' . View::e($labels[$i]) . '</text>';
+            }
+        }
+        foreach ($series as $s) {
+            $color = $s['color'];
+            if ($type === 'bar') {
+                $slot = $pw / max(1, $n);
+                $bw = max(2.0, min(26.0, $slot * 0.6));
+                for ($i = 0; $i < $n; $i++) {
+                    $yy = $y($s['values'][$i]);
+                    $bh = round($T + $ph - $yy, 1);
+                    if ($bh <= 0) {
+                        continue;
+                    }
+                    $x = round($L + $i * $slot + ($slot - $bw) / 2, 1);
+                    $svg .= '<rect x="' . $x . '" y="' . $yy . '" width="' . round($bw, 1) . '" height="' . $bh . '" rx="2" fill="' . View::e($color) . '"/>';
+                }
+            } else {
+                $d = '';
+                for ($i = 0; $i < $n; $i++) {
+                    $d .= ($i ? 'L' : 'M') . $xAt($i) . ' ' . $y($s['values'][$i]) . ' ';
+                }
+                $d = trim($d);
+                if ($type === 'area') {
+                    $svg .= '<path d="' . $d . ' L' . $xAt($n - 1) . ' ' . ($T + $ph) . ' L' . $xAt(0) . ' ' . ($T + $ph) . ' Z" fill="' . View::e($color) . '" fill-opacity="0.13" stroke="none"/>';
+                }
+                $svg .= '<path d="' . $d . '" fill="none" stroke="' . View::e($color) . '" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>';
+            }
+        }
+        $svg .= '</svg>';
+        $leg = '<div class="pcdna-chart-legend">';
+        foreach ($series as $s) {
+            $leg .= '<span class="pcdna-chart-lg"><span class="pcdna-chart-key" style="background:' . View::e($s['color']) . '"></span>'
+                . '<span>' . View::e((string) ($s['name'] ?? '')) . '</span>'
+                . (isset($s['total']) && $s['total'] !== '' ? '<strong class="pcdna-num">' . $s['total'] . '</strong>' : '') . '</span>';
+        }
+        $leg .= '</div>';
+        return '<div class="pcdna-chart" dir="ltr">' . $svg . '</div>' . $leg;
+    }
+
+    /** Status-code breakdown as coloured proportional bars (2xx/3xx/4xx/5xx). */
+    private static function statusBreakdown(array $st, int $reqs): string
+    {
+        $sum = 0;
+        foreach (self::STATUS_CLASSES as $k => $_) {
+            $sum += (int) ($st[$k] ?? 0);
+        }
+        if ($sum <= 0) {
+            return View::emptyState('کد وضعیتی ثبت نشده است', '', 'activity');
+        }
+        $h = '<ul class="pcdna-barlist" data-status-bars="1">';
+        foreach (self::STATUS_CLASSES as $k => [$label, $cls]) {
+            $v = (int) ($st[$k] ?? 0);
+            $ratio = $sum > 0 ? $v / $sum : 0;
+            $h .= '<li><div class="pcdna-barlist-row"><span class="pcdna-barlist-label">' . View::e($label) . '</span>'
+                . '<span class="pcdna-barlist-val"><strong class="pcdna-num">' . self::short($v) . '</strong><span class="pcdna-muted">'
+                . View::n($ratio * 100, 1) . '٪</span></span></div>'
+                . '<span class="pcdna-barlist-track"><span class="pcdna-barlist-bar pcdna-' . $cls . '" style="width:' . round(max($v > 0 ? 1 : 0, $ratio * 100), 1) . '%"></span></span></li>';
+        }
+        return $h . '</ul>';
+    }
+
+    /** Security events broken down by source (WAF, firewall, …) as bars. */
+    private static function secSources(array $sec, int $total): string
+    {
+        $rows = [];
+        foreach (self::SEC_SRC as $k => $label) {
+            $v = (int) ($sec[$k] ?? 0);
+            if ($v > 0) {
+                $rows[] = [$label, $v];
+            }
+        }
+        if (!$rows) {
+            return '<p class="pcdna-muted pcdna-small pcdna-pad">در این بازه رویداد امنیتی‌ای ثبت نشده است.</p>';
+        }
+        usort($rows, function ($a, $b) {
+            return $b[1] - $a[1];
+        });
+        $max = $rows[0][1] ?: 1;
+        $h = '<ul class="pcdna-barlist" data-sec-sources="1">';
+        foreach ($rows as [$label, $v]) {
+            $h .= '<li><div class="pcdna-barlist-row"><span class="pcdna-barlist-label">' . View::e($label) . '</span>'
+                . '<span class="pcdna-barlist-val"><strong class="pcdna-num">' . View::n($v) . '</strong>'
+                . '<span class="pcdna-muted">' . View::n($total > 0 ? $v * 100 / $total : 0, 1) . '٪</span></span></div>'
+                . '<span class="pcdna-barlist-track"><span class="pcdna-barlist-bar pcdna-c-5xx" style="width:' . round(max(1, $v * 100 / $max), 1) . '%"></span></span></li>';
+        }
+        return $h . '</ul>';
+    }
+
+    /** Top countries by requests (code + proportional bar). */
+    private static function countryBars(array $countries, int $reqs): string
+    {
+        $countries = array_slice(array_values(array_filter($countries, function ($c) {
+            return is_array($c) && (int) ($c['requests'] ?? 0) > 0;
+        })), 0, 10);
+        if (!$countries) {
+            return View::emptyState('هنوز داده‌ای برای کشورها ثبت نشده است', '', 'globe');
+        }
+        $max = max(array_map(function ($c) {
+            return (int) $c['requests'];
+        }, $countries)) ?: 1;
+        $h = '<ul class="pcdna-barlist" data-countries="1">';
+        foreach ($countries as $c) {
+            $code = strtoupper((string) ($c['code'] ?? '?'));
+            $v = (int) $c['requests'];
+            $h .= '<li><div class="pcdna-barlist-row"><span class="pcdna-barlist-label">' . View::ltr($code) . '</span>'
+                . '<span class="pcdna-barlist-val"><strong class="pcdna-num">' . View::n($v) . '</strong>'
+                . '<span class="pcdna-muted">' . View::n($reqs > 0 ? $v * 100 / $reqs : 0, 1) . '٪</span></span></div>'
+                . '<span class="pcdna-barlist-track"><span class="pcdna-barlist-bar pcdna-c-req" style="width:' . round(max(1, $v * 100 / $max), 1) . '%"></span></span></li>';
+        }
+        return $h . '</ul>';
+    }
+
+    /** Top-sites table (domain, requests, bytes) linking to the service in the admin. */
+    private static function topSites(array $sites): string
+    {
+        $sites = array_values(array_filter($sites, 'is_array'));
+        if (!$sites) {
+            return View::emptyState('هنوز ترافیکی ثبت نشده است', 'پس از عبور ترافیک از نودها، پرترافیک‌ترین سایت‌ها اینجا فهرست می‌شوند.', 'chart');
+        }
+        $byDomain = Data::servicesByDomain();
+        $maxB = max(1, (float) ($sites[0]['bytes'] ?? 1));
+        $t = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-topsites"><thead><tr><th>دامنه</th><th>درخواست</th><th>ترافیک</th><th></th></tr></thead><tbody>';
+        foreach (array_slice($sites, 0, 20) as $s) {
+            $domain = (string) ($s['domain'] ?? '?');
+            $svc = $byDomain[strtolower($domain)] ?? null;
+            $t .= '<tr><td>' . View::ltr($domain) . '</td>'
+                . '<td class="pcdna-num">' . View::n($s['requests'] ?? 0) . '</td>'
+                . '<td class="pcdna-num">' . View::bytes($s['bytes'] ?? 0) . View::meter((float) ($s['bytes'] ?? 0) / $maxB, 'brand') . '</td>'
+                . '<td class="pcdna-actions">' . ($svc
+                    ? '<a class="pcdna-btn pcdna-btn-sm" href="' . self::manageUrl((int) $svc->id) . '">مدیریت</a>'
+                        . '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::e(Data::serviceUrl((int) $svc->userid, (int) $svc->id)) . '" title="صفحه سرویس در WHMCS">#' . (int) $svc->id . '</a>'
+                    : View::badge('بدون سرویس', 'muted')) . '</td></tr>';
+        }
+        return $t . '</tbody></table></div>';
     }
 
     // ------------------------------------------------------------------ 8. status & incidents
