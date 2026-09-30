@@ -145,6 +145,14 @@ class Edge(Base):
     load_high: Mapped[int] = mapped_column(Integer, default=0)
     # consecutive metric reports with load1/cpus above EDGE_CPU_ALERT (edge_cpu alert)
     cpu_high: Mapped[int] = mapped_column(Integer, default=0)
+    # synthetic health probe (SPEC §8.1, job_probe): the controller itself fetches
+    # http://<ipv4>/__pcdn/health with Host: health.pcdn every ~60s to catch a node that
+    # still heartbeats but serves errors. probe_fail is the consecutive failure counter.
+    probe_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    probe_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    probe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    probe_fail: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class EdgeUptime(Base):
@@ -202,6 +210,38 @@ class SecurityEvent(Base):
     source: Mapped[str] = mapped_column(String(12), default="")
     rule: Mapped[str] = mapped_column(String(64), default="")
     user_agent: Mapped[str] = mapped_column(Text, default="")
+
+
+class Incident(Base):
+    """Operator-written incident shown on the public status page (SPEC §8.3)."""
+
+    __tablename__ = "incidents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text, default="")
+    # minor | major | maintenance
+    severity: Mapped[str] = mapped_column(String(16), default="minor")
+    # investigating | identified | monitoring | resolved | scheduled
+    status: Mapped[str] = mapped_column(String(16), default="investigating")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    updates: Mapped[list["IncidentUpdate"]] = relationship(
+        back_populates="incident", cascade="all, delete-orphan", order_by="IncidentUpdate.id"
+    )
+
+
+class IncidentUpdate(Base):
+    __tablename__ = "incident_updates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="investigating")
+    body: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    incident: Mapped[Incident] = relationship(back_populates="updates")
 
 
 class State(Base):

@@ -93,6 +93,12 @@ class Settings:
     # load shedding (SPEC §7.4): an edge using this % of its capacity_mbps leaves DNS answers
     # (while another edge of its pool stays) and comes back below this value - 15
     edge_shed_percent: float = field(default_factory=lambda: float(os.getenv("EDGE_SHED_PERCENT") or 90))
+    # synthetic edge probes (SPEC §8.1): the controller fetches /__pcdn/health from each edge
+    probe_enabled: bool = field(default_factory=lambda: _bool("PROBE_ENABLED", True))
+    probe_timeout: float = field(default_factory=lambda: float(os.getenv("PROBE_TIMEOUT") or 5))
+    probe_ipv6: bool = field(default_factory=lambda: _bool("PROBE_IPV6", True))
+    # consecutive probe failures before the edge_probe alert opens (edge still heartbeating)
+    probe_fail_checks: int = field(default_factory=lambda: int(os.getenv("PROBE_FAIL_CHECKS") or 3))
     ns_check_interval: int = field(default_factory=lambda: int(os.getenv("NS_CHECK_INTERVAL", "600")))
     ns_resolvers: list[str] = field(default_factory=lambda: _list("NS_RESOLVERS", "8.8.8.8,1.1.1.1"))
     scheduler_enabled: bool = field(default_factory=lambda: _bool("SCHEDULER_ENABLED", True))

@@ -138,8 +138,11 @@ def deep_health() -> tuple[dict, int]:
         online = len(online_edges(db))
         ups = up.summaries(db)
         worst = min((v["d30"] for v in ups.values() if v.get("d30") is not None), default=None)
+        probe_failing = sum(1 for e in edges if (e.probe_fail or 0) >= settings.probe_fail_checks)
         body["edges"] = {"enabled": len(edges), "online": online, "shed": sum(1 for e in edges if e.shed),
-                         "worst_uptime_30d": worst}
+                         "worst_uptime_30d": worst, "probe_failing": probe_failing}
+        if probe_failing:
+            warnings.append(f"{probe_failing} node(s) heartbeat but fail their health probe")
     except Exception:  # noqa: BLE001
         db.rollback()
     finally:
@@ -154,6 +157,24 @@ def deep_health() -> tuple[dict, int]:
     body["status"] = "degraded" if degraded else "ok"
     body["warnings"] = warnings
     return {"status": body.pop("status"), **body}, 200
+
+
+@health_router.get("/status.json")
+def status_json():
+    """Public status page data (SPEC §8.2): aggregate counts and operator incident text only,
+    never a node IP/name/region, customer domain, or any metric."""
+    from . import status as status_mod
+
+    db = SessionLocal()
+    try:
+        body = status_mod.public_status(db)
+    except Exception:  # noqa: BLE001 - the public page must never 500 on a transient error
+        db.rollback()
+        body = {"status": "operational", "updated_at": utcnow().isoformat() + "Z",
+                "nodes": {"total": 0, "online": 0}, "components": [], "incidents": []}
+    finally:
+        db.close()
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
 
 @health_router.get("/healthz/deep")

@@ -446,6 +446,8 @@ def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
         "applied_version": e.applied_version, "last_error": e.last_error,
         "group": e.group, "capacity_mbps": e.capacity_mbps, "metrics": edge_metrics(e), "shed": e.shed,
         "uptime": uptime if uptime is not None else {"h24": None, "d30": None},
+        "probe": {"ok": e.probe_ok, "ms": e.probe_ms,
+                  "at": e.probe_at.isoformat() + "Z" if e.probe_at else None, "error": e.probe_error},
     }
 
 

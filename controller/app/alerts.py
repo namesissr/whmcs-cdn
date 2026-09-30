@@ -312,7 +312,8 @@ def check_all(db, edges: bool = True) -> None:
 
     edges=False skips the edge checks right after a controller outage (see scheduler).
     """
-    for fn in ((check_edges, check_edge_load, check_edge_health) if edges else ()) + (check_certs, check_pdns):
+    for fn in ((check_edges, check_edge_load, check_edge_health, check_edge_probe) if edges else ()) \
+            + (check_certs, check_pdns):
         try:
             fn(db)
         except Exception:  # noqa: BLE001
@@ -448,6 +449,40 @@ def check_edge_health(db) -> None:
         return f"وضعیت نود {name} به حالت عادی برگشت." if name else "نود غیرفعال یا حذف شد؛ هشدار بسته شد."
 
     sync("edge_health:", active, normal)
+
+
+def check_edge_probe(db) -> None:
+    """edge_probe:{id} when a node heartbeats but its synthetic health check keeps failing.
+
+    "Reporting but broken": the agent is alive (last_seen fresh) yet the controller's own
+    fetch of /__pcdn/health has failed PROBE_FAIL_CHECKS times in a row. A node with no
+    heartbeat is left to the edge_offline alert instead.
+    """
+    from .models import Edge
+
+    now = utcnow()
+    cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
+    active, names = {}, {}
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
+        key = f"edge_probe:{e.id}"
+        names[key] = e.name
+        if e.last_seen_at is None or e.last_seen_at < cutoff:
+            continue  # no heartbeat: covered by edge_offline
+        if e.probe_ok is False and (e.probe_fail or 0) >= settings.probe_fail_checks:
+            active[key] = (
+                f"نود {e.name} گزارش می‌دهد ولی سالم نیست",
+                f"نود {e.name} ({e.ipv4}) هنوز گزارش می‌فرستد اما آزمون سلامت (health check) کنترلر "
+                f"روی آن {e.probe_fail} بار پیاپی ناموفق بوده است؛ احتمالاً nginx یا سرویس لبه درست کار "
+                f"نمی‌کند و درخواست‌ها با خطا پاسخ داده می‌شوند.\n"
+                f"خطا: {(e.probe_error or '-')[:400]}",
+                "warning",
+            )
+
+    def normal(cond):
+        name = names.get(cond["key"])
+        return f"آزمون سلامت نود {name} دوباره موفق شد." if name else "نود غیرفعال یا حذف شد؛ هشدار بسته شد."
+
+    sync("edge_probe:", active, normal)
 
 
 def check_certs(db) -> None:

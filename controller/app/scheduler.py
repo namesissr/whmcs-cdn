@@ -261,7 +261,25 @@ def job_geo(db, now: datetime | None = None, force: bool = False):
     alerts.sync("geo:", active, lambda c: "مسیریابی کشوری (GeoDNS) دوباره درست کار می‌کند.")
 
 
-JOBS = [job_edges, job_uptime, job_alerts, job_geo, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
+PROBE_INTERVAL = timedelta(seconds=60)
+
+
+def job_probe(db, now: datetime | None = None, force: bool = False):
+    """Every ~60s: synthetic health probe of every enabled edge (SPEC §8.1, leader only)."""
+    if not settings.probe_enabled:
+        return
+    from . import probe
+
+    now = now or utcnow()
+    last = _state(db, "probe:last_run")
+    if not force and last and now - datetime.fromisoformat(last) < PROBE_INTERVAL:
+        return
+    probe.run(db, now)
+    _set_state(db, "probe:last_run", now.isoformat())
+    db.commit()
+
+
+JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
 
 
 def run_once():

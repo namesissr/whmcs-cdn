@@ -456,3 +456,53 @@ Effective origin: `origin`; else every origin of `pool` (ok when any answers; TL
 protocol is https); else the apex's proxied record (or the first proxied host). SNI = `origin.sni` or
 the site domain. Addresses that are not public (after DNS resolution) are never contacted.
 `hours` is clamped to 1..744; `hours` has one zero-filled entry per hour, oldest first.
+
+---------------------------------------------------------------------------
+## 8. Reliability: synthetic edge probes, public status, incidents (WAVE 1)
+
+Goal: catch a node that still heartbeats but serves errors (e.g. a bad `nginx -t`), give
+customers a public status page, and let the operator post incidents.
+
+### 8.1 Synthetic edge probes
+- A scheduler job (`job_probe`, every ~60s, leader only) requests `http://<edge.ipv4>/__pcdn/health`
+  with `Host: health.pcdn` for every ENABLED edge, records latency and ok/fail, and (when the edge
+  also has IPv6 and PROBE_IPV6) the v6 address too. Timeout `PROBE_TIMEOUT` (default 5s). Never raises.
+- Stored on the Edge object as transient fields (not a new table): `probe_ok` (bool|null),
+  `probe_ms` (int|null), `probe_at` (iso|null), `probe_error` (str|null). Migration 0005 adds them.
+- Alert `edge_probe:{id}` (warning) when an edge is heartbeating (last_seen fresh) but its probe has
+  failed `PROBE_FAIL_CHECKS` (default 3) times in a row — i.e. "reporting but broken". Resolves when a
+  probe succeeds. Distinct from `edge_offline` (no heartbeat) and `edge_saturated`/`edge_health`.
+- `GET /api/v1/edges` edge object gains `probe: {ok, ms, at, error}`; `/healthz/deep` `edges` block
+  gains `probe_failing` (count).
+
+### 8.2 Public status (no auth, no secrets)
+- `GET /status.json` (public, on the health_router, never requires the admin key) →
+```json
+{"status": "operational|degraded|maintenance|major_outage",
+ "updated_at": "…Z",
+ "nodes": {"total": 6, "online": 6},          // counts only, NEVER IPs/names/locations
+ "components": [{"name": "شبکه توزیع محتوا (CDN)", "status": "operational"},
+                {"name": "سرویس تونل", "status": "operational"},
+                {"name": "DNS", "status": "operational"}],
+ "incidents": [{"id": 3, "title": "...", "body": "...", "severity": "minor|major|maintenance",
+                "status": "investigating|identified|monitoring|resolved",
+                "created_at": "…Z", "updated_at": "…Z",
+                "updates": [{"at": "…Z", "status": "...", "body": "..."}]}]}   // open + last 10 resolved
+```
+  Overall status = worst of: open incidents' severity, DNS reachability, and node availability
+  (major_outage when 0 nodes online, degraded when some down or a component degraded). It exposes
+  only aggregate counts and operator-written incident text — never a node IP, name, region, customer
+  domain, or any metric that could identify infrastructure.
+- A standalone static page `status/index.html` (in the repo, self-contained, RTL Persian, light/dark)
+  polls `/status.json` and renders it. The operator hosts it on any domain (or the WHMCS host).
+
+### 8.3 Incidents (admin)
+- Model `Incident` (id, title, body, severity, status, created_at, updated_at) and `IncidentUpdate`
+  (incident_id, status, body, created_at). Migration 0005.
+- Admin API (needs the admin key):
+  - `GET /api/v1/incidents?all=1` (open, or all with `all=1`, newest first),
+  - `POST /api/v1/incidents` {title, body, severity, status?},
+  - `POST /api/v1/incidents/{id}/updates` {status, body} (also moves the incident's status),
+  - `PATCH /api/v1/incidents/{id}` {title?, body?, severity?, status?}.
+  Resolving (`status: resolved`) sets updated_at; resolved incidents drop off `/status.json` after 10.
+- WHMCS admin: an "وضعیت و رخدادها" page to create/update/resolve incidents and see the public status.

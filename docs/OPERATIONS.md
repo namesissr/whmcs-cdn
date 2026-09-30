@@ -14,6 +14,7 @@
 - [۵. دسترس‌پذیری بالا (HA) برای سرور مرکزی](#۵-دسترسپذیری-بالا-ha-برای-سرور-مرکزی)
 - [۶. رمزنگاری کلیدهای خصوصی و مدیریت کلید](#۶-رمزنگاری-کلیدهای-خصوصی-و-مدیریت-کلید)
 - [۷. مانیتورینگ با /healthz/deep](#۷-مانیتورینگ-با-healthzdeep)
+- [۸. پایش سلامت نودها، صفحه وضعیت عمومی و رخدادها](#۸-پایش-سلامت-نودها-صفحه-وضعیت-عمومی-و-رخدادها-spec-8)
 - [مرجع دستورهای مدیریتی](#مرجع-دستورهای-مدیریتی)
 
 > در این سند، `manage` یعنی:
@@ -49,6 +50,10 @@
 | `BACKUP_PASSPHRASE` | خالی | رمز فایل پشتیبان (AES-256) |
 | `BACKUP_S3_ENDPOINT`، `BACKUP_S3_BUCKET`، `BACKUP_S3_ACCESS_KEY`، `BACKUP_S3_SECRET_KEY`، `BACKUP_S3_REGION`، `BACKUP_S3_PREFIX`، `BACKUP_S3_KEEP` | — | ارسال به فضای ابری سازگار با S3 (مثل Object Storage آروان) |
 | `INSTANCE_NAME` | نام کانتینر | نام این نمونه کنترلر در `/healthz/deep` و پیام‌ها |
+| `PROBE_ENABLED` | `true` | آزمون سلامت مصنوعی هر ۶۰ ثانیه از هر نود فعال (SPEC §8.1) |
+| `PROBE_TIMEOUT` | `5` | مهلت هر آزمون سلامت (ثانیه) |
+| `PROBE_IPV6` | `true` | آزمون آدرس IPv6 نود هم (سالم اگر هرکدام پاسخ دهند) |
+| `PROBE_FAIL_CHECKS` | `3` | شکست پیاپی لازم برای هشدار «گزارش می‌دهد ولی سالم نیست» |
 
 ---
 
@@ -686,6 +691,48 @@ docker compose exec controller python -m app.manage drop-unreadable-secrets --ye
 */2 * * * * curl -fsS --max-time 10 https://cdn-api.pasargadmizban.com/healthz/deep | grep -q '"status":"ok"' \
   || curl -s "https://tg-relay.example.com/bot<TOKEN>/sendMessage" -d chat_id=<ID> -d text="CDN controller NOT OK"
 ```
+
+---
+
+## ۸. پایش سلامت نودها، صفحه وضعیت عمومی و رخدادها (SPEC §8)
+
+### آزمون سلامت مصنوعی (synthetic probes)
+
+هر حدود ۶۰ ثانیه، کنترلر (فقط نمونه leader) خودش از هر نود فعال آدرس
+`http://<node>/__pcdn/health` را با هدر `Host: health.pcdn` می‌خواند و زمان پاسخ و موفق/ناموفق بودن
+آن را ذخیره می‌کند. این کار نودی را می‌گیرد که هنوز heartbeat می‌فرستد (agent سالم است) اما درخواست‌ها
+را با خطا پاسخ می‌دهد — مثلاً بعد از یک `nginx -t` خراب. موفقیت یعنی HTTP 200 که بدنه‌اش با `ok` شروع
+شود. اگر نود IPv6 داشته باشد و `PROBE_IPV6=true` باشد، آدرس IPv6 هم آزمایش می‌شود؛ نود سالم شمرده
+می‌شود اگر **هرکدام** از دو خانواده آدرس پاسخ دهند و خانواده ناموفق در `probe_error` ثبت می‌شود.
+
+پس از `PROBE_FAIL_CHECKS` (پیش‌فرض ۳) شکست پیاپی، در حالی که نود هنوز heartbeat می‌فرستد، هشدار
+`edge_probe:{id}` («نود گزارش می‌دهد ولی سالم نیست») ارسال می‌شود؛ با یک آزمون موفق برطرف می‌شود. اگر
+نود اصلاً heartbeat نفرستد، همان هشدار `edge_offline` پوشش می‌دهد و این هشدار ارسال نمی‌شود. نتیجه در
+`GET /api/v1/edges` (فیلد `probe`) و شمار نودهای ناسالم در `GET /healthz/deep` (`edges.probe_failing`)
+دیده می‌شود. تنظیم‌ها: `PROBE_ENABLED`، `PROBE_TIMEOUT`، `PROBE_IPV6`، `PROBE_FAIL_CHECKS`.
+
+### صفحه وضعیت عمومی
+
+`GET /status.json` (بدون احراز هویت، مانند `/healthz`) وضعیت کلی سرویس را برمی‌گرداند: وضعیت کلی، شمار
+کلی/آنلاین نودها (فقط عدد)، سه مؤلفه (CDN، سرویس تونل، DNS) و متن رخدادهای نوشته‌شده توسط اپراتور. این
+پاسخ **هیچ‌گاه** آدرس IP، نام، منطقه نود، دامنه مشتری یا معیاری که زیرساخت را لو دهد نمایش نمی‌دهد؛ فقط
+اعداد جمعی و متن رخدادها. صفحه ثابت `status/index.html` (فارسی، RTL، روشن/تیره) این آدرس را می‌خواند و
+نمایش می‌دهد؛ آن را روی هر دامنه‌ای (یا میزبان WHMCS) قرار دهید.
+
+### رخدادها (incidents)
+
+اپراتور با API زیر (نیازمند کلید ادمین) رخداد می‌سازد و به‌روزرسانی می‌کند:
+
+```text
+GET   /api/v1/incidents[?all=1]          # باز، یا همه با all=1، جدیدترین اول
+POST  /api/v1/incidents                  # {title, body, severity, status?}
+POST  /api/v1/incidents/{id}/updates     # {status, body} — وضعیت رخداد را هم جابه‌جا می‌کند
+PATCH /api/v1/incidents/{id}             # {title?, body?, severity?, status?}
+```
+
+`severity` یکی از `minor`، `major`، `maintenance` و `status` یکی از `investigating`، `identified`،
+`monitoring`، `resolved`، `scheduled` است. رخداد `resolved` پس از ۱۰ رخداد برطرف‌شده از `status.json`
+حذف می‌شود ولی همچنان با `?all=1` دیده می‌شود.
 
 ---
 

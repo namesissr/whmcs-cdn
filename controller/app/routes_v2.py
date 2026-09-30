@@ -17,7 +17,7 @@ from . import pdns, sections, ssl, tunnel
 from .auth import require_admin
 from .config import settings
 from .db import get_db
-from .models import Record, SecurityEvent, Site, UsageHourly, utcnow
+from .models import Incident, IncidentUpdate, Record, SecurityEvent, Site, UsageHourly, utcnow
 from .routes_admin import RecordIn, _record_from, bad, get_site
 from .services import site_to_dict, sync_site_dns
 from .validation import ValidationError
@@ -360,6 +360,104 @@ def overview(db: Session = Depends(get_db)):
                       for sid, b in usage.most_common(10)],
         "nameservers": settings.nameservers,
     }
+
+
+# ------------------------------------------------------------------ incidents (SPEC §8.3)
+
+INCIDENT_SEVERITIES = ("minor", "major", "maintenance")
+INCIDENT_STATUSES = ("investigating", "identified", "monitoring", "resolved", "scheduled")
+
+
+class IncidentIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=20000)
+    severity: str
+    status: str = "investigating"
+
+
+class IncidentUpdateIn(BaseModel):
+    status: str
+    body: str = Field(default="", max_length=20000)
+
+
+class IncidentPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    body: str | None = Field(default=None, max_length=20000)
+    severity: str | None = None
+    status: str | None = None
+
+
+def _check_severity(sev: str):
+    if sev not in INCIDENT_SEVERITIES:
+        bad(ValidationError("شدت باید یکی از minor، major یا maintenance باشد"))
+
+
+def _check_status(st: str):
+    if st not in INCIDENT_STATUSES:
+        bad(ValidationError("وضعیت باید یکی از investigating، identified، monitoring، resolved یا scheduled باشد"))
+
+
+def _get_incident(db: Session, incident_id: int) -> Incident:
+    inc = db.get(Incident, incident_id)
+    if inc is None:
+        raise HTTPException(404, "رخداد یافت نشد")
+    return inc
+
+
+@router.get("/incidents")
+def list_incidents(all: bool = False, db: Session = Depends(get_db)):
+    from .status import incident_dict
+
+    q = select(Incident).order_by(Incident.id.desc())
+    if not all:
+        q = q.where(Incident.status != "resolved")
+    return [incident_dict(i) for i in db.scalars(q)]
+
+
+@router.post("/incidents", status_code=201)
+def create_incident(body: IncidentIn, db: Session = Depends(get_db)):
+    from .status import incident_dict
+
+    _check_severity(body.severity)
+    _check_status(body.status)
+    inc = Incident(title=body.title.strip(), body=body.body, severity=body.severity, status=body.status)
+    db.add(inc)
+    db.flush()
+    inc.updates.append(IncidentUpdate(status=body.status, body=body.body))
+    db.commit()
+    return incident_dict(inc)
+
+
+@router.post("/incidents/{incident_id}/updates", status_code=201)
+def add_incident_update(incident_id: int, body: IncidentUpdateIn, db: Session = Depends(get_db)):
+    from .status import incident_dict
+
+    _check_status(body.status)
+    inc = _get_incident(db, incident_id)
+    inc.updates.append(IncidentUpdate(status=body.status, body=body.body))
+    inc.status = body.status
+    inc.updated_at = utcnow()
+    db.commit()
+    return incident_dict(inc)
+
+
+@router.patch("/incidents/{incident_id}")
+def update_incident(incident_id: int, body: IncidentPatch, db: Session = Depends(get_db)):
+    from .status import incident_dict
+
+    inc = _get_incident(db, incident_id)
+    data = body.model_dump(exclude_none=True)
+    if "severity" in data:
+        _check_severity(data["severity"])
+    if "status" in data:
+        _check_status(data["status"])
+    if not data:
+        bad(ValidationError("هیچ تغییری ارسال نشده است"))
+    for k, v in data.items():
+        setattr(inc, k, v.strip() if k == "title" else v)
+    inc.updated_at = utcnow()
+    db.commit()
+    return incident_dict(inc)
 
 
 @router.get("/events")
