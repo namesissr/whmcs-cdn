@@ -312,7 +312,8 @@ def check_all(db, edges: bool = True) -> None:
 
     edges=False skips the edge checks right after a controller outage (see scheduler).
     """
-    for fn in ((check_edges, check_edge_load, check_edge_health, check_edge_probe) if edges else ()) \
+    for fn in ((check_edges, check_edge_load, check_edge_health, check_edge_probe,
+                check_edge_address_probe) if edges else ()) \
             + (check_certs, check_pdns):
         try:
             fn(db)
@@ -483,6 +484,48 @@ def check_edge_probe(db) -> None:
         return f"آزمون سلامت نود {name} دوباره موفق شد." if name else "نود غیرفعال یا حذف شد؛ هشدار بسته شد."
 
     sync("edge_probe:", active, normal)
+
+
+def check_edge_address_probe(db) -> None:
+    """edge_address_down:{address_id} when an ADDITIONAL address of a heartbeating node fails its
+    synthetic health check PROBE_FAIL_CHECKS times in a row (SPEC §12.2).
+
+    The primary keeps the edge_probe alert; this covers the extra addresses added for failover.
+    A node with no heartbeat is left to edge_offline, and a disabled address (operator
+    maintenance) is not an incident. Resolves when the address recovers, is removed, or disabled.
+    """
+    from .models import Edge
+
+    now = utcnow()
+    cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
+    active, names = {}, {}
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
+        if e.last_seen_at is None or e.last_seen_at < cutoff:
+            continue  # no heartbeat: covered by edge_offline
+        for a in e.addresses:
+            key = f"edge_address_down:{a.id}"
+            names[key] = (e.name, a.ip)
+            if not a.enabled:
+                continue  # maintenance: not an incident
+            if a.probe_ok is False and (a.probe_fail or 0) >= settings.probe_fail_checks:
+                fam = 6 if a.family == 6 else 4
+                active[key] = (
+                    f"آدرس {a.ip} روی نود {e.name} قطع است",
+                    f"آدرس اضافی IPv{fam} «{a.ip}» نود {e.name} در آزمون سلامت (health check) کنترلر "
+                    f"{a.probe_fail} بار پیاپی ناموفق بوده و از پاسخ‌های DNS حذف شده است "
+                    f"(تا زمانی که دست‌کم یک آدرس دیگر همان خانواده سالم بماند).\n"
+                    f"خطا: {(a.probe_error or '-')[:400]}",
+                    "warning",
+                )
+
+    def normal(cond):
+        info = names.get(cond["key"])
+        if info is None:
+            return "آدرس حذف شد یا نود غیرفعال شد؛ هشدار بسته شد."
+        name, ip = info
+        return f"آدرس {ip} روی نود {name} دوباره سالم شد."
+
+    sync("edge_address_down:", active, normal)
 
 
 def check_certs(db) -> None:

@@ -7,14 +7,14 @@ from typing import Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import bundle, nscheck, pdns, sections
+from . import bundle, dnsbuild, nscheck, pdns, sections
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
-from .models import ApiKey, Edge, Record, Site, UsageHourly, utcnow
+from .models import ApiKey, Edge, EdgeAddress, Record, Site, UsageHourly, utcnow
 from .services import (
     refresh_quota,
     month_start,
@@ -104,6 +104,11 @@ def _clean_label(label: str | None) -> str | None:
     return label or None
 
 
+def _clean_addr_label(label: str | None) -> str:
+    """Edge-address label: stored as "" when absent (SPEC §12.1, String(64))."""
+    return (label or "").strip()[:64]
+
+
 class SiteSettings(BaseModel):
     cache_enabled: bool | None = None
     dev_mode: bool | None = None
@@ -148,6 +153,22 @@ class EdgePatch(BaseModel):
     group: Literal["general", "tunnel"] | None = None
     capacity_mbps: int | None = Field(default=None, ge=0, le=10_000_000)
     region: str | None = Field(default=None, pattern="^(home|global)$")
+
+
+class EdgeAddressIn(BaseModel):
+    """Add an additional address to an edge (SPEC §12.4)."""
+    model_config = ConfigDict(extra="forbid")
+    family: Literal[4, 6]
+    ip: str
+    label: str | None = None
+
+
+class EdgeAddressPatch(BaseModel):
+    """Edit / enable / disable an additional address (SPEC §12.4). The family is fixed."""
+    model_config = ConfigDict(extra="forbid")
+    ip: str | None = None
+    label: str | None = None
+    enabled: bool | None = None
 
 
 class EdgeBatchIn(BaseModel):
@@ -585,6 +606,38 @@ def dns_sync(domain: str, db: Session = Depends(get_db)):
 
 # ------------------------------------------------------------------ edges
 
+def _probe_dict(ok, ms, at, error) -> dict:
+    return {"ok": ok, "ms": ms, "at": at.isoformat() + "Z" if at else None, "error": error}
+
+
+def address_to_dict(a: EdgeAddress) -> dict:
+    """One additional address with its per-address health and current DNS-advertise state (§12)."""
+    return {
+        "id": a.id, "family": a.family, "ip": a.ip, "label": a.label, "enabled": a.enabled,
+        "primary": False,
+        "advertised": dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail),
+        "probe": _probe_dict(a.probe_ok, a.probe_ms, a.probe_at, a.probe_error),
+    }
+
+
+def _advertised_counts(e: Edge) -> dict:
+    """How many addresses of each family are currently advertised in DNS (primary + additional).
+
+    Per-address health only; the DNS fail-open (dnsbuild.edge_pools) can still advertise a
+    withdrawn address when a pool would otherwise be empty.
+    """
+    counts = {"4": 0, "6": 0}
+    primary_ok = dnsbuild.address_advertised(True, e.probe_ok, e.probe_fail)
+    if e.ipv4 and primary_ok:
+        counts["4"] += 1
+    if e.ipv6 and primary_ok:
+        counts["6"] += 1
+    for a in e.addresses:
+        if dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail):
+            counts["6" if a.family == 6 else "4"] += 1
+    return counts
+
+
 def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
     return {
         "id": e.id, "name": e.name, "ipv4": e.ipv4, "ipv6": e.ipv6, "region": e.region,
@@ -594,6 +647,9 @@ def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
         "uptime": uptime if uptime is not None else {"h24": None, "d30": None},
         "probe": {"ok": e.probe_ok, "ms": e.probe_ms,
                   "at": e.probe_at.isoformat() + "Z" if e.probe_at else None, "error": e.probe_error},
+        # additional addresses + per-family advertised counts (multi-address failover, SPEC §12)
+        "addresses": [address_to_dict(a) for a in e.addresses],
+        "advertised": _advertised_counts(e),
         # centralized logs hint (SPEC §11.2): the full lines come from GET /edges/{id}/logs
         "logs_at": e.logs_at.isoformat() + "Z" if e.logs_at else None,
         "has_logs": bool(e.logs and e.logs not in ("[]", "null")),
@@ -731,3 +787,111 @@ def edge_logs(edge_id: int, db: Session = Depends(get_db)):
         lines = []
     return {"name": edge.name, "logs_at": edge.logs_at.isoformat() + "Z" if edge.logs_at else None,
             "lines": lines}
+
+
+# ------------------------------------------------------------------ edge addresses (SPEC §12)
+
+def _get_edge(db: Session, edge_id: int) -> Edge:
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    return edge
+
+
+def _address_in_use(db: Session, ip: str, exclude_id: int | None = None) -> bool:
+    """True when `ip` already belongs to ANY edge — a primary (ipv4/ipv6) or an additional
+    address (SPEC §12.4: reject duplicates of any edge's address)."""
+    if db.scalar(select(Edge.id).where(or_(Edge.ipv4 == ip, Edge.ipv6 == ip))) is not None:
+        return True
+    q = select(EdgeAddress.id).where(EdgeAddress.ip == ip)
+    if exclude_id is not None:
+        q = q.where(EdgeAddress.id != exclude_id)
+    return db.scalar(q) is not None
+
+
+def _primary_entry(e: Edge, family: int) -> dict | None:
+    """The primary address of a family as an address entry (health = the edge-level probe)."""
+    ip = e.ipv4 if family == 4 else e.ipv6
+    if not ip:
+        return None
+    return {
+        "id": None, "family": family, "ip": ip, "label": "primary", "enabled": True, "primary": True,
+        "advertised": dnsbuild.address_advertised(True, e.probe_ok, e.probe_fail),
+        "probe": _probe_dict(e.probe_ok, e.probe_ms, e.probe_at, e.probe_error),
+    }
+
+
+@router.get("/edges/{edge_id}/addresses")
+def list_edge_addresses(edge_id: int, db: Session = Depends(get_db)):
+    """Primary + additional addresses with per-address health (SPEC §12.4). The primary is the
+    node's identity address (edges.ipv4/ipv6) and cannot be deleted; correct it via PATCH
+    /api/v1/edges/{id}."""
+    edge = _get_edge(db, edge_id)
+    return {
+        "edge_id": edge.id, "name": edge.name,
+        "primary": [p for p in (_primary_entry(edge, 4), _primary_entry(edge, 6)) if p],
+        "additional": [address_to_dict(a) for a in edge.addresses],
+        "advertised": _advertised_counts(edge),
+    }
+
+
+@router.post("/edges/{edge_id}/addresses", status_code=201)
+def add_edge_address(edge_id: int, body: EdgeAddressIn, db: Session = Depends(get_db)):
+    """Add an additional address to a node (SPEC §12.4). Validated, family-matched, and rejected
+    when the address already belongs to any edge."""
+    edge = _get_edge(db, edge_id)
+    try:
+        ip = validate_ip(body.ip, body.family)
+    except ValidationError as e:
+        bad(e)
+    if _address_in_use(db, ip):
+        raise HTTPException(409, "این آدرس قبلاً برای یکی از نودها ثبت شده است")
+    a = EdgeAddress(edge_id=edge.id, family=body.family, ip=ip, label=_clean_addr_label(body.label))
+    db.add(a)
+    db.commit()
+    db.refresh(edge)
+    return {"address": address_to_dict(a), "edge": edge_to_dict(edge), "dns_failed": sync_all_dns(db)}
+
+
+@router.patch("/edges/{edge_id}/addresses/{address_id}")
+def update_edge_address(edge_id: int, address_id: int, body: EdgeAddressPatch,
+                        db: Session = Depends(get_db)):
+    """Edit / rename / enable / disable an additional address (SPEC §12.4). The family is fixed;
+    a changed IP starts its health over. `enabled=false` withdraws it from DNS immediately."""
+    edge = _get_edge(db, edge_id)
+    a = db.get(EdgeAddress, address_id)
+    if a is None or a.edge_id != edge.id:
+        raise HTTPException(404, "address not found")
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        bad(ValidationError("هیچ تغییری ارسال نشده است"))
+    if changes.get("ip") is not None:
+        try:
+            ip = validate_ip(changes["ip"], a.family)  # family cannot change on edit
+        except ValidationError as e:
+            bad(e)
+        if _address_in_use(db, ip, exclude_id=a.id):
+            raise HTTPException(409, "این آدرس قبلاً برای یکی از نودها ثبت شده است")
+        if ip != a.ip:  # a new address is unprobed again -> advertised until it fails
+            a.ip = ip
+            a.probe_ok = a.probe_ms = a.probe_at = a.probe_error = None
+            a.probe_fail = 0
+    if "label" in changes:
+        a.label = _clean_addr_label(changes["label"])
+    if changes.get("enabled") is not None:
+        a.enabled = changes["enabled"]
+    db.commit()
+    db.refresh(edge)
+    return {"address": address_to_dict(a), "edge": edge_to_dict(edge), "dns_failed": sync_all_dns(db)}
+
+
+@router.delete("/edges/{edge_id}/addresses/{address_id}")
+def delete_edge_address(edge_id: int, address_id: int, db: Session = Depends(get_db)):
+    """Remove an additional address (SPEC §12.4). The primary cannot be deleted."""
+    edge = _get_edge(db, edge_id)
+    a = db.get(EdgeAddress, address_id)
+    if a is None or a.edge_id != edge.id:
+        raise HTTPException(404, "address not found")
+    db.delete(a)
+    db.commit()
+    return {"ok": True, "dns_failed": sync_all_dns(db)}

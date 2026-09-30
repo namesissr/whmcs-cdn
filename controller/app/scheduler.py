@@ -68,6 +68,18 @@ def dns_signature() -> str:
                      str(settings.geo_log)])
 
 
+def edge_dns_state(e) -> str:
+    """Per-edge fingerprint of everything that changes a zone's edge answers: identity, region,
+    group, load shedding, and — for multi-address failover (SPEC §12) — the advertised state of
+    the primary and of every additional address (health, enable/disable, add/remove)."""
+    flags = [f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}:{e.group}:{int(dnsbuild.is_shed(e))}",
+             f"p{int(dnsbuild.address_advertised(True, e.probe_ok, e.probe_fail))}"]
+    for a in sorted(e.addresses, key=lambda a: a.id):
+        flags.append(f"a{a.id}:{a.family}:{a.ip}:{int(a.enabled)}:"
+                     f"{int(dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail))}")
+    return "/".join(flags)
+
+
 def job_edges(db):
     """Resync every zone when the set of healthy edges changes, or after a failed DNS write."""
     if not edge_reports_trusted(db):
@@ -75,8 +87,8 @@ def job_edges(db):
     # the DNS settings and the record format are part of the state: changing GEOIP_ENABLED,
     # GEO_* or upgrading the controller rewrites every zone on the next tick
     # group and load shedding decide which edges answer (dnsbuild.dns_edges): part of the state too
-    current = ",".join(f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}:{e.group}:{int(dnsbuild.is_shed(e))}"
-                       for e in online_edges(db)) + "|" + dns_signature()
+    # per-address advertisement (probe health / enable / add-remove) is part of the state too (§12)
+    current = ",".join(edge_dns_state(e) for e in online_edges(db)) + "|" + dns_signature()
     dirty = db.get(State, DNS_DIRTY_KEY) is not None
     if current == _state(db, "online_edges") and not dirty:
         return

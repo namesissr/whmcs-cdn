@@ -166,6 +166,40 @@ class Edge(Base):
     # current bundle (GET /edge/version) to flag nodes that are behind ("update available")
     bundle_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # additional addresses of the same node for health-based failover (SPEC §12); ipv4/ipv6
+    # above stay the primary address
+    addresses: Mapped[list["EdgeAddress"]] = relationship(
+        back_populates="edge", cascade="all, delete-orphan", order_by="EdgeAddress.id"
+    )
+
+
+class EdgeAddress(Base):
+    """An additional address of an edge node (SPEC §12). The edge's own ipv4/ipv6 remain its
+    primary (identity) address; these are extra addresses of the SAME node between which DNS
+    fails over based ONLY on the synthetic health probe (§8.1). Each address carries its own
+    probe health and can be enabled/disabled by the operator for maintenance."""
+
+    __tablename__ = "edge_addresses"
+    # the same address can't be registered twice for a family (backstop; the endpoint also
+    # rejects duplicates of any edge's primary or additional address)
+    __table_args__ = (UniqueConstraint("family", "ip", name="uq_edge_addresses_family_ip"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id", ondelete="CASCADE"), index=True)
+    family: Mapped[int] = mapped_column(Integer)  # 4 | 6
+    ip: Mapped[str] = mapped_column(String(45))
+    label: Mapped[str] = mapped_column(String(64), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # per-address synthetic probe (SPEC §12.2); probe_fail is the consecutive-failure counter
+    probe_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    probe_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    probe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    probe_fail: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    edge: Mapped["Edge"] = relationship(back_populates="addresses")
+
 
 class EdgeUptime(Base):
     """Per-edge, per-hour availability rollup: how many scheduler samples found the edge

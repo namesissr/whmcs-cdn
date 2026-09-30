@@ -131,14 +131,57 @@ def diag_expression(home_alive: bool, global_alive: bool) -> str:
             f"..' resolver='..who:toString()..' country='..c..' pool='..{pool}")
 
 
+def address_advertised(enabled: bool, probe_ok: bool | None, probe_fail: int | None) -> bool:
+    """Whether one address (primary or additional, SPEC §12.1) may appear in DNS.
+
+    Advertised while the address is enabled AND it is healthy (probe_ok True) or never probed
+    yet (probe_ok None) OR it has not yet failed PROBE_FAIL_CHECKS probes in a row. It is only
+    withdrawn once its probe_fail reaches PROBE_FAIL_CHECKS (the same threshold as the §8.1
+    alert), so a single transient probe failure never yanks it; `enabled=false` (operator
+    maintenance) withdraws it immediately.
+    """
+    if not enabled:
+        return False
+    return probe_ok is True or probe_ok is None or (probe_fail or 0) < settings.probe_fail_checks
+
+
+def _edge_family_addresses(e, family: int) -> list[tuple[str, bool, bool]]:
+    """(ip, enabled, advertised) for every address of the edge in `family`: the primary
+    (edges.ipv4/ipv6, whose health is the edge-level probe) + every additional EdgeAddress."""
+    out: list[tuple[str, bool, bool]] = []
+    ip = e.ipv4 if family == 4 else e.ipv6
+    if ip:
+        out.append((ip, True, address_advertised(True, getattr(e, "probe_ok", None),
+                                                  getattr(e, "probe_fail", 0))))
+    for a in (getattr(e, "addresses", None) or []):
+        if getattr(a, "family", None) == family and getattr(a, "ip", None):
+            out.append((a.ip, bool(a.enabled),
+                        address_advertised(bool(a.enabled), a.probe_ok, a.probe_fail)))
+    return out
+
+
 def edge_pools(edges: list[Edge], family: int) -> tuple[list[str], list[str]]:
-    home, global_ = [], []
+    """The home and global pools of `family` addresses: for each edge, ALL of its advertised
+    addresses (primary + additional, SPEC §12.3), not just the single primary.
+
+    Fail-open (§12.3): if health withdrawal would leave a pool EMPTY, the withdrawal is ignored
+    for that pool and its known (enabled) addresses are advertised anyway — a pool is NEVER
+    emptied by health state. Operator-disabled addresses are never resurrected by fail-open.
+    """
+    known: dict[str, list[str]] = {"home": [], "global": []}   # enabled, ignoring health
+    adv: dict[str, list[str]] = {"home": [], "global": []}      # enabled and advertised
     for e in edges:
-        ip = e.ipv4 if family == 4 else e.ipv6
-        if not ip:
-            continue
-        (home if e.region == "home" else global_).append(ip)
-    return sorted(home), sorted(global_)
+        region = "home" if e.region == "home" else "global"
+        for ip, enabled, advertised in _edge_family_addresses(e, family):
+            if not enabled:
+                continue
+            known[region].append(ip)
+            if advertised:
+                adv[region].append(ip)
+    # fail-open: never emit an empty pool because of health withdrawal
+    home = adv["home"] or known["home"]
+    global_ = adv["global"] or known["global"]
+    return sorted(set(home)), sorted(set(global_))
 
 
 def site_edge_group(site) -> str:
