@@ -17,7 +17,7 @@ if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
  */
 final class Admin
 {
-    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'usage', 'events', 'settings', 'manage', 'api'];
+    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'usage', 'events', 'status', 'settings', 'manage', 'api'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -82,6 +82,9 @@ final class Admin
                 break;
             case 'events':
                 $body = Pages::events($get);
+                break;
+            case 'status':
+                $body = Pages::status($state);
                 break;
             case 'settings':
                 $body = Pages::settings();
@@ -191,6 +194,12 @@ final class Admin
             case 'wizard_edit':
             case 'wizard_apply':
                 return self::wizard($action, $post, $admin);
+            case 'incident_create':
+                return self::incidentCreate($post, $admin);
+            case 'incident_update':
+                return self::incidentUpdate($post, $admin);
+            case 'incident_resolve':
+                return self::incidentResolve((int) ($post['id'] ?? 0), $admin);
             case 'save_server':
                 $sid = (int) ($post['server'] ?? 0);
                 if ($sid !== 0 && !Env::serverById($sid)) {
@@ -467,5 +476,90 @@ final class Admin
         Env::cacheDelete(WidgetData::KEY);
         return [[['ok', 'راه‌اندازی انجام شد: ' . View::n($n['create']) . ' مورد ساخته و ' . View::n($n['update']) . ' مورد به‌روزرسانی شد.']],
             ['summary' => $summary]];
+    }
+
+    // ------------------------------------------------------------------ 8. incidents / public status
+
+    const INC_SEVERITY = ['minor', 'major', 'maintenance'];
+    const INC_STATUS = ['investigating', 'identified', 'monitoring', 'resolved'];
+
+    /** POST /api/v1/incidents {title, body, severity, status?} */
+    private static function incidentCreate(array $post, int $admin): array
+    {
+        $old = [
+            'title' => Env::input($post['title'] ?? ''),
+            'body' => Env::input($post['body'] ?? ''),
+            'severity' => Env::input($post['severity'] ?? ''),
+            'status' => Env::input($post['status'] ?? 'investigating') ?: 'investigating',
+        ];
+        $e = [];
+        if (function_exists('mb_strlen') ? mb_strlen($old['title']) < 3 : strlen($old['title']) < 3) {
+            $e[] = 'عنوان رخداد را وارد کنید (حداقل ۳ نویسه).';
+        }
+        if ($old['body'] === '') {
+            $e[] = 'متن رخداد را وارد کنید.';
+        }
+        if (!in_array($old['severity'], self::INC_SEVERITY, true)) {
+            $e[] = 'شدت رخداد نامعتبر است.';
+        }
+        if (!in_array($old['status'], self::INC_STATUS, true)) {
+            $e[] = 'وضعیت اولیه نامعتبر است.';
+        }
+        if ($e) {
+            return [array_map(function ($m) {
+                return ['bad', View::e($m)];
+            }, $e), ['incident_form' => $old]];
+        }
+        try {
+            Env::api(10)->post('/api/v1/incidents', ['title' => $old['title'], 'body' => $old['body'],
+                'severity' => $old['severity'], 'status' => $old['status']]);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('ثبت رخداد ناموفق بود: ' . $ex->getMessage())]], ['incident_form' => $old]];
+        }
+        Env::log('incident "' . $old['title'] . '" (' . $old['severity'] . '/' . $old['status'] . ') created by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'رخداد «' . View::e($old['title']) . '» ثبت شد.']], []];
+    }
+
+    /** POST /api/v1/incidents/{id}/updates {status, body} — also moves the incident status. */
+    private static function incidentUpdate(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $status = Env::input($post['status'] ?? '');
+        $body = Env::input($post['body'] ?? '');
+        if ($id <= 0) {
+            return [[['bad', 'شناسه رخداد نامعتبر است.']], []];
+        }
+        if (!in_array($status, self::INC_STATUS, true)) {
+            return [[['bad', 'وضعیت به‌روزرسانی نامعتبر است.']], []];
+        }
+        if ($body === '') {
+            return [[['bad', 'متن به‌روزرسانی را وارد کنید.']], []];
+        }
+        try {
+            Env::api(10)->post('/api/v1/incidents/' . $id . '/updates', ['status' => $status, 'body' => $body]);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('ثبت به‌روزرسانی ناموفق بود: ' . $ex->getMessage())]], []];
+        }
+        Env::log('incident #' . $id . ' updated to ' . $status . ' by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'به‌روزرسانی رخداد #' . View::n($id) . ' ثبت شد.']], []];
+    }
+
+    /** Quick resolve: posts a "resolved" update so it lands in the timeline too. */
+    private static function incidentResolve(int $id, int $admin): array
+    {
+        if ($id <= 0) {
+            return [[['bad', 'شناسه رخداد نامعتبر است.']], []];
+        }
+        try {
+            Env::api(10)->post('/api/v1/incidents/' . $id . '/updates',
+                ['status' => 'resolved', 'body' => 'این رخداد برطرف شد و سرویس‌ها به وضعیت عادی بازگشتند.']);
+        } catch (\Throwable $ex) {
+            return [[['bad', View::e('برطرف‌کردن رخداد ناموفق بود: ' . $ex->getMessage())]], []];
+        }
+        Env::log('incident #' . $id . ' resolved by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'رخداد #' . View::n($id) . ' برطرف شد.']], []];
     }
 }

@@ -24,8 +24,17 @@ final class Pages
         'plans' => ['پلن‌ها و قیمت‌گذاری', 'tag'],
         'usage' => ['گزارش مصرف', 'chart'],
         'events' => ['رویدادهای امنیتی', 'shield'],
+        'status' => ['وضعیت و رخدادها', 'activity'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
     ];
+
+    const INC_SEVERITY = ['minor' => ['کم‌اهمیت', 'warn'], 'major' => ['پراهمیت', 'bad'], 'maintenance' => ['تعمیرات', 'brand']];
+    const INC_STATUS = ['investigating' => ['در حال بررسی', 'bad'], 'identified' => ['علت شناسایی شد', 'warn'],
+        'monitoring' => ['در حال پایش', 'brand'], 'resolved' => ['برطرف شد', 'ok']];
+    const OVERALL_STATUS = ['operational' => ['همه‌چیز عادی است', 'ok'], 'degraded' => ['اختلال جزئی', 'warn'],
+        'maintenance' => ['تعمیرات برنامه‌ریزی‌شده', 'brand'], 'major_outage' => ['قطعی گسترده', 'bad']];
+    const COMPONENT_STATUS = ['operational' => ['عادی', 'ok'], 'degraded' => ['اختلال جزئی', 'warn'],
+        'partial_outage' => ['اختلال جزئی', 'warn'], 'maintenance' => ['تعمیرات', 'brand'], 'major_outage' => ['قطعی', 'bad']];
 
     const WHMCS_STATUS = [
         'Active' => ['فعال', 'ok'], 'Suspended' => ['معلق', 'bad'], 'Pending' => ['در انتظار', 'warn'],
@@ -1725,6 +1734,157 @@ final class Pages
         $h .= View::card('رویدادهای امنیتی (' . View::n(count($events)) . ')', ($events ? ($chips !== '' ? '<p class="pcdna-pad">' . $chips . '</p>' : '')
             . self::eventTable($events, Data::servicesByDomain(), false) : View::emptyState('رویدادی با این فیلتر پیدا نشد', '', 'shield')), '', 'pcdna-flush', 'shield');
         return $h;
+    }
+
+    // ------------------------------------------------------------------ 8. status & incidents
+
+    /**
+     * "وضعیت و رخدادها": the public status the customers see (/status.json) plus the
+     * incident console (create / update / resolve). SPEC §8.2–8.3.
+     */
+    public static function status(array $state = []): string
+    {
+        $ctlUrl = Env::controllerUrl();
+        $ping = self::ping();
+        // Hint about the standalone public status page — shown whether or not the controller is up.
+        $h = self::statusHint($ctlUrl);
+        if (!$ping['ok']) {
+            return $h . self::ctlError($ping);
+        }
+        $incPath = '/api/v1/incidents?all=1';
+        $r = self::fetch(['/status.json', $incPath]);
+        $pub = self::ok($r['/status.json']) ? (array) $r['/status.json']['data'] : null;
+        $h .= self::publicStatusCard($pub, $r['/status.json']['error'] ?? '');
+        $h .= self::incidentForm($state['incident_form'] ?? []);
+        $inc = self::ok($r[$incPath]) ? (array) $r[$incPath]['data'] : null;
+        if ($inc === null) {
+            $h .= View::card('رخدادها', View::alert('bad', 'فهرست رخدادها دریافت نشد: ' . View::e((string) ($r[$incPath]['error'] ?? ''))), '', 'pcdna-flush', 'activity');
+        } else {
+            $h .= self::incidentList($inc);
+        }
+        return $h;
+    }
+
+    private static function statusHint(string $ctlUrl): string
+    {
+        $public = $ctlUrl !== '' ? $ctlUrl . '/status.json' : '/status.json';
+        $body = '<p class="pcdna-muted">صفحهٔ وضعیت عمومی مشتریان یک صفحهٔ ایستا و مستقل در پوشهٔ '
+            . '<code dir="ltr">status/</code> مخزن پروژه است. آن را روی هر میزبان ایستا (همان دامنهٔ WHMCS یا یک زیردامنه مثل '
+            . View::ltr('status.example.com') . ') آپلود کنید؛ اگر روی دامنهٔ دیگری میزبانی شد، با پارامتر '
+            . '<code dir="ltr">?api=</code> یا ثابت <code dir="ltr">API_BASE</code> آن را به کنترلر وصل کنید.</p>'
+            . '<p class="pcdna-label">نشانی فایل عمومی وضعیت (JSON):</p>' . View::copyable($public, 'کپی نشانی');
+        return View::card('صفحهٔ وضعیت عمومی', $body, '', '', 'globe');
+    }
+
+    private static function publicStatusCard(?array $pub, string $error): string
+    {
+        if ($pub === null || !isset($pub['status'])) {
+            return View::card('آنچه مشتریان می‌بینند', View::alert('warn', 'وضعیت عمومی (/status.json) دریافت نشد'
+                . ($error !== '' ? ': ' . View::e($error) : '.')), '', 'pcdna-flush', 'activity');
+        }
+        [$label, $tone] = self::OVERALL_STATUS[$pub['status']] ?? [(string) $pub['status'], 'muted'];
+        $banner = '<div class="pcdna-status-banner pcdna-t-' . $tone . '">' . View::dot($tone)
+            . '<strong>' . View::e($label) . '</strong>'
+            . '<span class="pcdna-status-when">به‌روزرسانی: ' . View::e(View::ago($pub['updated_at'] ?? '')) . '</span></div>';
+        $comps = '';
+        foreach ((array) ($pub['components'] ?? []) as $c) {
+            if (!is_array($c)) {
+                continue;
+            }
+            [$cl, $ct] = self::COMPONENT_STATUS[$c['status'] ?? ''] ?? [(string) ($c['status'] ?? '—'), 'muted'];
+            $comps .= '<li><span>' . View::e((string) ($c['name'] ?? '')) . '</span>' . View::badge($cl, $ct) . '</li>';
+        }
+        $nodes = is_array($pub['nodes'] ?? null) ? $pub['nodes'] : [];
+        $nodesLine = isset($nodes['total'])
+            ? '<p class="pcdna-status-nodes">نودها: <strong>' . View::n((int) ($nodes['online'] ?? 0)) . '</strong> آنلاین از <strong>'
+                . View::n((int) $nodes['total']) . '</strong> نود (فقط شمارش؛ IP یا نام نودها هرگز افشا نمی‌شود).</p>'
+            : '';
+        $body = $banner . ($comps !== '' ? '<ul class="pcdna-status-comps">' . $comps . '</ul>' : '') . $nodesLine;
+        return View::card('آنچه مشتریان می‌بینند', $body, '', '', 'activity');
+    }
+
+    private static function incidentForm(array $old): string
+    {
+        $sev = View::select('severity', ['minor' => 'کم‌اهمیت', 'major' => 'پراهمیت', 'maintenance' => 'تعمیرات برنامه‌ریزی‌شده'], $old['severity'] ?? 'minor');
+        $st = View::select('status', ['investigating' => 'در حال بررسی', 'identified' => 'علت شناسایی شد', 'monitoring' => 'در حال پایش'], $old['status'] ?? 'investigating');
+        $form = '<form method="post" action="' . View::url(['page' => 'status']) . '" class="pcdna-form">' . View::csrf()
+            . '<input type="hidden" name="a" value="incident_create"><div class="pcdna-form-grid">'
+            . '<label class="pcdna-col-2"><span>عنوان رخداد</span><input class="pcdna-input" name="title" required maxlength="160" placeholder="اختلال در دسترسی به برخی سایت‌ها" value="' . View::e($old['title'] ?? '') . '"></label>'
+            . '<label><span>شدت</span>' . $sev . '</label>'
+            . '<label><span>وضعیت اولیه</span>' . $st . '</label>'
+            . '<label class="pcdna-col-2"><span>توضیح</span><textarea class="pcdna-input" name="body" rows="3" required placeholder="آنچه به مشتری نمایش داده می‌شود…">' . View::e($old['body'] ?? '') . '</textarea></label>'
+            . '</div><div class="pcdna-form-actions"><button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('plus') . '<span>ثبت رخداد جدید</span></button></div></form>';
+        return View::card('ثبت رخداد جدید', $form, '', '', 'plus');
+    }
+
+    private static function incidentList(array $incidents): string
+    {
+        // newest first by updated_at (fallback created_at)
+        usort($incidents, function ($a, $b) {
+            return strcmp((string) ($b['updated_at'] ?? $b['created_at'] ?? ''), (string) ($a['updated_at'] ?? $a['created_at'] ?? ''));
+        });
+        if (!$incidents) {
+            return View::card('رخدادها', View::emptyState('هیچ رخدادی ثبت نشده است', 'با فرم بالا می‌توانید اولین رخداد را ثبت کنید.', 'activity'), '', 'pcdna-flush', 'activity');
+        }
+        $open = 0;
+        $body = '';
+        foreach ($incidents as $inc) {
+            if (!is_array($inc)) {
+                continue;
+            }
+            if (($inc['status'] ?? '') !== 'resolved') {
+                $open++;
+            }
+            $body .= self::incidentCard($inc);
+        }
+        return View::card('رخدادها (' . View::n($open) . ' باز از ' . View::n(count($incidents)) . ')', '<div class="pcdna-incidents">' . $body . '</div>', '', 'pcdna-flush', 'activity');
+    }
+
+    private static function incidentCard(array $inc): string
+    {
+        $id = (int) ($inc['id'] ?? 0);
+        $resolved = ($inc['status'] ?? '') === 'resolved';
+        [$sevLabel, $sevTone] = self::INC_SEVERITY[$inc['severity'] ?? ''] ?? [(string) ($inc['severity'] ?? '—'), 'muted'];
+        [$stLabel, $stTone] = self::INC_STATUS[$inc['status'] ?? ''] ?? [(string) ($inc['status'] ?? '—'), 'muted'];
+        $head = '<div class="pcdna-incident-head"><div class="pcdna-incident-titles"><strong>#' . View::n($id) . ' — ' . View::e((string) ($inc['title'] ?? '')) . '</strong>'
+            . '<div class="pcdna-incident-badges">' . View::badge($sevLabel, $sevTone) . View::badge($stLabel, $stTone) . '</div></div>'
+            . '<span class="pcdna-incident-when">' . View::e(View::date($inc['updated_at'] ?? $inc['created_at'] ?? '', true)) . '</span></div>';
+        $bodyText = (string) ($inc['body'] ?? '');
+        $desc = $bodyText !== '' ? '<p class="pcdna-incident-body">' . nl2br(View::e($bodyText)) . '</p>' : '';
+        // timeline (newest first)
+        $updates = (array) ($inc['updates'] ?? []);
+        usort($updates, function ($a, $b) {
+            return strcmp((string) ($b['at'] ?? ''), (string) ($a['at'] ?? ''));
+        });
+        $tl = '';
+        foreach ($updates as $u) {
+            if (!is_array($u)) {
+                continue;
+            }
+            [$uLabel, $uTone] = self::INC_STATUS[$u['status'] ?? ''] ?? [(string) ($u['status'] ?? ''), 'muted'];
+            $tl .= '<li class="pcdna-t-' . $uTone . '"><div class="pcdna-tl-head">' . View::badge($uLabel, $uTone)
+                . '<span class="pcdna-tl-time">' . View::e(View::date($u['at'] ?? '', true)) . '</span></div>'
+                . ((string) ($u['body'] ?? '') !== '' ? '<p class="pcdna-tl-body">' . nl2br(View::e((string) $u['body'])) . '</p>' : '') . '</li>';
+        }
+        $timeline = $tl !== '' ? '<ul class="pcdna-timeline">' . $tl . '</ul>' : '';
+        // actions for open incidents
+        $actions = '';
+        if (!$resolved) {
+            // The update form and the quick-resolve form are SIBLINGS (nested <form> is invalid HTML).
+            $upForm = '<form method="post" action="' . View::url(['page' => 'status']) . '" class="pcdna-form">' . View::csrf()
+                . '<input type="hidden" name="a" value="incident_update"><input type="hidden" name="id" value="' . $id . '">'
+                . '<div class="pcdna-form-grid"><label><span>وضعیت جدید</span>'
+                . View::select('status', ['investigating' => 'در حال بررسی', 'identified' => 'علت شناسایی شد', 'monitoring' => 'در حال پایش', 'resolved' => 'برطرف شد'], $inc['status'] ?? 'monitoring') . '</label>'
+                . '<label class="pcdna-col-2"><span>متن به‌روزرسانی</span><input class="pcdna-input" name="body" required maxlength="500" placeholder="آخرین وضعیت رسیدگی…"></label>'
+                . '</div><div class="pcdna-form-actions"><button type="submit" class="pcdna-btn pcdna-btn-primary pcdna-btn-sm">' . View::icon('activity') . '<span>ثبت به‌روزرسانی</span></button></div></form>';
+            $resolve = View::postButton(['page' => 'status'], 'incident_resolve', ['id' => (string) $id], 'برطرف شد', 'pcdna-btn pcdna-btn-sm', 'این رخداد به‌عنوان «برطرف‌شده» ثبت شود؟', 'check');
+            $actions = '<div class="pcdna-incident-update"><div class="pcdna-incident-actions">' . $upForm . $resolve . '</div></div>';
+        }
+        $inner = $head . $desc . $timeline . $actions;
+        if ($resolved) {
+            return '<details class="pcdna-incident is-resolved"><summary>' . $head . '</summary><div class="pcdna-incident-detail">' . $desc . $timeline . '</div></details>';
+        }
+        return '<div class="pcdna-incident is-open">' . $inner . '</div>';
     }
 
     // ------------------------------------------------------------------ 7. settings & diagnostics
