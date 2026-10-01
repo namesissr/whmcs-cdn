@@ -294,18 +294,54 @@ class SandboxError(RuntimeError):
     pass
 
 
+def dac_readable(path: str, uid: int, gid: int, groups=()) -> bool:
+    """Would uid/gid pass the classic permission checks to open `path` for reading (x on every
+    parent directory, r on the file)? root (uid 0) is treated as any other uid: workers never are."""
+    try:
+        parts = os.path.realpath(path).split("/")[1:]
+        cur = "/"
+        for i, part in enumerate(parts):
+            st = os.stat(cur)
+            if not _perm(st, uid, gid, groups, 0o1):
+                return False
+            cur = os.path.join(cur, part)
+        return _perm(os.stat(cur), uid, gid, groups, 0o4)
+    except OSError:
+        return False
+
+
+def _perm(st, uid, gid, groups, bit) -> bool:
+    if st.st_uid == uid:
+        return bool(st.st_mode & (bit << 6))
+    if st.st_gid == gid or st.st_gid in groups:
+        return bool(st.st_mode & (bit << 3))
+    return bool(st.st_mode & bit)
+
+
 class Sandbox:
     """Pre-built Landlock ruleset + seccomp program; `preexec(limits)` applies them in the child
     between fork and exec (the parent is single-threaded, so preexec_fn is safe)."""
 
-    def __init__(self, exe: str, read_files=(), arch: str | None = None):
+    def __init__(self, exe: str, read_files=(), arch: str | None = None, abi_max: int | None = None):
         self.exe = os.path.realpath(exe)
         self.arch = arch or platform.machine()
         if self.arch not in SYSCALLS:
             raise SandboxError(f"unsupported architecture {self.arch}")
-        self.abi = landlock_abi()
+        self.kernel_abi = landlock_abi()
+        # abi_max (FN_LANDLOCK_ABI_MAX): use at most this Landlock ABI, to exercise the code paths of
+        # older kernels (Ubuntu 24.04 / 6.8 = ABI 4). It can only lower the ABI; 0 = no Landlock,
+        # which fails closed exactly like a kernel without it.
+        self.abi = self.kernel_abi if abi_max is None else max(0, min(self.kernel_abi, int(abi_max)))
         if self.abi < 1:
-            raise SandboxError("Landlock is not available (kernel >= 5.13 with landlock in the LSM list)")
+            raise SandboxError("Landlock is not available (kernel >= 5.13 with landlock in the LSM list)"
+                               if self.kernel_abi < 1 else "Landlock disabled (FN_LANDLOCK_ABI_MAX=0)")
+        # the worker uid must be able to reach every file it needs (DAC is checked before Landlock):
+        # a non-traversable parent directory would otherwise surface only as a silent engine failure
+        self.worker_ids = (65534, 65534) if os.geteuid() == 0 else (os.geteuid(), os.getegid())
+        for p in [self.exe] + [x for x in read_files]:
+            if not dac_readable(p, *self.worker_ids):
+                raise SandboxError(f"{p} is not readable by the worker uid {self.worker_ids[0]} "
+                                   "(check the permissions of every parent directory)")
         interp = elf_interp(self.exe)
         libs = shared_libs(self.exe, interp)
         if interp and not libs:
@@ -328,6 +364,7 @@ class Sandbox:
         for p in libs + ["/etc/ld.so.cache"] + list(read_files):
             if os.path.exists(p):
                 self._allow(os.path.realpath(p), LL_READ_FILE)
+        self.fail_at = None
         self.bpf = seccomp_program(self.arch)
         self._bpf_buf = ctypes.create_string_buffer(self.bpf, len(self.bpf))
         self._fprog = _SockFprog(len(self.bpf) // 8, ctypes.addressof(self._bpf_buf))
@@ -354,6 +391,19 @@ class Sandbox:
         cpu_s = cpu_ms / 1000.0
         rl_cpu = int(math.ceil(cpu_s)) + 1
 
+        fail_at = self.fail_at   # test hook: simulate a failing setup stage
+
+        def stage(name, ok):
+            if fail_at == name:
+                ok, err = False, 22
+            else:
+                err = ctypes.get_errno()
+            if not ok:
+                # stderr is the supervisor's diagnostics pipe; the worker never gets to exec
+                os.write(2, f"pcdn-fn sandbox setup failed at {name}: errno {err} ({os.strerror(err)})\n"
+                         .encode())
+                os._exit(126)
+
         def fn():
             try:   # under cgroup memory pressure the OOM killer takes a worker, never the supervisor
                 with open("/proc/self/oom_score_adj", "w") as f:
@@ -364,28 +414,34 @@ class Sandbox:
                              (resource.RLIMIT_STACK, 8 * 1024 * 1024), (resource.RLIMIT_CORE, 0),
                              (resource.RLIMIT_FSIZE, 0), (resource.RLIMIT_NOFILE, 16),
                              (resource.RLIMIT_NPROC, 0), (resource.RLIMIT_MEMLOCK, 0),
-                             (resource.RLIMIT_MSGQUEUE, 0), (resource.RLIMIT_SIGPENDING, 16)):
-                resource.setrlimit(res, (lim, lim))
-            resource.setrlimit(resource.RLIMIT_CPU, (rl_cpu, rl_cpu + 1))
-            if _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-                raise OSError(ctypes.get_errno(), "no_new_privs")
-            # refuse W^X violations even outside systemd's MemoryDenyWriteExecute (Linux >= 6.3)
+                             (resource.RLIMIT_MSGQUEUE, 0), (resource.RLIMIT_SIGPENDING, 16),
+                             (resource.RLIMIT_CPU, None)):
+                try:
+                    resource.setrlimit(res, (rl_cpu, rl_cpu + 1) if lim is None else (lim, lim))
+                    ok = True
+                except (OSError, ValueError) as e:
+                    ctypes.set_errno(getattr(e, "errno", None) or 22)
+                    ok = False
+                stage(f"setrlimit({res})", ok)
+            stage("no_new_privs", _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0)
+            # refuse W^X violations even outside systemd's MemoryDenyWriteExecute (Linux >= 6.3; older
+            # kernels return EINVAL and rely on the unit's MemoryDenyWriteExecute=yes)
             _libc.prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0)
-            if _libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ctypes.c_int(rfd), ctypes.c_uint32(0)) != 0:
-                raise OSError(ctypes.get_errno(), "landlock_restrict_self")
+            stage("landlock_restrict_self",
+                  _libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ctypes.c_int(rfd), ctypes.c_uint32(0)) == 0)
             # CPU budget: SIGPROF's default action terminates; the worker can neither catch nor block
             # it (rt_sigaction / rt_sigprocmask are not in the seccomp allow-list). Survives execve.
             signal.setitimer(signal.ITIMER_PROF, cpu_s)
-            if _libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.addressof(fprog), 0, 0) != 0:
-                raise OSError(ctypes.get_errno(), "seccomp")
+            stage("seccomp", _libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.addressof(fprog), 0, 0) == 0)
         return fn
 
     def spawn(self, argv: list[str], cpu_ms: int, memory_mb: int) -> subprocess.Popen:
         kw = {}
         if os.geteuid() == 0:   # never run customer code as root (tests / a misconfigured unit)
             kw = {"user": 65534, "group": 65534, "extra_groups": []}
+        # stderr: a bounded diagnostics channel (sandbox setup stage + errno, engine start errors)
         return subprocess.Popen([self.exe] + argv[1:], executable=self.exe, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True, cwd="/",
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, cwd="/",
                                 env={}, start_new_session=True, restore_signals=True,
                                 preexec_fn=self.preexec(cpu_ms, memory_mb), **kw)
 
@@ -546,6 +602,25 @@ class Usage:
 
 # ================================================================== the service
 
+class _Tail(asyncio.Protocol):
+    """Keeps the first DIAG_MAX bytes of a worker's stderr (diagnostics) and discards the rest, so a
+    chatty worker can never block on a full pipe or grow the supervisor's memory."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def data_received(self, data):
+        if len(self.buf) < DIAG_MAX:
+            self.buf += data[:DIAG_MAX - len(self.buf)]
+
+    def text(self) -> str:
+        t = self.buf.decode("utf-8", "replace")
+        return re.sub(r"[^\x20-\x7e]+", " ", t).strip()[:300]
+
+
+DIAG_MAX = 2048
+
+
 class Result:
     def __init__(self, kind, status=0, headers=(), body=b"", message=""):
         self.kind = kind   # resp | pass | error | timeout
@@ -560,10 +635,13 @@ class Service:
         self.runtime = os.path.realpath(cfg["FN_RUNTIME"])
         self.sandbox = None
         self.sandbox_error = None
+        abi_max = cfg.get("FN_LANDLOCK_ABI_MAX")
         try:
             if not os.path.isfile(self.runtime):
                 raise SandboxError("runtime missing: " + self.runtime)
-            self.sandbox = Sandbox(self.qjs, read_files=[self.runtime])
+            self.runtime = self._stage_runtime(self.runtime)
+            self.sandbox = Sandbox(self.qjs, read_files=[self.runtime],
+                                   abi_max=None if abi_max in (None, "") else _int(abi_max, 0, 0, 64))
         except (SandboxError, OSError) as e:
             self.sandbox_error = str(e)
         self.manifest = Manifest(cfg["FN_DIR"])
@@ -579,6 +657,24 @@ class Service:
         self.queue_s = _int(cfg.get("FN_QUEUE_MS"), 1000, 0, 30000) / 1000.0
         self.selftest_result: dict | None = None
         self.engine = self._engine_version()
+
+    @staticmethod
+    def _stage_runtime(path: str) -> str:
+        """As root, workers run as nobody (65534): when the runtime sits below a directory nobody may
+        not traverse (e.g. a CI checkout under a 0750 home), use a private root-owned 0644 copy in a
+        0755 directory. Never needed in production (/usr/share/pcdn/fn, read by the DynamicUser)."""
+        if os.geteuid() != 0 or dac_readable(path, 65534, 65534):
+            return path
+        import atexit  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+        d = tempfile.mkdtemp(prefix="pcdn-fn-runtime-")
+        os.chmod(d, 0o755)
+        dst = os.path.join(d, "runtime.js")
+        with open(path, "rb") as src, open(dst, "wb") as out:
+            out.write(src.read())
+        os.chmod(dst, 0o644)
+        atexit.register(lambda: (os.unlink(dst), os.rmdir(d)) if os.path.exists(dst) else None)
+        return dst
 
     def _engine_version(self) -> str:
         try:
@@ -614,19 +710,20 @@ class Service:
         except (OSError, subprocess.SubprocessError) as e:
             return Result("error", message="spawn failed: " + str(e))
         res = Result("error", message="no response")
-        rtrans = wtrans = None
+        rtrans = wtrans = etrans = diag = None
         try:
             pidfd = os.pidfd_open(proc.pid)
         except OSError as e:   # Linux < 5.3: never leave a worker behind
             os.kill(proc.pid, signal.SIGKILL)
             os.waitpid(proc.pid, 0)
             proc.returncode = -9
-            for f in (proc.stdin, proc.stdout):
+            for f in (proc.stdin, proc.stdout, proc.stderr):
                 f.close()
             return Result("error", message="pidfd_open: " + str(e))
         try:
             reader = asyncio.StreamReader(limit=8 * 1024 * 1024)
             rtrans, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), proc.stdout)
+            etrans, diag = await loop.connect_read_pipe(_Tail, proc.stderr)
             wtrans, _ = await loop.connect_write_pipe(asyncio.BaseProtocol, proc.stdin)
             wtrans.write(head + raw_code + body)
             if on_spawn:
@@ -642,7 +739,7 @@ class Service:
             # and close the fd afterwards). Closing the file objects underneath a registered transport
             # would leave a stale selector key, and the next pipe reusing that fd number would never
             # be polled.
-            for t, f in ((rtrans, proc.stdout), (wtrans, proc.stdin)):
+            for t, f in ((rtrans, proc.stdout), (wtrans, proc.stdin), (etrans, proc.stderr)):
                 if t is not None:
                     if not t.is_closing():
                         t.abort() if t is wtrans else t.close()
@@ -662,6 +759,8 @@ class Service:
                     killed = False
             status, ru = await self._reap(proc)
             os.close(pidfd)
+            if diag is not None and res.kind == "error":
+                await asyncio.sleep(0)   # let the stderr transport deliver what is already buffered
         used = (ru.ru_utime + ru.ru_stime) * 1000.0 if ru else 0.0
         sig = os.WTERMSIG(status) if status is not None and os.WIFSIGNALED(status) else 0
         if sig in (signal.SIGPROF, signal.SIGXCPU):
@@ -672,6 +771,11 @@ class Service:
             # died on its own (e.g. SIGSEGV on an engine fault); a worker WE killed after it
             # answered (pending timers) or at the wall-clock deadline keeps that classification
             res = Result("error", message=f"worker died (signal {sig})")
+        if res.kind == "error" and res.message.startswith(("worker exited", "worker died", "worker protocol")):
+            if status is not None and os.WIFEXITED(status):
+                res.message += f" (exit status {os.WEXITSTATUS(status)})"
+            if diag is not None and diag.text():
+                res.message += ": " + diag.text()
         res.cpu_ms = used
         return res
 
@@ -964,8 +1068,18 @@ class Service:
         req = {"method": "GET", "url": "http://selftest.invalid/x", "headers": [], "client": {}}
         secret = os.path.join(self.cfg["FN_DIR"], "manifest.json")
 
+        runs = []
+
         async def go(code, timeout_ms=50, memory_mb=16, ctx=None):
-            return await self.run(code, req, b"", timeout_ms, memory_mb, ctx)
+            r = await self.run(code, req, b"", timeout_ms, memory_mb, ctx)
+            runs.append(r)
+            return r
+
+        def as_json(r):
+            try:
+                return json.loads(r.body) if r.kind == "resp" else {}
+            except ValueError:
+                return {}
 
         r = await go("function handleRequest(r){return new Response('ok:'+r.method,{status:201})}")
         checks["engine"] = r.kind == "resp" and r.status == 201 and r.body == b"ok:GET"
@@ -974,21 +1088,19 @@ class Service:
                      "const p=%s;const o=p.filter(x=>{const f=std.open(x,'r');return f!==null});"
                      "const w=std.open('/tmp/pcdn-fn-w','w');"
                      "return new Response(JSON.stringify({o,w:w!==null}))}" % json.dumps(paths))
-        checks["fs_denied"] = r.kind == "resp" and json.loads(r.body or b"{}") == {"o": [], "w": False}
+        checks["fs_denied"] = as_json(r) == {"o": [], "w": False}
         r = await go("async function handleRequest(){const os=await import('os');let x;"
                      "try{x=os.exec(['/bin/true'],{block:true})}catch(e){x='denied'}"
                      "const k=os.kill(1,0);return new Response(JSON.stringify({x:String(x),k}))}")
-        try:
-            d = json.loads(r.body) if r.kind == "resp" else {}
-        except ValueError:
-            d = {}
+        d = as_json(r)
         checks["exec_denied"] = d.get("x") == "denied"
         checks["signal_denied"] = isinstance(d.get("k"), int) and d["k"] < 0
         t0 = time.monotonic()
         r = await go("function handleRequest(){for(;;){}}", timeout_ms=20)
         checks["cpu_limit"] = r.kind == "timeout" and time.monotonic() - t0 < 2.0
         r = await go("function handleRequest(){let a=[];for(;;)a.push(new Array(1e5).fill(1.5))}", memory_mb=16)
-        checks["memory_limit"] = r.kind in ("error", "timeout") and r.kind != "resp"
+        # only meaningful when the engine itself works (a broken engine "fails" every allocation)
+        checks["memory_limit"] = checks["engine"] and r.kind in ("error", "timeout")
         state = {}
 
         def hook(fr, proc):
@@ -1004,7 +1116,15 @@ class Service:
                      ctx={"selftest_hook": hook})
         checks["seccomp_active"] = r.kind == "resp" and state.get("seccomp") == "2" and state.get("nnp") == "1"
         ok = all(checks.values())
-        return dict(info, ok=ok, checks=checks, t=_now_iso())
+        out = dict(info, ok=ok, checks=checks, t=_now_iso())
+        # why a check failed: the invocation outcome (incl. the worker's setup stage / errno / stderr)
+        idx = {"engine": 0, "fs_denied": 1, "exec_denied": 2, "signal_denied": 2, "cpu_limit": 3,
+               "memory_limit": 4, "seccomp_active": 5}
+        details = {k: f"{runs[i].kind}: {runs[i].message}"[:300] for k, i in idx.items()
+                   if not checks.get(k) and i < len(runs)}
+        if details:
+            out["details"] = details
+        return out
 
     def write_status(self):
         st = dict(self.selftest_result or {"ok": False, "checks": {}, "engine": self.engine},

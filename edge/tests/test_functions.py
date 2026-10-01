@@ -788,3 +788,103 @@ def test_many_invocations_no_hang_no_fd_leak(svc):
         return time.monotonic() - t0, fds, len(os.listdir("/proc/self/fd"))
     took, before, after = asyncio.run(go())
     assert took < 30 and after <= before, (took, before, after)
+
+
+# ================================================================== older kernels / diagnostics (CI)
+
+ABIS = [a for a in range(1, 7) if a <= LANDLOCK]
+
+
+@pytest.mark.parametrize("abi", ABIS or [1])
+def test_sandbox_per_landlock_abi(probe, abi):
+    """Every Landlock ABI path (1: base fs, 2: +refer, 3: +truncate, 4: +TCP — Ubuntu 24.04 / 6.8,
+    5: +ioctl_dev, 6: +signal/abstract-unix scoping) keeps the documented guarantees."""
+    if abi > LANDLOCK:
+        pytest.skip("kernel ABI lower")
+    exe, secret = probe
+    sb = fn.Sandbox(exe, abi_max=abi)
+    assert sb.abi == abi
+    p = sb.spawn([exe, secret], cpu_ms=2000, memory_mb=16)
+    out, err = p.communicate(timeout=20)
+    res = {ln.split("=")[0]: tuple(int(x) for x in ln.split("=")[1].split(":")) for ln in out.decode().splitlines()}
+    assert res.get("done") == (0, 0), (out, err)
+    for k in ("open_passwd", "open_secret", "open_proc", "open_write_tmp", "execve_true"):
+        assert res[k] == (-1, 13), (abi, k, res[k])
+    for k in ("socket_inet", "socket_unix", "fork", "kill_parent", "ptrace", "fcntl_setown", "open_opath"):
+        assert res[k] == (-1, 1), (abi, k, res[k])
+
+
+@needs_sandbox
+@pytest.mark.parametrize("abi", ABIS or [1])
+def test_selftest_per_landlock_abi(svc, abi):
+    cfg = dict(svc.cfg, FN_LANDLOCK_ABI_MAX=str(abi))
+    s = fn.Service(cfg)
+    assert s.sandbox is not None and s.sandbox.abi == abi, s.sandbox_error
+    res = asyncio.run(s.selftest())
+    assert res["ok"] is True, res
+
+
+@needs_sandbox
+def test_no_landlock_fails_closed(svc):
+    s = fn.Service(dict(svc.cfg, FN_LANDLOCK_ABI_MAX="0"))
+    assert s.sandbox is None and "Landlock" in s.sandbox_error and not s.ready
+    res = asyncio.run(s.selftest())
+    assert res["ok"] is False and "Landlock" in res["error"]
+    r = asyncio.run(s.run("function handleRequest(){return new Response('x')}", REQ, b"", 50, 16))
+    assert r.kind == "error" and "sandbox unavailable" in r.message
+
+
+@needs_sandbox
+@pytest.mark.parametrize("stage", ["no_new_privs", "landlock_restrict_self", "seccomp", f"setrlimit({__import__('resource').RLIMIT_AS})"])
+def test_setup_failure_is_diagnosed(svc, stage):
+    svc.sandbox.fail_at = stage
+    try:
+        r = run(svc, "function handleRequest(){return new Response('x')}")
+        st = asyncio.run(svc.selftest())
+    finally:
+        svc.sandbox.fail_at = None
+    assert r.kind == "error"
+    assert f"sandbox setup failed at {stage}: errno 22" in r.message and "exit status 126" in r.message, r.message
+    assert st["ok"] is False and f"failed at {stage}" in st["details"]["engine"]
+
+
+@needs_sandbox
+def test_engine_start_errors_are_surfaced(svc):
+    r = run(svc, "function handleRequest(){ return new Response('x') }; std.exit(0)")   # std is not a global
+    assert r.kind == "error"
+    r = run(svc, "async function handleRequest(){const std=await import('std'); std.err.puts('boom\\n'); std.exit(5)}")
+    assert r.kind == "error" and "exit status 5" in r.message and "boom" in r.message
+
+
+@needs_sandbox
+def test_runtime_behind_untraversable_directory(tmp_path):
+    """The CI failure: a checkout under a 0750 home. As root, workers run as nobody, so the runtime is
+    staged into a private world-readable copy; a worker uid that cannot read it is reported precisely."""
+    if os.geteuid() != 0:
+        pytest.skip("needs root")
+    import tempfile
+    d = pathlib.Path(tempfile.mkdtemp(prefix="pcdn-fn-ci-", dir="/tmp"))
+    try:
+        (d / "work").mkdir()
+        shutil.copy(RUNTIME, d / "work" / "runtime.js")
+        os.chmod(d, 0o750)
+        assert not fn.dac_readable(str(d / "work" / "runtime.js"), 65534, 65534)
+        assert fn.dac_readable(str(d / "work" / "runtime.js"), 0, 0)
+        cfg = fn.load_config(None)
+        cfg.update(FN_DIR=str(tmp_path), FN_RUNTIME=str(d / "work" / "runtime.js"), FN_QJS=QJS)
+        s = fn.Service(cfg)
+        assert s.sandbox is not None and s.runtime != cfg["FN_RUNTIME"] and fn.dac_readable(s.runtime, 65534, 65534)
+        r = asyncio.run(s.run("function handleRequest(){return null}", REQ, b"", 50, 16))
+        assert r.kind == "pass", r.message
+        # without staging the preflight names the problem instead of a silent engine failure
+        with pytest.raises(fn.SandboxError, match="not readable by the worker uid 65534"):
+            fn.Sandbox(QJS, read_files=[cfg["FN_RUNTIME"]])
+    finally:
+        os.chmod(d, 0o755)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dac_readable():
+    assert fn.dac_readable("/etc/passwd", 65534, 65534)
+    assert not fn.dac_readable("/etc/shadow", 65534, 65534)
+    assert not fn.dac_readable("/nonexistent/x", 65534, 65534)
