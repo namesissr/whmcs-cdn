@@ -11,6 +11,7 @@ from . import (
     routes_metrics,
     routes_ops,
     routes_platform,
+    routes_storage,
     routes_tunnel,
     routes_v2,
 )
@@ -78,6 +79,8 @@ app.include_router(routes_v2.router)
 app.include_router(routes_platform.router)
 # wave 7 (SPEC §15.3/§15.4): tunnel quality, usage forecast, origin health
 app.include_router(routes_tunnel.router)
+# SPEC §16.8: object storage buckets (MinIO) + GB-hour usage for invoicing
+app.include_router(routes_storage.router)
 # public, unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)
 app.include_router(routes_v2.public_router)
 app.include_router(routes_capi.router)

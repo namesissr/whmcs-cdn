@@ -292,6 +292,10 @@ def job_cleanup(db):
     webhooks.prune(db)
     # SPEC §15.4: tunnel origin-down / origin-up site events are kept SITE_EVENTS_RETENTION_DAYS
     tunnel_quality.prune_events(db)
+    # SPEC §16.8: storage billing samples are kept like the bandwidth usage (400 days)
+    from . import storage
+
+    storage.prune(db)
     db.commit()
 
 
@@ -453,6 +457,16 @@ def job_tunnel_origin(db, now: datetime | None = None):
     return tunnel_quality.check_origins(db, now)
 
 
+def job_storage(db, now: datetime | None = None, force: bool = False):
+    """Hourly (SPEC §16.8, leader only): bucket usage from MinIO -> GB-hour billing samples, bucket
+    quotas re-balanced to each site's storage_gb, over-quota alerts. No-op without STORAGE_*."""
+    from . import storage
+
+    if not storage.available():
+        return None
+    return storage.run_hourly(db, now=now, force=force)
+
+
 def job_capacity(db, now: datetime | None = None, force: bool = False):
     """Daily: edge-group capacity alert from the 3-day p95 of the hourly tx (SPEC §15.5, leader
     only)."""
@@ -466,7 +480,7 @@ JOBRUN_PREFIX = "jobrun:"
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
 JOBS = [job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
         job_capacity, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
-        job_log_export, job_bot_ranges]
+        job_log_export, job_storage, job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
 FAST_JOBS = [job_webhooks]
 FAST_INTERVAL = 30.0

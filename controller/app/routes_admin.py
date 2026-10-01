@@ -95,6 +95,8 @@ class FeaturesIn(BaseModel):
     # TCP/UDP proxy (SPEC §16.4)
     l4_proxy: bool | None = None
     max_l4_apps: int | None = Field(default=None, ge=0, le=sections.L4_APPS_MAX)
+    # object storage (SPEC §16.8): GB of storage, 0 = none
+    storage_gb: int | None = Field(default=None, ge=0, le=1000000)
 
 
 class Plan(BaseModel):
@@ -147,7 +149,8 @@ class SiteSettings(BaseModel):
 class RecordIn(BaseModel):
     name: str = "@"
     type: str
-    content: str
+    # may be empty only with `storage` (then a CNAME to the storage endpoint host is stored)
+    content: str = ""
     ttl: int = Field(default=300, ge=60, le=86400)
     priority: int | None = None
     proxied: bool = False
@@ -160,6 +163,8 @@ class RecordIn(BaseModel):
     weight: int | None = Field(default=None, ge=0, le=100)
     health_protocol: Literal["tcp", "http", "https"] | None = None
     health_path: str | None = Field(default=None, max_length=512, pattern=r"^/[^\s\"'<>\\]*$")
+    # SPEC §16.8 origin shortcut: serve this proxied record from the site's storage bucket <name>
+    storage: str | None = Field(default=None, max_length=63, pattern=r"^[a-z0-9-]{1,63}$")
 
 
 class PurgeIn(BaseModel):
@@ -312,6 +317,17 @@ def update_plan(domain: str, plan: Plan, request: Request, db: Session = Depends
     refresh_quota(db, site)
     db.commit()
     _audit(db, request, "site.plan", site.domain, plan.model_dump(exclude_none=True))
+    if before["storage_gb"] != after["storage_gb"]:
+        # SPEC §16.8: the buckets' MinIO quotas follow the new storage_gb now (best effort; the
+        # hourly storage job re-applies them)
+        from . import storage
+
+        if storage.available():
+            try:
+                storage.sync_site_quotas(db, site)
+                db.commit()
+            except storage.StorageError:
+                db.rollback()
     if after["edge_group"] != group or (before["l4_proxy"], before["max_l4_apps"]) != (
             after["l4_proxy"], after["max_l4_apps"]):
         sync_site_dns(db, site)  # other edges answer / the l4-<id> names appear or go
@@ -392,6 +408,10 @@ def unsuspend(domain: str, db: Session = Depends(get_db)):
 def delete_site(domain: str, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     name = site.domain
+    # SPEC §16.8: revoke the storage access keys, remove empty buckets (others are kept + alerted)
+    from . import storage
+
+    storage.on_site_delete(db, site)
     delete_platform_data(db, site.id)
     db.delete(site)
     db.commit()
@@ -575,9 +595,51 @@ def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None,
         raise ValidationError("رکورد ALIAS نمی‌تواند با رکورد A/AAAA هم‌نام باشد")
 
 
+def _storage_origin(site: Site, body: RecordIn) -> tuple[str, str]:
+    """SPEC §16.8: validate a record's `storage` origin -> (type, content) to store. The bucket must be
+    one of this site's own buckets; an empty content becomes a CNAME to the storage endpoint host
+    (only informative: a proxied name answers with the edges)."""
+    from . import storage
+
+    if not body.proxied:
+        raise ValidationError("مبدأ فضای ذخیره‌سازی (storage) فقط برای رکورد پروکسی‌شده (CDN) مجاز است")
+    if body.pool:
+        raise ValidationError("برای هر رکورد فقط یکی از pool یا storage را تعیین کنید")
+    if sections.features_of(site)["storage_gb"] <= 0:
+        raise PermissionError("فضای ذخیره‌سازی در پلن شما فعال نیست")
+    from sqlalchemy.orm import object_session
+
+    from .models import StorageBucket
+
+    db = object_session(site)
+    if db is None or db.scalar(select(StorageBucket.id).where(
+            StorageBucket.site_id == site.id, StorageBucket.name == body.storage)) is None:
+        raise ValidationError(f"باکت {body.storage} برای این سرویس وجود ندارد")
+    if body.content.strip():
+        return body.type, body.content
+    host = _url_host(storage.public_endpoint())
+    if not host:
+        raise ValidationError("فضای ذخیره‌سازی روی این کنترلر پیکربندی نشده است")
+    return "CNAME", host
+
+
+def _url_host(url: str) -> str:
+    import httpx
+
+    try:
+        return httpx.URL(url).host if url else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> dict:
     name = normalize_name(body.name, site.domain)
-    rtype, content, prio, proxied = validate_record(body.type, body.content, body.priority, body.proxied)
+    rtype_in, content_in = body.type, body.content
+    if body.storage:
+        rtype_in, content_in = _storage_origin(site, body)
+    rtype, content, prio, proxied = validate_record(rtype_in, content_in, body.priority, body.proxied)
+    if body.storage and not proxied:
+        raise ValidationError("مبدأ فضای ذخیره‌سازی (storage) فقط برای رکوردهای A، AAAA و CNAME پروکسی‌شده مجاز است")
     if rtype == "CNAME" and name == "@" and not proxied:
         raise ValidationError("CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است؛ از ALIAS استفاده کنید")
     if rtype == "NS" and name == "@":
@@ -601,7 +663,8 @@ def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> d
     return {
         "name": name, "type": rtype, "content": content, "priority": prio, "proxied": proxied, "ttl": body.ttl,
         "pool": pool,
-        "origin_port": body.origin_port if proxied and not pool else None,
+        "storage_bucket": body.storage if proxied else None,
+        "origin_port": body.origin_port if proxied and not pool and not body.storage else None,
         "health_check": health,
         "health_port": body.health_port if health else None,
         "weight": body.weight,

@@ -257,5 +257,27 @@ class Settings:
     record_probe_enabled: bool = field(default_factory=lambda: _bool("RECORD_PROBE_ENABLED", True))
     record_probe_timeout: float = field(default_factory=lambda: float(os.getenv("RECORD_PROBE_TIMEOUT") or 5))
 
+    # SPEC §16.8 object storage (docs/STORAGE.md). STORAGE_ENDPOINT: the https URL the controller
+    # reaches MinIO on (operator config, trusted); STORAGE_PUBLIC_ENDPOINT: what customers' S3 tools
+    # and the edges use (default: the same). The admin pair is a MinIO user with the policy in
+    # deploy/storage/pcdn-controller-policy.json — never the MinIO root credentials. Empty endpoint or
+    # keys = the storage product is off (the storage routes answer 503).
+    storage_endpoint: str = field(default_factory=lambda: os.getenv("STORAGE_ENDPOINT", "").strip().rstrip("/"))
+    storage_public_endpoint: str = field(
+        default_factory=lambda: (os.getenv("STORAGE_PUBLIC_ENDPOINT") or os.getenv("STORAGE_ENDPOINT", "")
+                                 ).strip().rstrip("/"))
+    storage_admin_access_key: str = field(default_factory=lambda: os.getenv("STORAGE_ADMIN_ACCESS_KEY", "").strip())
+    storage_admin_secret_key: str = field(
+        default_factory=lambda: (os.getenv("STORAGE_ADMIN_SECRET_KEY") or os.getenv("STORAGE_ADMIN_SECRET", "")).strip())
+    storage_region: str = field(default_factory=lambda: (os.getenv("STORAGE_REGION") or "us-east-1").strip())
+    # global bucket name = prefix + per-site tag + "-" + name; MUST match the Resource of the
+    # controller's MinIO policy (arn:aws:s3:::cdn-*)
+    storage_bucket_prefix: str = field(
+        default_factory=lambda: (os.getenv("STORAGE_BUCKET_PREFIX") or "cdn-").strip().lower())
+    storage_max_buckets: int = field(
+        default_factory=lambda: min(100, max(1, int(os.getenv("STORAGE_MAX_BUCKETS") or 10))))
+    # only for a MinIO on a private network without TLS (never over the internet): allow http://
+    storage_insecure_http: bool = field(default_factory=lambda: _bool("STORAGE_INSECURE_HTTP", False))
+
 
 settings = Settings()

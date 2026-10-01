@@ -61,14 +61,15 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0015: analytics_minute, log_spool, webhook_delivery (analytics & platform, SPEC §14.3);
     # 0016: site_events (tunnel origin-down / origin-up events, SPEC §15.4);
     # 0017: l4_ports (TCP/UDP proxy edge ports, SPEC §16.4)
+    # 0018: storage_buckets + storage_usage_hourly (object storage, SPEC §16.8)
     tables = {d[1].name for d in flat if d[0] == "add_table"}
     assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses",
             "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
-            "site_events", "l4_ports"} <= tables, diff
-    # 0017: weighted / controller-checked DNS records (SPEC §16.7)
+            "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly"} <= tables, diff
+    # 0017: weighted / controller-checked DNS records (SPEC §16.7); 0018: records.storage_bucket
     record_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "records")
     assert record_added == ["health_at", "health_error", "health_fail", "health_ms", "health_ok", "health_path",
-                            "health_protocol", "weight"], diff
+                            "health_protocol", "storage_bucket", "weight"], diff
     # 0002: sites.secret String(64) -> Text
     assert any(d[0] == "modify_type" and d[2:4] == ("sites", "secret") for d in flat), diff
     # nothing else changed between 0001 and head
@@ -76,7 +77,7 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
              and not (d[0] == "add_index" and d[1].table.name in
                       ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses",
                        "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
-                       "site_events", "l4_ports"))]
+                       "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly"))]
     assert other == [], other
 
 

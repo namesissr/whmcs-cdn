@@ -156,6 +156,10 @@ class Record(Base):
     health_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     health_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     health_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # SPEC §16.8 origin shortcut: a proxied record served from one of the site's storage buckets
+    # (StorageBucket.name, the customer's short name). The edge gets the storage endpoint, the
+    # bucket path and the bucket's read token instead of an address (storage.edge_origin).
+    storage_bucket: Mapped[str | None] = mapped_column(String(63), nullable=True)
 
     site: Mapped[Site] = relationship(back_populates="records")
 
@@ -500,3 +504,61 @@ class SiteEvent(Base):
     type: Mapped[str] = mapped_column(String(32), index=True)  # e.g. tunnel.origin_down
     data: Mapped[str] = mapped_column(Text, default="{}")  # JSON
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class StorageBucket(Base):
+    """A customer bucket on the platform's MinIO (SPEC §16.8). `bucket` is the global name on MinIO
+    (STORAGE_BUCKET_PREFIX + a random per-site tag + "-" + `name`). `access_key` is the MinIO service
+    account (owned by the controller's storage user, inline policy scoped to this bucket only); its
+    secret is shown once and stored encrypted (`secret_key`). `origin_token` is the value the edges
+    send as Referer: the bucket policy allows anonymous s3:GetObject only with it, so the bucket is
+    a CDN origin without being public. size/objects are the last MinIO scanner reading."""
+
+    __tablename__ = "storage_buckets"
+    __table_args__ = (UniqueConstraint("site_id", "name", name="uq_storage_buckets_site_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(63))
+    bucket: Mapped[str] = mapped_column(String(63), unique=True)
+    access_key: Mapped[str] = mapped_column(String(32))
+    secret_key_stored: Mapped[str] = mapped_column("secret_key", Text)
+    origin_token_stored: Mapped[str] = mapped_column("origin_token", Text)
+    quota_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    objects: Mapped[int] = mapped_column(BigInteger, default=0)
+    usage_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def secret_key(self) -> str | None:
+        return crypto.decrypt(self.secret_key_stored)
+
+    @secret_key.setter
+    def secret_key(self, value: str):
+        self.secret_key_stored = crypto.encrypt(value)
+
+    @property
+    def origin_token(self) -> str | None:
+        return crypto.decrypt(self.origin_token_stored)
+
+    @origin_token.setter
+    def origin_token(self, value: str):
+        self.origin_token_stored = crypto.encrypt(value)
+
+
+class StorageUsageHourly(Base):
+    """Hourly sample of one bucket's stored bytes (SPEC §16.8 billing): bytes x 1 h = byte-hours, so
+    the sum of a month's rows / 1024^3 is the GB-hours WHMCS invoices. Keyed by the bucket's global
+    name (not its row) so the usage of a deleted bucket stays billable; pruned with the site."""
+
+    __tablename__ = "storage_usage_hourly"
+    __table_args__ = (UniqueConstraint("bucket", "hour", name="uq_storage_usage_bucket_hour"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    bucket: Mapped[str] = mapped_column(String(63))
+    hour: Mapped[datetime] = mapped_column(DateTime, index=True)
+    bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    objects: Mapped[int] = mapped_column(BigInteger, default=0)

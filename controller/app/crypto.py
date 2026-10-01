@@ -126,6 +126,28 @@ SITE_SECRETS = ("ssl_key_stored", "secret_stored", "origin_client_key_stored")
 # `state` rows holding a JSON document whose listed fields are encrypted secrets (the platform
 # origin-pull CA + client certificate keys, SPEC §14.2; see origin_pull.py)
 STATE_SECRETS = {"origin_pull:platform": ("ca_key", "client_key")}
+# encrypted columns of storage_buckets (SPEC §16.8): the customer's MinIO secret key (shown once,
+# kept for the record) and the bucket's edge origin token
+STORAGE_SECRETS = ("secret_key_stored", "origin_token_stored")
+
+
+def _storage_rows(db):
+    from sqlalchemy import select
+
+    from .models import StorageBucket
+
+    return list(db.scalars(select(StorageBucket).order_by(StorageBucket.id)))
+
+
+def _map_storage_secrets(db, fn, plaintext_only: bool) -> int:
+    changed = 0
+    for b in _storage_rows(db):
+        for attr in STORAGE_SECRETS:
+            v = getattr(b, attr)
+            if v and not (plaintext_only and is_encrypted(v)):
+                setattr(b, attr, fn(v))
+                changed += 1
+    return changed
 
 
 def _secret_rows(db):
@@ -184,6 +206,7 @@ def status(db) -> dict:
     values = [v for row in db.execute(select(*(getattr(Site, a) for a in SITE_SECRETS))) for v in row]
     values += [doc.get(f) for _, doc, fields in _state_docs(db) for f in fields]
     values += [v for site in _secret_rows(db) for v in site_secrets.values(site)]
+    values += [getattr(b, a) for b in _storage_rows(db) for a in STORAGE_SECRETS]
     sample = None
     for v in values:
         if not v:
@@ -217,6 +240,7 @@ def encrypt_existing(db) -> int:
                 changed += 1
         changed += site_secrets.map_values(site, encrypt, plaintext_only=True)
     changed += _map_state_secrets(db, encrypt, plaintext_only=True)
+    changed += _map_storage_secrets(db, encrypt, plaintext_only=True)
     db.commit()
     return changed
 
@@ -236,6 +260,7 @@ def rotate_all(db) -> int:
                 changed += 1
         changed += site_secrets.map_values(site, rotate, plaintext_only=False)
     changed += _map_state_secrets(db, rotate, plaintext_only=False)
+    changed += _map_storage_secrets(db, rotate, plaintext_only=False)
     db.commit()
     return changed
 
@@ -288,5 +313,15 @@ def drop_unreadable(db) -> list[str]:
         if not all(_readable(doc.get(f)) for f in fields):
             log.warning("dropping the unreadable %s secrets; they are recreated on next use", row.key)
             db.delete(row)
+    # storage buckets (SPEC §16.8): the stored copy of the customer's secret is only a record (it was
+    # shown once) and is forgotten; a new edge origin token is generated — the hourly storage job
+    # re-applies every bucket's origin policy, so the edges use the new token within the hour
+    import secrets as pysecrets
+
+    for b in _storage_rows(db):
+        if not _readable(b.secret_key_stored):
+            b.secret_key_stored = ""
+        if not _readable(b.origin_token_stored):
+            b.origin_token = pysecrets.token_hex(24)
     db.commit()
     return affected

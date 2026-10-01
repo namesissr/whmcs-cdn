@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import botranges, dnsbuild, images, l4, logexport, origin_pull, pdns, sections, webhooks
+from . import botranges, crypto, dnsbuild, images, l4, logexport, origin_pull, pdns, sections, storage, webhooks
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -332,6 +332,8 @@ def record_to_dict(r) -> dict:
         "id": r.id, "name": r.name, "type": r.type, "content": r.content,
         "ttl": r.ttl, "priority": r.priority, "proxied": r.proxied,
         "pool": r.pool, "origin_port": r.origin_port,
+        # SPEC §16.8: origin shortcut to one of the site's storage buckets (its short name)
+        "storage": r.storage_bucket,
         "health_check": r.health_check, "health_port": r.health_port,
         # SPEC §16.7: weighted / failover sets and the controller's probe of non-proxied records
         "weight": r.weight, "health_protocol": r.health_protocol, "health_path": r.health_path,
@@ -429,15 +431,28 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
     group = dnsbuild.edge_group(edge) if edge is not None else None
     shield_used = False
     platform_pull = False  # some site presents the platform origin-pull client certificate
+    buckets = storage.edge_buckets(db)  # SPEC §16.8 storage origins: (site id, name) -> bucket
     for site in db.scalars(select(Site).order_by(Site.id)):
         hosts, seen = [], set()
+        storage_on = bool(buckets) and sections.features_of(site)["storage_gb"] > 0
         for r in site.records:
             if not r.proxied:
                 continue
             name = fqdn(r.name, site.domain)
             if name in seen:  # one origin per hostname (first proxied record wins)
                 continue
-            if r.pool:
+            if r.storage_bucket:
+                # a bucket that is gone, a plan without storage or a controller without storage
+                # config drops the host (like a missing pool); the bucket's customer keys never
+                # travel, only its read token for the Referer-conditioned bucket policy
+                b = buckets.get((site.id, r.storage_bucket)) if storage_on else None
+                if b is None:
+                    continue
+                try:
+                    origin = {"storage": storage.edge_origin(b)}
+                except crypto.CryptoError:  # unreadable token (key lost): this host only
+                    continue
+            elif r.pool:
                 origin = {"pool": r.pool}
             else:
                 address = resolve_origin(site, r)
@@ -602,7 +617,10 @@ def delete_platform_data(db: Session, site_id: int) -> None:
 
     from .models import AnalyticsMinute, ApiKey, LogSpool, Purge, SecurityEvent, UsageHourly, WebhookDelivery
 
-    for model in (ApiKey, UsageHourly, SecurityEvent, Purge, AnalyticsMinute, LogSpool, WebhookDelivery):
+    from .models import StorageBucket, StorageUsageHourly
+
+    for model in (ApiKey, UsageHourly, SecurityEvent, Purge, AnalyticsMinute, LogSpool, WebhookDelivery,
+                  StorageBucket, StorageUsageHourly):
         db.execute(delete(model).where(model.site_id == site_id))
     l4.delete_site(db, site_id)  # SPEC §16.4: the site's edge ports are free again
     keys = [logexport.STATUS_KEY.format(site_id), logexport.DROPPED_KEY.format(site_id),

@@ -44,6 +44,8 @@ DEFAULT_FEATURES = {
     # wave 8 (SPEC §16.4): TCP/UDP proxy apps (section `l4`)
     "l4_proxy": False,
     "max_l4_apps": 0,
+    # SPEC §16.8: object storage quota of the site in GB (GiB), 0 = no storage product
+    "storage_gb": 0,
 }
 EDGE_GROUPS = ("general", "tunnel")
 WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
@@ -77,6 +79,7 @@ class Features(Strict):
     sla_target: float = Field(99.9, ge=0, le=100)
     l4_proxy: bool = False
     max_l4_apps: int = Field(0, ge=0, le=L4_APPS_MAX)
+    storage_gb: int = Field(0, ge=0, le=1000000)
 
 
 # ------------------------------------------------------------------ sections
@@ -577,7 +580,7 @@ class Video(Strict):
 
 L4_ID_RE = r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$"  # also the DNS label of l4-<id>.<domain>
 L4_PORT_MIN = 1024
-ALWAYS_RESERVED_PORTS = {22, 53, 80, 443}
+ALWAYS_RESERVED_PORTS = {22, 53, 80, 443, 8089, 8090}  # 8089/8090: the edges' loopback image servers
 
 
 class L4Origin(Strict):
