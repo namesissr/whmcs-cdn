@@ -50,9 +50,11 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
-    # 0008: sites.reseller_client_id / reseller_label
+    # 0008: sites.reseller_client_id / reseller_label; 0014: custom origin client certificate
+    # (authenticated origin pulls, SPEC §14.2)
     site_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "sites")
-    assert site_added == ["reseller_client_id", "reseller_label"], diff
+    assert site_added == ["origin_client_cert", "origin_client_expires_at", "origin_client_key",
+                          "reseller_client_id", "reseller_label"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
     # 0010: edge_addresses (multi-address edges / health-based failover);
     # 0011: usage_batches (idempotent usage reports, F7); 0012: audit_log (SPEC §13.2)
@@ -88,6 +90,10 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
     assert _diff(any_engine) == []
     with any_engine.connect() as c:
         assert c.execute(text("SELECT domain, secret FROM sites")).one() == ("legacy.com", "ab" * 32)
+        # 0014: no custom origin client certificate on existing sites
+        assert tuple(c.execute(text(
+            "SELECT origin_client_cert, origin_client_key, origin_client_expires_at FROM sites")).one()) \
+            == (None, None, None)
         # 0003/0004/0005/0013 fill in the new edge columns of existing edges
         assert tuple(c.execute(text(
             'SELECT "group", capacity_mbps, shed, load_high, cpu_high, metrics, probe_fail, probe_ok,'

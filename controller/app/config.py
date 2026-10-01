@@ -194,5 +194,11 @@ class Settings:
     # and stats stay governed by CAPI_RATE. Applied in addition to CAPI_RATE.
     capi_config_rate: int = field(default_factory=lambda: int(os.getenv("CAPI_CONFIG_RATE", "6")))
 
+    # bot management (SPEC §14.2): the scheduler leader fetches Google's and Bing's published crawler
+    # IP ranges daily (outbound through HTTPS_PROXY / ALL_PROXY like the alerts) for the edges'
+    # verified-bot check; a warning alert opens when they could not be refreshed for N days (0 = never)
+    bot_ranges_enabled: bool = field(default_factory=lambda: _bool("BOT_RANGES_ENABLED", True))
+    bot_ranges_stale_days: int = field(default_factory=lambda: int(os.getenv("BOT_RANGES_STALE_DAYS") or 3))
+
 
 settings = Settings()

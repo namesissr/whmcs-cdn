@@ -61,6 +61,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pasargad CDN Controller", version="1.1.0", lifespan=lifespan)
 app.include_router(routes_admin.router)
 app.include_router(routes_v2.router)
+# public, unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)
+app.include_router(routes_v2.public_router)
 app.include_router(routes_capi.router)
 app.include_router(routes_edge.router)
 app.include_router(routes_ops.router)

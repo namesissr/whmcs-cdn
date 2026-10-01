@@ -16,6 +16,7 @@ turning encryption on never breaks existing data; `python -m app.manage encrypt-
 Key material is never logged: errors mention the key index, never its value.
 """
 
+import json
 import logging
 
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
@@ -118,12 +119,50 @@ def rotate(value: str | None) -> str | None:
 
 # ------------------------------------------------------------------ bulk operations
 
+# encrypted columns of the sites table (ORM attribute names)
+SITE_SECRETS = ("ssl_key_stored", "secret_stored", "origin_client_key_stored")
+# `state` rows holding a JSON document whose listed fields are encrypted secrets (the platform
+# origin-pull CA + client certificate keys, SPEC §14.2; see origin_pull.py)
+STATE_SECRETS = {"origin_pull:platform": ("ca_key", "client_key")}
+
+
 def _secret_rows(db):
     from sqlalchemy import select
 
     from .models import Site
 
     return db.scalars(select(Site).order_by(Site.id))
+
+
+def _state_docs(db):
+    """(row, document, secret fields) of every STATE_SECRETS row present."""
+    from sqlalchemy import select
+
+    from .models import State
+
+    for row in list(db.scalars(select(State).where(State.key.in_(list(STATE_SECRETS))))):
+        try:
+            doc = json.loads(row.value)
+        except ValueError:
+            continue
+        if isinstance(doc, dict):
+            yield row, doc, STATE_SECRETS[row.key]
+
+
+def _map_state_secrets(db, fn, plaintext_only: bool) -> int:
+    """Apply encrypt/rotate to the secret fields of the STATE_SECRETS documents; returns the count."""
+    changed = 0
+    for row, doc, fields in _state_docs(db):
+        touched = 0
+        for f in fields:
+            v = doc.get(f)
+            if v and not (plaintext_only and is_encrypted(v)):
+                doc[f] = fn(v)
+                touched += 1
+        if touched:
+            row.value = json.dumps(doc)
+            changed += touched
+    return changed
 
 
 def status(db) -> dict:
@@ -138,16 +177,17 @@ def status(db) -> dict:
     except CryptoError as e:
         out["error"] = str(e)
         out["readable"] = False
+    values = [v for row in db.execute(select(*(getattr(Site, a) for a in SITE_SECRETS))) for v in row]
+    values += [doc.get(f) for _, doc, fields in _state_docs(db) for f in fields]
     sample = None
-    for key_raw, secret_raw in db.execute(select(Site.ssl_key_stored, Site.secret_stored)):
-        for v in (key_raw, secret_raw):
-            if not v:
-                continue
-            if is_encrypted(v):
-                out["encrypted"] += 1
-                sample = sample or v
-            else:
-                out["plaintext"] += 1
+    for v in values:
+        if not v:
+            continue
+        if is_encrypted(v):
+            out["encrypted"] += 1
+            sample = sample or v
+        else:
+            out["plaintext"] += 1
     if sample and out["error"] is None:
         try:
             decrypt(sample)
@@ -163,11 +203,12 @@ def encrypt_existing(db) -> int:
         raise CryptoError("DATA_ENCRYPTION_KEY is not set")
     changed = 0
     for site in _secret_rows(db):
-        for attr in ("ssl_key_stored", "secret_stored"):
+        for attr in SITE_SECRETS:
             v = getattr(site, attr)
             if v and not is_encrypted(v):
                 setattr(site, attr, encrypt(v))
                 changed += 1
+    changed += _map_state_secrets(db, encrypt, plaintext_only=True)
     db.commit()
     return changed
 
@@ -178,30 +219,38 @@ def rotate_all(db) -> int:
         raise CryptoError("DATA_ENCRYPTION_KEY is not set")
     changed = 0
     for site in _secret_rows(db):
-        for attr in ("ssl_key_stored", "secret_stored"):
+        for attr in SITE_SECRETS:
             v = getattr(site, attr)
             if v:
                 setattr(site, attr, rotate(v))
                 changed += 1
+    changed += _map_state_secrets(db, rotate, plaintext_only=False)
     db.commit()
     return changed
+
+
+def _readable(v: str | None) -> bool:
+    try:
+        decrypt(v)
+        return True
+    except CryptoError:
+        return False
 
 
 def drop_unreadable(db) -> list[str]:
     """Last resort after losing DATA_ENCRYPTION_KEY: forget secrets that cannot be decrypted.
 
-    Let's Encrypt certificates are queued for re-issue, custom certificates are removed (the
-    customer must upload them again), and challenge secrets are regenerated. Returns the
-    affected domains.
+    Let's Encrypt certificates are queued for re-issue, custom certificates (and custom origin
+    client certificates) are removed (the customer must upload them again), and challenge secrets
+    are regenerated. An unreadable platform origin-pull CA is dropped and recreated on next use
+    (customers using it must download the new CA). Returns the affected domains.
     """
     import secrets as pysecrets
 
     affected = []
     for site in _secret_rows(db):
         touched = False
-        try:
-            decrypt(site.ssl_key_stored)
-        except CryptoError:
+        if not _readable(site.ssl_key_stored):
             site.ssl_key_stored = None
             site.ssl_cert = None
             site.ssl_expires_at = None
@@ -210,12 +259,17 @@ def drop_unreadable(db) -> list[str]:
             else:
                 site.ssl_status = "pending"
             touched = True
-        try:
-            decrypt(site.secret_stored)
-        except CryptoError:
+        if not _readable(site.origin_client_key_stored):
+            site.origin_client_key_stored = site.origin_client_cert = site.origin_client_expires_at = None
+            touched = True
+        if not _readable(site.secret_stored):
             site.secret = pysecrets.token_hex(32)
             touched = True
         if touched:
             affected.append(site.domain)
+    for row, doc, fields in _state_docs(db):
+        if not all(_readable(doc.get(f)) for f in fields):
+            log.warning("dropping the unreadable %s secrets; they are recreated on next use", row.key)
+            db.delete(row)
     db.commit()
     return affected

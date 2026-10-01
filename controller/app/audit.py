@@ -29,6 +29,8 @@ DETAIL_WHITELIST = {
     # records / config / keys / purge
     "record_id", "type", "section", "key_id", "scopes", "name_count",
     "everything", "urls", "prefixes", "items", "fields",
+    # bulk imports (e.g. redirects CSV): replace | append
+    "mode",
 }
 # a key containing any of these substrings is never stored, as a second line of defence
 _SECRET_HINTS = ("secret", "token", "key", "password", "passphrase", "cert", "hash", "private")

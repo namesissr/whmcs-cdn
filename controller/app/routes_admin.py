@@ -84,6 +84,8 @@ class FeaturesIn(BaseModel):
     max_tunnel_connections: int | None = Field(default=None, ge=0, le=1000000)
     tunnel_max_mbps: int | None = Field(default=None, ge=0, le=100000)
     edge_group: Literal["general", "tunnel"] | None = None
+    max_transform_rules: int | None = Field(default=None, ge=0, le=1000)
+    max_redirects: int | None = Field(default=None, ge=0, le=10000)
 
 
 class Plan(BaseModel):

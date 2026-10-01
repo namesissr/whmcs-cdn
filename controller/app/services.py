@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import dnsbuild, pdns, sections
+from . import botranges, dnsbuild, origin_pull, pdns, sections
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -262,6 +262,8 @@ def site_to_dict(db: Session, site: Site) -> dict:
             "expires_at": site.ssl_expires_at.isoformat() + "Z" if site.ssl_expires_at else None,
             "error": site.ssl_error,
         },
+        # authenticated origin pulls (SPEC §14.2): setting, effective mode, uploaded cert facts (no key)
+        "origin_client": origin_pull.site_info(site, ssl_opts["origin_client_auth"]),
         "dnssec": site.dnssec_enabled,
         # customers whitelist these at their origin and use them for real-IP config
         "edge_ips": edge_ips(db),
@@ -385,6 +387,7 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
     peers = shield_peers(db, edge) if secret else []
     group = dnsbuild.edge_group(edge) if edge is not None else None
     shield_used = False
+    platform_pull = False  # some site presents the platform origin-pull client certificate
     for site in db.scalars(select(Site).order_by(Site.id)):
         hosts, seen = [], set()
         for r in site.records:
@@ -444,13 +447,19 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             cfg["pools"] = {"pools": []}
             hosts = [h for h in hosts if "pool" not in h["origin"]]
         for key, feat in (("firewall", "max_firewall_rules"), ("ratelimit", "max_ratelimit_rules"),
-                          ("pagerules", "max_page_rules")):
+                          ("pagerules", "max_page_rules"), ("transform", "max_transform_rules"),
+                          ("redirects", "max_redirects")):
             cfg[key] = dict(cfg[key], rules=cfg[key]["rules"][: feats[feat]])
         pool_names = {p["name"] for p in cfg["pools"]["pools"]}
         hosts = [h for h in hosts if "pool" not in h["origin"] or h["origin"]["pool"] in pool_names]
         if not hosts:
             continue
         shield_used = shield_used or cache["shield"]
+        # SPEC §14.2 authenticated origin pulls: what the edges present to this site's origin.
+        # {"mode": "off"|"platform"} or {"mode": "custom", "cert", "key"} (this site's own pair); a
+        # custom mode without a usable uploaded certificate is folded to off
+        ssl_opts["origin_client"] = origin_pull.edge_block(site, ssl_opts["origin_client_auth"])
+        platform_pull = platform_pull or ssl_opts["origin_client"]["mode"] == "platform"
 
         out.append({
             "id": site.id,
@@ -477,6 +486,10 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "image": cfg["image"],
             "errorpages": cfg["errorpages"],
             "tunnel": tunnel_for_edge(site, cfg["tunnel"], feats, pool_names),
+            # rules & security (SPEC §14.2); waf.packs travels inside "waf"
+            "transform": cfg["transform"],
+            "redirects": cfg["redirects"],
+            "bots": cfg["bots"],
         })
     body = {
         "sites": out,
@@ -490,6 +503,11 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "peers": peers if shield_used else [],
             "secret": secret,
         },
+        # node-wide verified crawler IP ranges for bot management (SPEC §14.2, botranges.py)
+        "bots": botranges.edge_block(db),
+        # node-wide platform client certificate for authenticated origin pulls (SPEC §14.2): the
+        # client cert + key only (never the CA key), present only while a site uses mode platform
+        "origin_pull": origin_pull.client_pair() if platform_pull else None,
     }
     # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()

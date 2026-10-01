@@ -27,7 +27,14 @@ from .routes_admin import (
     purge_site,
     update_record_of,
 )
-from .routes_v2 import read_section_of, site_analytics, site_events, write_section_of
+from .routes_v2 import (
+    csv_body,
+    import_redirects_of,
+    read_section_of,
+    site_analytics,
+    site_events,
+    write_section_of,
+)
 
 router = APIRouter(prefix="/capi/v1")
 
@@ -167,4 +174,15 @@ def write_section(section: str, body: dict, response: Response, request: Request
                   key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
     result = write_section_of(db, _site(_rate_limit_config(key)), section, body, response)
     _audit(db, request, key, "config.update", {"section": section})
+    return result
+
+
+@router.post("/redirects/import")
+def import_redirects(request: Request, response: Response, mode: str | None = None,
+                     body: dict = Depends(csv_body), key: ApiKey = Depends(require_scope("dns")),
+                     db: Session = Depends(get_db)):
+    """Bulk CSV import of redirect rules (SPEC §14.2), same rules as the admin endpoint."""
+    mode = body["mode"] or mode or "append"
+    result = import_redirects_of(db, _site(_rate_limit_config(key)), body["csv"], mode, response)
+    _audit(db, request, key, "redirects.import", {"count": result["imported"], "mode": mode})
     return result

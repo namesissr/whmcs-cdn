@@ -8,6 +8,9 @@ os.environ.update({
     "ADMIN_API_KEY": "test-admin-key",
     "SCHEDULER_ENABLED": "false",
     "NAMESERVERS": "ns1.example-cdn.com,ns2.example-cdn.com",
+    # no outbound fetch of the crawler IP ranges from the scheduler in tests (test_rules_security
+    # turns it on with an injected fetcher)
+    "BOT_RANGES_ENABLED": "false",
 })
 
 import httpx  # noqa: E402

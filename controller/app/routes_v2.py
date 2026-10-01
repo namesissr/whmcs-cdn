@@ -1,6 +1,7 @@
 """v2 admin API: configuration sections, custom SSL, zone import/export, DNSSEC, analytics (SPEC §2–4)."""
 
 import json
+import logging
 from collections import Counter
 from datetime import timedelta
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from . import pdns, sections, ssl, tunnel
+from . import origin_pull, pdns, sections, ssl, tunnel
 from .audit import record_audit
 from .auth import require_admin
 from .config import settings
@@ -24,6 +25,9 @@ from .services import site_to_dict, sync_site_dns
 from .validation import ValidationError
 
 router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
+# unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)
+public_router = APIRouter()
+log = logging.getLogger("pcdn")
 
 
 def _pydantic_422(e: pydantic.ValidationError):
@@ -69,6 +73,13 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
         bad(e)
     sections.store_section(site, section, value)
     db.commit()
+    if section == "ssl" and value["origin_client_auth"] == "platform":
+        # create the platform origin-pull CA now (once), so the CA the customer downloads next is the
+        # one the edges' client certificate chains to; a failure here is retried on the next edge poll
+        try:
+            origin_pull.ensure()
+        except Exception:  # noqa: BLE001 - never fail a saved section on this
+            log.exception("could not create the platform origin-pull certificate")
     # F1/F34: non-blocking warnings (e.g. an xhttp/h2 tunnel path on a multi-origin pool, or
     # force_https that would 301 tunnel clients on port 80) go in a header so the saved section body
     # is unchanged. json.dumps is ASCII (escapes Persian) so it is a valid latin-1 header value.
@@ -145,6 +156,102 @@ def remove_cert(domain: str, request: Request, db: Session = Depends(get_db)):
     db.commit()
     _audit(db, request, "ssl.custom.remove", site.domain)
     return site_to_dict(db, site)["ssl"]
+
+
+# ------------------------------------------------------------------ authenticated origin pulls (SPEC §14.2)
+
+@public_router.get("/origin-pull-ca.pem")
+def origin_pull_ca():
+    """The platform CA customers configure their origin to trust (client certificates the edges
+    present with ssl.origin_client_auth = platform chain to it). Public, CA certificate only."""
+    return Response(origin_pull.ca_cert_pem(), media_type="application/x-pem-file",
+                    headers={"Content-Disposition": 'attachment; filename="pcdn-origin-pull-ca.pem"',
+                             "Cache-Control": "public, max-age=3600"})
+
+
+@router.get("/sites/{domain}/ssl/origin-client")
+def origin_client_status(domain: str, db: Session = Depends(get_db)):
+    return origin_pull.site_info(get_site(db, domain))
+
+
+@router.put("/sites/{domain}/ssl/origin-client")
+def upload_origin_client(domain: str, body: CustomCert, request: Request, db: Session = Depends(get_db)):
+    """Upload the client certificate + key for ssl.origin_client_auth = custom (encrypted at rest)."""
+    site = get_site(db, domain)
+    cert, key = body.cert.strip() + "\n", body.key.strip() + "\n"
+    try:
+        info = origin_pull.validate_custom(cert, key)
+    except origin_pull.OriginClientError as e:
+        bad(e)
+    site.origin_client_cert, site.origin_client_key = cert, key
+    site.origin_client_expires_at = info["expires_at"]
+    db.commit()
+    # NB: the certificate and the private key are never written to the audit log
+    _audit(db, request, "ssl.origin_client.upload", site.domain)
+    return origin_pull.site_info(site)
+
+
+@router.delete("/sites/{domain}/ssl/origin-client")
+def remove_origin_client(domain: str, request: Request, db: Session = Depends(get_db)):
+    """Forget the custom origin client certificate; a site still set to custom is switched to off."""
+    site = get_site(db, domain)
+    if not site.origin_client_cert and not site.origin_client_key_stored:
+        raise HTTPException(404, "گواهی کلاینت مبدأ ثبت نشده است")
+    site.origin_client_cert = site.origin_client_key_stored = site.origin_client_expires_at = None
+    ssl_cfg = sections.get_section(site, "ssl")
+    if ssl_cfg["origin_client_auth"] == "custom":
+        sections.store_section(site, "ssl", dict(ssl_cfg, origin_client_auth="off"))
+    db.commit()
+    _audit(db, request, "ssl.origin_client.remove", site.domain)
+    return origin_pull.site_info(site)
+
+
+# ------------------------------------------------------------------ redirects CSV import (SPEC §14.2)
+
+async def csv_body(request: Request) -> dict:
+    """The CSV text of an import: a JSON body {"csv": "...", "mode"?: "..."} or the raw text/csv body."""
+    raw = await request.body()
+    if len(raw) > sections.CSV_MAX_BYTES + 65536:
+        raise HTTPException(413, "فایل CSV بیش از حد بزرگ است (حداکثر ۲ مگابایت)")
+    if "json" in request.headers.get("content-type", "").lower():
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            raise HTTPException(422, "بدنه JSON نامعتبر است") from None
+        if not isinstance(data, dict) or not isinstance(data.get("csv"), str):
+            raise HTTPException(422, "فیلد csv (متن فایل CSV) لازم است")
+        mode = data.get("mode")
+        return {"csv": data["csv"], "mode": mode if isinstance(mode, str) else None}
+    try:
+        return {"csv": raw.decode("utf-8-sig"), "mode": None}
+    except UnicodeDecodeError:
+        raise HTTPException(422, "فایل CSV باید با کدگذاری UTF-8 ذخیره شده باشد") from None
+
+
+def import_redirects_of(db: Session, site: Site, text: str, mode: str,
+                        response: Response | None = None) -> dict:
+    """Validate every row first; on any error nothing is saved (422 with per-row errors). replace
+    swaps the whole list, append adds after the existing rules. Plan limit -> 403."""
+    if mode not in ("replace", "append"):
+        bad(ValidationError("mode باید replace یا append باشد"))
+    existing = [] if mode == "replace" else sections.get_section(site, "redirects")["rules"]
+    rules, errors = sections.parse_redirects_csv(text, existing)
+    if errors:
+        raise HTTPException(422, errors)
+    if not rules:
+        bad(ValidationError("هیچ ردیف ریدایرکتی در فایل CSV پیدا نشد"))
+    value = write_section_of(db, site, "redirects", {"rules": existing + rules}, response)
+    return {"imported": len(rules), "total": len(value["rules"]), "mode": mode}
+
+
+@router.post("/sites/{domain}/redirects/import")
+def import_redirects(domain: str, request: Request, response: Response, mode: str | None = None,
+                     body: dict = Depends(csv_body), db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    mode = body["mode"] or mode or "append"
+    result = import_redirects_of(db, site, body["csv"], mode, response)
+    _audit(db, request, "redirects.import", site.domain, {"count": result["imported"], "mode": mode})
+    return result
 
 
 # ------------------------------------------------------------------ zone import / export

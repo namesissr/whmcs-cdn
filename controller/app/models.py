@@ -65,6 +65,13 @@ class Site(Base):
     ssl_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     ssl_source: Mapped[str | None] = mapped_column(String(12), nullable=True)  # letsencrypt | custom
 
+    # authenticated origin pulls, custom mode (SPEC §14.2): the customer's client certificate (PEM,
+    # chain allowed) the edges present to the origin, and its private key — encrypted at rest like
+    # ssl_key; use the `origin_client_key` property
+    origin_client_cert: Mapped[str | None] = mapped_column(Text, nullable=True)
+    origin_client_key_stored: Mapped[str | None] = mapped_column("origin_client_key", Text, nullable=True)
+    origin_client_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -79,6 +86,14 @@ class Site(Base):
     @ssl_key.setter
     def ssl_key(self, value: str | None):
         self.ssl_key_stored = crypto.encrypt(value)
+
+    @property
+    def origin_client_key(self) -> str | None:
+        return crypto.decrypt(self.origin_client_key_stored)
+
+    @origin_client_key.setter
+    def origin_client_key(self, value: str | None):
+        self.origin_client_key_stored = crypto.encrypt(value)
 
     @property
     def secret(self) -> str:

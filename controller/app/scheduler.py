@@ -380,12 +380,34 @@ def job_probe(db, now: datetime | None = None, force: bool = False):
     db.commit()
 
 
+def job_origin_pull(db, now: datetime | None = None):
+    """Renew the platform origin-pull client certificate when fewer than 30 days remain (SPEC §14.2,
+    leader only). Never creates the platform CA: that happens lazily on first use."""
+    from . import origin_pull
+
+    if db.get(State, origin_pull.STATE_KEY) is None:
+        return
+    db.rollback()
+    origin_pull.ensure(now=now, create=False)
+
+
+def job_bot_ranges(db, now: datetime | None = None, force: bool = False):
+    """Daily refresh of the verified search-engine crawler IP ranges (SPEC §14.2, leader only); runs
+    right away when none are stored yet. A failed fetch keeps the last good list."""
+    from . import botranges
+
+    if not settings.bot_ranges_enabled:
+        return
+    botranges.refresh(db, now=now, force=force)
+
+
 # metrics: per-job last-completed timestamps are stored in the State table under this prefix
 # (read by routes_metrics for pcdn_scheduler_job_last_run_age_seconds)
 JOBRUN_PREFIX = "jobrun:"
 
+# job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
 JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_cleanup,
-        job_prune_audit, job_ssl, job_backup]
+        job_prune_audit, job_ssl, job_backup, job_origin_pull, job_bot_ranges]
 
 
 def _record_job_run(name: str):
