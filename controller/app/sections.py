@@ -549,6 +549,61 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
     return value
 
 
+def _pool_multi_origin(site, pool_name: str) -> bool:
+    """True when the named pool has more than one non-backup origin (F1)."""
+    for p in get_section(site, "pools")["pools"]:
+        if p["name"] == pool_name:
+            return sum(1 for o in p["origins"] if not o.get("backup")) > 1
+    return False
+
+
+def _host_pools_multi_origin(site) -> bool:
+    """True when any pool the site's proxied hosts inherit has more than one non-backup origin (F1).
+    A tunnel path with neither origin nor pool inherits the host origin, which may be such a pool."""
+    return any(_pool_multi_origin(site, r.pool)
+               for r in getattr(site, "records", []) if getattr(r, "pool", None) and r.proxied)
+
+
+def section_warnings(site, name: str, value: dict) -> list[str]:
+    """Non-blocking Persian warnings for a validated section (F1, F34). The section is still saved;
+    these only surface a footgun to the panel. Returned to the caller (a response header), never
+    raised."""
+    out: list[str] = []
+    if name == "tunnel":
+        # F1: an xhttp/h2 tunnel session is split across origins when the pool has more than one
+        # non-backup origin, because (until the edge-side rendezvous fix ships) the origin is picked
+        # per HTTP request. ws/grpc are unaffected.
+        for p in value.get("paths", []):
+            if p["protocol"] not in ("xhttp", "h2"):
+                continue
+            multi = _pool_multi_origin(site, p["pool"]) if p["pool"] else (
+                not p["origin"] and _host_pools_multi_origin(site))
+            if multi:
+                out.append(f"مسیر تونل «{p['id']}» با پروتکل {p['protocol']} روی استخری با بیش از یک "
+                           f"مبدأ (origin) تعریف شده است؛ هر درخواست ممکن است به مبدأ دیگری برود و "
+                           f"نشست کاربر بشکند. برای این پروتکل‌ها از استخر تک‌مبدأ یا یک origin مشخص "
+                           f"استفاده کنید.")
+        # F34: force_https + tunnel paths — a ws/httpupgrade/xhttp client on port 80 gets a 301 and
+        # can never connect. Warn when the site has force_https on and any tunnel path exists.
+        if value.get("paths") and _force_https_on(site):
+            out.append("force_https روشن است و این سایت مسیر تونل دارد؛ کلاینت‌های تونل روی پورت ۸۰ "
+                       "با ریدایرکت ۳۰۱ روبه‌رو می‌شوند و نمی‌توانند وصل شوند. اگر تونل روی پورت ۸۰ "
+                       "لازم است، force_https را خاموش کنید.")
+    elif name == "ssl":
+        # F34 from the other side: turning force_https on while tunnel paths exist
+        if value.get("force_https") and get_section(site, "tunnel").get("paths"):
+            out.append("force_https روشن شد ولی این سایت مسیر تونل دارد؛ کلاینت‌های تونل روی پورت ۸۰ "
+                       "با ریدایرکت ۳۰۱ روبه‌رو می‌شوند و نمی‌توانند وصل شوند.")
+    return out
+
+
+def _force_https_on(site) -> bool:
+    try:
+        return bool(get_section(site, "ssl").get("force_https"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _check_tunnel(site, value: dict, feats: dict):
     """Plan limits and references of the tunnel section (the shape is checked by Tunnel)."""
     if len(value["paths"]) > feats["max_tunnel_paths"]:

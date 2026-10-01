@@ -8,7 +8,7 @@ import dns.exception
 import dns.rdatatype
 import dns.zone
 import pydantic
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -45,7 +45,8 @@ def read_section_of(site: Site, section: str) -> dict:
     return sections.get_section(site, section)
 
 
-def write_section_of(db: Session, site: Site, section: str, body: dict) -> dict:
+def write_section_of(db: Session, site: Site, section: str, body: dict,
+                     response: Response | None = None) -> dict:
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
     pools_in_use = {r.pool for r in site.records if r.pool}
@@ -59,6 +60,13 @@ def write_section_of(db: Session, site: Site, section: str, body: dict) -> dict:
         bad(e)
     sections.store_section(site, section, value)
     db.commit()
+    # F1/F34: non-blocking warnings (e.g. an xhttp/h2 tunnel path on a multi-origin pool, or
+    # force_https that would 301 tunnel clients on port 80) go in a header so the saved section body
+    # is unchanged. json.dumps is ASCII (escapes Persian) so it is a valid latin-1 header value.
+    if response is not None:
+        warnings = sections.section_warnings(site, section, value)
+        if warnings:
+            response.headers["X-Pcdn-Warnings"] = json.dumps(warnings)
     return value
 
 
@@ -68,8 +76,9 @@ def read_section(domain: str, section: str, db: Session = Depends(get_db)):
 
 
 @router.put("/sites/{domain}/config/{section}")
-def write_section(domain: str, section: str, body: dict, db: Session = Depends(get_db)):
-    return write_section_of(db, get_site(db, domain), section, body)
+def write_section(domain: str, section: str, body: dict, response: Response,
+                  db: Session = Depends(get_db)):
+    return write_section_of(db, get_site(db, domain), section, body, response)
 
 
 # ------------------------------------------------------------------ tunnel mode (SPEC §7.5)

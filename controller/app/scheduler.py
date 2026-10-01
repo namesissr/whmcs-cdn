@@ -9,15 +9,22 @@ import logging
 import threading
 from datetime import datetime, timedelta
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, or_, select
 
 from . import alerts, dnsbuild, geocheck, nscheck, ssl, uptime
 from .config import settings
 from .db import SessionLocal
 from .leader import instance_id, make_elector
-from .models import Purge, Site, State, UsageHourly, utcnow
+from .models import Purge, Site, State, UsageBatch, UsageHourly, utcnow
 from .routes_v2 import prune_events
-from .services import DNS_DIRTY_KEY, online_edges, refresh_quota, sync_all_dns, sync_site_dns
+from .services import (
+    DNS_DIRTY_KEY,
+    online_edges,
+    rebalance_pool_shed,
+    refresh_quota,
+    sync_all_dns,
+    sync_site_dns,
+)
 
 log = logging.getLogger("pcdn.scheduler")
 
@@ -64,8 +71,8 @@ def dns_signature() -> str:
     return ";".join([dnsbuild.BUILD_VERSION, str(settings.geoip_enabled), ",".join(settings.geo_home_countries),
                      settings.geo_no_ecs_pool, ",".join(settings.geo_no_ecs_resolvers),
                      ",".join(settings.geo_no_ecs_countries), settings.geo_unknown_pool,
-                     settings.lua_selector, str(settings.edge_probe), settings.health_url,
-                     str(settings.geo_log)])
+                     settings.lua_selector, settings.tunnel_lua_selector, str(settings.edge_probe),
+                     settings.health_url, str(settings.geo_log)])
 
 
 def edge_dns_state(e) -> str:
@@ -73,22 +80,72 @@ def edge_dns_state(e) -> str:
     group, load shedding, and — for multi-address failover (SPEC §12) — the advertised state of
     the primary and of every additional address (health, enable/disable, add/remove)."""
     flags = [f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}:{e.group}:{int(dnsbuild.is_shed(e))}",
-             f"p{int(dnsbuild.address_advertised(True, e.probe_ok, e.probe_fail))}"]
+             # F32: the primary's IPv4 and IPv6 advertise independently, so a per-family change
+             # (one family withdrawn/restored) still triggers a zone rewrite
+             f"p4{int(dnsbuild.address_advertised(True, e.probe_ok4, e.probe_fail4))}",
+             f"p6{int(dnsbuild.address_advertised(True, e.probe_ok6, e.probe_fail6))}"]
     for a in sorted(e.addresses, key=lambda a: a.id):
         flags.append(f"a{a.id}:{a.family}:{a.ip}:{int(a.enabled)}:"
                      f"{int(dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail))}")
     return "/".join(flags)
 
 
+SILENT_GUARD_ALERT = "edge_fleet_silent"
+
+
+def _bulk_went_silent(db, edges: list) -> bool:
+    """F10: is this a control-plane outage rather than many nodes dying at once?
+
+    The DNS edge set follows the control-plane heartbeat. If the online (heartbeating) set suddenly
+    collapses — more than EDGE_SILENT_GUARD_FRACTION of the previously-published edges go silent in
+    one step — that is far more likely the edges losing the controller than a simultaneous mass node
+    death, so we keep publishing the last-known DNS and raise a critical alert instead of emptying or
+    drastically shrinking the pool (fail-static, same spirit as SPEC §12.3 fail-open).
+
+    Armed only when EDGE_PROBE is on, because PowerDNS ifurlup then still removes a genuinely dead
+    edge from within its pool in ~5s — so a real single-node failure is handled at the data plane and
+    never reaches this guard, while a bulk go-silent is held here. DNS still reacts to genuine
+    reachability, never to any filtering signal. A fresh install (nothing published yet) is let
+    through so the first real edge set is published normally (see test_api fresh-install fallback)."""
+    if not settings.edge_probe or settings.edge_silent_guard_fraction <= 0:
+        alerts.resolve_alert(SILENT_GUARD_ALERT, "مجموعه نودهای فعال دوباره پایدار است.")
+        return False
+    prev_ids = _state(db, "online_edge_ids")
+    prev = {p for p in prev_ids.split(",") if p}
+    now_ids = {str(e.id) for e in edges}
+    if not prev or now_ids >= prev:  # fresh install, or the set is stable / grew
+        alerts.resolve_alert(SILENT_GUARD_ALERT, "مجموعه نودهای فعال دوباره پایدار است.")
+        return False
+    lost = prev - now_ids
+    if len(lost) / len(prev) <= settings.edge_silent_guard_fraction:
+        alerts.resolve_alert(SILENT_GUARD_ALERT, "مجموعه نودهای فعال دوباره پایدار است.")
+        return False
+    log.warning("F10 guard: %d/%d online edges went silent at once; keeping last-known DNS",
+                len(lost), len(prev))
+    alerts.raise_alert(
+        SILENT_GUARD_ALERT, "افت ناگهانی نودهای فعال (احتمال قطعی مسیر کنترلر)",
+        f"{len(lost)} نود از {len(prev)} نودی که در DNS منتشر شده بودند هم‌زمان از دسترس کنترلر خارج "
+        f"شدند. این معمولاً یعنی نودها به کنترلر نمی‌رسند، نه اینکه واقعاً از کار افتاده باشند؛ برای "
+        f"جلوگیری از خالی/کوچک شدن استخر DNS، آخرین وضعیت شناخته‌شده حفظ می‌شود و PowerDNS با پروب "
+        f"مستقیم، نودهای واقعاً از کارافتاده را ظرف چند ثانیه از استخر حذف می‌کند.", "critical")
+    return True
+
+
 def job_edges(db):
     """Resync every zone when the set of healthy edges changes, or after a failed DNS write."""
     if not edge_reports_trusted(db):
+        return
+    # F25: keep pool-level load shedding from herding a region before we (re)build zones
+    rebalance_pool_shed(db)
+    edges = online_edges(db)
+    # F10: a bulk "went silent" is treated as a control-plane outage, not many node deaths
+    if _bulk_went_silent(db, edges):
         return
     # the DNS settings and the record format are part of the state: changing GEOIP_ENABLED,
     # GEO_* or upgrading the controller rewrites every zone on the next tick
     # group and load shedding decide which edges answer (dnsbuild.dns_edges): part of the state too
     # per-address advertisement (probe health / enable / add-remove) is part of the state too (§12)
-    current = ",".join(edge_dns_state(e) for e in online_edges(db)) + "|" + dns_signature()
+    current = ",".join(edge_dns_state(e) for e in edges) + "|" + dns_signature()
     dirty = db.get(State, DNS_DIRTY_KEY) is not None
     if current == _state(db, "online_edges") and not dirty:
         return
@@ -100,6 +157,7 @@ def job_edges(db):
     failed = sync_all_dns(db, server_errors)
     if failed == 0:
         _set_state(db, "online_edges", current)
+        _set_state(db, "online_edge_ids", ",".join(sorted(str(e.id) for e in edges)))
         row = db.get(State, DNS_DIRTY_KEY)
         if row is not None:
             db.delete(row)
@@ -149,31 +207,39 @@ SSL_RENEW_RETRY = timedelta(hours=6)
 
 
 def job_ssl(db):
+    # F2: renew IN PLACE — never flip a due "active" site to "pending" first. The old flip removed
+    # nothing on its own, but it churned status and, together with the pre-F2 build_edge_config, could
+    # drop the site's HTTPS server. Now a due site keeps ssl_status "active" (and keeps serving its
+    # still-valid cert, F2 in services.build_edge_config) until ssl.issue() succeeds and sets active
+    # again. Pick the single most-urgent site: one awaiting first issuance ("pending"), or an active
+    # cert inside the 30-day renewal window (not a customer's own "custom" cert; respect the retry
+    # backoff after a failure). Order by expiry so the closest-to-expiring renews first; a pending
+    # site with no cert yet (NULL expiry) is taken first.
     renew_before = utcnow() + timedelta(days=30)
-    for site in db.scalars(select(Site).where(
-        Site.ssl_status == "active", Site.ssl_allowed.is_(True), Site.ssl_expires_at < renew_before,
-        or_(Site.ssl_source.is_(None), Site.ssl_source != "custom"),  # customers renew their own certs
-        or_(Site.ssl_error.is_(None), Site.updated_at < utcnow() - SSL_RENEW_RETRY),
-    )):
-        site.ssl_status = "pending"
-    db.commit()
-
+    not_custom = or_(Site.ssl_source.is_(None), Site.ssl_source != "custom")
+    retry_ok = or_(Site.ssl_error.is_(None), Site.updated_at < utcnow() - SSL_RENEW_RETRY)
     site = db.scalar(select(Site).where(
-        Site.ssl_status == "pending", Site.ns_verified_at.is_not(None), Site.ssl_allowed.is_(True)
-    ).order_by(Site.updated_at).limit(1))
+        Site.ns_verified_at.is_not(None), Site.ssl_allowed.is_(True),
+        or_(
+            Site.ssl_status == "pending",
+            and_(Site.ssl_status == "active", Site.ssl_expires_at < renew_before, not_custom, retry_ok),
+        ),
+    ).order_by(Site.ssl_expires_at.is_(None).desc(), Site.ssl_expires_at).limit(1))
     if site is None:
         return
     log.info("issuing certificate for %s", site.domain)
     had_cert = bool(site.ssl_cert)
     domain = site.domain
     try:
-        ssl.issue(site)
+        ssl.issue(site)  # sets ssl_status active, clears ssl_error, stores the new cert
         error = None
     except Exception as e:  # noqa: BLE001
         log.error("certificate for %s failed: %s", domain, e)
-        # keep serving the old (still valid) cert on renewal failure
+        # renewal failure: leave the still-valid cert active and served; set only the error + the
+        # updated_at that arms SSL_RENEW_RETRY. Initial issuance with no cert becomes "failed".
         site.ssl_status = "active" if had_cert else "failed"
         site.ssl_error = error = str(e)[-2000:]
+        site.updated_at = utcnow()
     db.commit()
     key = f"ssl_failed:{domain}"
     if error is None:
@@ -199,6 +265,8 @@ def job_uptime(db):
 def job_cleanup(db):
     db.execute(delete(Purge).where(Purge.created_at < utcnow() - timedelta(days=2)))
     db.execute(delete(UsageHourly).where(UsageHourly.hour < utcnow() - timedelta(days=400)))
+    # F7: usage idempotency keys only need to outlive the agent's retry window; a week is plenty
+    db.execute(delete(UsageBatch).where(UsageBatch.received_at < utcnow() - timedelta(days=7)))
     uptime.prune(db)
     prune_events(db)
     db.commit()

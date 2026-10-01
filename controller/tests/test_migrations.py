@@ -39,11 +39,14 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     diff = _diff(any_engine)
     flat = [d for grp in diff for d in (grp if isinstance(grp, list) else [grp])]
     # 0003: edge group / capacity / metrics columns; 0004: edges.cpu_high; 0005: probe fields;
-    # 0009: logs / logs_at / bundle_version (centralized node logs + bundle version)
+    # 0009: logs / logs_at / bundle_version (centralized node logs + bundle version);
+    # 0011: per-family primary probe (probe_ok4/fail4/ok6/fail6, F32) + shed hysteresis
+    # (shed_high / shed_since, F25)
     added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "edges")
     assert added == ["bundle_version", "capacity_mbps", "cpu_high", "group", "load_high", "logs",
                      "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
-                     "probe_ms", "probe_ok", "shed"], diff
+                     "probe_fail4", "probe_fail6", "probe_ms", "probe_ok", "probe_ok4", "probe_ok6",
+                     "shed", "shed_high", "shed_since"], diff
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
@@ -51,15 +54,18 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     site_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "sites")
     assert site_added == ["reseller_client_id", "reseller_label"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
-    # 0010: edge_addresses (multi-address edges / health-based failover)
+    # 0010: edge_addresses (multi-address edges / health-based failover);
+    # 0011: usage_batches (idempotent usage reports, F7)
     tables = {d[1].name for d in flat if d[0] == "add_table"}
-    assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses"} <= tables, diff
+    assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses",
+            "usage_batches"} <= tables, diff
     # 0002: sites.secret String(64) -> Text
     assert any(d[0] == "modify_type" and d[2:4] == ("sites", "secret") for d in flat), diff
     # nothing else changed between 0001 and head
     other = [d for d in flat if d[0] not in ("add_column", "add_table", "modify_type")
              and not (d[0] == "add_index" and d[1].table.name in
-                      ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses"))]
+                      ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses",
+                       "usage_batches"))]
     assert other == [], other
 
 

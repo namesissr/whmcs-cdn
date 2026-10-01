@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .auth import require_edge
 from .db import get_db
-from .models import Edge, Purge, SecurityEvent, Site, UsageHourly, utcnow
+from .models import Edge, Purge, SecurityEvent, Site, UsageBatch, UsageHourly, utcnow
 from .services import build_edge_config, record_metrics
 
 router = APIRouter(prefix="/edge/v1")
@@ -55,6 +56,11 @@ class Heartbeat(BaseModel):
     # self-registration into the right pool on first contact (SPEC §11.1); older agents omit them
     region: str | None = Field(default=None, pattern="^(home|global)$")
     group: str | None = Field(default=None, pattern="^(general|tunnel)$")
+    # F9: whether the node currently has a GeoIP database. The edge FAILS OPEN on allowed_countries
+    # when it has none (it no longer 403s every tunnel request), so the controller must NOT assume the
+    # edge enforces allowed_countries at the node — it doesn't here, and geoip provisioning is a node
+    # concern. Accepted for observability; older agents omit it.
+    geoip: bool | None = None
 
 
 EDGE_IP_PLACEHOLDER = "0.0.0.0"  # batch-created edges (SPEC §11.1) until the node reports itself
@@ -206,6 +212,11 @@ class EventIn(BaseModel):
 class UsageIn(BaseModel):
     items: list[UsageItem] = Field(max_length=20000)
     events: list[EventIn] = Field(default_factory=list, max_length=2000)
+    # F7: idempotency key for this POST. The agent generates a stable id per persisted outbox entry
+    # and resends the SAME id verbatim on any retry (timeout / lost response), so a replayed batch is
+    # counted at most once. Optional and pattern-validated: pre-upgrade agents omit it and keep the
+    # existing at-least-once behaviour (SHARED CONTRACT: field name `batch_id`, 32 lowercase hex).
+    batch_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
 
 
 DETAIL_KEYS = ("status", "codes", "countries", "paths", "security")
@@ -246,6 +257,17 @@ def _site_for_host(host: str, domains: dict[str, int]) -> int | None:
 
 @router.post("/usage")
 def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depends(get_db)):
+    # F7: dedup on batch_id. The insert shares this transaction with the UsageHourly upserts and the
+    # SecurityEvent inserts below, so a crash between them cannot mark a batch consumed without
+    # applying it, and a concurrent duplicate blocks on the primary key then fails. A replay of an
+    # already-applied batch hits the PK and is skipped (counted once). Missing batch_id -> no dedup.
+    if body.batch_id is not None:
+        db.add(UsageBatch(edge_id=edge.id, batch_id=body.batch_id))
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            return {"ok": True, "duplicate": True, "accepted": 0, "events": 0}
     domains = {d: i for i, d in db.execute(select(Site.id, Site.domain)).all()}
     agg: dict[tuple[int, datetime], dict] = {}
     for it in body.items:

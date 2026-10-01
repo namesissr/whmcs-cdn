@@ -2,12 +2,15 @@
 
 import ipaddress
 import json
+import logging
 from collections import defaultdict
 from datetime import timedelta
 
 from .config import settings
 from .models import Edge, Site, utcnow
 from .validation import fqdn
+
+log = logging.getLogger("pcdn.dnsbuild")
 
 
 def dot(name: str) -> str:
@@ -70,12 +73,35 @@ def home_test() -> str:
     return lua
 
 
-def _pick(ips: list[str]) -> str:
+def _tunnel_selector() -> str:
+    sel = (settings.tunnel_lua_selector or "all").strip().lower()
+    return sel if sel in SELECTORS else "all"
+
+
+def is_tunnel_site(site) -> bool:
+    """A site is 'tunnel' when its plan edge_group is tunnel OR its tunnel section is enabled."""
+    if site_edge_group(site) == "tunnel":
+        return True
+    try:
+        return bool(json.loads(getattr(site, "config", None) or "{}").get("tunnel", {}).get("enabled"))
+    except (ValueError, AttributeError):
+        return False
+
+
+def _site_selector(site) -> str:
+    """The DNS selector for one site (F33). Tunnel sites (edge_group=tunnel OR the tunnel section
+    enabled) use TUNNEL_LUA_SELECTOR (default "all") so a client receives EVERY healthy edge and its
+    dialer can fail over to the next address immediately (and keep TLS resumption on the one it keeps
+    using). General web sites keep LUA_SELECTOR."""
+    return _tunnel_selector() if is_tunnel_site(site) else _selector()
+
+
+def _pick(ips: list[str], selector: str | None = None) -> str:
     """LUA expression choosing among the edges of one pool."""
     if not ips:
         return "{}"  # e.g. AAAA when the pool has no IPv6 edge: the visitor uses IPv4
     lst = _lua_list(ips)
-    sel = _selector()
+    sel = selector if selector in SELECTORS else _selector()
     if settings.edge_probe:
         # PowerDNS probes the pool's edges itself; if none looks healthy from this
         # nameserver it still answers with the whole pool (never with the other pool)
@@ -98,7 +124,8 @@ def _log(rtype: str, pool: str) -> str:
 
 
 def lua_expression(home: list[str], global_: list[str],
-                   home_alive: bool | None = None, global_alive: bool | None = None, rtype: str = "A") -> str:
+                   home_alive: bool | None = None, global_alive: bool | None = None, rtype: str = "A",
+                   selector: str | None = None) -> str:
     """Build the LUA snippet that answers with the visitor's pool of online edges.
 
     home/global_: the online edges of one address family. *_alive: whether the pool has
@@ -109,12 +136,13 @@ def lua_expression(home: list[str], global_: list[str],
     home_alive = bool(home) if home_alive is None else home_alive
     global_alive = bool(global_) if global_alive is None else global_alive
     if geo_split(home_alive, global_alive):
-        log = _log(rtype, "(home and 'home' or 'global')")
-        return f";{home_test()}{log} if home then return {_pick(home)} else return {_pick(global_)} end"
+        logline = _log(rtype, "(home and 'home' or 'global')")
+        return (f";{home_test()}{logline} if home then return {_pick(home, selector)} "
+                f"else return {_pick(global_, selector)} end")
     if settings.geo_log:
         pool = "'all'" if not settings.geoip_enabled else ("'home-only'" if home_alive else "'global-only'")
-        return f";{_log(rtype, pool).strip()} return {_pick(home + global_)}"
-    return f";return {_pick(home + global_)}"
+        return f";{_log(rtype, pool).strip()} return {_pick(home + global_, selector)}"
+    return f";return {_pick(home + global_, selector)}"
 
 
 def diag_expression(home_alive: bool, global_alive: bool) -> str:
@@ -147,12 +175,20 @@ def address_advertised(enabled: bool, probe_ok: bool | None, probe_fail: int | N
 
 def _edge_family_addresses(e, family: int) -> list[tuple[str, bool, bool]]:
     """(ip, enabled, advertised) for every address of the edge in `family`: the primary
-    (edges.ipv4/ipv6, whose health is the edge-level probe) + every additional EdgeAddress."""
+    (edges.ipv4/ipv6) + every additional EdgeAddress.
+
+    F32: the primary uses its OWN family's probe state (probe_ok4/probe_fail4 for IPv4,
+    probe_ok6/probe_fail6 for IPv6), so a dead family is withdrawn while the healthy family stays
+    advertised. NULL probe_ok* (never probed yet) advertises, fail-open. The aggregate edges.probe_*
+    stays only for the §8.1 edge_probe alert."""
     out: list[tuple[str, bool, bool]] = []
     ip = e.ipv4 if family == 4 else e.ipv6
     if ip:
-        out.append((ip, True, address_advertised(True, getattr(e, "probe_ok", None),
-                                                  getattr(e, "probe_fail", 0))))
+        if family == 4:
+            ok, fail = getattr(e, "probe_ok4", None), getattr(e, "probe_fail4", 0)
+        else:
+            ok, fail = getattr(e, "probe_ok6", None), getattr(e, "probe_fail6", 0)
+        out.append((ip, True, address_advertised(True, ok, fail)))
     for a in (getattr(e, "addresses", None) or []):
         if getattr(a, "family", None) == family and getattr(a, "ip", None):
             out.append((a.ip, bool(a.enabled),
@@ -178,10 +214,32 @@ def edge_pools(edges: list[Edge], family: int) -> tuple[list[str], list[str]]:
             known[region].append(ip)
             if advertised:
                 adv[region].append(ip)
-    # fail-open: never emit an empty pool because of health withdrawal
-    home = adv["home"] or known["home"]
-    global_ = adv["global"] or known["global"]
-    return sorted(set(home)), sorted(set(global_))
+    return _budget(known["home"], adv["home"], family), _budget(known["global"], adv["global"], family)
+
+
+def _budget(known: list[str], adv: list[str], family: int) -> list[str]:
+    """Apply the probe-based DNS withdrawal budget (F26) and the §12.3 fail-open to one pool.
+
+    Withdrawing an address rests only on the controller's single probe vantage point, so a wide
+    "probe says down" is more likely a bad path (or a correlated outage) than real mass death. On
+    probe evidence alone we therefore withdraw at most floor(n * PROBE_WITHDRAW_MAX_FRACTION) of the
+    pool's n known (enabled) addresses; the extra withdrawn addresses are kept advertised (least
+    address string first, deterministically) and the situation is logged. Fail-open (§12.3) is the
+    boundary case: it never emits an empty pool. DNS still reacts to genuine reachability only."""
+    known_sorted = sorted(set(known))
+    n = len(known_sorted)
+    if n == 0:
+        return []
+    adv_set = set(adv)
+    withdrawn = [ip for ip in known_sorted if ip not in adv_set]
+    max_withdraw = int(n * settings.probe_withdraw_max_fraction)  # floor
+    if len(withdrawn) <= max_withdraw:
+        result = [ip for ip in known_sorted if ip in adv_set]
+        return result or known_sorted  # fail-open: never empty
+    keep_back = withdrawn[max_withdraw:]  # restore everything beyond the budget
+    log.warning("F26 withdrawal budget: family=%s wanted to withdraw %d/%d on probe evidence; "
+                "keeping %d advertised", family, len(withdrawn), n, len(keep_back))
+    return sorted(adv_set.union(keep_back))
 
 
 def site_edge_group(site) -> str:
@@ -241,11 +299,15 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
     v6_home, v6_global = edge_pools(edges, 6)
     have_v4 = bool(v4_home or v4_global)
     have_v6 = bool(v6_home or v6_global)
+    # F10: a tunnel site must NEVER fall back to its raw origin when no edge is online — that would
+    # send tunnel clients straight at the backend and defeat the tunnel. Combined with the scheduler's
+    # bulk-silence guard, this keeps a control-plane outage from exposing/last-known-losing the tunnel.
+    tunnel = is_tunnel_site(site)
 
-    # non-proxied A/AAAA sets where the customer asked for health checks
+    # non-proxied A/AAAA sets where the customer asked for health checks (never a tunnel-site origin)
     checked: dict[tuple[str, str], list] = defaultdict(list)
     for r in site.records:
-        if not (r.proxied and have_v4) and r.type in ("A", "AAAA"):
+        if not (r.proxied and have_v4) and r.type in ("A", "AAAA") and not (tunnel and r.proxied):
             checked[(fqdn(r.name, domain), r.type)].append(r)
     checked = {k: v for k, v in checked.items() if any(getattr(r, "health_check", False) for r in v)}
 
@@ -256,6 +318,10 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             proxied_names[name].append(r)
             continue
         ttl = r.ttl or settings.default_ttl
+        if r.proxied:  # proxied record with no online edge -> origin fallback
+            if tunnel:
+                continue  # F10(c): never expose a tunnel site's origin
+            ttl = min(ttl, settings.proxied_ttl)  # F10(d): bound how long a stale origin answer lives
         if (name, r.type) in checked:
             continue
         if r.type in ("CNAME", "NS", "ALIAS"):
@@ -278,13 +344,15 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             f"{rtype} \"ifportup({int(port)}, {_lua_list(ips)}, {{selector='all', backupSelector='all'}})\"")
 
     home_alive, global_alive = bool(v4_home), bool(v4_global)
+    selector = _site_selector(site)
     for name in proxied_names:
         # The customer sees their record; resolvers see our edges.
         add(name, "LUA", settings.proxied_ttl,
-            "A \"" + lua_expression(v4_home, v4_global, home_alive, global_alive) + "\"")
+            "A \"" + lua_expression(v4_home, v4_global, home_alive, global_alive, selector=selector) + "\"")
         if have_v6:
             add(name, "LUA", settings.proxied_ttl,
-                "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive, "AAAA") + "\"")
+                "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive, "AAAA",
+                                           selector=selector) + "\"")
     if proxied_names:
         add(f"{DIAG_LABEL}.{domain}", "LUA", 5, "TXT \"" + diag_expression(home_alive, global_alive) + "\"")
 

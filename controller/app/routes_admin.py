@@ -627,10 +627,10 @@ def _advertised_counts(e: Edge) -> dict:
     withdrawn address when a pool would otherwise be empty.
     """
     counts = {"4": 0, "6": 0}
-    primary_ok = dnsbuild.address_advertised(True, e.probe_ok, e.probe_fail)
-    if e.ipv4 and primary_ok:
+    # F32: each primary family advertises on its own probe state
+    if e.ipv4 and dnsbuild.address_advertised(True, e.probe_ok4, e.probe_fail4):
         counts["4"] += 1
-    if e.ipv6 and primary_ok:
+    if e.ipv6 and dnsbuild.address_advertised(True, e.probe_ok6, e.probe_fail6):
         counts["6"] += 1
     for a in e.addresses:
         if dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail):

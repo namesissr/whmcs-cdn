@@ -86,6 +86,10 @@ class Settings:
     # global pools only follows the controller's view of the edges (agent heartbeats), so
     # ns1 and ns2 always agree; EDGE_PROBE adds PowerDNS's own checks inside the pool.
     lua_selector: str = field(default_factory=lambda: os.getenv("LUA_SELECTOR", "random"))
+    # selector for tunnel sites (F33): tunnel clients need MORE than one edge address so a Go/
+    # Xray/sing-box dialer can fail over immediately and keep TLS resumption. "all" answers with
+    # every healthy edge of the pool; general (non-tunnel) sites keep LUA_SELECTOR.
+    tunnel_lua_selector: str = field(default_factory=lambda: os.getenv("TUNNEL_LUA_SELECTOR", "all"))
     edge_probe: bool = field(default_factory=lambda: _bool("EDGE_PROBE", True))
     health_url: str = field(default_factory=lambda: os.getenv("EDGE_HEALTH_URL", "http://health.pcdn/__pcdn/health"))
 
@@ -106,12 +110,32 @@ class Settings:
     # load shedding (SPEC §7.4): an edge using this % of its capacity_mbps leaves DNS answers
     # (while another edge of its pool stays) and comes back below this value - 15
     edge_shed_percent: float = field(default_factory=lambda: float(os.getenv("EDGE_SHED_PERCENT") or 90))
+    # load shedding hysteresis (F25): shed only after this many consecutive reports at/above
+    # EDGE_SHED_PERCENT, and keep an edge shed for at least EDGE_SHED_HOLD seconds, so a single
+    # 60s sample cannot herd a whole region onto one edge
+    edge_shed_checks: int = field(default_factory=lambda: max(1, int(os.getenv("EDGE_SHED_CHECKS") or 3)))
+    edge_shed_hold: int = field(default_factory=lambda: int(os.getenv("EDGE_SHED_HOLD") or 300))
+    # optional second shed signal (F25): load1/cpus at/above this for EDGE_SHED_CHECKS reports also
+    # sheds; 0 disables the CPU signal (bandwidth stays the only trigger)
+    edge_cpu_shed: float = field(default_factory=lambda: float(os.getenv("EDGE_CPU_SHED") or 0))
+    # control-plane outage guard (F10): if the online (heartbeating) edge set shrinks by more than
+    # this fraction in one scheduler tick, keep publishing the last-known DNS and alert instead of
+    # emptying/shrinking the pool — a bulk "went silent" is treated as a controller-path outage, not
+    # as many simultaneous node deaths. Only active when EDGE_PROBE is on (PowerDNS ifurlup still
+    # removes genuinely-dead edges within ~5s). 0 disables the guard.
+    edge_silent_guard_fraction: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_SILENT_GUARD_FRACTION") or 0.5))
     # synthetic edge probes (SPEC §8.1): the controller fetches /__pcdn/health from each edge
     probe_enabled: bool = field(default_factory=lambda: _bool("PROBE_ENABLED", True))
     probe_timeout: float = field(default_factory=lambda: float(os.getenv("PROBE_TIMEOUT") or 5))
     probe_ipv6: bool = field(default_factory=lambda: _bool("PROBE_IPV6", True))
     # consecutive probe failures before the edge_probe alert opens (edge still heartbeating)
     probe_fail_checks: int = field(default_factory=lambda: int(os.getenv("PROBE_FAIL_CHECKS") or 3))
+    # probe-based DNS withdrawal budget (F26): on probe evidence alone, withdraw at most this
+    # fraction of a group+region+family pool's addresses; beyond that keep the rest advertised and
+    # alert (a wide "probe says down" is more likely a bad vantage point than real mass death)
+    probe_withdraw_max_fraction: float = field(
+        default_factory=lambda: float(os.getenv("PROBE_WITHDRAW_MAX_FRACTION") or 0.34))
     ns_check_interval: int = field(default_factory=lambda: int(os.getenv("NS_CHECK_INTERVAL", "600")))
     ns_resolvers: list[str] = field(default_factory=lambda: _list("NS_RESOLVERS", "8.8.8.8,1.1.1.1"))
     scheduler_enabled: bool = field(default_factory=lambda: _bool("SCHEDULER_ENABLED", True))
@@ -160,6 +184,10 @@ class Settings:
 
     # customer API (SPEC §10.1): per-key requests allowed per minute (in-process sliding window)
     capi_rate: int = field(default_factory=lambda: int(os.getenv("CAPI_RATE", "60")))
+    # a tighter per-key limit for config/record *writes* only (F5): a burst of these bumps the edge
+    # config version and, without coalescing on the edge, can herd fleet-wide reloads. Reads, purges
+    # and stats stay governed by CAPI_RATE. Applied in addition to CAPI_RATE.
+    capi_config_rate: int = field(default_factory=lambda: int(os.getenv("CAPI_CONFIG_RATE", "6")))
 
 
 settings = Settings()

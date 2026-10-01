@@ -9,7 +9,7 @@ routes so behaviour/validation never drifts between the two surfaces.
 
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -34,16 +34,29 @@ router = APIRouter(prefix="/capi/v1")
 # controller workers the effective limit is CAPI_RATE * (number of processes). Fine for the
 # current single-process deployment; move to a shared store (Redis) if that changes.
 _hits: dict[int, list[float]] = {}
+# F5: a separate, tighter window for config/record *writes* only. A burst of these bumps the edge
+# config version and can herd fleet-wide reloads, so they are limited beyond the general CAPI_RATE.
+# Reads, purges and stats never touch this window.
+_config_hits: dict[int, list[float]] = {}
+
+
+def _sliding(store: dict[int, list[float]], key_id: int, limit: int, label: str):
+    now = time.monotonic()
+    window = store.setdefault(key_id, [])
+    window[:] = [t for t in window if t > now - 60]
+    if len(window) >= limit:
+        raise HTTPException(429, f"محدودیت نرخ {label} ({limit} در دقیقه) رد شد؛ کمی بعد دوباره تلاش کنید")
+    window.append(now)
 
 
 def _rate_limit(key_id: int):
-    now = time.monotonic()
-    window = _hits.setdefault(key_id, [])
-    cutoff = now - 60
-    window[:] = [t for t in window if t > cutoff]
-    if len(window) >= settings.capi_rate:
-        raise HTTPException(429, f"محدودیت نرخ درخواست ({settings.capi_rate} در دقیقه) رد شد؛ کمی بعد دوباره تلاش کنید")
-    window.append(now)
+    _sliding(_hits, key_id, settings.capi_rate, "درخواست")
+
+
+def _rate_limit_config(key: ApiKey) -> ApiKey:
+    """F5: extra per-key limit for config/record write verbs (in addition to CAPI_RATE)."""
+    _sliding(_config_hits, key.id, settings.capi_config_rate, "تغییر پیکربندی")
+    return key
 
 
 def resolve_key(authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> ApiKey:
@@ -108,18 +121,18 @@ def list_records(key: ApiKey = Depends(require_scope("dns"))):
 
 @router.post("/records", status_code=201)
 def add_record(body: RecordIn, key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
-    return add_record_of(db, _site(key), body)
+    return add_record_of(db, _site(_rate_limit_config(key)), body)
 
 
 @router.patch("/records/{record_id}")
 def update_record(record_id: int, body: RecordIn, key: ApiKey = Depends(require_scope("dns")),
                   db: Session = Depends(get_db)):
-    return update_record_of(db, _site(key), record_id, body)
+    return update_record_of(db, _site(_rate_limit_config(key)), record_id, body)
 
 
 @router.delete("/records/{record_id}")
 def delete_record(record_id: int, key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
-    return delete_record_of(db, _site(key), record_id)
+    return delete_record_of(db, _site(_rate_limit_config(key)), record_id)
 
 
 @router.get("/config/{section}")
@@ -128,6 +141,6 @@ def read_section(section: str, key: ApiKey = Depends(require_scope("dns"))):
 
 
 @router.put("/config/{section}")
-def write_section(section: str, body: dict, key: ApiKey = Depends(require_scope("dns")),
+def write_section(section: str, body: dict, response: Response, key: ApiKey = Depends(require_scope("dns")),
                   db: Session = Depends(get_db)):
-    return write_section_of(db, _site(key), section, body)
+    return write_section_of(db, _site(_rate_limit_config(key)), section, body, response)

@@ -1,12 +1,13 @@
 import hashlib
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import pdns, sections
+from . import dnsbuild, pdns, sections
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -57,14 +58,37 @@ def edge_load_percent(e: Edge, now: datetime | None = None) -> float | None:
 
 
 def update_shed(e: Edge, now: datetime | None = None):
-    """Recompute the load-shedding flag (with hysteresis). Caller commits."""
+    """Recompute the load-shedding flag with hysteresis, a consecutive-report requirement and a
+    minimum hold time (F25). Caller commits.
+
+    An edge is shed only after EDGE_SHED_CHECKS consecutive reports at/above EDGE_SHED_PERCENT (or,
+    when EDGE_CPU_SHED>0, load1/cpus at/above it), so a single 60s spike can no longer herd a whole
+    region. Once shed it stays shed for at least EDGE_SHED_HOLD seconds, then recovers only when the
+    load is genuinely back below EDGE_SHED_PERCENT - SHED_HYSTERESIS (and CPU below EDGE_CPU_SHED).
+    The pool-level "shed at most one edge per group+region per tick / keep capacity above load" cap
+    lives in the scheduler, which alone sees the whole edge set."""
+    now = now or utcnow()
     pct = edge_load_percent(e, now)
-    if pct is None:
+    if pct is None:  # no fresh metrics: is_shed's freshness guard already excludes this edge
         e.shed = False
-    elif pct >= settings.edge_shed_percent:
-        e.shed = True
-    elif pct < settings.edge_shed_percent - SHED_HYSTERESIS:
+        e.shed_high = 0
+        e.shed_since = None
+        return
+    ratio = cpu_ratio(edge_metrics(e) or {}) if settings.edge_cpu_shed > 0 else None
+    cpu_high = ratio is not None and ratio >= settings.edge_cpu_shed
+    high = pct >= settings.edge_shed_percent or cpu_high
+    e.shed_high = (e.shed_high or 0) + 1 if high else 0
+    if not e.shed:
+        if e.shed_high >= settings.edge_shed_checks:
+            e.shed = True
+            e.shed_since = now
+        return
+    held = e.shed_since is not None and now - e.shed_since < timedelta(seconds=settings.edge_shed_hold)
+    recovered = pct < settings.edge_shed_percent - SHED_HYSTERESIS and (
+        ratio is None or ratio < settings.edge_cpu_shed)
+    if recovered and not held:
         e.shed = False
+        e.shed_since = None
 
 
 def cpu_ratio(m: dict) -> float | None:
@@ -87,6 +111,47 @@ def record_metrics(e: Edge, metrics: dict, now: datetime | None = None):
     e.load_high = (e.load_high or 0) + 1 if pct is not None and pct > LOAD_ALERT_PERCENT else 0
     ratio = cpu_ratio(clean)
     e.cpu_high = (e.cpu_high or 0) + 1 if ratio is not None and ratio > settings.edge_cpu_alert else 0
+
+
+def _peak_mbps(e: Edge, now: datetime | None = None) -> float:
+    """The edge's current peak (rx/tx) load in Mbps from its fresh metrics, else 0."""
+    if not metrics_fresh(e, now):
+        return 0.0
+    m = edge_metrics(e) or {}
+    return max(float(m.get("rx_mbps") or 0), float(m.get("tx_mbps") or 0))
+
+
+def rebalance_pool_shed(db: Session, now: datetime | None = None) -> None:
+    """Pool-level load-shed safety cap (F25). Load shedding is decided per edge on each heartbeat
+    (update_shed), which cannot see the rest of the pool; here — where the scheduler holds the whole
+    online edge set — we make sure shedding never herds a region: within each (group, region) pool
+    the remaining unshed capacity_mbps must stay at or above the pool's aggregate load. When it would
+    drop below, the least-loaded shed edges are put back into DNS (their shed_high is reset so they
+    do not instantly re-shed). Recovery is never throttled. Caller-independent: commits its own work."""
+    now = now or utcnow()
+    pools: dict[tuple[str, str], list[Edge]] = defaultdict(list)
+    for e in online_edges(db):
+        pools[(dnsbuild.edge_group(e), "home" if e.region == "home" else "global")].append(e)
+    changed = False
+    for members in pools.values():
+        shed = [e for e in members if dnsbuild.is_shed(e, now)]
+        if not shed:
+            continue
+        unshed = [e for e in members if not dnsbuild.is_shed(e, now)]
+        # capacity_mbps 0 means "unknown, never shed" — if any staying edge is unknown-capacity we
+        # cannot compute a meaningful floor, so assume the pool can absorb the load and don't force
+        if unshed and any(e.capacity_mbps <= 0 for e in unshed):
+            continue
+        load = sum(_peak_mbps(e, now) for e in members)
+        unshed_cap = sum(e.capacity_mbps for e in unshed)
+        for e in sorted(shed, key=lambda e: _peak_mbps(e, now)):
+            if unshed_cap >= load:
+                break
+            e.shed, e.shed_since, e.shed_high = False, None, 0
+            unshed_cap += e.capacity_mbps
+            changed = True
+    if changed:
+        db.commit()
 
 
 DNS_DIRTY_KEY = "dns_dirty"
@@ -281,8 +346,16 @@ def build_edge_config(db: Session) -> dict:
             continue
         cfg = sections.all_config(site)
         feats = sections.features_of(site)
+        # F2: keep serving the stored certificate while it is present AND unexpired, including
+        # during a renewal or a manual re-request (ssl_status "pending"). A renewal/retry/re-request
+        # must never drop the site's HTTPS server from the edge config while the old cert is still
+        # valid. Every path that should actually STOP HTTPS (custom-cert removal routes_v2:119,
+        # undecryptable key crypto:206, plan losing SSL routes_admin.apply_plan) clears ssl_cert, so
+        # gating on the stored pair + expiry never serves a cert that no longer applies. ssl=None
+        # only when there is genuinely no usable cert (initial issuance, or expired + reissue failed).
         ssl = None
-        if site.ssl_status == "active" and site.ssl_cert and site.ssl_key:
+        if (site.ssl_cert and site.ssl_key and site.ssl_status in ("active", "pending")
+                and (site.ssl_expires_at is None or site.ssl_expires_at > utcnow())):
             ssl = {"cert": site.ssl_cert, "key": site.ssl_key}
 
         cache = dict(cfg["cache"])
@@ -314,6 +387,9 @@ def build_edge_config(db: Session) -> dict:
             "id": site.id,
             "domain": site.domain,
             "status": site.effective_status,
+            # F21: the site's edge group, so a node can tell own-group from foreign-group changes and
+            # defer a foreign-group-only reload (the edge keeps every site configured for DNS fail-open)
+            "edge_group": dnsbuild.site_edge_group(site),
             "secret": site.secret,
             "hosts": hosts,
             "ssl": ssl,
@@ -347,6 +423,13 @@ def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str])
     if cap > 0 and (t["per_connection_mbps"] == 0 or t["per_connection_mbps"] > cap):
         t["per_connection_mbps"] = cap
     t["max_connections"] = feats["max_tunnel_connections"]
+    # F35: a suspended or over-quota site keeps advertising its tunnel path prefixes as `cut_paths`
+    # so the edge can answer client reconnects with a cheap, rate-limited, body-less 503 on exactly
+    # those paths instead of an unthrottled full-HTML 503 (or falling through to the origin). Only
+    # when the plan has tunnel and the customer had it enabled; a plan-disabled tunnel has no paths.
+    cut = (feats["tunnel"] and tunnel.get("enabled")
+           and site.effective_status in ("suspended", "over_quota"))
+    t["cut_paths"] = [p["path"] for p in t["paths"]] if cut else []
     if not feats["tunnel"] or site.effective_status != "active":
         t["enabled"] = False
     return t

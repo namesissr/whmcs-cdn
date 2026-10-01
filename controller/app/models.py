@@ -157,6 +157,19 @@ class Edge(Base):
     probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     probe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     probe_fail: Mapped[int] = mapped_column(Integer, default=0)
+    # per-family primary probe state (SPEC §12, F32): the primary IPv4 and IPv6 address of a node
+    # are probed and withdrawn independently, so a dead family is pulled from DNS while the healthy
+    # family stays advertised. probe_ok*/probe_fail* mirror probe_ok/probe_fail but per family; the
+    # aggregate probe_ok/probe_fail above is kept only for the §8.1 edge_probe alert. NULL = never
+    # probed yet (advertised, fail-open) — the migration backfills NULL for the same reason.
+    probe_ok4: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    probe_fail4: Mapped[int] = mapped_column(Integer, default=0)
+    probe_ok6: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    probe_fail6: Mapped[int] = mapped_column(Integer, default=0)
+    # consecutive metric reports at/above EDGE_SHED_PERCENT (F25 shed hysteresis) and the time the
+    # edge was last put into the shed state, so a shed is held for at least EDGE_SHED_HOLD seconds
+    shed_high: Mapped[int] = mapped_column(Integer, default=0)
+    shed_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # centralized node logs (SPEC §11.2): a capped rolling buffer of recent WARN/ERROR/crit
     # lines the agent ships (nginx error log + the agent's own log). JSON list, newest last,
     # hard-capped (~120 lines / ~16 KiB, oldest dropped). NEVER access logs, IPs, tokens or keys.
@@ -315,6 +328,20 @@ class ApiKey(Base):
             return list(json.loads(self.scopes or "[]"))
         except ValueError:
             return []
+
+
+class UsageBatch(Base):
+    """Idempotency key for a usage POST (F7). The agent sends a stable ``batch_id`` per persisted
+    outbox entry and resends the SAME id verbatim on any retry (timeout / lost response). The first
+    successful apply inserts (edge_id, batch_id) in the same transaction as the UsageHourly upserts;
+    a replay hits the primary key and is skipped, so a timed-out POST is counted at most once. Rows
+    are pruned after a week (job_cleanup). Missing batch_id keeps the old at-least-once behaviour."""
+
+    __tablename__ = "usage_batches"
+
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id", ondelete="CASCADE"), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
 class State(Base):

@@ -194,6 +194,9 @@ def test_dns_advertises_additional_addresses(client):
 
 def test_dns_withdraws_after_threshold_and_restores(client, health_server, probe_map, monkeypatch):
     monkeypatch.setattr(settings, "probe_fail_checks", 3)
+    # this test covers the per-address probe debounce; the F26 withdrawal budget (which for a tiny
+    # 2-address pool would keep both) is exercised separately, so disable it here
+    monkeypatch.setattr(settings, "probe_withdraw_max_fraction", 1.0)
     _, port = health_server
     with SessionLocal() as db:
         e = _edge(db, ipv4="5.160.1.1", region="global")

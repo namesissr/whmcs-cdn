@@ -243,6 +243,10 @@ def edge_obj(client, name):
 
 def test_heartbeat_metrics_and_shed_hysteresis(client, monkeypatch):
     monkeypatch.setattr(settings, "edge_shed_percent", 90.0)
+    # this test covers the load%/hysteresis-band behaviour; the consecutive-report and hold-time
+    # guards (F25) are exercised separately, so opt into immediate shed here
+    monkeypatch.setattr(settings, "edge_shed_checks", 1)
+    monkeypatch.setattr(settings, "edge_shed_hold", 0)
     client.post("/api/v1/edges", json={"name": "t1", "ipv4": "5.160.1.20", "capacity_mbps": 100})
     token = client.post("/api/v1/edges/1/rotate-token").json()["token"]
     heartbeat(client, token)  # v1 agent: no metrics
@@ -335,6 +339,8 @@ def test_dns_load_shedding():
 
 def test_scheduler_resyncs_dns_on_shed_and_group_changes(client, fake_pdns, monkeypatch):
     monkeypatch.setattr(settings, "edge_shed_percent", 90.0)
+    monkeypatch.setattr(settings, "edge_shed_checks", 1)
+    monkeypatch.setattr(settings, "edge_shed_hold", 0)
     site(client)
     t1 = add_edge(client, "ir-1", "5.160.1.10")
     t2 = add_edge(client, "ir-2", "5.160.1.11")
@@ -366,6 +372,8 @@ def test_scheduler_resyncs_dns_on_shed_and_group_changes(client, fake_pdns, monk
 
 def test_edge_saturated_alert(client, alert_settings, monkeypatch):
     monkeypatch.setattr(settings, "edge_shed_percent", 90.0)
+    monkeypatch.setattr(settings, "edge_shed_checks", 1)
+    monkeypatch.setattr(settings, "edge_shed_hold", 0)
     client.post("/api/v1/edges", json={"name": "t1", "ipv4": "5.160.1.20", "capacity_mbps": 100})
     token = client.post("/api/v1/edges/1/rotate-token").json()["token"]
 

@@ -87,6 +87,15 @@ def _apply(edge: Edge, r4, r6, now: datetime) -> None:
     edge.probe_at = now
     edge.probe_error = " | ".join(errors) or None
     edge.probe_fail = 0 if ok else (edge.probe_fail or 0) + 1
+    # F32: the primary IPv4 and IPv6 address get INDEPENDENT probe state, so a dead family is
+    # withdrawn from DNS (dnsbuild._edge_family_addresses) while the healthy family stays advertised.
+    # Only touch a family we actually probed this run; the aggregate above stays for the §8.1 alert.
+    if r4 is not None:
+        edge.probe_ok4 = r4[0]
+        edge.probe_fail4 = 0 if r4[0] else (edge.probe_fail4 or 0) + 1
+    if r6 is not None:
+        edge.probe_ok6 = r6[0]
+        edge.probe_fail6 = 0 if r6[0] else (edge.probe_fail6 or 0) + 1
 
 
 def _apply_address(a: EdgeAddress, result: tuple[bool, int | None, str | None], now: datetime) -> None:
