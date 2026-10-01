@@ -1203,3 +1203,24 @@ with a precise report rather than a weaker isolation.
 ### 16.10 English client app
 The WHMCS client app gains full English (LTR) alongside Persian, selected from the WHMCS client
 language (fallback Persian), all strings through one dictionary; numbers/dates localized.
+
+### 16.11 Implementation notes (as built)
+- L4: edges render stream servers from the node-wide `l4` list; PROXY protocol `off|v1` only (nginx
+  stream); unsafe/busy ports are skipped so a reload never fails; ports 8089/8090/8091 (edge loopback
+  services) are never allocated.
+- Images v2: signature = HMAC over the transform params in the fixed order `w,h,fit,q,fmt,width,height`
+  (present ones, raw values), no expiry; bad/missing signature → 403; transforms run in the sandboxed
+  `pcdn-imaged` service with image_filter / original fallback.
+- Video: prefetch via nginx `mirror`, once per segment per 600 s, ≤ 100/s per node; video bytes are
+  attributed agent-side by media extension.
+- DNS: weighted sets use PowerDNS LUA `pickwrandom` when weights differ; outbound AXFR carries proxied
+  names as LUA records (PowerDNS-specific).
+- Storage: MinIO admin via the controller's own SigV4 + madmin client; per-bucket service accounts;
+  bucket read by the CDN through a Referer-token policy; edges reach it via `origin.storage`, GET/HEAD
+  only, visitor credentials stripped, path escapes 400; suspension does not cut S3 key access.
+- Edge Functions: QuickJS per invocation under Landlock (ABI 1..7 handled; none → fail closed) +
+  seccomp + no_new_privs + MDWE + rlimits inside a DynamicUser/PrivateNetwork unit; fetch only to the
+  site's own origin through a local socket; WHMCS accepts up to 9 MB bodies only for PUT
+  config/functions.
+- English client app: Persian source strings are the dictionary keys; English sent only to English
+  viewers; admin addon stays Persian.

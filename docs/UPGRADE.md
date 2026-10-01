@@ -49,13 +49,13 @@ docker compose up -d
 
 نکات این نسخه:
 
-- **مهاجرت دیتابیس.** کنترلر هنگام بالا آمدن، مهاجرت‌ها را تا نسخه‌ی `0016` زیر یک قفل اجرا می‌کند
-  (موج ۷: `0016` رویدادهای قطعی تونل؛ موج ۶: `0013` قابلیت‌ها و Shield نودها، `0014` گواهی mTLS مبدأ، `0015` آمار دقیقه‌ای، صف لاگ و
+- **مهاجرت دیتابیس.** کنترلر هنگام بالا آمدن، مهاجرت‌ها را تا نسخه‌ی `0018` زیر یک قفل اجرا می‌کند
+  (موج ۸: `0017` پروکسی TCP/UDP و رکوردهای وزن‌دار، `0018` فضای ذخیره‌سازی؛ موج ۷: `0016` رویدادهای قطعی تونل؛ موج ۶: `0013` قابلیت‌ها و Shield نودها، `0014` گواهی mTLS مبدأ، `0015` آمار دقیقه‌ای، صف لاگ و
   وب‌هوک‌ها). حتماً بررسی کنید:
   ```bash
-  docker compose exec controller python -m app.manage current   # باید «current» و «head» هر دو 0016 باشند
+  docker compose exec controller python -m app.manage current   # باید «current» و «head» هر دو 0018 باشند
   ```
-  اگر `current` از `head` عقب‌تر بود (مثلاً `0015 head 0016`) یا `‎/healthz` خطای 502 داد، مهاجرت را دستی
+  اگر `current` از `head` عقب‌تر بود (مثلاً `0016 head 0018`) یا `‎/healthz` خطای 502 داد، مهاجرت را دستی
   اجرا و کنترلر را ری‌استارت کنید:
   ```bash
   docker compose exec controller python -m app.manage migrate
@@ -196,7 +196,7 @@ cd /opt/pcdn/edge && sudo ./install.sh --upgrade
 
 ## ۴) بعد از به‌روزرسانی — چک‌لیست
 
-- [ ] `manage current` نسخه‌ی دیتابیس = آخرین نسخه (`0016`).
+- [ ] `manage current` نسخه‌ی دیتابیس = آخرین نسخه (`0018`).
 - [ ] `https://<دامنه-کنترلر>/healthz` سالم و `‎/metrics` پاسخ می‌دهد.
 - [ ] همه‌ی نودها در پنل سبز و بدون نشانِ «به‌روزرسانی موجود».
 - [ ] یک سرویس تست: DNS، SSL، و یک مسیر تونل آزمایشی کار می‌کند.
@@ -213,3 +213,40 @@ cd /opt/pcdn/edge && sudo ./install.sh --upgrade
   `docs/OPERATIONS.md`).
 - نودها: فایل‌های نود نسخه‌دار نیستند؛ برای برگشت، نسخه‌ی قبلی بسته را دوباره نصب کنید.
 - WHMCS: پوشه‌های ماژولِ کنارگذاشته را بازگردانید. جدول‌های `mod_pasargadcdn_*` بی‌خطر باقی می‌مانند.
+
+---
+
+## ۶) موج ۸ — کارهای اضافه (فقط اگر این امکانات را می‌خواهید)
+
+همه‌ی موارد زیر اختیاری‌اند و بدون آن‌ها سامانه مثل قبل کار می‌کند.
+
+**سرور پنل (`/opt/pcdn/.env`):**
+- پروکسی TCP/UDP: `L4_PORT_RANGE=20000-29999` (پیش‌فرض)، `L4_RESERVED_PORTS` (اختیاری).
+- رکوردهای وزن‌دار: `RECORD_PROBE_ENABLED=true`، `RECORD_PROBE_TIMEOUT=5`.
+- Edge Functions: `FUNCTIONS_MAX_SITE_KB=8192` (پیش‌فرض).
+- فضای ذخیره‌سازی: `STORAGE_ENDPOINT`, `STORAGE_ADMIN_ACCESS_KEY`, `STORAGE_ADMIN_SECRET_KEY` و بقیه طبق
+  `docs/STORAGE.md` — اول سرور ذخیره‌سازی را با `deploy/storage` راه بیندازید.
+- DNS ثانویه: در `dns/pdns.conf` گزینه‌ی `secondary=yes` اضافه شده؛ بعد از `git pull` کانتینر PowerDNS را
+  دوباره بالا بیاورید: `docker compose up -d --force-recreate pdns` (نام سرویس را با compose خودتان تطبیق دهید).
+
+**هر نود:**
+- ارتقای معمول (`--upgrade`) ماژول stream و include آن را در `nginx.conf` اضافه می‌کند؛ هر نود یک بار reload می‌شود.
+- **فایروال:** بازه‌ی `L4_PORT_RANGE` را برای **TCP و UDP** باز کنید (فقط اگر پروکسی TCP/UDP می‌فروشید).
+- اختیاری: `--harden-net` (محافظ SYN flood و …؛ اگر SYN proxy را روشن کنید اتصال‌های قدیمیِ ثبت‌نشده یک
+  بار قطع می‌شوند)، `--avif` (تبدیل AVIF)، `--functions` (Edge Functions؛ بعد از نصب با
+  `systemctl status pcdn-fn` و `cat /run/pcdn-fn/status.json` بررسی کنید که `ok: true` است).
+  مثال: `cd /opt/pcdn/edge && sudo ./install.sh --upgrade --functions --harden-net`
+- جزئیات: `docs/NODES.md` §۱۲.
+
+**WHMCS:**
+- فایل zip جدید را مثل قبل در ریشه‌ی WHMCS باز کنید (کل پوشه‌ها را جایگزین کنید).
+- پنل مشتری حالا فارسی/انگلیسی است (دکمه‌ی EN/FA؛ زبان پیش‌فرض از زبان کاربر در WHMCS).
+- اگر Edge Functions می‌فروشید، وب‌سرورِ جلوی WHMCS باید بدنه‌ی درخواست تا **۹ مگابایت** را بپذیرد
+  (مثلاً `client_max_body_size 10m;` در nginx یا `post_max_size`/`upload_max_filesize` ≥ 10M در PHP).
+- گزینه‌های پیکربندی تازه (اختیاری، در محصول): `L4 Proxy`، `L4 Apps`، `Edge Functions`، `Max Functions`،
+  `Storage GB`؛ و در تنظیمات افزونه «قیمت هر گیگابایت-ماه ذخیره‌سازی».
+
+**ابزارها:**
+- تست بار برای تعیین ظرفیت نودها: `docs/LOADTEST.md`.
+- خط فرمان `pcdn` و انتشار امضاشده: `docs/CLI.md`؛ Terraform: `docs/TERRAFORM.md`.
+

@@ -278,3 +278,22 @@ curl -s -X DELETE -H "Authorization: Bearer $ADMIN_API_KEY" https://<controller>
 > فرمت لاگ دسترسی nginx در این نسخه چند فیلد تازه گرفته است (`us`, `pg`, `sc`, `pr`, `rf`)؛ بنابراین هر نود
 > پس از ارتقا **یک بار** nginx را reload می‌کند. خط‌های قدیمی لاگ همچنان خوانده می‌شوند.
 
+## ۱۲. امکانات موج ۸ روی نود
+
+| قابلیت | فعال‌سازی | نکته |
+|---|---|---|
+| پروکسی TCP/UDP | خودکار با `--upgrade` (ماژول stream + include در nginx.conf) | بازه‌ی `L4_PORT_RANGE` را برای TCP و UDP در فایروال باز کنید؛ فقط PROXY protocol v1 |
+| ویدئو (HLS/DASH) | خودکار | برش ۱ مگابایتی mp4 با ماژول slice |
+| تصاویر نسخه‌ی ۲ | خودکار؛ AVIF با `--avif` (بسته‌ی libavif-bin) | سرویس ایزوله‌ی `pcdn-imaged` روی loopback |
+| محافظ شبکه | `--harden-net` / حذف با `--no-harden-net` | جدول nftables `pcdn_guard`؛ SSH و فهرست مجاز همیشه اول؛ تنظیمات `GUARD_*` در agent.conf |
+| Edge Functions | `--functions` / حذف با `--no-functions` | سرویس `pcdn-fn` (QuickJS در سندباکس Landlock + seccomp)؛ وضعیت در `/run/pcdn-fn/status.json` |
+| مبدأ باکت ذخیره‌سازی | خودکار | پورت داخلی `STORAGE_FETCH_PORT` (۸۰۹۱، فقط 127.0.0.1) |
+
+بعد از ارتقا، زیر نام نود در پنل نشان‌های قابلیت تازه (`l4`، `video`، `avif`، `edge_functions`، …) گزارش
+می‌شوند. اگر `l4` گزارش نشد، `sudo ./install.sh --upgrade` را دوباره اجرا کنید تا include ماژول stream اضافه شود.
+
+عیب‌یابی سریع:
+- `sudo nft list table inet pcdn_guard` — قوانین محافظ شبکه.
+- `sudo systemctl status pcdn-fn pcdn-imaged` — سرویس‌های توابع و تصاویر.
+- `sudo tail /var/log/nginx/pcdn-l4.log` — لاگ پروکسی TCP/UDP.
+
