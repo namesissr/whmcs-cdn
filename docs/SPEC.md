@@ -875,3 +875,94 @@ General CDN capabilities for website customers. Defaults keep today's behaviour 
 - **OpenAPI + Terraform** — `GET /capi/v1/openapi.json` (customer API only); a Terraform provider
   (`terraform-provider-pcdn/`, Go, terraform-plugin-framework) with resources `pcdn_record`,
   `pcdn_config_section`, `pcdn_purge` and data source `pcdn_site`, authenticated with a customer API key.
+
+#### 14.3.1 Live analytics — contract
+- `POST /edge/v1/usage` gains an optional `live` list (≤5000, same `batch_id` dedup as the rest of the
+  batch): `{host, minute (ISO, seconds = 0, UTC), requests, bytes, cache_hits, status: {"2xx": n, "3xx",
+  "4xx", "5xx"}, countries: {cc: n} (top ≤20), paths: {path-without-query: n} (top ≤20)}`. Pre-6D agents
+  omit it. Each `UsageItem` also gains `platform_errors` (≥0, default 0): responses with status ≥500
+  that the edge produced itself — no upstream status and no security action (WAF/rate-limit/DDoS/bot
+  blocks are not errors); origin errors (any upstream status present) never count.
+- Controller table `analytics_minute` `(site_id, minute)` PK, `requests, bytes, cache_hits, details`
+  (JSON: status/countries/paths, capped like hourly details). Rows older than 24 h are deleted by a
+  leader job. Hosts map to sites exactly like hourly usage.
+- `GET /api/v1/sites/{domain}/analytics/live?minutes=60` (1..1440; other → 422) and the same on
+  `GET /capi/v1/analytics/live` (scope `stats`) →
+  `{minutes, from, to, series: [{t, requests, bytes, cache_hits, status: {...}}] (one per minute,
+  zero-filled, oldest first; the current minute may be partial), totals: {requests, bytes, cache_hits,
+  hit_ratio (0..1 | null), status}, top_paths: [[path, n]] ≤10, top_countries: [[cc, n]] ≤10}`.
+
+#### 14.3.2 Log export — contract
+- Plan feature `log_export` (bool, default true). Section `logs`: `{enabled: false, s3_endpoint: ""
+  (https URL, host must resolve only to public addresses), region: "us-east-1", bucket: "" (S3 bucket
+  name rules), prefix: "" (≤128, `[A-Za-z0-9/_.-]`, no `..`), access_key: "" (≤128), secret_key
+  (write-only: GET returns `""` plus `secret_key_set: bool`; PUT with `""`/omitted keeps the stored
+  one), anonymize_ip: true, sample_rate: 1.0 (0.01..1)}`. `enabled: true` needs endpoint, bucket and
+  both keys (else 422). Secret stored encrypted; never in edge config, audit or logs.
+- Edge config per site: `logs: {enabled, sample_rate, anonymize_ip}` only. The edge samples that site's
+  access-log records and posts them: `POST /edge/v1/logship {batch_id (32 hex), records: [{host, t
+  (ISO), ip, method, scheme, path (query stripped, ≤2048), status, bytes, rt (seconds), cache, country,
+  ua (≤512), referer (≤1024, query stripped), proto}]}` ≤5000 records per POST. With `anonymize_ip` the
+  edge zeroes the last IPv4 octet / all but the first 48 bits of IPv6 before sending; the controller
+  re-applies it (idempotent) and drops records of sites without `logs.enabled`.
+- Controller spools gzip JSON-lines chunks per site/hour (`log_spool` table) with a per-site hourly cap
+  `LOG_EXPORT_MAX_PER_HOUR` (default 500000; excess counted as dropped). A leader job uploads every
+  completed hour as one object `{prefix}{domain}/YYYY/MM/DD/HH-<8hex>.jsonl.gz` (concatenated gzip
+  members) with SigV4 (path-style, like backups); failures keep the chunks and retry every 10 min;
+  chunks older than 72 h are dropped (counted).
+- `GET /api/v1/sites/{domain}/logs/status` → `{enabled, last_upload_at, last_object, last_error,
+  last_error_at, pending_records, dropped_records}`; `POST /api/v1/sites/{domain}/logs/test` → writes a
+  tiny `{prefix}{domain}/.pcdn-test` object → `{ok, error}` (rate-limited like config writes).
+
+#### 14.3.3 Webhooks — contract
+- Plan feature `max_webhooks` (int, default 10; 0 = none). Section `webhooks`: `{items: [{id
+  ("wh_" + 8 hex; assigned by the controller when missing/unknown), url (https, ≤512, host must resolve
+  only to public addresses at save and at every delivery), events: [non-empty subset of purge.completed,
+  ssl.issued, ssl.failed, quota.warning, quota.exceeded, site.suspended, site.unsuspended,
+  attack.detected], enabled: true, description: "" (≤100)}]}`. GET adds `secret_set: true` per item and
+  never returns a secret. A PUT that creates items returns them as usual plus `new_secrets: {id:
+  "whsec_" + 40 hex}` — the only time a secret is shown. Removing an item deletes its secret.
+- `POST /api/v1/sites/{domain}/webhooks/{id}/rotate` → `{id, secret}`;
+  `POST /api/v1/sites/{domain}/webhooks/{id}/test` → sends a `ping` event now → `{ok, status_code,
+  error}`; `GET /api/v1/sites/{domain}/webhooks/deliveries?limit=50` (≤200, last 7 days) →
+  `[{id, hook_id, event, status: pending|ok|failed, attempts, last_code, last_error, created_at,
+  delivered_at, next_attempt_at}]`.
+- Delivery: `POST url`, body `{id: "evt_" + 16 hex, type, created_at, site, data}`; headers
+  `Content-Type: application/json`, `User-Agent: PasargadCDN-Webhooks/1`, `X-Pcdn-Event`,
+  `X-Pcdn-Delivery`, `X-Pcdn-Timestamp` (unix seconds), `X-Pcdn-Signature: sha256=<hex HMAC-SHA256(secret,
+  timestamp + "." + raw body)>`. 2xx = delivered. 10 s timeout, redirects not followed, response body
+  read ≤4 KB and discarded. Retries (leader job): 1 m, 5 m, 30 m, 2 h, 6 h, then every 6 h until 24 h
+  after creation → `failed`. Delivery rows kept 7 days.
+- Emitted from: purge creation (`purge.completed` once the purge is queued for all edges), certificate
+  issue success/failure, quota transitions (warning at 80 %, exceeded), admin suspend/unsuspend,
+  `attack.detected` (security events for the site above `ATTACK_EVENTS_PER_5M`, default 1000, at most
+  once per hour per site).
+
+#### 14.3.4 SLA report — contract
+- `GET /api/v1/sites/{domain}/sla?month=YYYY-MM` (default: current UTC month; ≤12 months back) →
+  `{month, domain, requests, platform_errors, request_success_pct, edge_uptime_pct, availability_pct,
+  target_pct, met, days: [{date, requests, platform_errors, request_success_pct, edge_uptime_pct}]}`.
+  `request_success_pct = 100 × (1 − platform_errors / requests)`; `edge_uptime_pct` = mean probe uptime
+  of the edges in the site's edge group for that day/month; `availability_pct` = the lower of the two
+  non-null values; percentages have 3 decimals, null without data. `target_pct` = plan feature
+  `sla_target` (default 99.9); `met` = availability ≥ target (null without data).
+
+#### 14.3.5 Customer API additions & OpenAPI
+- `GET /capi/v1/site` (any scope) → `{domain, status, suspended, plan, nameservers, cname_target,
+  ssl_status}`. `GET /capi/v1/openapi.json` (no auth): OpenAPI 3 for the `/capi/v1` routes only, with a
+  bearer security scheme; no admin/edge paths.
+
+#### 14.3.6 Terraform provider
+- `terraform-provider-pcdn/` (Go, terraform-plugin-framework), provider `pcdn` with `endpoint`
+  (or `PCDN_ENDPOINT`) and sensitive `api_key` (or `PCDN_API_KEY`). Resources: `pcdn_record` (CRUD via
+  `/capi/v1/records`, PATCH on update, import by id), `pcdn_config_section` (`section` + `config` JSON
+  string; PUT on create/update, delete = no-op with a warning, plan diff on normalized JSON),
+  `pcdn_purge` (`urls`/`prefixes`/`everything` + `triggers` map; every change → replace → new purge).
+  Data source `pcdn_site`. Unit tests against an httptest server; CI job `terraform` (go vet, go test,
+  go build).
+
+#### 14.3.7 Team access (WHMCS only)
+- In the client area, a logged-in WHMCS user who is not the account owner and lacks the
+  "manage products" permission gets a read-only app: the boot payload carries `readonly: true`, write
+  controls are hidden/disabled, and `api.php` refuses every non-GET call with 403 for that user (server
+  side, independent of the UI). Owners and WHMCS versions without sub-users keep full access.
