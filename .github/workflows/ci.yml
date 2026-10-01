@@ -47,12 +47,14 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nginx libnginx-mod-http-js libnginx-mod-http-geoip2 \
-            libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter python3-pytest
+            libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter libnginx-mod-stream \
+            python3-pil nftables python3-pytest
           sudo systemctl stop nginx
           sudo pip install --break-system-packages -q mmdb-writer netaddr
       # nginx -t binds the listen ports, so the tests run as root
       - run: sudo python3 -m pytest -q -p no:cacheprovider edge/tests
-      - run: bash -n edge/install.sh && bash -n edge/pcdn-geoip-update.sh
+      - run: sudo python3 -m pytest -q -p no:cacheprovider tools/loadtest/tests
+      - run: bash -n edge/install.sh && bash -n edge/bootstrap.sh && bash -n edge/pcdn-geoip-update.sh
 
   whmcs:
     runs-on: ubuntu-latest
