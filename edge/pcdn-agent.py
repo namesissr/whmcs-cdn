@@ -88,6 +88,9 @@ DEFAULTS = {
     "HTTP_PORT": "80",
     "HTTPS_PORT": "443",
     "RESIZE_PORT": "8089",
+    # SPEC §16.8: loopback port (127.0.0.1 only) where the image resizer fetches originals of hosts
+    # whose origin is an object-storage bucket (rendered only while such a host has images on)
+    "STORAGE_FETCH_PORT": "8091",
     "DICT_SIZE": "32m",
     "CACHE_MAX_SIZE": "10g",
     "CACHE_KEYS_ZONE": "5m",
@@ -770,7 +773,7 @@ def resolve_origin(host: dict, pools: dict, default_proto: str):
     origin = host.get("origin")
     if isinstance(origin, str):  # v1 shape: bare address
         origin = {"address": origin, "port": None}
-    if not isinstance(origin, dict):
+    if not isinstance(origin, dict) or "storage" in origin:   # storage: norm_storage_origin
         return None
     if origin.get("pool") is not None:
         name = str(origin["pool"])
@@ -786,6 +789,80 @@ def resolve_origin(host: dict, pools: dict, default_proto: str):
     elif not (isinstance(port, int) or str(port).isdigit()) or not 1 <= int(port) <= 65535:
         return None
     return default_proto, None, _hp(addr, port)
+
+
+# ----------------------------------------------------------------- object-storage origins (SPEC §16.8)
+
+_STO_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+SAFE_STO_HOST = re.compile(rf"^(?=.{{1,253}}$){_STO_LABEL}(?:\.{_STO_LABEL})*$")
+SAFE_STO_BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+# path-style prefix: "/<segment>..." ending in "/<bucket>"; a segment never starts with "." (no "."
+# / ".." segment) and never contains "%", so nothing in it is decoded or normalised away
+SAFE_STO_PREFIX = re.compile(r"^(?:/[A-Za-z0-9_~-][A-Za-z0-9._~-]{0,127}){1,16}$")
+SAFE_STO_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+STO_KEYS = ("host", "port", "tls", "host_header", "bucket", "path_prefix", "referer")
+
+
+def _sto_ip(v: str) -> str | None:
+    """An IP literal (v4 dotted, v6 bare or bracketed) -> its compressed form, or None."""
+    try:
+        ip = ipaddress.ip_address(v[1:-1] if v.startswith("[") and v.endswith("]") else v)
+    except ValueError:
+        return None
+    if ip.is_unspecified or ip.is_multicast:
+        return None
+    return ip.compressed if ip.version == 4 else f"[{ip.compressed}]"
+
+
+def _sto_hostname(v: str) -> str | None:
+    """A hostname or an IP literal -> nginx form ("[v6]" bracketed), or None."""
+    if ":" in v or "[" in v or re.match(r"^[0-9.]+$", v):   # an address, never a name
+        return _sto_ip(v)
+    return v if SAFE_STO_HOST.match(v) else None
+
+
+def norm_storage_origin(origin) -> dict | None:
+    """A host's `origin = {"storage": {...}}` (SPEC §16.8: records only, never pools) -> {proto,
+    hp, host, ssl_name, host_header, bucket, prefix, referer, tls}, or None when anything is off.
+    Strict: host = hostname or IP, port 1..65535 (int), tls bool, host_header = host[:port],
+    bucket / path_prefix charset (prefix ends in "/<bucket>"), referer [A-Za-z0-9_-]{16,128}.
+    The referer is the bucket's read token: never log or expose the result (storage_log_repr)."""
+    if not isinstance(origin, dict) or set(origin) != {"storage"}:
+        return None
+    st = origin["storage"]
+    if not isinstance(st, dict) or not all(isinstance(st.get(k), (str, int)) for k in STO_KEYS):
+        return None
+    host, port, tls = st["host"], st["port"], st["tls"]
+    if not isinstance(host, str) or not isinstance(tls, bool) or type(port) is not int or not 1 <= port <= 65535:
+        return None
+    nhost = _sto_hostname(host.lower())
+    hh = st["host_header"]
+    if nhost is None or not isinstance(hh, str) or len(hh) > 260:
+        return None
+    m = re.match(r"^(\[[0-9a-fA-F:.]+\]|[^:\[\]]+)(?::(\d{1,5}))?$", hh)
+    if (not m or _sto_hostname(m.group(1).lower()) is None
+            or (m.group(2) is not None and not 1 <= int(m.group(2)) <= 65535)):
+        return None
+    bucket, prefix, ref = st["bucket"], st["path_prefix"], st["referer"]
+    if not all(isinstance(x, str) for x in (bucket, prefix, ref)):
+        return None
+    if (not SAFE_STO_BUCKET.match(bucket) or ".." in bucket or len(prefix) > 512
+            or not SAFE_STO_PREFIX.match(prefix) or not prefix.endswith("/" + bucket)
+            or not SAFE_STO_TOKEN.match(ref)):
+        return None
+    return {"proto": "https" if tls else "http", "tls": tls, "hp": f"{nhost}:{port}", "host": nhost,
+            # SNI / certificate name: the hostname (nginx sends no SNI for an IP literal, and an IP
+            # endpoint only verifies when its certificate names it)
+            "ssl_name": nhost.strip("[]"), "host_header": m.group(1).lower() + (f":{m.group(2)}" if m.group(2) else ""),
+            "bucket": bucket, "prefix": prefix, "referer": ref}
+
+
+def storage_log_repr(origin) -> str:
+    """repr() of a host's origin for log lines, the storage read token (referer) masked."""
+    if isinstance(origin, dict) and isinstance(origin.get("storage"), dict):
+        origin = dict(origin, storage={k: ("<redacted>" if k == "referer" else v)
+                                       for k, v in origin["storage"].items()})
+    return repr(origin)
 
 
 def norm_pools(site: dict) -> dict:
@@ -1427,7 +1504,7 @@ def l4_busy_ports(cfg: dict, proc: str = "/proc/net") -> set:
     return busy - mine
 
 
-def render_l4(config: dict, cfg: dict) -> dict:
+def render_l4(config: dict, cfg: dict, reserved_extra: tuple = ()) -> dict:
     """SPEC §16.4 stream config: {"l4/stream.conf": main stream {} block, "l4/sites/<id>.conf": one
     server per app}; {} when no app is rendered (so nodes and sites without L4 keep their tree).
     nginx.conf includes NGINX_DIR/l4/*.conf at the main context. Apps outside L4_PORT_RANGE, on a
@@ -1442,6 +1519,7 @@ def render_l4(config: dict, cfg: dict) -> dict:
     lo, hi = l4_port_range(cfg)
     reserved = {_int(cfg.get(k), 0, 0, 65535) for k in ("HTTP_PORT", "HTTPS_PORT", "RESIZE_PORT", "IMAGE_PORT")}
     reserved |= {int(x) for x in re.findall(r"\d{1,5}", str(cfg.get("GUARD_SSH_PORTS") or "22"))}
+    reserved |= set(reserved_extra)   # e.g. STORAGE_FETCH_PORT while it is rendered (SPEC §16.8)
     group = cfg.get("GROUP") or ""
     busy = l4_busy_ports(cfg) if any(norm_l4(x) for x in sites) else set()
     sites.sort(key=lambda s: (bool(group and s.get("edge_group") not in (None, "", group)), int(s["id"])))
@@ -2185,10 +2263,75 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             out.append(f"map {src} $pcdn_tfu_{sid}_{j} {{\n    {hit} $pcdn_tfr_{sid}_{j};\n    default {nxt};\n}}")
             nxt = f"$pcdn_tfu_{sid}_{j}"
         tf_uri = nxt
+
+    # --- SPEC §16.8 object-storage origins (records only): per host index the validated origin.
+    # The bucket's read token (Referer) lives in storage/<sid>.conf (0600, root-only like the shield
+    # secret), never in this 0644 file; $pcdn_sm_<sid> is "" for GET/HEAD and the Allow value for any
+    # other method (405); $pcdn_sbad_<sid> refuses paths that a storage server would normalise
+    # out of the bucket (dot segments, encoded slashes / backslashes) or that are not origin-form.
+    stor_of = {}
+    for hi, h in enumerate(site.get("hosts") or []):
+        if isinstance(h, dict) and isinstance(h.get("origin"), dict) and "storage" in h["origin"]:
+            st = norm_storage_origin(h["origin"])
+            if st:
+                stor_of[hi] = dict(st, var=f"$pcdn_sref_{sid}_{len(stor_of)}")
+    stor_path = stor_bad = stor_badp = None
+    if stor_of and active:
+        files[f"storage/{sid}.conf"] = (
+            f"# {domain} (site {sid}) object-storage read tokens (SPEC §16.8) — generated by pcdn-agent\n"
+            + "".join(f"map $uri {st['var']} {{\n    default {_q(st['referer'])};\n}}\n" for st in stor_of.values()))
+        out.append(f"include {cfg['NGINX_DIR'].rstrip('/')}/storage/{sid}.conf;")
+        out.append(f'map $request_method $pcdn_sm_{sid} {{\n    GET "";\n    HEAD "";\n    default "GET, HEAD";\n}}')
+        bad_re = '"~*(?:^[^/]|/(?:[.]|%2e){1,2}(?:/|$)|%2f|%5c|\\x5c|%00)"'
+        # the path sent to the bucket: the visitor's raw path, or a rewrite_path result without its query
+        stor_path = "$pcdn_path"
+        if tf_uri:
+            out.append(f'map {tf_uri} $pcdn_sp_{sid} {{\n    "~^(/[^?]*)" $1;\n    default $pcdn_path;\n}}')
+            stor_path = f"$pcdn_sp_{sid}"
+        stor_bad, stor_badp = f"$pcdn_sbad_{sid}", f"$pcdn_sbad_{sid}"
+        out.append(f"map {stor_path} {stor_bad} {{\n    default \"\";\n    {bad_re} 1;\n}}")
+        if tf_uri:   # servers that never apply rewrite_path (resizer origin, functions fetch)
+            stor_badp = f"$pcdn_sbadp_{sid}"
+            out.append(f"map $pcdn_path {stor_badp} {{\n    default \"\";\n    {bad_re} 1;\n}}")
+    sport_sto = _int(cfg.get("STORAGE_FETCH_PORT"), 8091, 1, 65535)
+    stor_now = {}   # the storage origin of the host being rendered ({} = an ordinary origin)
+
+    def stor_hdrs(st, cond=False):
+        """Request headers towards a storage origin: nothing of the visitor's request but Accept /
+        Accept-Encoding (no Authorization, Cookie, X-Amz-*, X-Pcdn-*, header rules), Host =
+        host_header and the bucket's Referer token. cond: also the visitor's Range / conditional
+        headers (uncached locations only: in a cached one they would store partial content)."""
+        L = ["proxy_pass_request_headers off;", "proxy_pass_request_body off;",
+             f"proxy_set_header Host {_q(st['host_header'])};", f"proxy_set_header Referer {st['var']};",
+             'proxy_set_header Content-Length "";', "proxy_set_header Accept $http_accept;",
+             "proxy_set_header Accept-Encoding $http_accept_encoding;"]
+        if cond:
+            L += [f"proxy_set_header {n} $http_{n.lower().replace('-', '_')};"
+                  for n in ("Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since")]
+        return L
+
+    def stor_guard(bad):
+        return [f"if ($pcdn_sm_{sid}) {{ return 405; }}", f"if ({bad}) {{ return 400; }}"]
+
+    def origin_pass(uri=""):
+        """proxy_pass to the current host's origin; a storage origin always gets path_prefix + the
+        path (never the query string)."""
+        if stor_now:
+            return f"proxy_pass $pcdn_proto://$pcdn_target{stor_now['prefix']}{stor_path};"
+        return f"proxy_pass $pcdn_proto://$pcdn_target{uri};"
+
     mtls_now = []   # proxy_ssl_certificate lines of the host being rendered (origin-bound HTTPS only)
 
-    def loc_common(hides=(), extra_add=(), hdrs=None):
-        lines = list(proxy_hdrs if hdrs is None else hdrs)
+    def loc_common(hides=(), extra_add=(), hdrs=None, guard=True, cached=True):
+        """guard: an origin-bound location (storage origins: GET/HEAD only, safe paths). cached:
+        the location caches (storage origins then get no Range / conditional headers)."""
+        if stor_now:
+            lines = (stor_guard(stor_bad) if guard else []) + list(
+                stor_hdrs(stor_now, not cached) if hdrs is None else hdrs)
+            if guard:
+                extra_add = [f"add_header Allow $pcdn_sm_{sid} always;"] + list(extra_add)
+        else:
+            lines = list(proxy_hdrs if hdrs is None else hdrs)
         for n in dict.fromkeys(list(hides) + resp_hide + tf_hide):
             lines.append(f"proxy_hide_header {n};")
         lines += list(extra_add)
@@ -2250,7 +2393,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         if bttl > 0:
             hides += ["Cache-Control", "Expires"]
             adds.append(f"add_header Cache-Control \"public, max-age={bttl}\" always;")
-        origin = loc_common(hides, adds) + L + mtls_now + [f"proxy_pass $pcdn_proto://$pcdn_target{uri or tf_uri};"]
+        origin = loc_common(hides, adds, cached=cacheable) + L + mtls_now + [origin_pass(uri or tf_uri)]
         if not (shielded and cacheable):
             return [f"    location {match} {{"] + ind(origin) + ["    }"]
         # SPEC §14.1 origin shield: GET/HEAD cache misses go to the shield peers (consistent hash on
@@ -2586,7 +2729,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                       "proxy_cache_lock on;", "proxy_cache_lock_timeout 10s;", "proxy_cache_lock_age 10s;"]
             if mirror:
                 L += ["mirror /__pcdn/vpf;", "mirror_request_body off;"]
-            L += mtls_now + [f"proxy_pass $pcdn_proto://$pcdn_target{tf_uri};"]
+            L += mtls_now + [origin_pass(tf_uri)]
             return [f"    location {match} {{"] + ind(L) + ["    }"]
 
         out_l += block("~* \\.(?:m3u8|mpd)$", manifest=True)
@@ -2597,11 +2740,13 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             # videoNext names the next segment once per segment and bounded per node; it is fetched
             # into the cache under exactly the key its own request will use (HIT when it arrives)
             nkey = key.replace("$request_uri", "$pcdn_vnext$is_args$args").replace("$pcdn_path", "$pcdn_vnext")
-            L = ["internal;", 'if ($pcdn_vnext = "") { return 204; }'] + list(proxy_hdrs) + [
+            L = ["internal;", 'if ($pcdn_vnext = "") { return 204; }'] + (
+                stor_hdrs(stor_now) if stor_now else list(proxy_hdrs)) + [
                 f"proxy_cache {zone};", f'proxy_cache_key "{nkey}";',
                 f"proxy_cache_valid 200 206 {video['segment_ttl']}s;", "proxy_cache_valid 404 10s;",
                 "proxy_ignore_headers Cache-Control Expires Set-Cookie Vary;", "proxy_cache_lock on;",
                 "proxy_cache_lock_timeout 10s;"] + mtls_now + [
+                f"proxy_pass $pcdn_proto://$pcdn_target{stor_now['prefix']}$pcdn_vnext;" if stor_now else
                 "proxy_pass $pcdn_proto://$pcdn_target$pcdn_vnext$is_args$args;"]
             out_l += ["    location = /__pcdn/vpf {"] + ind(L) + ["    }"]
         return out_l
@@ -2610,7 +2755,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         """The function routes of one server plus @pcdn_fn_pass (the site's default origin handling,
         used for `pass` and on_error "origin") and @pcdn_fn_err (502 through the site's error pages)."""
         L = []
-        common = loc_common(hdrs=[])   # the site's response headers (HSTS, Alt-Svc, header rules)
+        # the site's response headers (HSTS, Alt-Svc, header rules); a function answers any method
+        # itself, only its pass to a storage origin (@pcdn_fn_pass) is GET/HEAD-only
+        common = loc_common(hdrs=[], guard=False)
         for f in fns:
             err = "@pcdn_fn_pass" if f["on_error"] == "origin" else "@pcdn_fn_err"
             B = [f"client_max_body_size {1024 * 1024};",
@@ -2654,6 +2801,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             F += [f"    set $pcdn_pool {_q(pool)};", "    set $pcdn_target $pcdn_upstream;"]
         else:
             F.append(f"    set $pcdn_target {_q(target)};")
+        if stor_now:
+            F += storage_server_tail(f'if ($http_x_pcdn_fn_site != "{sid}") {{ return 421; }}', True)
+            return "\n".join(F)
         F += ["    proxy_ssl_server_name on;", "    proxy_ssl_name $host;"]
         if proto == "https" and sslo.get("origin_verify"):
             F += ["    proxy_ssl_verify on;", f"    proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
@@ -2671,11 +2821,32 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         F += ["    location / {"] + ind(L) + ["    }", "}"]
         return "\n".join(F)
 
-    for host in site["hosts"]:
+    def storage_server_tail(first, cond):
+        """The rest of a loopback server towards the current host's storage origin (functions
+        fetch, resizer originals): GET/HEAD only, safe paths, never cached, storage headers."""
+        st = stor_now
+        F = ["    proxy_ssl_server_name on;", f"    proxy_ssl_name {_q(st['ssl_name'])};"]
+        if st["tls"]:
+            F += ["    proxy_ssl_verify on;", f"    proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
+                  "    proxy_ssl_verify_depth 4;"]
+        L = [first] + stor_guard(stor_badp) + stor_hdrs(st, cond)
+        L += ["proxy_cache off;", "proxy_intercept_errors off;", f"add_header Allow $pcdn_sm_{sid} always;",
+              f"proxy_pass $pcdn_proto://$pcdn_target{st['prefix']}$pcdn_path;"]
+        return F + ["    location / {"] + ind(L) + ["    }", "}"]
+
+    def storage_fetch_server(host_name):
+        """127.0.0.1:STORAGE_FETCH_PORT server of a storage host with images on: the resizer /
+        transformer fetch originals here (X-Pcdn-Origin), Host = the site host as for any origin."""
+        F = ["server {", f"    listen 127.0.0.1:{sport_sto};", f"    server_name {host_name};", "    access_log off;",
+             f"    set $pcdn_proto {stor_now['proto']};", f"    set $pcdn_target {_q(stor_now['hp'])};"]
+        return "\n".join(F + storage_server_tail("proxy_read_timeout 60s;", False))
+
+    for hi, host in enumerate(site["hosts"]):
         name = str(host["name"]).lower()
-        res = resolve_origin(host, pools, origin_proto)
+        st = stor_of.get(hi)
+        res = (st["proto"], None, st["hp"]) if st else resolve_origin(host, pools, origin_proto)
         if not SAFE_NAME.match(name) or res is None:
-            log.warning("skipping unsafe host entry %r -> %r", name, host.get("origin"))
+            log.warning("skipping unsafe host entry %r -> %s", name, storage_log_repr(host.get("origin")))
             continue
         proto, pool, target = res
         valid_hosts.append(name)
@@ -2740,8 +2911,11 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             continue
 
         s.append(f"    set $pcdn_proto {proto};")
-        # client certificate towards this host's origin (only when it is reached over HTTPS)
-        mtls_now[:] = mtls_lines if proto == "https" else []
+        stor_now.clear()
+        stor_now.update(st or {})
+        # client certificate towards this host's origin (only when it is reached over HTTPS; never
+        # towards the platform's own object storage)
+        mtls_now[:] = mtls_lines if proto == "https" and not st else []
         mtls_used = mtls_used or bool(mtls_now)
         if pool:
             s.append(f"    set $pcdn_pool {_q(pool)};")
@@ -2758,7 +2932,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 s.append("    if ($scheme = http) { return 301 https://$host$request_uri; }")
         for code in rd_codes:   # SPEC §14.2 redirect rules (first matching rule, see redirect_maps)
             s.append(f"    if ({rd_var} ~ \"^{code}(.*)$\") {{ return {code} $1; }}")
-        if body_on:
+        if body_on and not st:   # storage origins take no request bodies (GET/HEAD only)
             s.append(f"    if ({fn_bodychk}) {{ rewrite ^ /__pcdn/body$uri last; }}")
         if image_on:
             if imv2["secret"]:   # SPEC §16.6 signed transform URLs: unsigned / wrong signature -> 403
@@ -2768,8 +2942,11 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             s.append(f"    limit_req zone=pcdn_rlk_{sid} burst={rps * 2} nodelay;")
             s.append("    limit_req_status 429;")
         s.append("    proxy_ssl_server_name on;")
-        s.append("    proxy_ssl_name $host;")
-        if proto == "https" and sslo.get("origin_verify"):
+        if st:   # SPEC §16.8: the storage endpoint's own name, always verified
+            s.append(f"    proxy_ssl_name {_q(st['ssl_name'])};")
+        else:
+            s.append("    proxy_ssl_name $host;")
+        if (proto == "https" and sslo.get("origin_verify")) or (st and st["tls"]):
             s.append("    proxy_ssl_verify on;")
             s.append(f"    proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};")
             s.append("    proxy_ssl_verify_depth 4;")
@@ -2790,7 +2967,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         for cls in err_pages:
             s.append(f"    location = /__pcdn/err/{cls}.html {{ internal; default_type text/html; "
                      f"alias {cfg['NGINX_DIR']}/errors/{sid}-{cls}.html; add_header Cache-Control no-store always; }}")
-        if body_on:
+        if body_on and not st:
             # the body is read here (in memory: bodyNeed only routes requests whose declared length
             # fits), inspected, then proxied as is (never cached) with the original request URI
             s.append(f"    location ^~ /__pcdn/body/ {{ internal; client_max_body_size {BODY_CAP}; "
@@ -2799,8 +2976,10 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             s += proxy_loc("@pcdn_body", "bypass", 0, 0, False, uri=body_uri)
 
         if image_on:
-            L = ["internal;", "rewrite ^/__pcdn/img(/.*)$ $1 break;"]
-            adds = []
+            # storage origins: the GET/HEAD / path guard runs before the rewrite (`break` ends the
+            # rewrite directives of this location)
+            L = ["internal;"] + (stor_guard(stor_bad) if st else []) + ["rewrite ^/__pcdn/img(/.*)$ $1 break;"]
+            adds = [f"add_header Allow $pcdn_sm_{sid} always;"] if st else []
             if cache_on:
                 key, _ = cache_key(ignore_q, image=True)
                 L += [f"proxy_cache {zone};", f"proxy_cache_key \"{key}\";",
@@ -2811,7 +2990,10 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 adds.append("add_header X-Cache BYPASS always;")
             if imv2["avif"] and not webp_on:   # the variant depends on Accept (webp_on adds its own Vary)
                 adds.append("add_header Vary Accept;")
-            L = L + loc_common(["Set-Cookie"], adds) + [
+            # a storage origin: the resizer fetches originals through this host's loopback storage
+            # server (storage_fetch_server), which adds the bucket's Host / Referer / path prefix
+            L = L + loc_common(["Set-Cookie"], adds, hdrs=proxy_hdrs, guard=False) + [
+                f"proxy_set_header X-Pcdn-Origin http://127.0.0.1:{sport_sto};" if st else
                 "proxy_set_header X-Pcdn-Origin $pcdn_proto://$pcdn_target;",
                 "proxy_set_header X-Pcdn-W $pcdn_img_w;",
                 "proxy_set_header X-Pcdn-H $pcdn_img_h;",
@@ -2835,6 +3017,11 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         # tunnel paths: "^~" prefix locations, so no page rule / static regex location can take them
         if tunnel:
             for p in tunnel["paths"]:
+                if st and not p["origin"] and not p["pool"]:
+                    # a storage origin never carries tunnels (SPEC §16.8): only paths with their own
+                    # origin / pool work on such a host
+                    s.append(f"    location ^~ {_q(p['path'])} {{ return 404; }}")
+                    continue
                 s += tunnel_loc(p, proto, pool, target)
             if fallback == "decoy":
                 s.append("    location / {")
@@ -2885,6 +3072,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         out.append("\n".join(s))
         if fn_live:
             out.append(fn_fetch_server(name, proto, pool, target))
+        if st and image_on:
+            out.append(storage_fetch_server(name))
+            meta["storage_fetch"] = True
 
     if mtls_used and mtls_id != "platform":
         files[f"mtls/{sid}.crt"], files[f"mtls/{sid}.key"] = mtls_pair
@@ -2938,10 +3128,11 @@ def render_all(config: dict, cfg: dict) -> dict:
         files["shield.conf"] = sh_conf
     platform = norm_origin_pull(config)   # node-wide platform client certificate (SPEC §14.2)
     platform_pair = (platform["cert"], platform["key"]) if platform else None
-    resizer_pairs, platform_used, fn_any = {}, False, False
+    resizer_pairs, platform_used, fn_any, sto_fetch = {}, False, False, False
     for site in config.get("sites", []):
         text, extra, js, meta = _render_site(site, cfg, shield, platform_pair)
         fn_any = fn_any or bool(meta.get("functions"))
+        sto_fetch = sto_fetch or bool(meta.get("storage_fetch"))
         files[f"sites/{int(site['id'])}.conf"] = text
         files.update(extra)
         platform_used = platform_used or meta.get("mtls_platform")
@@ -2953,7 +3144,8 @@ def render_all(config: dict, cfg: dict) -> dict:
             for p in js["pools"].values():
                 if p["health"]["enabled"]:
                     max_timeout = max(max_timeout, p["health"]["timeout"])
-    files.update(render_l4(config, cfg))   # SPEC §16.4 ({} without L4 apps)
+    sto_port = (_int(cfg.get("STORAGE_FETCH_PORT"), 8091, 1, 65535),) if sto_fetch else ()
+    files.update(render_l4(config, cfg, sto_port))   # SPEC §16.4 ({} without L4 apps)
     if platform_used:   # one 0600 pair per node, only while some site presents it
         files["mtls/platform.crt"], files["mtls/platform.key"] = platform_pair
     # verified crawler ranges: only while some site uses bot management (a daily range refresh
@@ -2970,6 +3162,10 @@ def render_all(config: dict, cfg: dict) -> dict:
         files["http.conf"] += ("\n# edge functions fetch() socket (SPEC §16.9): unknown hosts\nserver {\n"
                                f"    listen unix:{cfg.get('FN_FETCH_SOCKET') or '/run/pcdn-fnfetch/fetch.sock'} "
                                "default_server;\n    server_name _;\n    access_log off;\n    return 421;\n}\n")
+    if sto_fetch:   # SPEC §16.8: the resizer's storage-origin port answers 404 for any other host
+        files["http.conf"] += ("\n# object-storage origins for the image resizer (SPEC §16.8): unknown hosts\nserver {\n"
+                               f"    listen 127.0.0.1:{_int(cfg.get('STORAGE_FETCH_PORT'), 8091, 1, 65535)} "
+                               "default_server;\n    server_name _;\n    access_log off;\n    return 404;\n}\n")
     # JSON is valid JS; ensure_ascii keeps U+2028 & co. out of the source
     files["js/sites.js"] = ("// generated by pcdn-agent, do not edit\nexport default "
                             + json.dumps(js_sites, ensure_ascii=True, sort_keys=True) + ";\n")
@@ -3012,12 +3208,13 @@ def _group_digests(files: dict, pattern: str) -> dict:
 
 def site_digests(files: dict) -> dict:
     """Per-site content digest (config + certs + error pages) for group-aware reload deferral (F21)."""
-    return _group_digests(files, r"^(?:sites|certs|errors|mtls|l4/sites)/(\d+)")
+    return _group_digests(files, r"^(?:sites|certs|errors|mtls|storage|l4/sites)/(\d+)")
 
 
 def cert_digests(files: dict) -> dict:
-    """Per-site certificate/key digest, so a foreign-group site's cert rotation is never deferred."""
-    return _group_digests(files, r"^certs/(\d+)\.")
+    """Per-site certificate/key digest, so a foreign-group site's cert rotation is never deferred;
+    the object-storage read tokens (SPEC §16.8) too: a rotated token is refused by the bucket at once."""
+    return _group_digests(files, r"^(?:certs|storage)/(\d+)\.")
 
 
 GLOBAL_FILES = ("http.conf", "js/pcdn.js", "shield.conf", "bots.conf", "mtls.conf", "mtls/platform.crt",
@@ -3059,15 +3256,17 @@ def run(cmd: str) -> tuple[int, str]:
 def write_tree(root: str, files: dict):
     os.makedirs(os.path.join(root, "sites"), exist_ok=True)
     os.makedirs(os.path.join(root, "certs"), mode=0o700, exist_ok=True)
-    if any(rel.startswith("mtls/") for rel in files):
-        os.makedirs(os.path.join(root, "mtls"), mode=0o700, exist_ok=True)
+    for d in ("mtls", "storage"):
+        if any(rel.startswith(d + "/") for rel in files):
+            os.makedirs(os.path.join(root, d), mode=0o700, exist_ok=True)
     for rel, content in files.items():
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # keys and the HMAC / shield secrets are only read by the nginx master (root) at load time;
-        # so are the origin-pull client certificates (mtls/, mtls.conf; SPEC §14.2)
+        # so are the origin-pull client certificates (mtls/, mtls.conf; SPEC §14.2) and the object-
+        # storage read tokens (storage/; SPEC §16.8)
         mode = 0o600 if (rel.endswith(".key") or rel in ("js/sites.js", "shield.conf", "mtls.conf")
-                         or rel.startswith("mtls/")) else 0o644
+                         or rel.startswith(("mtls/", "storage/"))) else 0o644
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as f:
             f.write(content)

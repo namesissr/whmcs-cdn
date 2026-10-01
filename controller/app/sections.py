@@ -587,7 +587,7 @@ class Video(Strict):
 
 L4_ID_RE = r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$"  # also the DNS label of l4-<id>.<domain>
 L4_PORT_MIN = 1024
-ALWAYS_RESERVED_PORTS = {22, 53, 80, 443, 8089, 8090}  # 8089/8090: the edges' loopback image servers
+ALWAYS_RESERVED_PORTS = {22, 53, 80, 443, 8089, 8090, 8091}  # edge loopback image (8089/8090) and storage-fetch (8091) servers
 
 
 class L4Origin(Strict):
