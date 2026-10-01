@@ -1,0 +1,645 @@
+"""Unit tests for SPEC §14.3.1 (live minute aggregates, platform_errors) and §14.3.2 (log export:
+sampling, record shape, IP anonymization, on-disk spool, shipping) of the edge agent."""
+
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import re
+import subprocess
+import urllib.error
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+HERE = pathlib.Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("agent_6d", HERE.parent / "pcdn-agent.py")
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+
+TOKEN = "edge_" + "t0ken" * 8
+SITE_SECRET = "ab" * 32
+
+
+def make_cfg(tmp_path, **over):
+    cfg = dict(agent.DEFAULTS)
+    cfg.update({
+        "CONTROLLER_URL": "http://127.0.0.1:9", "EDGE_TOKEN": TOKEN,
+        "NGINX_DIR": str(tmp_path / "pcdn"), "CACHE_DIR": str(tmp_path / "cache"),
+        "STATE_FILE": str(tmp_path / "state.json"), "ACCESS_LOG": str(tmp_path / "access.log"),
+        "ERROR_LOG": str(tmp_path / "error.log"), "BUNDLE_VERSION_FILE": str(tmp_path / "bundle.version"),
+        "PAGES_DIR": str(HERE.parent / "pages"), "NJS_FILE": str(HERE.parent / "njs/pcdn.js"),
+        "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"), "GEOIP_DB": str(tmp_path / "missing.mmdb"),
+        "NGINX_TEST_CMD": "true", "NGINX_RELOAD_CMD": "true", "NGINX_USER": "root", "RELOAD_VERIFY": "no",
+        "NGINX_CAPS": dict(agent.LEGACY_CAPS, nginx="1.24.0"),
+    })
+    cfg.update(over)
+    return cfg
+
+
+def iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
+T0 = NOW.replace(second=5) - timedelta(minutes=10)   # a recent minute (inside the 24 h live window)
+
+
+def line(**kw) -> dict:
+    """A current-format access-log record (pcdn-base.conf log_format)."""
+    e = {"t": iso(T0), "h": "a.com", "b": 100, "s": 200, "c": "MISS", "ip": "203.0.113.77", "cc": "IR", "m": "GET",
+         "u": "/p?q=secret", "ua": "Mozilla/5.0", "v": "ok", "tn": "", "rt": 0.012, "bu": 80, "ub": "90",
+         "us": "200", "pg": "", "sc": "https", "pr": "HTTP/2.0", "rf": "https://ref.example/x?token=1#frag"}
+    e.update(kw)
+    return e
+
+
+def write_log(path, rows):
+    with open(path, "a") as f:
+        f.write("".join(json.dumps(r) + "\n" for r in rows))
+
+
+class Ctl:
+    """Records POSTs; `fail` maps a path to an exception factory (or None = succeed)."""
+
+    def __init__(self):
+        self.posts, self.fail, self.calls = [], {}, 0
+
+    def call(self, method, path, body=None, headers=None, timeout=30):
+        self.calls += 1
+        f = self.fail.get(path)
+        if f is not None:
+            raise f()
+        self.posts.append((path, json.loads(json.dumps(body)), timeout))
+        return 200, {}, {"ok": True}
+
+    def bodies(self, path):
+        return [b for p, b, _ in self.posts if p == path]
+
+
+def http_error(code):
+    return lambda: urllib.error.HTTPError("http://c/x", code, "err", {}, io.BytesIO(b""))
+
+
+def new_agent(tmp_path, **over):
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg, a.state, a.ctl = make_cfg(tmp_path, **over), {}, Ctl()
+    return a
+
+
+SITES_CFG = {"version": "v1", "sites": [
+    {"id": 1, "domain": "a.com", "secret": SITE_SECRET, "hosts": [{"name": "a.com", "origin": {"address": "1.2.3.4"}}],
+     "logs": {"enabled": True, "sample_rate": 1.0, "anonymize_ip": True, "secret_key": "S3CRET-KEY-X"}},
+    {"id": 2, "domain": "b.com", "secret": SITE_SECRET, "hosts": [{"name": "b.com", "origin": {"address": "1.2.3.4"}}],
+     "logs": {"enabled": False, "sample_rate": 1.0, "anonymize_ip": True}},
+    {"id": 3, "domain": "raw.com", "secret": SITE_SECRET,
+     "hosts": [{"name": "raw.com", "origin": {"address": "1.2.3.4"}}],
+     "logs": {"enabled": True, "sample_rate": 1.0, "anonymize_ip": False}},
+    {"id": 4, "domain": "shop.a.com", "secret": SITE_SECRET,
+     "hosts": [{"name": "shop.a.com", "origin": {"address": "1.2.3.4"}}]},   # nested, no logs section
+]}
+
+
+# ----------------------------------------------------------------- live minute aggregates
+
+def test_minute_bucketing_and_top_n(tmp_path):
+    log = tmp_path / "access.log"
+    m1 = T0
+    m2 = T0 + timedelta(minutes=1)
+    rows = [line(t=iso(m1), s=200, c="HIT", b=10, u="/a?x=1", cc="IR"),
+            line(t=iso(m1 + timedelta(seconds=30)), s=404, b=20, u="/a?y=2", cc="DE"),
+            line(t=iso(m1), s=503, us="", b=5, u="/b", cc="", h="B.a.com"),
+            line(t=iso(m2), s=301, c="STALE", b=7, u="/c", cc="us"),
+            line(t=iso(m2), s=101, b=1, u="/ws", tn="ws", cc="IR")]
+    # 30 countries and 150 distinct paths in one minute of c.com: counted with a cap, top 20 sent
+    ccs = [chr(65 + i // 26) + chr(65 + i % 26) for i in range(30)]
+    for i, cc in enumerate(ccs):
+        rows += [line(t=iso(m1), h="c.com", cc=cc, u="/hot")] * (i + 1)
+    rows += [line(t=iso(m1), h="c.com", u=f"/p{i}?q={i}") for i in range(150)]
+    rows += [line(t=iso(m1), h="c.com", u="/p5")] * 3      # a tracked path keeps counting past the cap
+    rows += [line(t=iso(m1), h="c.com", u="/late")] * 50   # new path beyond the tracking cap: not counted
+    write_log(log, rows)
+    state = {}
+    agent.read_usage(state, str(log))
+    items = {(i["host"], i["minute"]): i for i in agent.live_items(state["live"], agent.live_cutoff())}
+    k1, k2 = m1.strftime("%Y-%m-%dT%H:%M:00Z"), m2.strftime("%Y-%m-%dT%H:%M:00Z")
+    a1 = items[("a.com", k1)]
+    assert a1 == {"host": "a.com", "minute": k1, "requests": 2, "bytes": 30, "cache_hits": 1,
+                  "status": {"2xx": 1, "4xx": 1}, "countries": {"IR": 1, "DE": 1}, "paths": {"/a": 2}}
+    assert items[("b.a.com", k1)]["status"] == {"5xx": 1} and items[("b.a.com", k1)]["countries"] == {}
+    a2 = items[("a.com", k2)]
+    # 1xx (WebSocket 101) is not one of the four status classes; tunnels still count as requests
+    assert a2["requests"] == 2 and a2["cache_hits"] == 1 and a2["status"] == {"3xx": 1}
+    assert a2["countries"] == {"US": 1, "IR": 1} and a2["paths"] == {"/c": 1, "/ws": 1}
+    c = items[("c.com", k1)]
+    assert len(c["countries"]) == 20 and c["countries"][ccs[-1]] == 30 and ccs[0] not in c["countries"]
+    assert len(c["paths"]) == 20 and c["paths"]["/hot"] == sum(range(1, 31)) and c["paths"]["/p5"] == 4
+    raw = state["live"][f"c.com|{k1}"]["paths"]
+    assert len(raw) == agent.LIVE_PATH_TRACK and "/late" not in raw and "/p149" not in raw
+    assert all("?" not in p for p in raw)
+    # minutes are ISO with seconds = 0 (UTC)
+    assert all(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:00Z", m) for _, m in items)
+
+
+def test_live_window_and_post_bound(tmp_path):
+    log = tmp_path / "access.log"
+    old = NOW - timedelta(hours=25)
+    write_log(log, [line(t=iso(old), u="/old"), line(u="/new")])
+    state = {}
+    agent.read_usage(state, str(log))
+    # hourly usage still counts the old line; live never counts minutes older than 24 h
+    assert sum(a["requests"] for a in state["pending"].values()) == 2
+    assert [k.split("|")[1] for k in state["live"]] == [T0.strftime("%Y-%m-%dT%H:%M:00Z")]
+
+    # more host-minutes than one POST may carry: the OLDEST minutes are dropped
+    live = {}
+    base = NOW.replace(second=0) - timedelta(minutes=100)
+    for m in range(100):
+        minute = (base + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:00Z")
+        for h in range(60):
+            live[f"h{h}.com|{minute}"] = {"requests": 1, "bytes": 1, "cache_hits": 0, "status": {"2xx": 1},
+                                          "countries": {}, "paths": {"/": 1}}
+    items = agent.live_items(live, agent.live_cutoff())
+    assert len(items) == agent.LIVE_MAX
+    minutes = [i["minute"] for i in items]
+    assert minutes == sorted(minutes)                                      # oldest first in the POST
+    newest = (base + timedelta(minutes=99)).strftime("%Y-%m-%dT%H:%M:00Z")
+    dropped = (base + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:00Z")
+    assert newest in minutes and dropped not in minutes
+    # a host the controller would reject (> 253 chars) is never sent
+    assert agent.live_item("x" * 254 + "|" + newest, live[f"h0.com|{newest}"]) is None
+
+
+def test_live_pending_cap_drops_oldest(monkeypatch):
+    monkeypatch.setattr(agent, "LIVE_PENDING_MAX", 8)
+    live = {}
+    for m in range(12):
+        agent._account_live(live, "a.com", f"2026-10-01T10:{m:02d}:00Z", 1, False, 200, "IR", "/")
+    assert len(live) <= 8 and "a.com|2026-10-01T10:11:00Z" in live and "a.com|2026-10-01T10:00:00Z" not in live
+
+
+def test_live_rides_in_the_usage_batch_and_retries_with_same_batch_id(tmp_path):
+    a = new_agent(tmp_path)
+    write_log(a.cfg["ACCESS_LOG"], [line(u="/x?a=1"), line(u="/x", s=500, us="")])
+    a.ctl.fail["/edge/v1/usage"] = lambda: OSError("controller down")
+    with pytest.raises(OSError):
+        a.push_usage()
+    [entry] = a.state["outbox"]
+    assert entry["live"] and a.state["live"] == {} and a.state["pending"] == {}
+    persisted = json.loads(pathlib.Path(a.cfg["STATE_FILE"]).read_text())   # saved before the POST (F8)
+    assert persisted["outbox"][0]["id"] == entry["id"] and persisted["outbox"][0]["live"] == entry["live"]
+    a.ctl.fail.clear()
+    a.push_usage()
+    [body] = a.ctl.bodies("/edge/v1/usage")
+    assert body["batch_id"] == entry["id"] and re.fullmatch(r"[0-9a-f]{32}", body["batch_id"])
+    [lv] = body["live"]
+    assert lv["host"] == "a.com" and lv["requests"] == 2 and lv["status"] == {"2xx": 1, "5xx": 1}
+    assert lv["paths"] == {"/x": 2}
+    [item] = body["items"]
+    assert item["platform_errors"] == 1 and item["requests"] == 2
+    assert a.state["outbox"] == []
+
+
+def test_live_backlog_bounded_and_24h_cutoff_on_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "LIVE_BACKLOG_MAX", 5)
+    fresh = NOW.replace(second=0).strftime("%Y-%m-%dT%H:%M:00Z")
+    stale = (NOW - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:00Z")
+
+    def li(minute, host="a.com"):
+        return {"host": host, "minute": minute, "requests": 1, "bytes": 1, "cache_hits": 0, "status": {},
+                "countries": {}, "paths": {}}
+    outbox = [{"id": "1" * 32, "ts": 0, "items": [{"host": "a.com"}], "events": [], "live": [li(stale), li(fresh)]},
+              {"id": "2" * 32, "ts": 0, "items": [], "events": [], "live": [li(fresh, f"h{i}") for i in range(4)]}]
+    agent.trim_live_backlog(outbox, agent.live_cutoff())
+    assert [x["minute"] for x in outbox[0]["live"]] == [fresh]           # > 24 h dropped, newest entries win
+    assert len(outbox[1]["live"]) == 4
+    assert outbox[0]["items"] == [{"host": "a.com"}] and outbox[0]["id"] == "1" * 32   # hourly untouched
+    outbox.append({"id": "3" * 32, "ts": 0, "items": [], "events": [], "live": [li(fresh, "z")] * 2})
+    agent.trim_live_backlog(outbox, agent.live_cutoff())
+    assert "live" not in outbox[0] and len(outbox[1]["live"]) == 3 and len(outbox[2]["live"]) == 2
+
+
+def test_usage_rejected_with_live_is_resent_without_it(tmp_path):
+    a = new_agent(tmp_path)
+    write_log(a.cfg["ACCESS_LOG"], [line()])
+    seen = []
+
+    class Picky(Ctl):
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            seen.append(json.loads(json.dumps(body)))
+            if "live" in body:
+                raise http_error(422)()
+            return super().call(method, path, body, headers, timeout)
+    a.ctl = Picky()
+    a.push_usage()
+    assert len(seen) == 2 and "live" in seen[0] and "live" not in seen[1]
+    assert seen[0]["batch_id"] == seen[1]["batch_id"] and seen[1]["items"][0]["requests"] == 1
+    assert a.state["outbox"] == []
+
+
+# ----------------------------------------------------------------- platform_errors
+
+PE_CASES = [
+    # (record overrides, counted?, why)
+    (dict(s=500, us=""), True, "njs / internal failure: no upstream"),
+    (dict(s=502, us=""), True, "origin hostname not resolved by the edge: no upstream recorded"),
+    (dict(s=504, us="", c=""), True, "edge-produced 504"),
+    (dict(s=500, us="", v="log:waf:942100"), True, "a log-only verdict is not an action"),
+    (dict(s=500, us="", pg=""), True, "custom 5xx error page for an edge error"),
+    (dict(s=502, us="502"), False, "origin connect failure (nginx records the upstream)"),
+    (dict(s=504, us="504"), False, "origin timeout"),
+    (dict(s=500, us="500"), False, "origin answered 500"),
+    (dict(s=503, us="-"), False, "upstream state without a status"),
+    (dict(s=502, us="502, 502"), False, "several upstream attempts"),
+    (dict(s=502, us="504 : 502"), False, "shield hop failed, origin fallback failed"),
+    (dict(s=500, us="", c="HIT"), False, "served from cache"),
+    (dict(s=500, us="", c="STALE"), False, "stale cache entry"),
+    (dict(s=503, us="", v="challenge:ddos:auto"), False, "DDoS challenge"),
+    (dict(s=503, us="", v="block:ratelimit:login"), False, "rate-limit block"),
+    (dict(s=500, us="", v="captcha:firewall:r1"), False, "captcha"),
+    (dict(s=503, us="", pg="site"), False, "suspended / over-quota page"),
+    (dict(s=501, us=""), False, "unsupported client request"),
+    (dict(s=505, us=""), False, "unsupported HTTP version"),
+    (dict(s=499, us=""), False, "client closed: < 500"),
+    (dict(s=404, us=""), False, "4xx"),
+    (dict(s=200, us=""), False, "2xx"),
+    (dict(s="x", us=""), False, "garbage status"),
+]
+
+
+@pytest.mark.parametrize("over,counted,why", PE_CASES, ids=[c[2] for c in PE_CASES])
+def test_platform_error_classification(over, counted, why):
+    assert agent.platform_error(line(**over)) is counted, why
+
+
+def test_platform_errors_in_hourly_items_and_old_lines(tmp_path):
+    log = tmp_path / "access.log"
+    rows = [line(**over) for over, _, _ in PE_CASES if isinstance(over["s"], int)]
+    old = {"t": iso(T0), "h": "a.com", "b": 10, "s": 500, "c": "", "v": "ok", "u": "/old"}   # pre-6D format
+    rows.append(old)
+    write_log(log, rows)
+    state = {}
+    agent.read_usage(state, str(log))
+    [item] = agent.usage_items(state["pending"])
+    assert item["platform_errors"] == sum(1 for over, c, _ in PE_CASES if c)
+    assert item["requests"] == len(rows)                                  # the old line still counts
+    assert not agent.platform_error(old)                                  # no "us": never counted
+    no_pe = agent.usage_item("x.com|2026-10-01T10:00:00Z", {"bytes": 1, "requests": 1, "cache_hits": 0})
+    assert no_pe["platform_errors"] == 0                                  # v1 state entry
+
+
+# ----------------------------------------------------------------- record shape / anonymization
+
+@pytest.mark.parametrize("ip,anon", [
+    ("203.0.113.77", "203.0.113.0"), ("203.0.113.0", "203.0.113.0"),
+    ("2001:db8:abcd:1234:5678::1", "2001:db8:abcd::"), ("[2001:db8:abcd:ffff::9]", "2001:db8:abcd::"),
+    ("::ffff:198.51.100.9", "198.51.100.0"), ("fe80::1%eth0", "fe80::"),
+    ("", ""), ("-", ""), ("not-an-ip", ""), ("1.2.3.4.5", ""), (None, ""),
+])
+def test_anonymize_ip(ip, anon):
+    assert agent.anonymize_ip(ip) == anon
+    assert agent.anonymize_ip(agent.anonymize_ip(ip)) == anon   # idempotent (the controller re-applies it)
+
+
+def test_log_record_shape_query_stripping_and_truncation():
+    dt = datetime(2026, 10, 1, 10, 5, 3, tzinfo=timezone.utc)
+    e = line(u="/" + "p" * 3000 + "?q=1", ua="U" * 600, rf="https://r.example/" + "r" * 2000 + "?s=1", m="GET",
+             s=206, b=1234, rt="1.23456", c="HIT", cc="ir", sc="https", pr="HTTP/2.0", ip="198.51.100.200")
+    r = agent.log_record(e, "a.com", dt, True)
+    assert list(r) == ["t", "host", "ip", "method", "scheme", "path", "status", "bytes", "rt", "cache", "country",
+                       "ua", "referer", "proto"]   # the controller's export order
+    assert r["t"] == "2026-10-01T10:05:03Z" and r["ip"] == "198.51.100.0" and r["country"] == "IR"
+    assert len(r["path"]) == 2048 and "?" not in r["path"] and len(r["ua"]) == 512
+    assert len(r["referer"]) == 1024 and "?" not in r["referer"]
+    assert (r["status"], r["bytes"], r["rt"], r["cache"], r["scheme"], r["proto"]) == (206, 1234, 1.235, "HIT",
+                                                                                        "https", "HTTP/2.0")
+    short = agent.log_record(line(rf="https://ref.example/x?token=1#frag", u="/a/b?c=d#e"), "a.com", dt, False)
+    assert short["referer"] == "https://ref.example/x" and short["path"] == "/a/b" and short["ip"] == "203.0.113.77"
+    # an old-format line still yields a valid record; junk numbers / countries are neutralised
+    old = agent.log_record({"t": "x", "h": "a.com", "s": "bad", "b": None, "rt": "nan", "cc": "XYZ"}, "a.com", dt, True)
+    assert (old["status"], old["bytes"], old["rt"], old["country"], old["ip"], old["scheme"], old["referer"]) == (
+        0, 0, 0.0, "", "", "", "")
+    # a lone surrogate (raw non-UTF-8 bytes in a header) never makes a record unencodable
+    bad = agent.log_record(json.loads(b'{"ua": "x\xed\xa0\x80y", "u": "/\xed\xa0\x80"}'), "a.com", dt, True)
+    json.dumps(bad, ensure_ascii=False).encode("utf-8")
+    assert bad["ua"].startswith("x�") and bad["ua"].endswith("y") and bad["path"].startswith("/�")
+
+
+def test_sampling_is_deterministic_and_bounded(tmp_path):
+    cfg = make_cfg(tmp_path)
+    state = {}
+    ls = agent.LogShip(cfg, state)
+    body = {"version": "v1", "sites": [dict(SITES_CFG["sites"][0], logs={"enabled": True, "sample_rate": 0.1}),
+                                       dict(SITES_CFG["sites"][1], logs={"enabled": True, "sample_rate": 0.0001}),
+                                       dict(SITES_CFG["sites"][2], logs={"enabled": True, "sample_rate": 7})]}
+    ls.update_config(body)
+    assert ls.site_for("a.com") == (0.1, True) and ls.site_for("www.b.com") == (0.01, True)   # clamped
+    assert ls.site_for("raw.com") == (1.0, True) and ls.site_for("other.com") is None
+    raws = [json.dumps(line(u=f"/r{i}", ip=f"10.0.{i // 250}.{i % 250}")).encode() for i in range(20000)]
+    pts = [agent.sample_point(r) for r in raws]
+    assert all(0.0 <= p < 1.0 for p in pts)
+    assert 1700 <= sum(p < 0.1 for p in pts) <= 2300            # ~10 %
+    assert 120 <= sum(p < 0.01 for p in pts) <= 300             # ~1 %
+    assert [agent.sample_point(r) for r in raws[:50]] == pts[:50]   # same line -> same decision
+    log = tmp_path / "access.log"
+    log.write_bytes(b"".join(r + b"\n" for r in raws))
+    agent.read_usage(state, str(log), ship=ls)
+    ls.flush()
+    [b] = ls.batches()
+    assert 1700 <= b[3] <= 2300
+    # read again from scratch: the very same lines are selected
+    first = sorted(r["path"] for r in ls._read(b[0]))
+    state2 = {}
+    ls2 = agent.LogShip(make_cfg(tmp_path, LOGSHIP_SPOOL_DIR=str(tmp_path / "spool2")), state2)
+    ls2.update_config(body)
+    agent.read_usage(state2, str(log), ship=ls2)
+    ls2.flush()
+    assert sorted(r["path"] for r in ls2._read(ls2.batches()[0][0])) == first
+
+
+def test_sampling_scope_disabled_tunnel_internal_and_nested_sites(tmp_path):
+    a = new_agent(tmp_path)
+    a.logship.update_config(SITES_CFG)
+    rows = [line(h="a.com", u="/keep?x=1"), line(h="www.a.com", u="/sub"),
+            line(h="b.com", u="/disabled-site"), line(h="www.b.com", u="/disabled-site"),
+            line(h="shop.a.com", u="/nested-disabled"), line(h="x.shop.a.com", u="/nested-disabled"),
+            line(h="a.com", u="/vpn", tn="ws", s=101), line(h="a.com", u="/grpc", tn="grpc"),
+            line(h="a.com", u="/__pcdn/verify?t=1"), line(h="a.com", u="/%5F%5Fpcdn/captcha"),
+            line(h="a.com", u="//__pcdn/health"), line(h="unknown.org", u="/nosite"),
+            line(h="raw.com", u="/raw", ip="2001:db8::1")]
+    write_log(a.cfg["ACCESS_LOG"], rows)
+    a.push_usage()
+    recs = [r for f in a.logship.batches() for r in a.logship._read(f[0])]
+    assert sorted((r["host"], r["path"]) for r in recs) == [("a.com", "/keep"), ("raw.com", "/raw"),
+                                                           ("www.a.com", "/sub")]
+    by = {r["path"]: r for r in recs}
+    assert by["/keep"]["ip"] == "203.0.113.0" and by["/raw"]["ip"] == "2001:db8::1"   # anonymize_ip false
+    assert by["/keep"]["referer"] == "https://ref.example/x" and by["/keep"]["proto"] == "HTTP/2.0"
+    # every request still counts for usage / live
+    [body] = a.ctl.bodies("/edge/v1/usage")
+    assert sum(i["requests"] for i in body["items"]) == len(rows) == sum(x["requests"] for x in body["live"])
+
+
+def test_sampling_budget_never_slows_usage(tmp_path, monkeypatch):
+    """Record building has its own CPU budget per read pass; beyond it the pass's export records are
+    dropped and counted while every line is still accounted for usage."""
+    monkeypatch.setattr(agent, "LOGSHIP_SAMPLE_BUDGET", -1.0)   # exhausted from the first record
+    a = new_agent(tmp_path)
+    a.logship.update_config(SITES_CFG)
+    write_log(a.cfg["ACCESS_LOG"], [line(u=f"/x{i}") for i in range(7)] + [line(h="b.com")])
+    a.push_usage()
+    [body] = a.ctl.bodies("/edge/v1/usage")
+    assert sum(i["requests"] for i in body["items"]) == 8
+    assert a.logship.batches() == [] and a.logship.stats()["dropped"] == 7   # b.com is not exported
+    monkeypatch.setattr(agent, "LOGSHIP_SAMPLE_BUDGET", 2.0)    # next pass: budget again
+    write_log(a.cfg["ACCESS_LOG"], [line(u="/y")])
+    a.push_usage()
+    assert [r["path"] for f in a.logship.batches() for r in a.logship._read(f[0])] == ["/y"]
+
+
+def test_export_failure_never_disturbs_usage_or_security_accounting(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("bug in record building")
+    monkeypatch.setattr(agent, "log_record", boom)
+    a = new_agent(tmp_path)
+    a.logship.update_config(SITES_CFG)
+    write_log(a.cfg["ACCESS_LOG"], [line(s=403, v="block:waf:942100", u="/?id=1"), line(tn="ws", u="/t", s=101, bu=5)])
+    a.push_usage()
+    [body] = a.ctl.bodies("/edge/v1/usage")
+    [item] = body["items"]
+    assert item["requests"] == 2 and item["security"] == {"waf": 1} and item["tunnel"]["sessions"] == 1
+    assert [e["rule"] for e in body["events"]] == ["942100"] and sum(x["requests"] for x in body["live"]) == 2
+    assert a.logship.batches() == []
+
+
+def test_unreadable_spool_batch_is_dropped_and_counted(tmp_path):
+    a = spooled(tmp_path, 2, per=3)
+    first = a.logship.batches()[0][0]
+    (pathlib.Path(a.logship.dir) / first).write_text("not json\n{also not\n")
+    assert a.logship.ship(a.ctl) == 1
+    assert a.logship.batches() == [] and a.state["logship"]["dropped"] == 3
+
+
+def test_no_sampling_without_enabled_sites(tmp_path):
+    a = new_agent(tmp_path)
+    a.logship.update_config({"version": "v", "sites": [SITES_CFG["sites"][1], SITES_CFG["sites"][3]]})
+    assert not a.logship.active
+    write_log(a.cfg["ACCESS_LOG"], [line(h="b.com"), line(h="a.com")])
+    a.push_usage()
+    assert a.logship.batches() == [] and not os.path.exists(a.logship.dir)
+    a.logship.ship(a.ctl)
+    assert a.ctl.bodies("/edge/v1/logship") == []
+
+
+# ----------------------------------------------------------------- spool + shipping
+
+def spooled(tmp_path, n_batches, per=3, **cfg_over):
+    a = new_agent(tmp_path, **cfg_over)
+    a.logship.update_config(SITES_CFG)
+    for b in range(n_batches):
+        for i in range(per):
+            a.logship.offer(line(u=f"/b{b}/{i}"), "a.com", T0, None)
+        a.logship.flush()
+    return a
+
+
+def test_spool_files_are_private_and_survive_a_restart(tmp_path):
+    a = spooled(tmp_path, 3)
+    files = a.logship.batches()
+    assert [f[3] for f in files] == [3, 3, 3]
+    d = pathlib.Path(a.logship.dir)
+    assert d == tmp_path / "logship" and (d.stat().st_mode & 0o777) == 0o700
+    assert all((d / f[0]).stat().st_mode & 0o777 == 0o600 for f in files)
+    ids = [f[2] for f in files]
+    # agent restart: a fresh LogShip on the same state file/dir sees the same batches and ids
+    agent.save_state(a.cfg["STATE_FILE"], a.state)
+    b = new_agent(tmp_path)
+    b.state = agent.load_state(b.cfg["STATE_FILE"])
+    assert [f[2] for f in b.logship.batches()] == ids and b.logship.site_for("a.com") == (1.0, True)
+    assert b.logship.ship(b.ctl) == 3
+    posts = b.ctl.bodies("/edge/v1/logship")
+    assert [p["batch_id"] for p in posts] == ids                       # oldest first, ids from the spool
+    assert [r["path"] for r in posts[0]["records"]] == ["/b0/0", "/b0/1", "/b0/2"]
+    assert b.logship.batches() == []
+
+
+def test_failed_post_keeps_batch_and_retries_with_same_id_after_backoff(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock[0])
+    a = spooled(tmp_path, 2)
+    ids = [f[2] for f in a.logship.batches()]
+    a.ctl.fail["/edge/v1/logship"] = lambda: TimeoutError("timed out")
+    assert a.logship.ship(a.ctl) == 0 and a.ctl.calls == 1             # stops at the first failure
+    assert [f[2] for f in a.logship.batches()] == ids
+    a.ctl.fail.clear()
+    clock[0] += 10
+    assert a.logship.ship(a.ctl) == 0 and a.ctl.calls == 1             # backing off (30 s)
+    clock[0] += 25
+    assert a.logship.ship(a.ctl) == 2
+    assert [p["batch_id"] for p in a.ctl.bodies("/edge/v1/logship")] == ids
+    a.ctl.fail["/edge/v1/logship"] = http_error(503)
+    spooled_more = a.logship
+    spooled_more.offer(line(), "a.com", T0, None)
+    spooled_more.flush()
+    for _ in range(2):                                                 # backoff doubles: 30 s, 60 s
+        clock[0] += 3600
+        a.logship.ship(a.ctl)
+    assert a.logship.backoff == 60 and len(a.logship.batches()) == 1
+
+
+def test_404_disables_shipping_until_the_config_changes(tmp_path):
+    a = spooled(tmp_path, 2)
+    a.ctl.fail["/edge/v1/logship"] = http_error(404)
+    assert a.logship.ship(a.ctl) == 0 and a.ctl.calls == 1
+    assert a.logship.stats()["disabled"] and len(a.logship.batches()) == 2   # spool kept
+    a.logship.next_run = 0
+    for _ in range(5):                                                 # no spinning
+        a.logship.ship(a.ctl)
+    assert a.ctl.calls == 1
+    a.logship.update_config(SITES_CFG)                                 # same version: still off
+    a.logship.ship(a.ctl)
+    assert a.ctl.calls == 1
+    # the off flag survives a restart
+    agent.save_state(a.cfg["STATE_FILE"], a.state)
+    b = new_agent(tmp_path)
+    b.state = agent.load_state(b.cfg["STATE_FILE"])
+    b.logship.ship(b.ctl)
+    assert b.ctl.calls == 0
+    b.logship.update_config(dict(SITES_CFG, version="v2"))            # a config change re-enables it
+    assert b.logship.ship(b.ctl) == 2 and not b.logship.stats()["disabled"]
+
+
+def test_rejected_batch_is_dropped_and_counted(tmp_path):
+    a = spooled(tmp_path, 2, per=4)
+    first = a.logship.batches()[0][0]
+
+    class OneBad(Ctl):
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            if first.split("-")[1] == body["batch_id"]:
+                raise http_error(422)()
+            return super().call(method, path, body, headers, timeout)
+    a.ctl = OneBad()
+    assert a.logship.ship(a.ctl) == 1
+    assert a.logship.batches() == [] and a.state["logship"]["dropped"] == 4
+
+
+def test_spool_cap_and_age_drop_oldest_and_count(tmp_path):
+    a = spooled(tmp_path, 1, per=2, LOGSHIP_SPOOL_MAX_MB="0.002")      # ~2 KB
+    for b in range(1, 6):
+        for i in range(2):
+            a.logship.offer(line(u=f"/b{b}/{i}"), "a.com", T0, None)
+        a.logship.flush()
+    files = a.logship.batches()
+    assert 0 < len(files) < 6 and sum(f[4] for f in files) <= a.logship.cap
+    kept = [r["path"] for f in files for r in a.logship._read(f[0])]
+    assert "/b5/1" in kept and "/b0/0" not in kept                      # the oldest went first
+    st = a.logship.stats()
+    assert st["dropped"] == 12 - len(kept) and st["spool_records"] == len(kept)
+    assert a.state["logship"]["dropped"] == st["dropped"]
+    # batches older than 72 h are dropped (and counted) too
+    d = pathlib.Path(a.logship.dir)
+    ancient = d / f"{int((agent.time.time() - 73 * 3600) * 1000):013d}-{'c' * 32}-7.jsonl"
+    ancient.write_text(json.dumps({"host": "a.com"}) + "\n")
+    a.logship.enforce()
+    assert not ancient.exists() and a.logship.stats()["dropped"] == st["dropped"] + 7
+
+
+def test_run_budget_bounds_one_shipping_run(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock[0])
+    a = spooled(tmp_path, 6)
+
+    class Slow(Ctl):
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            clock[0] += 2.0                                            # every POST takes 2 s
+            return super().call(method, path, body, headers, timeout)
+    a.ctl = Slow()
+    assert a.logship.ship(a.ctl) == 3                                   # 0, 2, 4 s started; not at 6 s
+    assert len(a.logship.batches()) == 3
+    assert all(t == 30 for _, _, t in a.ctl.posts)                      # LOGSHIP_TIMEOUT per POST
+    assert a.logship.next_run - clock[0] >= 30 - 6                       # own cadence
+    assert a.logship.ship(a.ctl) == 0                                    # not due yet
+    clock[0] += 60
+    assert a.logship.ship(a.ctl) == 3
+
+
+def test_tick_ships_after_usage_and_reports_spool_in_heartbeat(tmp_path):
+    a = new_agent(tmp_path, HEARTBEAT_INTERVAL="60", USAGE_INTERVAL="60")
+    a.running, a.last_usage, a.last_heartbeat, a.net_prev = True, 0.0, 0.0, None
+
+    class Cfg(Ctl):
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            if path == "/edge/v1/config":
+                return 200, {"ETag": "e1"}, json.loads(json.dumps(SITES_CFG))
+            if path.startswith("/edge/v1/purges"):
+                return 200, {}, []
+            return super().call(method, path, body, headers, timeout)
+    a.ctl = Cfg()
+    a.metrics = lambda: {}
+    write_log(a.cfg["ACCESS_LOG"], [line(u="/one?x=1"), line(h="b.com")])
+    a.tick()
+    order = [p for p, _, _ in a.ctl.posts]
+    assert order.index("/edge/v1/usage") < order.index("/edge/v1/logship")
+    [lb] = a.ctl.bodies("/edge/v1/logship")
+    assert [r["path"] for r in lb["records"]] == ["/one"] and lb["records"][0]["ip"] == "203.0.113.0"
+    hb = [b for b in a.ctl.bodies("/edge/v1/heartbeat") if "metrics" in b][0]
+    assert hb["capabilities"]["live_analytics"] is True and hb["capabilities"]["logship"] is True
+    assert set(hb["logship"]) == {"sites", "spool_batches", "spool_records", "spool_bytes", "dropped", "disabled"}
+    assert hb["logship"]["sites"] == 2
+
+
+def test_no_secrets_in_state_spool_or_payloads(tmp_path):
+    a = spooled(tmp_path, 1)
+    write_log(a.cfg["ACCESS_LOG"], [line()])
+    a.push_usage()
+    agent.save_state(a.cfg["STATE_FILE"], a.state)
+    a.logship.ship(a.ctl)
+    blobs = [pathlib.Path(a.cfg["STATE_FILE"]).read_text(), json.dumps(a.ctl.posts),
+             json.dumps(a.logship.stats())]
+    blobs += [(pathlib.Path(a.logship.dir) / f).read_text() for f in os.listdir(a.logship.dir)]
+    for blob in blobs:
+        for secret in (TOKEN, SITE_SECRET, "S3CRET-KEY-X", "secret_key", "token=1", "q=secret"):
+            assert secret not in blob
+    assert a.state["logship"]["sites"] == {"a.com": [1.0, True], "raw.com": [1.0, False], "shop.a.com": None}
+
+
+def test_install_upgrade_keeps_logship_tunables(tmp_path):
+    """agent.conf is rewritten by every install.sh run; --upgrade carries LOGSHIP_* lines over, a
+    fresh install leaves them to the agent's defaults."""
+    install = (HERE.parent / "install.sh").read_text()
+
+    def block(start, end):
+        return start + install.split(start, 1)[1].split(end, 1)[0]
+    upgrade = block('if [ "$UPGRADE" = yes ]; then', 'TCP_CC="${TCP_CC:-bbr}"')
+    write = block("cat > /etc/pcdn/agent.conf <<EOF", "\nEOF") + "\nEOF\n"
+    keep = block("# >>> pcdn keep logship", "# <<< pcdn keep logship")
+    conf = tmp_path / "agent.conf"
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CONTROLLER": "", "TOKEN": "", "REGION": "", "ROLE": "",
+           "TCP_CC": "", "HTTP3": "", "KEEP_CONF": "", "NGINX_USER": "www-data", "IPV6": "yes", "CACHE_SIZE": "10g",
+           "HTTP_PORT": "80", "HTTPS_PORT": "443"}
+
+    def run(script, **over):
+        script = script.replace("/etc/pcdn/agent.conf", str(conf))
+        subprocess.run(["bash", "-euc", script], env=dict(env, **over), check=True, capture_output=True)
+    conf.write_text("CONTROLLER_URL=https://c\nEDGE_TOKEN=t\nLOGSHIP_SPOOL_MAX_MB=1024\nLOGSHIP_INTERVAL=45\n"
+                    "LOGSHIP_EVIL=x\n")
+    run(upgrade + write + keep, UPGRADE="yes")
+    cfg = agent.load_config(str(conf))
+    assert cfg["LOGSHIP_SPOOL_MAX_MB"] == "1024" and cfg["LOGSHIP_INTERVAL"] == "45" and cfg["EDGE_TOKEN"] == "t"
+    assert "LOGSHIP_EVIL" not in conf.read_text() and conf.read_text().count("LOGSHIP_SPOOL_MAX_MB") == 1
+    run(write + keep, UPGRADE="no", CONTROLLER="https://c", TOKEN="t")          # fresh install: defaults
+    assert "LOGSHIP" not in conf.read_text() and agent.load_config(str(conf))["LOGSHIP_SPOOL_MAX_MB"] == "256"
+
+
+def test_logs_section_never_changes_rendering(tmp_path):
+    cfg = make_cfg(tmp_path)
+    site = {"id": 7, "domain": "example.com", "status": "active", "secret": SITE_SECRET, "ssl": None,
+            "hosts": [{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}],
+            "cache": {"enabled": True, "level": "standard"}}
+    with_logs = dict(site, logs={"enabled": True, "sample_rate": 0.5, "anonymize_ip": False})
+    assert agent.render_site(site, cfg) == agent.render_site(with_logs, cfg)
+    f1, d1 = agent.render_tree({"sites": [site]}, cfg)
+    f2, d2 = agent.render_tree({"sites": [with_logs]}, cfg)
+    assert d1 == d2 and f1 == f2
+    assert '"us":"$upstream_status"' in f1["http.conf"] and "map $uri $pcdn_page" in f1["http.conf"]

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -143,6 +144,16 @@ DEFAULTS = {
     "SHIELD_HTTPS_PORT": "",
     # TCP congestion control written by install.sh --cc (informational for the agent)
     "TCP_CC": "bbr",
+    # SPEC §14.3.2 log export: sampled access-log records of sites with logs.enabled are spooled
+    # here (0700 dir, 0600 files; empty = "logship" next to STATE_FILE) and POSTed to
+    # /edge/v1/logship. The spool is capped (oldest batches dropped beyond it, counted) so a long
+    # controller outage can never fill the disk.
+    "LOGSHIP_SPOOL_DIR": "",
+    "LOGSHIP_SPOOL_MAX_MB": "256",
+    # seconds between shipping runs (own cadence, after config / purges / usage in the same loop)
+    "LOGSHIP_INTERVAL": "30",
+    # per-POST timeout (seconds); a run starts no new POST after LOGSHIP_RUN_BUDGET seconds
+    "LOGSHIP_TIMEOUT": "30",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -323,7 +334,10 @@ def heartbeat_capabilities(cfg: dict) -> dict:
     return {"http3": bool(c["http3"]), "early_hints": bool(c["early_hints"]),
             "webp_convert": bool(c["webp_convert"]), "webp_mode": c["webp_mode"],
             "modules": list(c["modules"]), "nginx": c["nginx"],
-            "waf_packs": dict(WAF_PACK_VERSIONS)}   # SPEC §14.2 managed rule-set versions
+            "waf_packs": dict(WAF_PACK_VERSIONS),   # SPEC §14.2 managed rule-set versions
+            # SPEC §14.3: this agent sends 1-minute `live` aggregates + platform_errors with its usage
+            # and ships sampled access-log records to /edge/v1/logship
+            "live_analytics": True, "logship": True}
 
 
 _GUARD = re.compile(r"^# @if (\w+)\n(.*?)(?:^# @else \1\n(.*?))?^# @endif \1\n", re.S | re.M)
@@ -2341,6 +2355,172 @@ def floor_hour(ts: str) -> str:
     return _utc(ts).replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00Z")
 
 
+_TS_MEMO: list = [None, None]   # last access-log timestamp -> (UTC datetime, hour key, minute key)
+
+
+def _times(ts: str) -> tuple:
+    """(UTC datetime, "YYYY-MM-DDTHH:00:00Z", "YYYY-MM-DDTHH:MM:00Z") of an access-log timestamp,
+    memoised for the last value (consecutive lines mostly share a second)."""
+    if _TS_MEMO[0] == ts:
+        return _TS_MEMO[1]
+    dt = _utc(ts)
+    v = (dt, dt.strftime("%Y-%m-%dT%H:00:00Z"), dt.strftime("%Y-%m-%dT%H:%M:00Z"))
+    _TS_MEMO[0], _TS_MEMO[1] = ts, v
+    return v
+
+
+CACHE_SERVED = ("HIT", "STALE", "UPDATING", "REVALIDATED")
+SECURITY_ACTIONS = ("block", "challenge", "captcha")
+# 5xx answers nginx gives to a malformed / unsupported CLIENT request (unknown transfer coding or
+# method, bad HTTP version): client-triggerable, so they never count against the platform
+CLIENT_5XX = (501, 505)
+
+
+def platform_error(e: dict) -> bool:
+    """SPEC §14.3.1 `platform_errors`: is this access-log record a 5xx the edge produced itself?
+
+    Counted only when ALL of these hold:
+      * status 500..599, except 501 / 505 (nginx's answer to an unsupported client request: the
+        visitor can trigger it at will, so it says nothing about the platform);
+      * the record carries the "us" field (a pre-6D log line without it is never counted: no
+        evidence either way) and it is empty: no upstream was contacted. Any value - "502" (origin
+        connect failure / bad gateway), "504" (origin timeout), "-" (upstream state without a
+        status), "502, 200" (several attempts) - means the origin was involved: an origin error;
+      * the response was not served from the cache (HIT / STALE / UPDATING / REVALIDATED: content
+        the origin produced earlier);
+      * no security action: the verdict "v" is not block / challenge / captcha (WAF, firewall,
+        rate-limit, DDoS, bot, hotlink decisions are the customer's settings, not errors; "log:..."
+        verdicts are not actions);
+      * it is not the suspended / over-quota page of the site ("pg" = "site": the site's own status).
+    What remains: e.g. njs or internal nginx failures (500), an origin hostname that the edge's
+    resolver could not resolve (502, nginx records no upstream for it - the SPEC rule counts it),
+    and a customer error page served for such an edge-produced 5xx."""
+    try:
+        code = int(e.get("s") or 0)
+    except (TypeError, ValueError):
+        return False
+    if code < 500 or code > 599 or code in CLIENT_5XX:
+        return False
+    if "us" not in e or str(e.get("us") or "").strip():
+        return False
+    if e.get("c") in CACHE_SERVED:
+        return False
+    if str(e.get("v") or "ok").split(":", 1)[0] in SECURITY_ACTIONS:
+        return False
+    return not e.get("pg")
+
+
+# ---- live minute aggregates (SPEC §14.3.1)
+LIVE_MAX = 5000                    # `live` items per usage POST
+LIVE_TOP = 20                      # top countries / paths per item
+LIVE_PATH_TRACK = 100              # distinct paths counted per host-minute before taking the top
+LIVE_CC_TRACK = 64                 # distinct countries counted per host-minute
+LIVE_PATH_LEN = 256
+LIVE_PENDING_MAX = 20000           # host-minutes held between two pushes (oldest dropped beyond)
+LIVE_MAX_BYTES = 2 * 1024 * 1024   # estimated JSON size of the `live` list of one POST
+LIVE_BACKLOG_MAX = 20000           # live items kept across the whole outbox (newest win)
+LIVE_BACKLOG_BYTES = 8 * 1024 * 1024
+LIVE_WINDOW = 86400                # the controller keeps 24 h of minutes; older ones are never sent
+
+
+def live_cutoff(now: float | None = None) -> str:
+    """Minute key 24 h ago: live buckets older than this are not counted or sent."""
+    t = time.time() if now is None else now
+    return datetime.fromtimestamp(t - LIVE_WINDOW, timezone.utc).strftime("%Y-%m-%dT%H:%M:00Z")
+
+
+def _prune_live(live: dict):
+    """Drop the oldest quarter of the pending host-minutes (amortised: called at the cap)."""
+    keys = sorted(live, key=lambda k: k.rsplit("|", 1)[1])
+    for k in keys[: max(1, len(keys) // 4)]:
+        del live[k]
+
+
+def _account_live(live: dict, host: str, minute: str, nbytes: int, hit: bool, code: int, cc: str, path: str):
+    key = f"{host}|{minute}"
+    b = live.get(key)
+    if b is None:
+        if len(live) >= LIVE_PENDING_MAX:
+            _prune_live(live)
+        b = live[key] = {"requests": 0, "bytes": 0, "cache_hits": 0, "status": {}, "countries": {}, "paths": {}}
+    b["requests"] += 1
+    b["bytes"] += nbytes
+    if hit:
+        b["cache_hits"] += 1
+    if 200 <= code <= 599:
+        _inc(b["status"], f"{code // 100}xx")
+    if cc and (cc in b["countries"] or len(b["countries"]) < LIVE_CC_TRACK):
+        _inc(b["countries"], cc)
+    if path:
+        path = path[:LIVE_PATH_LEN]
+        if path in b["paths"] or len(b["paths"]) < LIVE_PATH_TRACK:
+            _inc(b["paths"], path)
+
+
+def _top(d: dict, n: int) -> dict:
+    return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n])
+
+
+def live_item(key: str, b: dict) -> dict | None:
+    """One `live` entry: {host, minute, requests, bytes, cache_hits, status, countries (top 20),
+    paths (top 20, query already stripped)}. None for a host the controller would reject."""
+    host, minute = key.rsplit("|", 1)
+    if not host or len(host) > 253:
+        return None
+
+    def cnt(d):   # the controller rejects the WHOLE usage POST (422) on a negative number
+        return {k: max(0, int(v)) for k, v in d.items()}
+    return {"host": host, "minute": minute, "requests": max(0, int(b.get("requests") or 0)),
+            "bytes": max(0, int(b.get("bytes") or 0)), "cache_hits": max(0, int(b.get("cache_hits") or 0)),
+            "status": cnt(b.get("status") or {}), "countries": cnt(_top(b.get("countries") or {}, LIVE_TOP)),
+            "paths": cnt(_top(b.get("paths") or {}, LIVE_TOP))}
+
+
+def _live_size(item: dict) -> int:
+    """Cheap upper estimate of an item's JSON size (bytes)."""
+    return (160 + len(item["host"]) + sum(len(k) + 12 for k in item["paths"])
+            + 10 * len(item["countries"]) + 12 * len(item["status"]))
+
+
+def _select_live(items: list, cutoff: str, max_items: int, max_bytes: int) -> list:
+    """Newest minutes first within the caps (older ones are dropped), returned oldest first."""
+    keep = []
+    for it in sorted((x for x in items if x["minute"] >= cutoff), key=lambda x: x["minute"], reverse=True):
+        size = _live_size(it)
+        if len(keep) >= max_items or size > max_bytes:
+            break
+        keep.append(it)
+        max_bytes -= size
+    keep.reverse()
+    return keep
+
+
+def live_items(live: dict, cutoff: str) -> list[dict]:
+    """The pending host-minutes as one POST's `live` list (≤ LIVE_MAX, ≤ LIVE_MAX_BYTES, no minute
+    older than 24 h; when there are more, the OLDEST minutes are dropped - live data is best-effort)."""
+    items = [it for it in (live_item(k, v) for k, v in live.items()) if it]
+    return _select_live(items, cutoff, LIVE_MAX, LIVE_MAX_BYTES)
+
+
+def trim_live_backlog(outbox: list, cutoff: str):
+    """Bound the live data held in the usage outbox (controller unreachable): drop minutes older than
+    24 h and keep only the newest LIVE_BACKLOG_MAX items / LIVE_BACKLOG_BYTES across all entries.
+    Only `live` is ever trimmed - an entry's hourly items and events, and its batch_id, are untouched,
+    so a retried batch stays idempotent (the controller dedups the whole body on batch_id)."""
+    n, size = LIVE_BACKLOG_MAX, LIVE_BACKLOG_BYTES
+    for entry in reversed(outbox):          # newest entries first
+        live = entry.get("live")
+        if not live:
+            continue
+        keep = _select_live(live, cutoff, n, size) if n > 0 and size > 0 else []
+        n -= len(keep)
+        size -= sum(_live_size(x) for x in keep)
+        if keep:
+            entry["live"] = keep
+        else:
+            entry.pop("live", None)
+
+
 def _bucket(pending: dict, key: str) -> dict:
     a = pending.get(key)
     if isinstance(a, list):  # v1 state file: [bytes, requests, cache_hits]
@@ -2357,25 +2537,38 @@ def _inc(d: dict, k: str, n: int = 1):
     d[k] = d.get(k, 0) + n
 
 
-def _account(e: dict, pending: dict, events: list):
+_CC = re.compile(r"^[A-Z]{2}$")
+
+
+def _account(e: dict, pending: dict, events: list, live: dict | None = None, cutoff: str = "",
+             ship=None, raw: bytes | None = None):
+    """Fold one access-log record into the host-hour (`pending`), the security `events`, the
+    host-minute `live` buckets (SPEC §14.3.1; minutes before `cutoff` skipped) and, for sites with
+    log export, the sampler `ship` (SPEC §14.3.2; `raw` is the log line, the sampling key)."""
     host = e["h"].lower()
-    a = _bucket(pending, f"{host}|{floor_hour(e['t'])}")
-    a["bytes"] += int(e.get("b") or 0)
+    dt, hour, minute = _times(e["t"])
+    a = _bucket(pending, f"{host}|{hour}")
+    nbytes = int(e.get("b") or 0)
+    a["bytes"] += nbytes
     a["requests"] += 1
-    if e.get("c") in ("HIT", "STALE", "UPDATING", "REVALIDATED"):
+    hit = e.get("c") in CACHE_SERVED
+    if hit:
         a["cache_hits"] += 1
     code = int(e.get("s") or 0)
     if 100 <= code <= 599:
         _inc(a["status"], f"{code // 100}xx")
         _inc(a["codes"], str(code))
+        if code >= 500 and platform_error(e):
+            a["platform_errors"] = a.get("platform_errors", 0) + 1
     cc = str(e.get("cc") or "").upper()
-    if re.match(r"^[A-Z]{2}$", cc):
+    if not _CC.match(cc):
+        cc = ""
+    if cc:
         _inc(a["countries"], cc)
     uri = str(e.get("u") or "")
-    if uri:
-        path = uri.split("?", 1)[0][:512]
-        if path in a["paths"] or len(a["paths"]) < PATH_TRACK:
-            _inc(a["paths"], path)
+    path = uri.split("?", 1)[0][:512] if uri else ""
+    if path and (path in a["paths"] or len(a["paths"]) < PATH_TRACK):
+        _inc(a["paths"], path)
     tn = e.get("tn")
     if tn in TUNNEL_PROTOCOLS:
         _account_tunnel(a, e, tn, code)
@@ -2385,9 +2578,17 @@ def _account(e: dict, pending: dict, events: list):
         _inc(a["security"], source)
         if action in ("challenge", "captcha"):
             _inc(a["security"], "challenge")
-        events.append({"t": _utc(e["t"]).strftime("%Y-%m-%dT%H:%M:%SZ"), "host": host, "ip": str(e.get("ip") or ""),
+        events.append({"t": dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "host": host, "ip": str(e.get("ip") or ""),
                        "country": cc, "method": str(e.get("m") or ""), "path": uri[:2048], "action": action,
                        "source": source, "rule": rule, "user_agent": str(e.get("ua") or "")[:512]})
+    # best-effort extras last, so nothing in them can cut the hourly / security accounting short
+    if live is not None and minute >= cutoff:
+        _account_live(live, host, minute, nbytes, hit, code, cc, path)
+    if ship is not None:
+        try:
+            ship.offer(e, host, dt, raw)
+        except Exception as exc:  # noqa: BLE001 - log export must never break usage accounting
+            log.debug("logship: record skipped: %s", exc)
 
 
 def _nsum(v) -> int:
@@ -2419,12 +2620,16 @@ def _account_tunnel(a: dict, e: dict, proto: str, code: int):
     _inc(t["by_protocol"], proto, up + down)
 
 
-def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float | None = None) -> int:
+def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float | None = None,
+             ship=None, cutoff: str | None = None) -> int:
     """Aggregate complete lines from path starting at pos with O(line) memory (F24); returns the new
     position. Stops after max_bytes or the time budget, so a huge backlog is drained over ticks
-    instead of held in RAM 2-3x on one thread. A partial trailing line is left for the next read."""
+    instead of held in RAM 2-3x on one thread. A partial trailing line is left for the next read.
+    Also fills state['live'] (host-minutes since `cutoff`) and feeds the log-export sampler `ship`."""
     pending = state.setdefault("pending", {})
     events = state.setdefault("events", [])
+    live = state.setdefault("live", {})
+    cutoff = live_cutoff() if cutoff is None else cutoff
     read = 0
     with open(path, "rb", buffering=1 << 20) as f:
         f.seek(pos)
@@ -2434,7 +2639,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
             pos += len(raw)
             read += len(raw)
             try:
-                _account(json.loads(raw), pending, events)
+                _account(json.loads(raw), pending, events, live, cutoff, ship, raw)
             except (ValueError, KeyError, TypeError, AttributeError):
                 pass
             if read >= max_bytes or (deadline is not None and time.monotonic() > deadline):
@@ -2442,7 +2647,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
     return pos
 
 
-def _drain_rotated(state: dict, log_path: str, max_bytes: int, deadline: float | None) -> bool:
+def _drain_rotated(state: dict, log_path: str, max_bytes: int, deadline: float | None, ship=None) -> bool:
     """Drain the rotated (.1) file recorded in state across ticks (F24). Returns True while more of
     it remains (so the caller can defer the live file to the next tick)."""
     rotated = log_path + ".1"
@@ -2454,7 +2659,7 @@ def _drain_rotated(state: dict, log_path: str, max_bytes: int, deadline: float |
     if rst.st_ino != state.get("rot_inode"):
         state.pop("rot_inode", None), state.pop("rot_pos", None)
         return False
-    newpos = _consume(rotated, int(state.get("rot_pos", 0)), state, max_bytes, deadline)
+    newpos = _consume(rotated, int(state.get("rot_pos", 0)), state, max_bytes, deadline, ship)
     if newpos >= rst.st_size:  # fully drained
         state.pop("rot_inode", None), state.pop("rot_pos", None)
         return False
@@ -2462,11 +2667,13 @@ def _drain_rotated(state: dict, log_path: str, max_bytes: int, deadline: float |
     return True
 
 
-def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, time_budget: float = 5.0) -> None:
-    """Consume new access-log lines and merge them into state['pending'] / state['events']."""
+def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, time_budget: float = 5.0,
+               ship=None) -> None:
+    """Consume new access-log lines and merge them into state['pending'] / state['events'] /
+    state['live']; sampled log-export records go to `ship` (a LogShip, None = export off)."""
     deadline = time.monotonic() + time_budget
     # finish any rotated file still being drained from an earlier tick before touching the live file
-    if state.get("rot_inode") is not None and _drain_rotated(state, log_path, max_bytes, deadline):
+    if state.get("rot_inode") is not None and _drain_rotated(state, log_path, max_bytes, deadline, ship):
         return
     try:
         st = os.stat(log_path)
@@ -2478,10 +2685,10 @@ def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, ti
         # logrotate moved the file: record the old one (now .1) to drain across ticks, start new at 0
         state["rot_inode"], state["rot_pos"] = state["log_inode"], pos
         pos = 0
-        _drain_rotated(state, log_path, max_bytes, deadline)
+        _drain_rotated(state, log_path, max_bytes, deadline, ship)
     elif st.st_size < pos:
         pos = 0  # truncated
-    state["log_pos"] = _consume(log_path, pos, state, max_bytes, deadline)
+    state["log_pos"] = _consume(log_path, pos, state, max_bytes, deadline, ship)
     state["log_inode"] = st.st_ino
     if len(pending) > 50000:  # controller unreachable for a long time: keep newest
         for k in sorted(pending, key=lambda k: k.split("|")[1])[: len(pending) - 50000]:
@@ -2494,7 +2701,9 @@ def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, ti
 def usage_item(key: str, a) -> dict:
     a = _bucket({key: a}, key)
     host, hour = key.split("|", 1)
-    item = {"host": host, "hour": hour, "bytes": a["bytes"], "requests": a["requests"], "cache_hits": a["cache_hits"]}
+    item = {"host": host, "hour": hour, "bytes": a["bytes"], "requests": a["requests"], "cache_hits": a["cache_hits"],
+            # SPEC §14.3.1: edge-produced 5xx of this host-hour (see platform_error); 0 when none
+            "platform_errors": int(a.get("platform_errors") or 0)}
     for k in ("status", "codes", "countries", "security"):
         if a[k]:
             item[k] = a[k]
@@ -2509,6 +2718,418 @@ def usage_item(key: str, a) -> dict:
 
 def usage_items(pending: dict) -> list[dict]:
     return [usage_item(k, v) for k, v in pending.items()]
+
+
+# ----------------------------------------------------------------- log export (SPEC §14.3.2)
+#
+# Per site the edge config carries `logs: {enabled, sample_rate, anonymize_ip}` (never the bucket or
+# keys). While the agent reads the access log for usage it samples the records of enabled sites,
+# builds the export record (anonymizing the IP first), and appends it to a batch; full batches (5000
+# records or ~2 MiB) and, after each read, the partial one are written to the on-disk spool, one file
+# per batch whose name carries its batch_id. Shipping runs on its own cadence after config / purges /
+# usage in the same loop: oldest batch first, `POST /edge/v1/logship {batch_id, records}`, the file is
+# deleted only on success and the SAME batch_id is resent on any retry (the controller dedups it).
+
+LOGSHIP_MAX_RECORDS = 5000               # per batch = per POST (SPEC §14.3.2)
+LOGSHIP_BATCH_BYTES = 2 * 1024 * 1024    # a batch is also closed at ~2 MiB, so one POST stays short
+LOGSHIP_MAX_AGE = 72 * 3600              # the controller drops older records; so does the spool
+LOGSHIP_RUN_BUDGET = 5.0                 # seconds per run after which no new POST is started
+# CPU seconds record building may take per access-log read pass (that pass has 5 s for everything):
+# beyond it the sampled records of the pass are dropped (counted), so export never slows usage
+LOGSHIP_SAMPLE_BUDGET = 2.0
+LOGSHIP_BACKOFF = (30, 900)              # first / max seconds between attempts after a failure
+LOGSHIP_WARN_EVERY = 600                 # at most one "dropped" warning per 10 minutes
+SPOOL_FILE = re.compile(r"^(\d{13})-([0-9a-f]{32})-(\d{1,6})\.jsonl$")
+
+
+_IP_MEMO: dict = {}   # (address, anonymize) -> export value; visitors repeat, parsing an IP does not
+_ISO_MEMO: list = [None, ""]
+_JSON_LINE = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), check_circular=False)
+
+
+def anonymize_ip(value) -> str:
+    """IPv4: last octet zeroed; IPv6: only the first 48 bits kept (an IPv4-mapped IPv6 address is
+    treated as IPv4); "" when not an IP. Idempotent, like the controller's re-application."""
+    try:
+        ip = ipaddress.ip_address(str(value or "").strip().strip("[]"))
+    except ValueError:
+        return ""
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.version == 4:
+        return str(ipaddress.IPv4Address(int(ip) & 0xFFFFFF00))
+    return str(ipaddress.IPv6Address(int(ip) >> 80 << 80))   # drops any %zone as well
+
+
+def _clean_ip(value) -> str:
+    try:
+        return str(ipaddress.ip_address(str(value or "").strip().strip("[]")))
+    except ValueError:
+        return ""
+
+
+def _s(v, n: int) -> str:
+    """Visitor-controlled text, truncated to n characters. nginx logs non-UTF-8 bytes raw and
+    json.loads(bytes) decodes them with surrogatepass, so a lone surrogate is replaced (U+FFFD): the
+    record must stay encodable as UTF-8 all the way into the customer's export."""
+    s = ("" if v is None else str(v))[:n]
+    return s if s.isascii() else s.encode("utf-8", "surrogatepass").decode("utf-8", "replace")[:n]
+
+
+def _no_query(v, n: int) -> str:
+    """Path / URL without query string and fragment, truncated to n characters."""
+    return _s(("" if v is None else str(v)).split("?", 1)[0].split("#", 1)[0], n)
+
+
+def _num(v, cast, default=0):
+    try:
+        x = cast(v)
+    except (TypeError, ValueError):
+        return default
+    return x if x == x and 0 <= x < 10 ** 15 else default   # NaN / negative / absurd -> default
+
+
+def _export_ip(value, anonymize: bool) -> str:
+    key = (value, anonymize)
+    v = _IP_MEMO.get(key)
+    if v is None:
+        v = anonymize_ip(value) if anonymize else _clean_ip(value)
+        if len(_IP_MEMO) >= 65536:
+            _IP_MEMO.clear()
+        _IP_MEMO[key] = v
+    return v
+
+
+def log_record(e: dict, host: str, dt: datetime, anonymize: bool) -> dict:
+    """The export record of one access-log line (SPEC §14.3.2), IP already anonymized when asked.
+    Keys in the order the controller writes them to the customer's objects."""
+    cc = str(e.get("cc") or "").upper()
+    if _ISO_MEMO[0] != dt:
+        _ISO_MEMO[0], _ISO_MEMO[1] = dt, dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ip = e.get("ip")
+    return {"t": _ISO_MEMO[1], "host": _s(host, 253),
+            "ip": _export_ip(ip if isinstance(ip, str) else str(ip or ""), anonymize),
+            "method": _s(e.get("m"), 16), "scheme": _s(e.get("sc"), 8), "path": _no_query(e.get("u"), 2048),
+            "status": _num(e.get("s"), int), "bytes": _num(e.get("b"), int),
+            "rt": round(_num(e.get("rt"), float, 0.0), 3), "cache": _s(e.get("c"), 16),
+            "country": cc if _CC.match(cc) else "", "ua": _s(e.get("ua"), 512),
+            "referer": _no_query(e.get("rf"), 1024), "proto": _s(e.get("pr"), 16)}
+
+
+def sample_point(raw: bytes) -> float:
+    """Deterministic sampling key in [0, 1): a hash of the raw log line. The same line always gets
+    the same decision (a re-read after a restart samples identically, tests are reproducible) and
+    distinct lines are spread uniformly, so `sample_point(line) < sample_rate` keeps that fraction."""
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") / 18446744073709551616.0
+
+
+def _internal_path(uri: str) -> bool:
+    """/__pcdn/... (health, challenge verification, captcha, ...) also when percent-encoded or
+    with extra leading slashes; never exported."""
+    head = uri[:64]
+    if "%" in head:
+        head = urllib.parse.unquote(head)
+    return head.lstrip("/").startswith("__pcdn/") or head.lstrip("/") == "__pcdn"
+
+
+def logship_sites(body: dict) -> dict:
+    """{domain: [sample_rate, anonymize_ip] | None} from the edge config: every site with
+    logs.enabled (rate clamped to 0.01..1, anonymize unless explicitly false), plus - as None - the
+    disabled sites nested under an enabled domain, so the longest-suffix host -> site mapping (the
+    controller's) never attributes their hosts to the enabled parent."""
+    enabled, off = {}, set()
+    for s in body.get("sites") or []:
+        if not isinstance(s, dict):
+            continue
+        dom = str(s.get("domain") or "").lower().rstrip(".")
+        if not dom or len(dom) > 253:
+            continue
+        lg = s.get("logs")
+        if isinstance(lg, dict) and lg.get("enabled") is True:
+            rate = _num(lg.get("sample_rate", 1.0), float, 1.0)
+            enabled[dom] = [min(1.0, max(0.01, rate)), lg.get("anonymize_ip") is not False]
+        else:
+            off.add(dom)
+    out: dict = dict(enabled)
+    for dom in off:
+        parts = dom.split(".")
+        if dom not in out and any(".".join(parts[i:]) in enabled for i in range(1, len(parts))):
+            out[dom] = None
+    return out
+
+
+class LogShip:
+    """Sampling, spool and shipping of the log export (SPEC §14.3.2). Persistent bits live in
+    state["logship"]: sites (logship_sites), cfg (last config version seen), off (config version at
+    which the controller answered 404: shipping stays off until the version changes) and dropped
+    (records dropped by the spool cap / age / a rejected batch, reported in the heartbeat)."""
+
+    def __init__(self, cfg: dict, state: dict):
+        self.cfg, self.state = cfg, state
+        st = state.get("logship")
+        if not isinstance(st, dict):
+            st = state["logship"] = {}
+        self.st = st
+        self.dir = cfg.get("LOGSHIP_SPOOL_DIR") or os.path.join(
+            os.path.dirname(cfg.get("STATE_FILE") or "/var/lib/pcdn/state.json"), "logship")
+        try:
+            mb = float(cfg.get("LOGSHIP_SPOOL_MAX_MB") or 256)
+        except (TypeError, ValueError):
+            mb = 256.0
+        self.cap = int(min(max(mb, 0.001), 1e6) * 1024 * 1024)
+        self.buf: list[str] = []
+        self.buf_bytes = 0
+        self.memo: dict = {}          # host -> (rate, anonymize) | None
+        self.next_run = 0.0           # monotonic: shipping cadence / backoff
+        self.backoff = 0
+        self.last_warn = 0.0
+        self.last_ms = 0              # batch names sort in creation order, also within one millisecond
+        self.spent = 0.0              # record-building seconds in the current read pass
+        self.over = 0                 # records not built this pass (sampling budget exhausted)
+        self._dir_ok = False
+
+    # ---- configuration
+    def update_config(self, body: dict):
+        """Called with every full config body (not on 304): new site settings, and a new version
+        re-enables shipping after a 404."""
+        self.st["sites"] = logship_sites(body)
+        self.memo = {}
+        ver = str(body.get("version") or "")
+        if "off" in self.st and self.st["off"] != ver:
+            self.st.pop("off", None)
+            self.next_run = 0.0
+            log.info("logship: config changed, shipping re-enabled")
+        self.st["cfg"] = ver
+
+    @property
+    def active(self) -> bool:
+        """Some site exports its logs (otherwise the reader skips the sampler entirely)."""
+        return any(self.st.get("sites", {}).values())
+
+    def site_for(self, host: str):
+        """(sample_rate, anonymize_ip) of the site serving `host`, or None (longest domain suffix,
+        like the controller's host -> site mapping)."""
+        v = self.memo.get(host, False)
+        if v is not False:
+            return v
+        sites = self.st.get("sites") or {}
+        parts = host.split(".")
+        v = None
+        for i in range(len(parts) - 1):
+            d = ".".join(parts[i:])
+            if d in sites:
+                v = tuple(sites[d]) if sites[d] else None
+                break
+        if len(self.memo) < 10000:
+            self.memo[host] = v
+        return v
+
+    # ---- sampling
+    def begin_pass(self):
+        self.spent, self.over = 0.0, 0
+
+    def end_pass(self):
+        """After a read pass: spool the partial batch, count what the sampling budget skipped."""
+        if self.over:
+            self._dropped(self.over, f"sampling budget {LOGSHIP_SAMPLE_BUDGET:.0f} s per read pass")
+            self.over = 0
+        self.flush()
+
+    def offer(self, e: dict, host: str, dt: datetime, raw: bytes | None):
+        """Sample one access-log record: only sites with logs.enabled, never tunnel traffic or the
+        edge's own /__pcdn/ endpoints; kept when sample_point(line) < sample_rate."""
+        st = self.site_for(host)
+        if st is None or e.get("tn") in TUNNEL_PROTOCOLS:
+            return
+        rate, anonymize = st
+        if rate < 1.0:
+            key = raw if raw is not None else json.dumps(e, sort_keys=True).encode()
+            if sample_point(key) >= rate:
+                return
+        if _internal_path(str(e.get("u") or "")):
+            return
+        if self.spent > LOGSHIP_SAMPLE_BUDGET:
+            self.over += 1
+            return
+        t0 = time.monotonic()
+        line = _JSON_LINE.encode(log_record(e, host, dt, anonymize))
+        self.buf.append(line)
+        self.buf_bytes += len(line) + 1
+        if len(self.buf) >= LOGSHIP_MAX_RECORDS or self.buf_bytes >= LOGSHIP_BATCH_BYTES:
+            self.flush()
+        self.spent += time.monotonic() - t0
+
+    def flush(self):
+        """Write the pending records as one spooled batch (never raises: export is best-effort)."""
+        if not self.buf:
+            return
+        lines, self.buf, self.buf_bytes = self.buf, [], 0
+        try:
+            self._ensure_dir()
+            self.last_ms = max(int(time.time() * 1000), self.last_ms + 1)
+            name = f"{self.last_ms:013d}-{uuid.uuid4().hex}-{len(lines)}.jsonl"
+            tmp = os.path.join(self.dir, ".tmp-" + name)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, os.path.join(self.dir, name))
+        except OSError as e:
+            self._dropped(len(lines), f"spool write failed ({e})")
+            return
+        self.enforce()
+
+    # ---- spool
+    def _ensure_dir(self):
+        if not self._dir_ok:
+            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            os.chmod(self.dir, 0o700)
+            self._dir_ok = True
+
+    def batches(self) -> list[tuple]:
+        """Spooled batches oldest first: (name, ms, batch_id, records, size). Stale temp files of
+        an interrupted write are removed."""
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return []
+        out = []
+        for n in names:
+            p = os.path.join(self.dir, n)
+            m = SPOOL_FILE.match(n)
+            try:
+                if m:
+                    out.append((n, int(m.group(1)), m.group(2), int(m.group(3)), os.path.getsize(p)))
+                elif n.startswith(".tmp-") and time.time() - os.path.getmtime(p) > 600:
+                    os.unlink(p)
+            except OSError:
+                pass
+        out.sort()
+        return out
+
+    def enforce(self) -> list[tuple]:
+        """Drop batches older than 72 h, then the oldest ones while the spool exceeds its cap;
+        returns what is left (oldest first)."""
+        files = self.batches()
+        total = sum(f[4] for f in files)
+        old = (time.time() - LOGSHIP_MAX_AGE) * 1000
+        keep, dropped = [], 0
+        for f in files:
+            if f[1] < old or total > self.cap:
+                try:
+                    os.unlink(os.path.join(self.dir, f[0]))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    keep.append(f)
+                    continue
+                total -= f[4]
+                dropped += f[3]
+            else:
+                keep.append(f)
+        if dropped:
+            self._dropped(dropped, f"spool cap {self.cap // (1024 * 1024)} MB / age {LOGSHIP_MAX_AGE // 3600} h")
+        return keep
+
+    def _dropped(self, n: int, why: str):
+        self.st["dropped"] = int(self.st.get("dropped") or 0) + n
+        now = time.monotonic()
+        if now - self.last_warn >= LOGSHIP_WARN_EVERY or not self.last_warn:
+            self.last_warn = now
+            log.warning("logship: dropped %d records (%s); %d dropped in total", n, why, self.st["dropped"])
+
+    def stats(self) -> dict:
+        """Heartbeat block: spool size, drops, whether shipping is off after a 404."""
+        files = self.batches()
+        return {"sites": sum(1 for v in (self.st.get("sites") or {}).values() if v),
+                "spool_batches": len(files), "spool_records": sum(f[3] for f in files),
+                "spool_bytes": sum(f[4] for f in files), "dropped": int(self.st.get("dropped") or 0),
+                "disabled": "off" in self.st}
+
+    # ---- shipping
+    def _read(self, name: str) -> list | None:
+        try:
+            with open(os.path.join(self.dir, name), encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return []
+        out = []
+        for ln in text.splitlines():
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out[:LOGSHIP_MAX_RECORDS]
+
+    def _remove(self, name: str):
+        try:
+            os.unlink(os.path.join(self.dir, name))
+        except OSError:
+            pass
+
+    def due(self) -> bool:
+        return "off" not in self.st and time.monotonic() >= self.next_run
+
+    def ship(self, ctl) -> int:
+        """One shipping run: POST spooled batches oldest first until the spool is empty or
+        LOGSHIP_RUN_BUDGET has passed (no new POST is started after it; each POST is time-boxed by
+        LOGSHIP_TIMEOUT). The next run is at least LOGSHIP_INTERVAL and 3x this run's duration away,
+        so shipping takes a bounded share of the loop. Returns the number of batches delivered.
+          * 2xx -> the batch file is deleted;
+          * 404 -> an old controller without the endpoint: shipping stops until the config version
+            changes (the spool is kept, capped and aged as usual);
+          * 400 / 413 / 422 -> this batch can never be accepted: dropped (counted), next batch;
+          * anything else (timeout, connection error, 5xx, 401, 429) -> exponential backoff
+            (30 s .. 15 min); the batch is retried later with the SAME batch_id."""
+        if not self.due():
+            return 0
+        start = time.monotonic()
+        interval = _int(self.cfg.get("LOGSHIP_INTERVAL"), 30, 1, 3600)
+        timeout = _int(self.cfg.get("LOGSHIP_TIMEOUT"), 30, 3, 600)
+        sent = 0
+        failed = False
+        for name, _, bid, count, _ in self.enforce():
+            if time.monotonic() - start > LOGSHIP_RUN_BUDGET:
+                break
+            records = self._read(name)
+            if records is None:          # vanished (dropped by the cap meanwhile)
+                continue
+            if not records:              # unreadable / corrupt: never retried forever
+                self._remove(name)
+                self._dropped(count, "unreadable spool batch")
+                continue
+            try:
+                ctl.call("POST", "/edge/v1/logship", {"batch_id": bid, "records": records}, timeout=timeout)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    self.st["off"] = str(self.st.get("cfg") or "")
+                    log.warning("logship: the controller has no /edge/v1/logship (404); "
+                                "shipping is off until the next config change")
+                    return sent
+                if e.code in (400, 413, 422):
+                    self._remove(name)
+                    self._dropped(len(records), f"batch rejected with HTTP {e.code}")
+                    continue
+                failed = True
+                log.warning("logship: POST failed: HTTP %s", e.code)
+                break
+            except Exception as e:  # noqa: BLE001 - timeouts, connection errors: retry later
+                failed = True
+                log.warning("logship: POST failed: %s", e)
+                break
+            self._remove(name)
+            sent += 1
+        took = time.monotonic() - start
+        if failed:
+            self.backoff = min(LOGSHIP_BACKOFF[1], self.backoff * 2 if self.backoff else LOGSHIP_BACKOFF[0])
+            self.next_run = time.monotonic() + self.backoff
+        else:
+            self.backoff = 0
+            self.next_run = time.monotonic() + max(interval, 3 * took)
+        return sent
 
 
 # ----------------------------------------------------------------- centralized logs (SPEC §11.2)
@@ -2881,6 +3502,14 @@ class Agent:
         self.last_heartbeat = 0.0
         self.net_prev = None
 
+    @property
+    def logship(self) -> LogShip:
+        """The log-export sampler / spool / shipper (SPEC §14.3.2), bound to the current state."""
+        ls = self.__dict__.get("_logship")
+        if ls is None or ls.state is not self.state:
+            ls = self.__dict__["_logship"] = LogShip(self.cfg, self.state)
+        return ls
+
     def _reload_min_interval(self) -> float:
         """F5 reload back-pressure: base RELOAD_MIN_INTERVAL, doubled (up to 600 s) while more than
         2×nproc worker generations are still draining, so reloads never outpace worker shutdown."""
@@ -2944,6 +3573,10 @@ class Agent:
         code, hdrs, body = self.ctl.call("GET", "/edge/v1/config", headers=headers)
         if code == 304:
             return
+        try:   # SPEC §14.3.2: log-export settings are agent-side only (never rendered, no reload)
+            self.logship.update_config(body)
+        except Exception as e:  # noqa: BLE001 - never let log export break config sync
+            log.error("logship config update failed: %s", e)
         version = body["version"]
         etag = hdrs.get("ETag") or hdrs.get("etag")
         body = with_cached_bot_ranges(body, st)   # SPEC §14.2: keep the last good crawler ranges
@@ -3018,21 +3651,39 @@ class Agent:
         the controller instead of double-billing."""
         pending = self.state.setdefault("pending", {})
         events = self.state.setdefault("events", [])
-        if not pending and not events:
+        live = self.state.setdefault("live", {})
+        if not pending and not events and not live:
             return
         outbox = self.state.setdefault("outbox", [])
         keys, evs = list(pending), list(events)
         now = time.time()
+        cutoff = live_cutoff(now)
+        entries = []
         while keys or evs:
             bk, keys = keys[:MAX_ITEMS], keys[MAX_ITEMS:]
             be, evs = evs[:MAX_EVENTS], evs[MAX_EVENTS:]
-            entry = {"id": _new_batch_id(), "ts": now, "items": [usage_item(k, pending[k]) for k in bk], "events": be}
-            outbox.append(entry)
+            entries.append({"id": _new_batch_id(), "ts": now, "items": [usage_item(k, pending[k]) for k in bk],
+                            "events": be})
+        # SPEC §14.3.1: the host-minutes ride in the same outbox entry (same batch_id, so a retry stays
+        # idempotent); ≤ LIVE_MAX per POST, oldest minutes dropped beyond that (best-effort)
+        lv = live_items(live, cutoff)
+        if lv:
+            if not entries:
+                entries.append({"id": _new_batch_id(), "ts": now, "items": [], "events": []})
+            entries[0]["live"] = lv
+        outbox.extend(entries)
         pending.clear()
         del events[:]
+        live.clear()
+        trim_live_backlog(outbox, cutoff)
 
     def push_usage(self):
-        read_usage(self.state, self.cfg["ACCESS_LOG"])
+        ls = self.logship
+        ls.begin_pass()
+        try:
+            read_usage(self.state, self.cfg["ACCESS_LOG"], ship=ls if ls.active else None)
+        finally:
+            ls.end_pass()   # the partial log-export batch of this read goes to the spool (never raises)
         self._enqueue_usage()
         # F8: persist the outbox (with its batch_ids and the advanced log_pos) BEFORE the first POST,
         # so a crash or restart replays the SAME batch rather than a different one. A save failure is
@@ -3051,12 +3702,27 @@ class Agent:
                 continue
             kept.append(e)
         outbox[:] = kept
+        trim_live_backlog(outbox, live_cutoff(now))   # retried entries never carry minutes older than 24 h
         timeout = _int(self.cfg.get("USAGE_TIMEOUT"), 150, 10, 600)
         for entry in list(outbox):
             body = {"batch_id": entry["id"], "items": entry["items"]}
             if entry["events"]:
                 body["events"] = entry["events"]
-            self.ctl.call("POST", "/edge/v1/usage", body, timeout=timeout)   # retries reuse batch_id
+            if entry.get("live"):
+                body["live"] = entry["live"]
+            try:
+                self.ctl.call("POST", "/edge/v1/usage", body, timeout=timeout)   # retries reuse batch_id
+            except urllib.error.HTTPError as e:
+                # live data must never hold back the hourly usage: a request the controller rejects as
+                # a whole (validation / size) is resent once without `live`, under the same batch_id
+                # (a rejected request was not applied, so the dedup row does not exist yet)
+                if e.code not in (400, 413, 422) or "live" not in body:
+                    raise
+                log.warning("usage batch %s rejected (HTTP %d) with live data; resending without it",
+                            entry["id"], e.code)
+                entry.pop("live", None)
+                body.pop("live")
+                self.ctl.call("POST", "/edge/v1/usage", body, timeout=timeout)
             outbox.remove(entry)
 
     def metrics(self) -> dict:
@@ -3086,10 +3752,16 @@ class Agent:
         return body
 
     def heartbeat(self):
-        """Periodic heartbeat with load metrics (keeps applied_version / last error as reported)."""
+        """Periodic heartbeat with load metrics (keeps applied_version / last error as reported) and
+        the log-export spool state (SPEC §14.3.2: dropped records are counted here)."""
+        extra = {}
+        try:
+            extra["logship"] = self.logship.stats()
+        except Exception:  # noqa: BLE001 - informational only
+            pass
         self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
                                                              error=self.state.get("last_error"),
-                                                             metrics=self.metrics()))
+                                                             metrics=self.metrics(), **extra))
 
     def ship_logs(self):
         """Ship new WARN/ERROR/crit lines to the controller (SPEC §11.2). Fail-soft: never raises."""
@@ -3119,6 +3791,12 @@ class Agent:
                 self.last_usage = time.time()
             except Exception as e:  # noqa: BLE001 - pending usage stays in state for next try
                 log.error("usage push failed: %s", e)
+        # SPEC §14.3.2: log export last, on its own cadence and time budget, so it never delays the
+        # config sync, purges, heartbeat or usage of this tick (LogShip.ship)
+        try:
+            self.logship.ship(self.ctl)
+        except Exception as e:  # noqa: BLE001 - log export is best-effort
+            log.error("logship failed: %s", e)
         try:  # F8: a persistence failure must not exit the process (systemd would restart-and-replay)
             save_state(self.cfg["STATE_FILE"], self.state)
         except OSError as e:

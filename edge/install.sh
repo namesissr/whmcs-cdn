@@ -22,7 +22,7 @@
 #   --cc bbr|cubic     TCP congestion control (default bbr)
 #   --upgrade          update an installed edge in place: controller, token, ports, IPv6, cache
 #                      size, region, role, --http3 and --cc are read from /etc/pcdn/agent.conf
-#                      (flags still override)
+#                      (flags still override); LOGSHIP_* tunables set there are kept
 #   --distro-nginx     same as --no-http3 (the default)
 set -euo pipefail
 
@@ -38,6 +38,7 @@ GEOIP=yes
 UPGRADE=no
 HTTP3=""     # yes | no ("" = not given: no, or the installed value on --upgrade)
 TCP_CC=""    # bbr | cubic ("" = not given: bbr, or the installed value on --upgrade)
+KEEP_CONF="" # operator-tuned agent.conf lines carried over by --upgrade (log export, SPEC §14.3.2)
 # F6: worker_shutdown_timeout — bounds how many draining worker generations pile up after reloads.
 # 1h matches the default tunnel idle_timeout; use 20-30m on <=4GB nodes. Never seconds (a hard cut).
 SHUTDOWN_TIMEOUT=1h
@@ -82,6 +83,7 @@ if [ "$UPGRADE" = yes ]; then
   v="$(conf HTTPS_PORT)"; [ -n "$v" ] && HTTPS_PORT="$v"
   if [ -z "$TCP_CC" ]; then v="$(conf TCP_CC)"; case "$v" in bbr|cubic) TCP_CC="$v" ;; esac; fi
   if [ -z "$HTTP3" ]; then v="$(conf HTTP3)"; case "$v" in yes|no) HTTP3="$v" ;; esac; fi
+  KEEP_CONF="$(grep -E '^LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)=' /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
 HTTP3="${HTTP3:-no}"
@@ -283,6 +285,12 @@ fi
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
   echo "RESOLVER=127.0.0.53" >> /etc/pcdn/agent.conf
 fi
+# >>> pcdn keep logship (edge/tests/test_analytics_logship.py runs this)
+# SPEC §14.3.2 log export: the agent defaults are a spool next to its state file
+# (/var/lib/pcdn/logship), capped at LOGSHIP_SPOOL_MAX_MB=256, shipped every LOGSHIP_INTERVAL=30 s with
+# LOGSHIP_TIMEOUT=30 s per POST; values an operator added to agent.conf survive --upgrade
+if [ -n "$KEEP_CONF" ]; then printf '%s\n' "$KEEP_CONF" >> /etc/pcdn/agent.conf; fi
+# <<< pcdn keep logship
 umask 022
 
 cat > /etc/logrotate.d/pcdn <<'EOF'

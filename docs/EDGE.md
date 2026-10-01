@@ -244,8 +244,16 @@ worker to each IP-literal tunnel origin — see the **Origin** bullet above.)
  "tn": "grpc",      $pcdn_tn: tunnel protocol, "" for normal requests (map default, set in the location)
  "rt": 1800.25,     $request_time: the whole session for ws/httpupgrade, the stream for grpc/h2
  "bu": 188,         $request_length
- "ub": "20291"}     $upstream_bytes_sent (string: "" without upstream, "a, b" after retries)
+ "ub": "20291",     $upstream_bytes_sent (string: "" without upstream, "a, b" after retries)
+ "us": "200",       $upstream_status ("" = no upstream contacted; SPEC §14.3.1 platform_errors)
+ "pg": "",          $pcdn_page: "site" for the suspended / over-quota page
+ "sc": "https",     $scheme            (log export, SPEC §14.3.2)
+ "pr": "HTTP/2.0",  $server_protocol   (log export)
+ "rf": "..."}       $http_referer      (log export; query stripped before shipping)
 ```
+
+The 6D fields are appended at the end, so the parser still accepts lines written before an upgrade
+(they simply never count as platform errors and carry no scheme/protocol/referer).
 
 Measured with real nginx 1.24 (`test_tunnel_log_fields_and_usage`): for a WebSocket session
 that echoed 20 000 bytes, `b` = 20 201 (downstream frames are counted), `bu` = 188 (request
@@ -384,6 +392,11 @@ batch older than this, 6 days — inside the controller's 7-day `batch_id` dedup
 `FOREIGN_DEFER` (defer a reload up to this long when only another edge group's sites changed and no
 global file changed, 900 s, F21).
 
+Log export keys (SPEC §14.3.2): `LOGSHIP_SPOOL_DIR` (default: `logship/` next to `STATE_FILE`, dir
+0700 / files 0600), `LOGSHIP_SPOOL_MAX_MB` (256 — oldest batches dropped beyond it, and anything
+older than 72 h), `LOGSHIP_INTERVAL` (30 s), `LOGSHIP_TIMEOUT` (30 s per POST). `install.sh --upgrade`
+keeps these if an operator set them.
+
 ## Usage / events
 
 The access log line (`log_format pcdn`) is SPEC §5. Per host-hour the agent aggregates bytes,
@@ -392,6 +405,30 @@ by verdict source (plus `challenge` for challenge/captcha actions); every non-ok
 an event. Items (≤ 20 000) and events (≤ 2 000) are POSTed in batches; unacknowledged data
 stays in the state file (events backlog capped at 10 000, newest kept). v1 state files and log
 rotation handling keep working.
+
+**Live analytics (SPEC §14.3.1).** The same log pass also buckets per host-minute: requests, bytes,
+cache hits, status classes, top-20 countries and top-20 paths (query stripped). They ride in the
+same usage POST as `live` (same outbox entry and `batch_id`), ≤ 5 000 items / ~2 MiB per POST and
+20 000 items / 8 MiB across the outbox, oldest minutes dropped first, nothing older than 24 h. If
+the controller rejects a POST carrying `live` (400/413/422) it is resent once without it under the
+same `batch_id`, so hourly usage is never held back by live data.
+
+**platform_errors (SPEC §14.3.1).** Counted per host-hour when the status is 500–599 except 501
+and 505 (any visitor can provoke those with a malformed request, which would let anyone lower a
+site's SLA), `us` is present and empty (no upstream contacted — any upstream status is an origin
+error), the response was not served from cache, the verdict is not block/challenge/captcha and
+`pg` is not `site`. Known limit: an origin *hostname* that fails to resolve is logged without an
+upstream, so it counts as a platform error even when the cause is the customer's own DNS.
+
+**Log export (SPEC §14.3.2).** For sites whose config has `logs.enabled`, a line is kept when
+`blake2b-64(raw line) / 2^64 < sample_rate` (deterministic). Tunnel traffic and `/__pcdn/`
+requests are excluded; with `anonymize_ip` the IP is reduced (IPv4 /24, IPv6 /48) before anything
+is written to the spool. Records are spooled on disk in batches (stable 32-hex `batch_id` = file
+name, reused verbatim on retries) and POSTed to `/edge/v1/logship` (≤ 5 000 records / ~2 MiB)
+on their own cadence with a time box, backoff 30 s → 15 min; a 404 (older controller) pauses
+shipping until the config version changes; a 400/413/422 drops that one batch (counted). The
+heartbeat reports `capabilities.live_analytics` / `capabilities.logship` and a `logship` block
+(sites, spool size, dropped, disabled).
 
 ## Tests
 

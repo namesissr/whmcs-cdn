@@ -326,6 +326,9 @@ Max 20 000 items and 2 000 events per request.
   "v" verdict}` where verdict is `ok` or `<action>:<source>:<rule>`
 (e.g. `block:waf:942100`, `challenge:ddos:auto`, `block:ratelimit:login`,
 `log:firewall:r3`). The agent derives security counters and events from `v`.
+Wave 6D appends (older lines without them stay valid): `"us"` upstream status (`""` = no upstream
+contacted), `"pg"` (`site` for the suspended / over-quota page), `"sc"` scheme, `"pr"` protocol,
+`"rf"` referer — see §14.3.1 / §14.3.2.
 
 ### Reload discipline (how the edge applies a new config)
 The config body is the unit of propagation, but applying it must not send a GOAWAY to every HTTP/2
@@ -882,7 +885,9 @@ General CDN capabilities for website customers. Defaults keep today's behaviour 
   "4xx", "5xx"}, countries: {cc: n} (top ≤20), paths: {path-without-query: n} (top ≤20)}`. Pre-6D agents
   omit it. Each `UsageItem` also gains `platform_errors` (≥0, default 0): responses with status ≥500
   that the edge produced itself — no upstream status and no security action (WAF/rate-limit/DDoS/bot
-  blocks are not errors); origin errors (any upstream status present) never count.
+  blocks are not errors); origin errors (any upstream status present) never count. 501 and 505 are
+  excluded (any visitor can provoke them with a malformed request), as are cache-served responses and
+  the suspended/over-quota page.
 - Controller table `analytics_minute` `(site_id, minute)` PK, `requests, bytes, cache_hits, details`
   (JSON: status/countries/paths, capped like hourly details). Rows older than 24 h are deleted by a
   leader job. Hosts map to sites exactly like hourly usage.
