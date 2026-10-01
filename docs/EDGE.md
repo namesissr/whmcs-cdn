@@ -249,7 +249,9 @@ worker to each IP-literal tunnel origin — see the **Origin** bullet above.)
  "pg": "",          $pcdn_page: "site" for the suspended / over-quota page
  "sc": "https",     $scheme            (log export, SPEC §14.3.2)
  "pr": "HTTP/2.0",  $server_protocol   (log export)
- "rf": "..."}       $http_referer      (log export; query stripped before shipping)
+ "rf": "...",       $http_referer      (log export; query stripped before shipping)
+ "tp": "grpc1",     $pcdn_tp: tunnel path id ("" for normal requests; SPEC §15.1)
+ "uct": "0.012"}    $upstream_connect_time ("-" when the connect failed)
 ```
 
 The 6D fields are appended at the end, so the parser still accepts lines written before an upgrade
@@ -448,3 +450,33 @@ an h2c echo server and an HTTP/2-over-TLS client that never need HPACK Huffman d
 an nginx h2c server, so CI needs no extra packages. Tests skip
 when nginx, the modules or node are missing; the e2e nginx runs `user root` because pytest
 temp dirs are not traversable by unprivileged workers.
+
+## Tunnel quality, fair share & speed test (SPEC §15)
+
+**Per-path telemetry.** Per host-hour the usage item's `tunnel.paths` carries, per path id (≤ 50):
+sessions, seconds, bytes, `abnormal`, `connect_ms_sum`/`connect_n` and classified `errors`
+(`classify_tunnel`, first match wins): gRPC over HTTP/1.x → `protocol`; 101/2xx → session; 499 after
+an accepted upgrade → session (client close); no upstream contacted: 429/503 → `limit`, 403 →
+`country`, 400/426 → `protocol`, other 5xx → `edge`; last upstream 502 → `origin_refused`, 504 →
+`origin_timeout`; any other upstream status → `origin_error`. `abnormal` comes from the nginx error log
+(`[error]` … "while proxying upgraded connection" / "while reading upstream"), because the access log
+cannot tell an origin reset from a clean end. Live minute items add `tunnel_attempts`/`tunnel_errors`.
+
+**426 for ws/httpupgrade without `Upgrade`.** The edge answers before the origin is contacted, so a
+client configured with the wrong protocol shows up as `protocol` instead of an opaque origin error.
+
+**Fair share (admission only).** nginx 1.24 cannot rate-limit upgraded/unbuffered streams, so fair share
+refuses NEW sessions (429) of one dominant site while the node is hot (≥ 85 % of `node.capacity_mbps`,
+cleared below 80 %); see SPEC §15.8 for the exact rule. Established sessions are never touched; the hot
+flag lives in the `pcdn_fair` shared dict, is refreshed on every heartbeat and expires after 180 s.
+Capacity comes from the controller (`node.capacity_mbps`, set per node in the panel) or `CAPACITY_MBPS`
+in agent.conf; 0 = never hot.
+
+**Speed test.** `/__pcdn/speed/{ping,down,up}` on every active site (CORS `*`, no-store, rate-limited
+per IP, counted as normal traffic). Downloads are served from `SPEED_FILE` (random data written once,
+10 MiB) via the flv module (`--with-http_flv_module`); `X-Pcdn-Node` is a hash of the node name, never
+an address.
+
+New agent.conf keys (kept by `--upgrade`): `CAPACITY_MBPS` (0), `FAIR_SHARE_PCT` (25), `NODE_NAME`
+(hostname), `SPEED_FILE` (`speed.bin` next to the state file).
+

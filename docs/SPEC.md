@@ -1086,3 +1086,27 @@ Per host-hour, per tunnel **path id**, the edge adds to the usage item's `tunnel
   configurable sizes (10/50/100 GB, admin-priced); when its invoice is paid the service's controller
   cap for the current month is raised by that amount (same mechanism as prepaid top-ups, logged,
   idempotent per invoice item), shown on the wallet card and statement.
+
+### 15.8 Implementation notes (as built)
+- Log fields: `"tp"` tunnel path id, `"uct"` `$upstream_connect_time` (appended after `"rf"`).
+- `ws` / `httpupgrade` paths answer **426** when the request has no `Upgrade` header (never reaches
+  the origin); gRPC over HTTP/1.x is classified `protocol`. xhttp/h2/grpc semantics are unchanged.
+- `abnormal` cannot be observed in the access log (an origin reset on an established session logs the
+  same status as a clean end), so the edge counts nginx error-log `[error]` lines ending in
+  "while proxying upgraded connection" / "while reading upstream", attributed by host + longest tunnel
+  prefix. An origin that itself answers 502/504 counts as refused/timeout.
+- Fair share is **admission control**, not `limit_rate` (nginx 1.24 ignores `limit_rate` on
+  upgraded/unbuffered proxying): while the node is hot (≥ 85 % of `node.capacity_mbps`, cleared below
+  80 %), a site's NEW sessions get 429 only when, over the last 1–2 minutes, it has ≥ 30 opens, the
+  other sites together ≥ 10, its share is above `node.fair_share_pct` AND it has more opens than all
+  other sites combined. Established sessions and xhttp POSTs are never touched; any error fails open;
+  the hot flag expires after 180 s without an agent heartbeat. Edge config gains
+  `node: {name, capacity_mbps, fair_share_pct}` per requesting edge and `tunnel.fair_share` (default
+  true); `capacity_mbps` 0 = never hot.
+- Speed test: `/__pcdn/speed/ping` (2/s per IP, burst 20), `/down?bytes=1..10485760` (default 1 MB,
+  400 if invalid; ≥ 64 bytes served from a pre-generated random file via the flv module, so the first
+  13 bytes are an FLV header), `/up` (≤ 10 MB, 413 above, 405 other methods); down+up share 12/min
+  per IP; CORS `Access-Control-Allow-Origin: *` (the WHMCS client area is another origin); headers
+  `Cache-Control: no-store, no-transform`, `X-Pcdn-Node` = first 8 hex of sha256(node name).
+- `tunnel_attempts` in live items = every tunnel request with a path id that minute.
+- Add-on traffic is one WHMCS add-on per size (WHMCS add-ons take no configurable options).
