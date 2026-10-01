@@ -31,6 +31,8 @@ if (class_exists(__NAMESPACE__ . '\\Prepaid', false)) {
 final class Prepaid
 {
     const ITEM_TYPE = 'PasargadCdnTopup';
+    /** = StorageBilling::ITEM_TYPE (kept here so renewals() needs no other class) */
+    const STORAGE_ITEM_TYPE = 'PasargadCdnStorage';
     const RESELLER_ITEM_TYPE = 'PasargadCdnResellerTopup';
     const TPL_RESELLER_EXHAUSTED = 'Pasargad CDN Reseller Traffic Exhausted';
     const TPL_EXHAUSTED = 'Pasargad CDN Traffic Exhausted';
@@ -657,8 +659,8 @@ final class Prepaid
     // ------------------------------------------------------------------ renewals from the wallet
 
     /**
-     * Pays unpaid invoices that contain ONLY this addon's items (CDN service renewals and
-     * traffic top-ups) from the client's credit, oldest first, only when fully covered.
+     * Pays unpaid invoices that contain ONLY this addon's items (CDN service renewals,
+     * traffic top-ups and §16.8 storage charges) from the client's credit, oldest first, only when fully covered.
      * Invoices with any other product are never touched.
      */
     public static function renewals(array $pids, ?int $userId): array
@@ -721,7 +723,8 @@ final class Prepaid
         $core = false;
         foreach ($items as $it) {
             $t = (string) $it->type;
-            if ($t === self::ITEM_TYPE) {
+            // SPEC §16.8: a month's object-storage charge (StorageBilling, prepaid mode) is a CDN-only line too
+            if ($t === self::ITEM_TYPE || $t === self::STORAGE_ITEM_TYPE) {
                 $core = true;
             } elseif (($t === 'Hosting' || $t === 'PromoHosting') && isset($cdnServices[(int) $it->relid])) {
                 $core = $core || $t === 'Hosting';

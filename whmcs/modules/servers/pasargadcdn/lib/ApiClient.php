@@ -240,7 +240,8 @@ class ApiClient
      * Secrets never reach the WHMCS module log: edge tokens (shown to the admin
      * once), private keys of custom certificates, and (SPEC §14.3) the log-export
      * S3 keys in `logs` bodies plus webhook signing secrets — `new_secrets` of a
-     * webhooks PUT, the `secret` of a rotation and any `whsec_…` value.
+     * webhooks PUT, the `secret` of a rotation and any `whsec_…` value; (SPEC §16.8) the
+     * `secret_key` (and `access_key`) of a storage bucket create / rotate-key answer.
      */
     public static function redact($text)
     {

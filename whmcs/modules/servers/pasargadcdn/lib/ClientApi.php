@@ -44,6 +44,13 @@ class ClientApi
     /** Webhook ids are assigned by the controller: "wh_" + 8 hex (SPEC §14.3.3). */
     const WEBHOOK_ID = 'wh_[0-9a-f]{8}';
 
+    /**
+     * SPEC §16.8 bucket name as the controller accepts it (storage.validate_name / NAME_RE): 3–40
+     * characters of a-z, 0-9 and -, starting and ending with a letter or digit. Anything else never
+     * leaves WHMCS (the controller prefixes it and never lets a name choose a host).
+     */
+    const BUCKET = '[a-z0-9][a-z0-9-]{1,38}[a-z0-9]';
+
     /** method => [sub-path regex relative to /api/v1/sites/{domain}, ...] */
     const ROUTES = [
         'GET' => [
@@ -53,15 +60,22 @@ class ClientApi
             'analytics/live', 'logs/status', 'webhooks/deliveries', 'sla',
             // Wave 7 (SPEC §15.3/§15.4): tunnel quality, tunnel usage and origin health — read-only
             'tunnel/quality', 'tunnel/usage', 'tunnel/health',
+            // SPEC §16.8 object storage: overview + buckets (never a secret — the controller returns
+            // secret_key only in the create / rotate-key answers)
+            'storage', 'storage/buckets',
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
             // Wave 8 (SPEC §16.6): new image transform secret (returned once, never logged — ApiClient::redact)
-            'image/transform-secret'],
+            'image/transform-secret',
+            // SPEC §16.8: new bucket / new access key — secret_key returned once, never logged (ApiClient::redact)
+            'storage/buckets', 'storage/buckets/' . self::BUCKET . '/rotate-key'],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
         'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client',
             // Wave 8 (SPEC §16.6): forget the image transform secret (unsigned transforms allowed again)
-            'image/transform-secret'],
+            'image/transform-secret',
+            // SPEC §16.8: delete an (empty, unused) bucket — 409 otherwise
+            'storage/buckets/' . self::BUCKET],
     ];
 
     /**
@@ -253,6 +267,10 @@ class ClientApi
         if (!is_array($data)) {
             // Empty/non-JSON body: fine for a 2xx, generic message for a 4xx.
             return $code < 300 ? [$code, ['ok' => true]] : self::fail($code, I18n::tr('درخواست توسط سرور CDN رد شد (HTTP %s)', $code));
+        }
+        if ($code >= 400 && isset($data['detail']) && is_string($data['detail'])) {
+            // SPEC §16.10: a known controller detail (e.g. the §16.8 storage refusals) in the app's language
+            $data['detail'] = I18n::controller($data['detail']);
         }
         return [$code, $data];
     }

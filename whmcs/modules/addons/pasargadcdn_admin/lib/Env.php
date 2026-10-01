@@ -32,6 +32,8 @@ final class Env
     const TUNNEL_EVENTS = 'mod_pasargadcdn_tunnel_events';
     /** Wave 7 (SPEC §15.7): «بسته‌ی ترافیک افزوده» invoice items already applied (idempotency per item). */
     const ADDON_ITEMS = 'mod_pasargadcdn_addon_items';
+    /** SPEC §16.8: one storage charge per service and month (StorageBilling) */
+    const STORAGE_BILLS = 'mod_pasargadcdn_storage_bills';
     const DEAD_STATUSES = ['Terminated', 'Cancelled', 'Fraud'];
     const DEFAULT_NS = ['ns1.pasargadmizban.com', 'ns2.pasargadmizban.com'];
 
@@ -303,6 +305,29 @@ final class Env
         }
         self::$memo['tbl:' . self::TUNNEL_EVENTS] = true;
         self::$memo['tbl:' . self::ADDON_ITEMS] = true;
+        // ---- SPEC §16.8 object storage billing ------------------------------------
+        if (!$schema->hasTable(self::STORAGE_BILLS)) {
+            $schema->create(self::STORAGE_BILLS, function ($t) {
+                $t->increments('id');
+                $t->integer('service_id');
+                $t->integer('userid');
+                $t->char('month', 7);                      // the billed (closed) month, UTC
+                $t->decimal('gb_month', 14, 4)->default(0);
+                $t->decimal('amount', 16, 2)->default(0);
+                $t->integer('currency')->default(0);
+                $t->string('mode', 16)->default('');       // invoice (prepaid) | billable (overage / cut)
+                $t->integer('invoice_id')->nullable();
+                $t->integer('billable_id')->nullable();
+                $t->string('status', 16)->default('pending'); // pending | invoiced | billable | skipped | failed
+                $t->string('note', 191)->nullable();
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+                // the idempotency key: a service is charged at most once per month, whatever runs in parallel
+                $t->unique(['service_id', 'month'], 'mod_pcdn_storage_once');
+                $t->index('month', 'mod_pcdn_storage_month');
+            });
+        }
+        self::$memo['tbl:' . self::STORAGE_BILLS] = true;
     }
 
     // ------------------------------------------------------------------ servers / controller

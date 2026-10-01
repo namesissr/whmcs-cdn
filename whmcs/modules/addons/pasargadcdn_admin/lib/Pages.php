@@ -1835,6 +1835,14 @@ final class Pages
             . '<small>افزونه‌ها پنهان ساخته می‌شوند و قیمتی برایشان ثبت نمی‌شود: در Setup ← Products/Services ← Product Addons قیمت را تعیین و «Show on Order» را روشن کنید. '
             . 'پس از پرداخت فاکتور، سقف ترافیک همان ماه سرویس به اندازه‌ی بسته بالا می‌رود (یک بار برای هر قلم فاکتور).</small></label></div></fieldset>';
 
+        // SPEC §16.8: optional «Storage GB» configurable option (object storage quota of the service)
+        $h .= '<fieldset class="pcdna-fieldset" data-storage-fs="1"><legend>فضای ذخیره‌سازی ابری (اختیاری)</legend><div class="pcdna-checks-row">'
+            . self::check('storage_opt', !empty($in['storage_opt']), 'گزینه‌ی قابل‌تنظیم «Storage GB» ساخته شود (فهرست کشویی اندازه‌ها، متصل به همه‌ی محصولات CDN)')
+            . '</div><div class="pcdna-form-grid"><label><span>اندازه‌ها (گیگابایت، با کاما جدا؛ ۰ = بدون فضا)</span><input class="pcdna-input" name="storage_sizes" dir="ltr" inputmode="numeric" value="'
+            . View::e(implode(', ', array_map('intval', (array) ($in['storage_sizes'] ?? Wizard::STORAGE_SIZES)))) . '">'
+            . '<small>مقدار انتخاب‌شده در سفارش، سهمیه‌ی فضای ذخیره‌سازی سرویس (storage_gb) می‌شود؛ محصولی که این گزینه را ندارد فضای ذخیره‌سازی ندارد. '
+            . 'قیمت‌ها صفر ساخته می‌شوند: یا در Setup ← Configurable Options برای هر اندازه قیمت ماهانه بگذارید، یا در تنظیمات ماژول «قیمت هر گیگابایت-ماه ذخیره‌سازی» را تعیین کنید تا مصرف واقعی هر ماه فاکتور شود. اجرای دوباره چیزی را تکرار نمی‌کند.</small></label></div></fieldset>';
+
         // feature matrix, one table per plan family (a single «CDN» family now — tunnel is included in every plan)
         $h .= '<fieldset class="pcdna-fieldset"><legend>امکانات پلن‌ها</legend>';
         foreach (Wizard::FAMILIES as $fam => $famLabel) {
@@ -3141,6 +3149,15 @@ final class Pages
             $add($noMail ? 'warn' : 'ok', 'ایمیل خوش‌آمد', $noMail ? 'بدون ایمیل خوش‌آمد: ' . View::e(implode('، ', array_map(function ($p) {
                 return $p->name;
             }, $noMail))) : 'تنظیم شده', 'تب Details محصول → Welcome Email: «' . Wizard::EMAIL_NAME . '».');
+            // SPEC §16.8: monthly object-storage charges (only shown once a price is set)
+            $sp = str_replace(',', '', trim(Env::setting('storage_price', '')));
+            if ($sp !== '' && is_numeric($sp) && (float) $sp > 0) {
+                $billed = (string) Env::kvGet('storage_billed_month', '');
+                $add('ok', 'صورتحساب فضای ذخیره‌سازی', 'هر گیگابایت-ماه ' . View::n((float) $sp, 2) . ' — '
+                    . ($mode === 'prepaid' ? 'فاکتور پرداخت از کیف پول' : 'قلم فاکتور بعدی (Billable Item)')
+                    . ' — آخرین ماه صورتحساب‌شده: ' . ($billed !== '' ? View::e($billed) : 'هنوز هیچ'),
+                    'کران WHMCS یک بار پس از پایان هر ماه (UTC، با دو ساعت تأخیر) مصرف ماه قبل را از کنترلر می‌خواند؛ هر سرویس در هر ماه فقط یک بار (جدول ' . Env::STORAGE_BILLS . ').');
+            }
         }
         $hooks = is_file(dirname(__DIR__) . '/hooks.php');
         $active = false;

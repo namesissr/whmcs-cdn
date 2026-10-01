@@ -77,6 +77,8 @@
     { title: t('عملکرد'), items: ['cache', 'pagerules', 'image', 'video', 'pools'] },
     // Wave 8 (SPEC §16.4 / §16.5): TCP/UDP apps and video delivery, shown only when the controller returns `l4` / `video`.
     { title: 'TCP/UDP', items: ['tcpudp'] },
+    // SPEC §16.8: «فضای ذخیره‌سازی» once the controller's plan features carry storage_gb (storage.js).
+    { title: t('ذخیره‌سازی'), items: ['storage'] },
     // Wave 6B (SPEC §14.2): shown only when the controller returns the section (see available()).
     { title: t('قوانین'), items: ['redirects', 'transform'] },
     { title: t('امنیت'), items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
@@ -1023,6 +1025,8 @@
       health_check: hc,
       health_port: hc && r.health_port ? Number(r.health_port) : null
     };
+    // SPEC §16.8: a proxied record served from one of the site's storage buckets (`storage`, sent only when set).
+    if (P.storage) b = P.storage.recordBodyExtra(r, b);
     // Wave 8 (SPEC §16.7): weight + health check (type/path) on non-proxied A/AAAA/CNAME — only for a controller that knows them.
     return P.w8 ? P.w8.recordBodyExtra(r, b) : b;
   }
@@ -1117,6 +1121,7 @@
     var x = [];
     if (r.priority !== null && r.priority !== undefined && (r.type === 'MX' || r.type === 'SRV')) x.push([t('اولویت'), String(r.priority)]);
     if (r.pool) x.push([t('استخر'), r.pool]);
+    if (r.storage && r.proxied) x.push([t('باکت'), String(r.storage)]);
     if (r.origin_port) x.push([t('پورت'), String(r.origin_port)]);
     if (r.health_check) x.push([t('بررسی سلامت'), (r.health_protocol && r.health_protocol !== 'tcp' ? r.health_protocol.toUpperCase() + ' ' : '') + String(r.health_port || (r.health_protocol === 'https' ? 443 : 80))]);
     if (P.w8) x = x.concat(P.w8.recordExtras(r));
@@ -1189,10 +1194,11 @@
       });
   }
 
-  function recordModal(orig) {
+  /** Record dialog: orig = the record to edit, or null for a new one (preset = initial values, e.g. the storage page's «مبدأ CDN»). */
+  function recordModal(orig, preset) {
     var f = features();
     var pools = (config('pools').pools || []).map(function (p) { return p.name; });
-    var r = orig ? clone(orig) : { type: 'A', name: '', content: '', ttl: 300, priority: null, proxied: true, pool: null, origin_port: null, health_check: false, health_port: null };
+    var r = orig ? clone(orig) : Object.assign({ type: 'A', name: '', content: '', ttl: 300, priority: null, proxied: true, pool: null, origin_port: null, health_check: false, health_port: null }, preset || {});
     var d = P.dialog({ title: orig ? t('ویرایش رکورد') : t('افزودن رکورد'), icon: orig ? 'edit' : 'plus', subtitle: orig ? fqdn(orig.name) : S.site.domain, kind: 'modal', wide: true });
     d.el.classList.add('pcdn-record-modal');
     var errBox = h('div');
@@ -1225,12 +1231,15 @@
           help: t('روشن: ترافیک وب از CDN عبور می‌کند، آی‌پی سرور مخفی می‌ماند و کش و امنیت اعمال می‌شود. برای ایمیل، FTP و SSH خاموش بگذارید.'), onchange: draw }));
         if (r.proxied && MAILISH.test(String(r.name || '').split('.')[0])) px.appendChild(P.alertBox('warning', t('به نظر می‌رسد این رکورد برای ایمیل یا دسترسی مستقیم است. رکوردهای ایمیل نباید پروکسی شوند؛ وگرنه ایمیل کار نمی‌کند.')));
         if (r.proxied) {
+          // SPEC §16.8: origin = the record's value (your server) or one of the site's storage buckets
+          var stf = P.storage ? P.storage.recordFields(r, draw) : null;
+          if (stf) px.appendChild(stf);
           var g2 = h('div', { className: 'pcdn-grid' });
-          if (f.load_balancer && pools.length) {
+          if (r.storage) { /* bucket origin: no pool, no origin port */ } else if (f.load_balancer && pools.length) {
             g2.appendChild(P.select(r, 'pool', t('استخر توزیع بار'), [[null, t('— بدون استخر —')]].concat(pools.map(function (p) { return [p, p]; })),
               { help: t('در صورت انتخاب، ترافیک به سرورهای استخر فرستاده می‌شود و «مقدار» فقط پشتیبان است.'), onchange: draw, ltr: false }));
           }
-          if (!r.pool) g2.appendChild(P.input(r, 'origin_port', t('پورت سرور اصلی'), { type: 'number', min: 1, max: 65535, nullable: true, placeholder: '80 / 443', help: t('خالی بگذارید تا بر اساس پروتکل (۸۰ یا ۴۴۳) انتخاب شود.') }));
+          if (!r.pool && !r.storage) g2.appendChild(P.input(r, 'origin_port', t('پورت سرور اصلی'), { type: 'number', min: 1, max: 65535, nullable: true, placeholder: '80 / 443', help: t('خالی بگذارید تا بر اساس پروتکل (۸۰ یا ۴۴۳) انتخاب شود.') }));
           px.appendChild(g2);
         } else if (P.w8 && P.w8.recordsV2()) {
           px.appendChild(P.w8.recordFields(r, draw));
@@ -1550,7 +1559,7 @@
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
     reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
-    readonly: READONLY, onLeave: onLeave, refreshNav: refreshNav
+    readonly: READONLY, onLeave: onLeave, refreshNav: refreshNav, recordModal: recordModal
   };
 
   // ------------------------------------------------------------------ boot

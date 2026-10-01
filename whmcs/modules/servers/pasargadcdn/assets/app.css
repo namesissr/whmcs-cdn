@@ -1488,6 +1488,29 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 #pcdn-app.pc-narrow .pcdn-l4 { flex-direction: column; }
 #pcdn-app.pc-narrow .pcdn-l4 .pcdn-wh-ctl { align-self: flex-end; }
 
+/* SPEC §16.8 object storage (storage.js) */
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-usage { display: flex; flex-direction: column; gap: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-usage-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-used { font-size: 20px; font-weight: 800; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-pct { margin-inline-start: auto; font-weight: 800; color: var(--t-fg); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-usage .pcdn-meter { height: 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-facts dd, :is(#pcdn-app, #pcdn-layer) .pcdn-st-bfacts dd { min-width: 0; overflow-wrap: anywhere; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-facts { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); }
+#pcdn-app.pc-md .pcdn-st-facts, #pcdn-app.pc-narrow .pcdn-st-facts { grid-template-columns: minmax(0, 1fr); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-facts .pcdn-copyable code, :is(#pcdn-app, #pcdn-layer) .pcdn-st-bfacts .pcdn-copyable code { overflow-wrap: anywhere; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-bfacts .pcdn-nowrap { white-space: nowrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-bname { font-family: var(--pc-mono); font-size: 15px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-bfacts > div { padding: 5px 0; font-size: 13px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 46%; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-cred { display: flex; flex-direction: column; gap: 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-cred .pcdn-key-value { overflow-wrap: anywhere; word-break: break-all; min-width: 0; flex: 1; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-st-guide { display: flex; flex-direction: column; gap: 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-rec-storage { margin-bottom: 10px; }
+#pcdn-app.pc-narrow .pcdn-st-bucket { flex-direction: column; }
+#pcdn-app.pc-narrow .pcdn-st-actions { max-width: none; justify-content: flex-start; }
+#pcdn-app.pc-narrow .pcdn-st-bfacts > div { flex-direction: column; gap: 2px; }
+#pcdn-app.pc-narrow .pcdn-st-bfacts dd { text-align: start; }
+
 /* ------------------------------------------------------------------ English / LTR (SPEC §16.10)
    The rules above use logical properties, so an LTR page mirrors by itself; these cover what
    cannot be logical (the root direction, the select arrow image, list counters). */

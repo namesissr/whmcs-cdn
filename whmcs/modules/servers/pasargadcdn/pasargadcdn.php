@@ -95,6 +95,8 @@ function pasargadcdn_ConfigOptions()
  *                                         — yes/no
  *   Tunnel Paths, Tunnel Connections, Tunnel Mbps — number; Tunnel — yes/no;
  *   Edge Group — "general" | "tunnel"
+ *   L4 Proxy — yes/no; L4 Apps — number (SPEC §16.4)
+ *   Storage GB — number / dropdown «50|50 GB» (SPEC §16.8 features.storage_gb)
  * Products saved before v2 have empty configoption5..14, i.e. every v2
  * feature off / 0 until the admin ticks them; likewise products saved before
  * tunnel mode (configoption15..19 empty) get tunnel off, group "general".
@@ -170,6 +172,12 @@ function pasargadcdn_plan(array $params): array
     }
     if (isset($co['L4 Apps']) && $co['L4 Apps'] !== '') {
         $plan['features']['max_l4_apps'] = min(100, max(0, (int) $co['L4 Apps']));
+    }
+    // SPEC §16.8 object storage: configurable option «Storage GB» (dropdown «50|50 GB» or quantity) →
+    // features.storage_gb, sent ONLY when the product has the option (older controllers: extra="forbid";
+    // without it the controller default 0 = no storage applies). Clamped to the controller's 0..1000000.
+    if (isset($co['Storage GB']) && $co['Storage GB'] !== '') {
+        $plan['features']['storage_gb'] = min(1000000, max(0, (int) $co['Storage GB']));
     }
     // Controller ranges (SPEC §7.1) — out-of-range values would make Create/ChangePackage fail.
     $f = &$plan['features'];
@@ -891,6 +899,9 @@ function pasargadcdn_features_text(array $f): string
     if (!empty($f['l4_proxy'])) {
         $txt .= sprintf(' · TCP/UDP: %d apps', $f['max_l4_apps'] ?? 0);
     }
+    if (!empty($f['storage_gb'])) {
+        $txt .= sprintf(' · storage: %d GB', $f['storage_gb']);
+    }
     if (($f['edge_group'] ?? 'general') !== 'general') {
         $txt .= ' · edge group: ' . $f['edge_group'];
     }
@@ -1003,7 +1014,7 @@ function pasargadcdn_assets(string $base, string $lang = 'fa'): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js'])),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js'])),
     ];
 }
 

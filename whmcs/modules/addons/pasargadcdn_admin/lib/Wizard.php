@@ -32,6 +32,14 @@ final class Wizard
     /** Wave 7: «بسته‌ی ترافیک افزوده» product add-ons, one per size (WHMCS add-ons carry no configurable options). */
     const ADDON_NAME = 'بسته‌ی ترافیک افزوده';
     const ADDON_SIZES = [10, 50, 100];
+    /**
+     * SPEC §16.8: optional configurable option «Storage GB» (→ features.storage_gb, pasargadcdn_plan()),
+     * a dropdown with one sub-option per size («50|50 گیگابایت»), in its own option group linked to every
+     * CDN product. Prices are the admin's (rows are created at 0).
+     */
+    const STORAGE_GROUP = 'Pasargad CDN — فضای ذخیره‌سازی';
+    const STORAGE_OPTION = 'Storage GB|فضای ذخیره‌سازی ابری (گیگابایت)';
+    const STORAGE_SIZES = [0, 10, 50, 100];
     const BILLING = [
         'prepaid' => 'پیش‌پرداخت از کیف پول (پیشنهادی)',
         'overage' => 'فاکتور ترافیک اضافه در پایان ماه',
@@ -205,6 +213,7 @@ final class Wizard
             'overage_price' => (float) self::BASE_OVERAGE[$kind], 'overage_allow' => 100,
             'email' => true, 'email_update' => false, 'update' => false, 'plans' => [],
             'addon' => true, 'addon_sizes' => self::ADDON_SIZES,
+            'storage_opt' => false, 'storage_sizes' => self::STORAGE_SIZES,
         ];
         $existing = self::existingServerGroup();
         if ($existing) {
@@ -262,7 +271,33 @@ final class Wizard
             'plans' => [],
             'addon' => !empty($post['addon']),
             'addon_sizes' => self::ADDON_SIZES,
+            'storage_opt' => !empty($post['storage_opt']),
+            'storage_sizes' => self::STORAGE_SIZES,
         ];
+        // SPEC §16.8: «Storage GB» sizes, e.g. "0, 10, 50, 100" (GB, 0..1000000, 1 to 8 values, at least one > 0)
+        $rawSt = trim(str_replace(['،', '-', '/'], ',', (string) Env::input($post['storage_sizes'] ?? '')));
+        if ($rawSt !== '') {
+            $sizes = [];
+            foreach (explode(',', $rawSt) as $v) {
+                $v = $numv($v);
+                if ($v === '') {
+                    continue;
+                }
+                if (!ctype_digit($v) || (int) $v > 1000000) {
+                    $sizes = null;
+                    break;
+                }
+                $sizes[(int) $v] = (int) $v;
+            }
+            if ($sizes === null || !$sizes || count($sizes) > 8 || max($sizes) <= 0) {
+                if ($in['storage_opt']) {
+                    $e[] = 'اندازه‌های فضای ذخیره‌سازی باید ۱ تا ۸ عدد صحیح (گیگابایت، ۰ تا ۱٬۰۰۰٬۰۰۰) با کاما جدا و دست‌کم یکی بیشتر از صفر باشند؛ مثلاً 0,10,50,100.';
+                }
+            } else {
+                ksort($sizes);
+                $in['storage_sizes'] = array_values($sizes);
+            }
+        }
         // Wave 7: add-on traffic sizes, e.g. "10, 50, 100" (GB, 1..100000, at most 6)
         $rawSizes = trim(str_replace(['،', '-', '/'], ',', (string) Env::input($post['addon_sizes'] ?? '')));
         if ($rawSizes !== '') {
@@ -685,6 +720,11 @@ final class Wizard
                         : 'یک‌بار پرداخت، پنهان تا قیمت‌گذاری؛ پس از پرداخت فاکتور، سقف ترافیک این ماه سرویس ' . View::n($gb) . ' گیگابایت بالا می‌رود'];
             }
         }
+        if (!empty($in['storage_opt'])) {
+            foreach (self::storagePlan($in) as $st) {
+                $steps[] = $st;
+            }
+        }
         $perMb = self::perMb($in['overage_price']);
         $found = [];
         foreach ($in['plans'] as $key => $p) {
@@ -939,7 +979,139 @@ final class Wizard
                 $out[] = $row;
             }
         }
+        if (!empty($in['storage_opt'])) {
+            foreach (self::applyStorageOption($in) as $row) {
+                $out[] = $row;
+            }
+        }
         return $out;
+    }
+
+    // ------------------------------------------------------------------ SPEC §16.8: «Storage GB» configurable option
+
+    const STORAGE_TABLES = ['tblproductconfiggroups', 'tblproductconfigoptions', 'tblproductconfigoptionssub', 'tblproductconfiglinks'];
+
+    public static function storageSubName(int $gb): string
+    {
+        return $gb . '|' . ($gb > 0 ? View::n($gb) . ' گیگابایت' : 'بدون فضای ذخیره‌سازی');
+    }
+
+    /** [group row|null, option row|null] of the wizard's «Storage GB» option (remembered ids first, then names). */
+    public static function findStorageOption(): array
+    {
+        foreach (self::STORAGE_TABLES as $tb) {
+            if (!Env::hasTable($tb)) {
+                return [null, null];
+            }
+        }
+        $mem = (array) Env::kvGet('storage_option', []);
+        $opt = !empty($mem['cid']) ? Capsule::table('tblproductconfigoptions')->where('id', (int) $mem['cid'])->first() : null;
+        $group = $opt ? Capsule::table('tblproductconfiggroups')->where('id', (int) $opt->gid)->first() : null;
+        if (!$group) {
+            $group = Capsule::table('tblproductconfiggroups')->where('name', self::STORAGE_GROUP)->first();
+            $opt = null;
+        }
+        if ($group && !$opt) {
+            foreach (Capsule::table('tblproductconfigoptions')->where('gid', (int) $group->id)->get() as $o) {
+                if (trim(explode('|', (string) $o->optionname)[0]) === 'Storage GB') {
+                    $opt = $o;
+                    break;
+                }
+            }
+        }
+        return [$group, $opt];
+    }
+
+    /** Read-only preview rows of applyStorageOption(). */
+    private static function storagePlan(array $in): array
+    {
+        foreach (self::STORAGE_TABLES as $tb) {
+            if (!Env::hasTable($tb)) {
+                return [['op' => 'skip', 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Storage GB', 'detail' => 'جدول ' . $tb . ' در این نسخه‌ی WHMCS نیست']];
+            }
+        }
+        [$group, $opt] = self::findStorageOption();
+        $have = [];
+        if ($opt) {
+            foreach (Capsule::table('tblproductconfigoptionssub')->where('configid', (int) $opt->id)->get(['optionname']) as $r) {
+                $have[] = (int) trim(explode('|', (string) $r->optionname)[0]);
+            }
+        }
+        $new = array_values(array_diff($in['storage_sizes'], $have));
+        return [['op' => $opt ? ($new ? 'update' : 'skip') : 'create', 'kind' => 'گزینه‌ی قابل‌تنظیم',
+            'label' => 'Storage GB — ' . self::STORAGE_GROUP,
+            'detail' => ($opt ? 'گزینه‌ی موجود #' . (int) $opt->id . ($new ? ' — اندازه‌های جدید: ' . implode('، ', array_map(function ($g) {
+                return View::n($g);
+            }, $new)) : ' دست نمی‌خورد') : 'فهرست کشویی ' . implode('، ', array_map(function ($g) {
+                return View::n($g);
+            }, $in['storage_sizes'])) . ' گیگابایت')
+                . ' — به همه‌ی محصولات CDN وصل می‌شود؛ قیمت‌ها صفر ساخته می‌شوند و با مدیر است. مقدار انتخاب‌شده سهمیه‌ی فضای ذخیره‌سازی (storage_gb) سرویس است.']];
+    }
+
+    /**
+     * Creates (idempotently) the «Storage GB» dropdown: group, option, one sub-option per size (missing
+     * ones only), zero pricing rows per currency, and links to every CDN product (missing ones only).
+     */
+    private static function applyStorageOption(array $in): array
+    {
+        foreach (self::STORAGE_TABLES as $tb) {
+            if (!Env::hasTable($tb)) {
+                return [['op' => 'skip', 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Storage GB', 'link' => '']];
+            }
+        }
+        [$group, $opt] = self::findStorageOption();
+        $op = 'skip';
+        if ($group) {
+            $gid = (int) $group->id;
+        } else {
+            $gid = (int) Capsule::table('tblproductconfiggroups')->insertGetId(Env::onlyColumns('tblproductconfiggroups', ['name' => self::STORAGE_GROUP,
+                'description' => 'سهمیه‌ی فضای ذخیره‌سازی ابری (S3) سرویس CDN — SPEC §16.8']));
+            $op = 'create';
+        }
+        if ($opt) {
+            $cid = (int) $opt->id;
+        } else {
+            $cid = (int) Capsule::table('tblproductconfigoptions')->insertGetId(Env::onlyColumns('tblproductconfigoptions', ['gid' => $gid,
+                'optionname' => self::STORAGE_OPTION, 'optiontype' => '1', 'qtyminimum' => 0, 'qtymaximum' => 0, 'order' => 0, 'hidden' => 0]));
+            $op = 'create';
+        }
+        $subs = [];
+        foreach (Capsule::table('tblproductconfigoptionssub')->where('configid', $cid)->get(['id', 'optionname']) as $r) {
+            $subs[(int) trim(explode('|', (string) $r->optionname)[0])] = (int) $r->id;
+        }
+        $order = $subs ? (int) Capsule::table('tblproductconfigoptionssub')->where('configid', $cid)->max('sortorder') : 0;
+        foreach ($in['storage_sizes'] as $gb) {
+            if (!isset($subs[(int) $gb])) {
+                $subs[(int) $gb] = (int) Capsule::table('tblproductconfigoptionssub')->insertGetId(Env::onlyColumns('tblproductconfigoptionssub',
+                    ['configid' => $cid, 'optionname' => self::storageSubName((int) $gb), 'sortorder' => ++$order, 'hidden' => 0]));
+                $op = $op === 'skip' ? 'update' : $op;
+            }
+        }
+        // zero prices per currency (WHMCS shows an option without a pricing row as unavailable)
+        if (Env::hasTable('tblpricing')) {
+            $cols = ['msetupfee', 'qsetupfee', 'ssetupfee', 'asetupfee', 'bsetupfee', 'tsetupfee', 'monthly', 'quarterly', 'semiannually', 'annually', 'biennially', 'triennially'];
+            foreach (Capsule::table('tblcurrencies')->pluck('id')->all() as $cur) {
+                foreach ($subs as $sub) {
+                    $key = ['type' => 'configoptions', 'currency' => (int) $cur, 'relid' => $sub];
+                    if (!Capsule::table('tblpricing')->where($key)->exists()) {
+                        Capsule::table('tblpricing')->insert(Env::onlyColumns('tblpricing', $key + array_fill_keys($cols, 0)));
+                    }
+                }
+            }
+        }
+        $linked = 0;
+        foreach (Capsule::table('tblproducts')->where('servertype', 'pasargadcdn')->orderBy('id')->pluck('id')->all() as $pid) {
+            if (!Capsule::table('tblproductconfiglinks')->where('gid', $gid)->where('pid', (int) $pid)->exists()) {
+                Capsule::table('tblproductconfiglinks')->insert(['gid' => $gid, 'pid' => (int) $pid]);
+                $linked++;
+            }
+        }
+        if ($linked && $op === 'skip') {
+            $op = 'update';
+        }
+        Env::kvSet('storage_option', ['gid' => $gid, 'cid' => $cid]);
+        return [['op' => $op, 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Storage GB — ' . self::STORAGE_GROUP,
+            'link' => 'configproductoptions.php?action=managegroup&id=' . $gid]];
     }
 
     // ------------------------------------------------------------------ Wave 7: add-on traffic (SPEC §15.7)

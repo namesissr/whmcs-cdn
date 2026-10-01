@@ -73,6 +73,22 @@ class I18n
         'حذف رکورد محلی ناموفق بود: %s' => 'Deleting the local record failed: %s',
         'زیرسایت حذف شد.' => 'Sub-site deleted.',
         'سرور CDN تنظیم نشده است.' => 'No CDN server is configured.',
+        // SPEC §16.8 object storage — controller details (translated by controller(), see below)
+        'نام باکت باید %s تا %s کاراکتر از حروف کوچک انگلیسی، رقم و - باشد و با حرف یا رقم شروع و تمام شود' => 'The bucket name must be %s to %s characters of lowercase English letters, digits and -, and start and end with a letter or digit',
+        'باکت یافت نشد' => 'Bucket not found',
+        'فضای ذخیره‌سازی در پلن این سرویس فعال نیست' => 'Object storage is not included in this service\'s plan',
+        'باکتی با این نام برای این سرویس وجود دارد' => 'This service already has a bucket with this name',
+        'حداکثر %s باکت برای هر سرویس مجاز است' => 'At most %s buckets are allowed per service',
+        'فضای ذخیره‌سازی این سرویس پر است؛ باکت جدید ساخته نمی‌شود' => 'This service\'s storage is full; no new bucket can be created',
+        'این نام باکت در دسترس نیست' => 'This bucket name is not available',
+        'این باکت مبدأ رکورد %s است؛ ابتدا رکورد را تغییر دهید' => 'This bucket is the origin of record %s; change the record first',
+        'باکت خالی نیست؛ ابتدا همه فایل‌ها را حذف کنید' => 'The bucket is not empty; delete all of its files first',
+        'مبدأ فضای ذخیره‌سازی (storage) فقط برای رکورد پروکسی‌شده (CDN) مجاز است' => 'A storage origin is only allowed on a proxied (CDN) record',
+        'برای هر رکورد فقط یکی از pool یا storage را تعیین کنید' => 'Set only one of pool or storage per record',
+        'فضای ذخیره‌سازی در پلن شما فعال نیست' => 'Object storage is not included in your plan',
+        'باکت %s برای این سرویس وجود ندارد' => 'Bucket %s does not exist for this service',
+        'فضای ذخیره‌سازی روی این کنترلر پیکربندی نشده است' => 'Object storage is not configured on this controller',
+        'مبدأ فضای ذخیره‌سازی (storage) فقط برای رکوردهای A، AAAA و CNAME پروکسی‌شده مجاز است' => 'A storage origin is only allowed on proxied A, AAAA and CNAME records',
         // templates/clientarea.tpl
         'برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.' => 'Enable JavaScript in your browser to manage the CDN.',
         'در حال بارگذاری پنل CDN…' => 'Loading the CDN panel…',
@@ -111,6 +127,33 @@ class I18n
             // no settings table (tests) — Persian
         }
         return 'fa';
+    }
+
+    /**
+     * A controller error detail in the current language (SPEC §16.8 / §16.10): the controller writes its
+     * details in Persian; on an English request a known one (an EN key, %s parts matched as wildcards)
+     * is answered in English, anything else is returned unchanged (the app shows it after an English
+     * lead-in).
+     */
+    public static function controller(string $detail): string
+    {
+        if (self::$current !== 'en' || $detail === '') {
+            return $detail;
+        }
+        if (isset(self::EN[$detail])) {
+            return self::EN[$detail];
+        }
+        foreach (self::EN as $fa => $en) {
+            if (strpos($fa, '%s') === false) {
+                continue;
+            }
+            $re = '/^' . str_replace('%s', '(.{1,200}?)', preg_quote($fa, '/')) . '$/uD';
+            if (preg_match($re, $detail, $m)) {
+                array_shift($m);
+                return vsprintf($en, $m);
+            }
+        }
+        return $detail;
     }
 
     /** $fa in the current language; extra arguments fill %s placeholders. */

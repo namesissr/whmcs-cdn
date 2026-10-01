@@ -20,8 +20,10 @@
  *    one controller /api/v1/usage call per CDN server and work only for services
  *    at/near their cap. Wave 7: one GET /api/v1/events?type=tunnel per CDN server
  *    for the origin-down / back-up e-mails (TunnelAlerts) and the add-on traffic
- *    cap retries / month rollover (AddonTraffic). Errors are logged, never thrown
- *    into WHMCS's cron.
+ *    cap retries / month rollover (AddonTraffic). SPEC §16.8: once a month, after it
+ *    closes, one GET /api/v1/storage/usage per CDN server and one invoice / billable item
+ *    per service that stored data (StorageBilling; off while the storage price is 0).
+ *    Errors are logged, never thrown into WHMCS's cron.
  */
 
 if (!defined('WHMCS')) {
@@ -126,6 +128,18 @@ add_hook('AfterCronJob', 1, function ($vars) {
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: tunnel/add-on cron hook error: ' . $e->getMessage());
+        }
+    }
+    // SPEC §16.8: object-storage charges of the previous month (once, after the month closes)
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Prepaid.php';
+        require_once __DIR__ . '/lib/StorageBilling.php';
+        \PasargadCdn\Admin\StorageBilling::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: storage billing cron hook error: ' . $e->getMessage());
         }
     }
 });
