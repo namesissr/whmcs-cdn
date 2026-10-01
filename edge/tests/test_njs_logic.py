@@ -39,6 +39,15 @@ const out = cases.map(c => {
     for (let i = 0; i < c.n; i++) { const h = m.upstream(req(c.site, '/', '', { vars: { pcdn_pool: c.pool, remote_addr: c.ip || ('10.0.0.' + (i % 250)) } })); seen[h] = (seen[h] || 0) + 1; }
     return seen;
   }
+  if (c.kind === 'tnpick') {
+    const seen = {};
+    for (let i = 0; i < c.uris.length; i++) {
+      seen[c.uris[i]] = m.tunnelUpstream({ uri: c.uris[i], method: 'GET', variables: {
+        pcdn_site: c.site, pcdn_tn: c.tn, pcdn_tn_pool: c.pool, pcdn_tn_prefix: c.prefix,
+        remote_addr: c.ip || '10.0.0.1' }, headersIn: {}, args: {}, error: () => {} });
+    }
+    return seen;
+  }
   if (c.kind === 'hc') { store[c.key] = c.value; return null; }
 });
 console.log(JSON.stringify(out));
@@ -156,6 +165,52 @@ def test_pool_selection(tmp_path):
                                 {"kind": "upstream", "site": "1", "pool": "main", "n": 400}])[-1]
     assert set(res) == {"10.0.0.1:80", "10.0.0.2:80"}  # everything down: fail open to the primaries
     assert run(tmp_path, [{"kind": "upstream", "site": "1", "pool": "nope", "n": 1}])[0] == {"127.0.0.1:9": 1}
+
+
+def _pool3(**over):
+    p = {"method": "weighted", "protocol": "http",
+         "health": {"enabled": True, "path": "/", "interval": 5, "timeout": 2, "expect": "2xx"},
+         "origins": [{"hp": "10.0.0.1:80", "weight": 1, "backup": False, "up": None},
+                     {"hp": "10.0.0.2:80", "weight": 1, "backup": False, "up": None},
+                     {"hp": "10.0.0.3:80", "weight": 1, "backup": False, "up": None}]}
+    p.update(over)
+    return p
+
+
+def test_tunnel_rendezvous_affinity(tmp_path):
+    # F1: xhttp/h2 tunnel sessions must stick to ONE origin. The session id is the path segment
+    # after the tunnel prefix; every request of a session (the packet-up GET and its POSTs) hashes
+    # to the same origin, and a health change only moves the sessions on the origin that failed.
+    build(tmp_path, {"1": site(pools={"main": _pool3()})})
+    ids = [f"sess{i:03d}" for i in range(40)]
+    uris = []
+    for sid in ids:
+        uris += [f"/p/{sid}", f"/p/{sid}/1", f"/p/{sid}/50"]
+    res = run(tmp_path, [{"kind": "tnpick", "site": "1", "pool": "main", "tn": "xhttp", "prefix": "/p", "uris": uris}])[0]
+    for sid in ids:  # a GET + its packet-up POSTs all reach one origin
+        assert len({res[f"/p/{sid}"], res[f"/p/{sid}/1"], res[f"/p/{sid}/50"]}) == 1, sid
+    assert len({res[f"/p/{sid}"] for sid in ids}) == 3  # sessions spread across all three origins
+    before = {sid: res[f"/p/{sid}"] for sid in ids}
+    dead = "10.0.0.1:80"
+    res2 = run(tmp_path, [{"kind": "hc", "key": "1|main|" + dead, "value": 5},
+                          {"kind": "tnpick", "site": "1", "pool": "main", "tn": "xhttp", "prefix": "/p",
+                           "uris": [f"/p/{sid}" for sid in ids]}])[-1]
+    for sid in ids:
+        if before[sid] == dead:
+            assert res2[f"/p/{sid}"] != dead              # moved off the failed origin
+        else:
+            assert res2[f"/p/{sid}"] == before[sid]       # every other session is undisturbed
+
+
+def test_tunnel_ws_grpc_keep_random_and_web_balancer_unpinned(tmp_path):
+    # F1 guard: only xhttp/h2 use the session-key rendezvous. ws/grpc tunnel pools and the web
+    # balancer (upstream(), no key) must still spread across the whole pool, not pin to one origin.
+    build(tmp_path, {"1": site(pools={"main": _pool3(health={"enabled": False})})})
+    web = run(tmp_path, [{"kind": "upstream", "site": "1", "pool": "main", "n": 600}])[0]
+    assert len(web) == 3                                   # weighted-random over all three origins
+    ws = run(tmp_path, [{"kind": "tnpick", "site": "1", "pool": "main", "tn": "ws", "prefix": "/p",
+                         "uris": [f"/p/s{i}" for i in range(400)]}])[0]
+    assert len(set(ws.values())) == 3                      # ws pool uses random, not a session hash
 
 
 def test_tunnel_paths_only_see_firewall_block_allow_log(tmp_path):

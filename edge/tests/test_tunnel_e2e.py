@@ -125,7 +125,8 @@ def tn(tmp_path_factory):
 
 
 def log_lines(env, host, tn=None):
-    for _ in range(20):  # nginx writes the line when the request/session ends
+    # nginx writes the line when the request/session ends, and the log is buffered (F23), so poll
+    for _ in range(40):
         lines = [e for e in env.log() if e["h"] == host and (tn is None or e.get("tn") == tn)]
         if lines:
             return lines
@@ -144,6 +145,16 @@ def status_of(head: str) -> int:
     return int(head.split(" ", 2)[1])
 
 
+def log_wait(env, host, marker, timeout=5.0):
+    """Wait for a specific buffered access-log line (F23: buffer=64k flush=1s) to reach the file."""
+    for _ in range(int(timeout / 0.1)):
+        hit = [e for e in env.log() if e["h"] == host and marker in e["u"]]
+        if hit:
+            return hit
+        time.sleep(0.1)
+    return []
+
+
 # ----------------------------------------------------------------- rendering
 
 def test_rendered_config(tn):
@@ -152,16 +163,34 @@ def test_rendered_config(tn):
     # tunnel locations come before the page rule / static regex locations
     assert conf.index('location ^~ "/wsn"') < conf.index("location / {")
     assert "proxy_read_timeout 90s;" in conf and "grpc_read_timeout 90s;" in conf and "grpc_send_timeout 90s;" in conf
-    assert "client_max_body_size 0;" in conf and "tcp_nodelay on;" in conf and "limit_req_dry_run on;" in conf
+    assert "client_max_body_size 0;" in conf and "tcp_nodelay on;" in conf
+    assert "limit_req_dry_run" not in conf                                    # F40: skipped via empty key
     assert "grpc_pass grpc://pcdn_tn_201_" in conf  # IP-literal origin -> keepalive upstream
     assert "keepalive 64;" in conf and "keepalive_requests 1000000;" in conf
     assert "proxy_pass http://$pcdn_tn_target;" in conf  # hostname / pool origin -> resolved per request
-    assert "limit_conn pcdn_tn_site 100;" in conf and "limit_conn pcdn_tn_ip 50;" in conf
+    assert "limit_conn pcdn_tn_site2 100;" in conf and "limit_conn pcdn_tn_ip2 50;" in conf  # F13
+    # F3/F14: HTTP/2 body buffer + relay buffers on the tunnel data path
+    assert "client_body_buffer_size 256k;" in conf and "http2_chunk_size 16k;" in conf
+    assert "proxy_buffer_size 16k;" in conf and "grpc_buffer_size 16k;" in conf
+    assert "grpc_next_upstream error timeout;" in conf                        # F28
+    # F27/N2: raised client-facing HTTP/2 connection timers + stream cap on the tunnel host
+    assert "keepalive_timeout 600s;" in conf and "keepalive_time 6h;" in conf
+    assert "keepalive_requests 10000000;" in conf and "send_timeout 90s;" in conf
+    # F13: xhttp counts only the downlink GET
+    xh = conf.split('location ^~ "/xh" {', 1)[1].split("\n    }", 1)[0]
+    assert "set $pcdn_tn_ckey $pcdn_tn_isget;" in xh
+    # F1: a pool tunnel path carries the session-affinity prefix, set before $pcdn_tn_target
+    wsp = conf.split('location ^~ "/wsp" {', 1)[1].split("\n    }", 1)[0]
+    assert 'set $pcdn_tn_prefix "/wsp";' in wsp and 'set $pcdn_tn_pool "tp";' in wsp
+    assert wsp.index('set $pcdn_tn_prefix "/wsp";') < wsp.index("set $pcdn_tn_target $pcdn_tn_upstream;")
     lim = (tn.tmp / "pcdn/sites/205.conf").read_text()
-    assert "limit_conn pcdn_tn_ip 2;" in lim and "limit_conn pcdn_tn_site" not in lim
+    assert "limit_conn pcdn_tn_ip2 2;" in lim and "limit_conn pcdn_tn_site2" not in lim
     assert "location ^~ \"/t\"" not in (tn.tmp / "pcdn/sites/208.conf").read_text()  # tunnel.enabled = false
     http = (tn.tmp / "pcdn/http.conf").read_text()
     assert "http2_max_concurrent_streams" in http and '"tn":"$pcdn_tn"' in http
+    assert "grpc_connect_timeout 10s;" in http and "resolver_timeout 11s;" in http  # F12 / F15
+    assert "reuseport backlog=65535 so_keepalive=120s:30s:4;" in http           # F4/F16/F17
+    assert "location = /__pcdn/confver {" in http                               # F29
 
 
 # ----------------------------------------------------------------- WebSocket / HTTPUpgrade
@@ -252,6 +281,14 @@ def test_xhttp_download_streams_unbuffered(tn):
         sock.close()
 
 
+def test_xhttp_large_download_integrity(tn):
+    # F14: with the relay buffers raised (proxy_buffer_size / http2_chunk_size 16k) a large tunnel
+    # download must still be byte-exact.
+    n = 2_000_000
+    r = tn.req("lim.test", f"/x/big?n={n}")
+    assert r.status == 200 and len(r.body) == n and r.body == b"b" * n
+
+
 def test_xhttp_chunked_upload_not_buffered(tn):
     sock = connect(tn.sport, "tn.test", True, alpn=["http/1.1"])
     try:
@@ -334,7 +371,7 @@ def test_security_bypassed_on_tunnel_paths_but_blocks_apply(tn):
     # a normal path of the same site: challenged (firewall challenge rule + DDoS js mode)
     r = tn.req("tn.test", "/normal?m=n1")
     assert r.status in (403, 429)  # 429: the site's legacy 1 r/s limit_req also applies to normal paths
-    assert [e["v"] for e in log_lines(tn, "tn.test") if "m=n1" in e["u"]] == ["challenge:firewall:chal"]
+    assert [e["v"] for e in log_wait(tn, "tn.test", "m=n1")] == ["challenge:firewall:chal"]
     # tunnel path: WAF signature, scanner UA, challenge rules, rate limits all bypassed
     for i in range(3):
         sock, head, _ = ws_open(tn, "tn.test", "/ws" + SQLI[1:] + f"&i={i}", extra={"User-Agent": "sqlmap/1.7"})
@@ -346,7 +383,7 @@ def test_security_bypassed_on_tunnel_paths_but_blocks_apply(tn):
     sock, head, _ = ws_open(tn, "tn.test", "/ws?m=evil", extra={"X-Evil": "yes"})
     sock.close()
     assert status_of(head) in (403, 429)  # the deny page itself is subject to the legacy limit_req (1 r/s)
-    assert [e["v"] for e in log_lines(tn, "tn.test") if "m=evil" in e["u"]] == ["block:firewall:evil"]
+    assert [e["v"] for e in log_wait(tn, "tn.test", "m=evil")] == ["block:firewall:evil"]
     # blocked_ips too
     sock, head, _ = ws_open(tn, "blk.test", "/t", tls=False)
     sock.close()

@@ -8,6 +8,14 @@ set -euo pipefail
 
 DEST="${PCDN_GEOIP_DB:-/usr/share/pcdn/geo/country.mmdb}"
 BASE="${PCDN_GEOIP_URL:-https://download.db-ip.com/free}"
+
+# F9: the daily retry timer runs with --if-missing and must be a cheap no-op once the DB exists, so
+# it does not re-download monthly-stable data every day (the monthly timer handles the refresh).
+if [ "${1:-}" = "--if-missing" ] && [ -s "$DEST" ]; then
+  echo "pcdn-geoip-update: $DEST already present, skipping"
+  exit 0
+fi
+
 DIR="$(dirname "$DEST")"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

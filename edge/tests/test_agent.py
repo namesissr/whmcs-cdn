@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -30,6 +31,7 @@ def make_cfg(tmp_path, **over):
         "NGINX_TEST_CMD": "true",
         "NGINX_RELOAD_CMD": "true",
         "NGINX_USER": "root",
+        "RELOAD_VERIFY": "no",  # no real nginx to poll /__pcdn/confver in unit tests
     })
     cfg.update(over)
     return cfg
@@ -66,7 +68,7 @@ def test_render_rejects_unsafe_and_skips_https_without_cert(tmp_path):
     assert 'set $pcdn_target "[2a01:4f8::1]:80";' in text
     assert "listen 443" not in text and "return 301" not in text  # no cert -> no https redirect
     assert "Strict-Transport-Security" not in text  # HSTS only with a certificate
-    assert "limit_req zone=pcdn_rl_7 burst=40" in text
+    assert "limit_req zone=pcdn_rlk_7 burst=40" in text  # F40: renamed zone keyed on $pcdn_rl_key
     assert 'max-age=600' in text
     assert "wordpress_logged_in" in text and "bad cookie" not in text
     assert files == {}
@@ -142,8 +144,11 @@ def test_origin_regex_blocks_port_injection():
 def test_http_conf_ports_and_geo(tmp_path):
     cfg = make_cfg(tmp_path, HTTP_PORT="8081", HTTPS_PORT="8443", LISTEN_IPV6="no")
     text = agent.render_http(cfg)
-    assert "listen 8081 default_server;" in text and "listen 8443 ssl http2 default_server;" in text
+    # F4/F16/F17: default_server listens carry reuseport + backlog + so_keepalive
+    assert "listen 8081 default_server reuseport backlog=65535 so_keepalive=120s:30s:4;" in text
+    assert "listen 8443 ssl http2 default_server reuseport backlog=65535 so_keepalive=120s:30s:4;" in text
     assert "[::]" not in text and "{{" not in text
+    assert "grpc_connect_timeout 10s;" in text and "resolver_timeout 11s;" in text  # F12 / F15
     assert "geoip2" not in text and "map $host $pcdn_country" in text
     db = tmp_path / "c.mmdb"
     db.write_bytes(b"x")
@@ -310,12 +315,99 @@ def test_push_usage_batches_and_keeps_backlog(tmp_path, monkeypatch):
     a.ctl = RecordingCtl(fail=True)
     with pytest.raises(OSError):
         a.push_usage()
-    assert len(a.state["pending"]) == 5 and len(a.state["events"]) == 5  # nothing lost
+    # F7: nothing lost — pending/events drained into the persisted outbox with stable batch_ids
+    assert sum(len(e["items"]) for e in a.state["outbox"]) == 5
+    assert sum(len(e["events"]) for e in a.state["outbox"]) == 5
+    assert a.state["pending"] == {} and a.state["events"] == []
+    ids = [e["id"] for e in a.state["outbox"]]
+    assert all(re.fullmatch(r"[0-9a-f]{32}", i) for i in ids)
     a.ctl = RecordingCtl()
     a.push_usage()
     assert [len(b["items"]) for b in a.ctl.bodies] == [2, 2, 1]
     assert [len(b.get("events", [])) for b in a.ctl.bodies] == [3, 2, 0]
-    assert a.state["pending"] == {} and a.state["events"] == []
+    # F7: the retry reuses the SAME batch_ids as the failed attempt, so the controller dedups them
+    assert [b["batch_id"] for b in a.ctl.bodies] == ids
+    assert a.state["outbox"] == [] and a.state["pending"] == {} and a.state["events"] == []
+
+
+MINSITE = {"id": 1, "domain": "a.com", "status": "active", "secret": "ab" * 32,
+           "hosts": [{"name": "a.com", "origin": {"address": "1.2.3.4", "port": 80}}]}
+
+
+class SeqCtl:
+    """Serves a controlled config version/etag; ignores If-None-Match so the diff-skip path is hit."""
+    def __init__(self):
+        self.body = {"version": "v0", "sites": []}
+        self.etag = "e0"
+        self.hb = []
+
+    def serve(self, version, etag, sites=None):
+        self.body, self.etag = {"version": version, "sites": sites if sites is not None else []}, etag
+
+    def call(self, method, path, body=None, headers=None, timeout=30):
+        if path == "/edge/v1/config":
+            return 200, {"ETag": self.etag}, dict(self.body)
+        if "heartbeat" in path:
+            self.hb.append(body)
+        return 200, {}, None
+
+
+def test_reload_coalescing_and_diff_skip(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock[0])
+    cfg = make_cfg(tmp_path, RELOAD_MIN_INTERVAL="120", RELOAD_DEBOUNCE="5")
+    root = cfg["NGINX_DIR"].rstrip("/")
+    applies = []
+
+    def fake_apply(config, cfg_, files=None, digest=None):
+        applies.append(digest)
+        agent.write_tree(root, files)   # so first_boot is False afterwards
+        return None
+    monkeypatch.setattr(agent, "apply_config", fake_apply)
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg, a.state, a.ctl = cfg, {}, SeqCtl()
+
+    a.ctl.serve("v1", "e1")            # first boot -> apply immediately
+    a.sync_config()
+    assert len(applies) == 1 and a.state["version"] == "v1"
+
+    # F20: a new version whose rendered tree is identical is applied without a reload
+    a.ctl.serve("v2", "e2")
+    a.sync_config()
+    assert len(applies) == 1 and a.state["version"] == "v2" and a.state["etag"] == "e2"
+
+    # F5: a genuinely changed config is coalesced — held until it settles AND the min interval passes
+    a.ctl.serve("v3", "e3", [MINSITE])
+    clock[0] = 1010
+    a.sync_config()                    # freshly seen -> pending, nothing applied (age < debounce)
+    assert len(applies) == 1
+    clock[0] = 1016
+    a.sync_config()                    # settled, but only 16s since the last reload (< 120)
+    assert len(applies) == 1
+    clock[0] = 1140
+    a.sync_config()                    # settled and > 120s since the last reload -> apply once
+    assert len(applies) == 2 and a.state["version"] == "v3"
+    assert "pending_version" not in a.state
+
+
+def test_diff_skip_runs_reload_once(tmp_path):
+    counter = tmp_path / "reloads"
+    cfg = make_cfg(tmp_path, NGINX_RELOAD_CMD=f"sh -c 'echo x >> {counter}'")
+
+    class C:
+        def __init__(self):
+            self.n = 0
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            if path == "/edge/v1/config":
+                self.n += 1
+                return 200, {"ETag": f"e{self.n}"}, {"version": f"v{self.n}", "sites": [MINSITE]}
+            return 200, {}, None
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg, a.state, a.ctl = cfg, {}, C()
+    a.sync_config()   # first boot -> write + reload
+    a.sync_config()   # identical tree (new version/etag) -> diff-skip, no reload
+    a.sync_config()
+    assert counter.read_text().count("x") == 1  # F20: only the first apply reloaded
 
 
 @pytest.mark.skipif(shutil.which("nginx") is None, reason="nginx not installed")
@@ -354,7 +446,8 @@ def test_installer_edits_make_stock_nginx_conf_valid(tmp_path):
     for _ in range(2):  # idempotent
         subprocess.run(["bash", "-ec", block.replace("/etc/nginx/nginx.conf", str(stock))], check=True)
     edited = stock.read_text()
-    assert edited.count("worker_rlimit_nofile 524288;") == 1 and edited.count("multi_accept on;") == 1
+    assert edited.count("worker_rlimit_nofile 524288;") == 1 and edited.count("multi_accept off;") == 1
+    assert edited.count("worker_shutdown_timeout") == 1 and "worker_shutdown_timeout 1h;" in edited  # F6
     assert "worker_connections 65535;" in edited
     cfg = make_cfg(tmp_path, LISTEN_IPV6="no", HTTP_PORT="18680", HTTPS_PORT="18643")
     agent.bootstrap(cfg)
@@ -433,39 +526,58 @@ def test_tunnel_normalisation():
 
 
 def test_tunnel_render(tmp_path):
+    db = tmp_path / "geo.mmdb"
+    db.write_bytes(b"x")  # F9: a present GeoIP DB enables the allowed_countries gate
+    cfg = make_cfg(tmp_path, GEOIP_DB=str(db))
     site = dict(SITE, tunnel=TUNNEL, pools=POOLS, rate_limit_rps=0,
                 hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}},
                        {"name": "lb.example.com", "origin": {"pool": "main"}}],
                 headers={"request": [{"name": "X-A", "value": "1"}], "response": [{"name": "X-B", "value": "2"}]},
                 pagerules={"rules": [{"id": "p", "pattern": "/svc*", "cache": "everything"}]})
-    text, files = agent.render_site(site, make_cfg(tmp_path))
+    text, files = agent.render_site(site, cfg)
     assert files == {}
     srv = text.split("server {")[1]
     loc = lambda path: srv.split(f'location ^~ "{path}" {{', 1)[1].split("\n    }", 1)[0]  # noqa: E731
     assert 'location ^~ "/svc" {' in srv and srv.index('location ^~ "/svc"') < srv.index('location ~ "^/svc.*$"')
     assert "__pcdn/x" not in text and "passwd" not in text and "/ok" not in text
-    assert "map $pcdn_country $pcdn_tcc_7 {\n    DE 1;\n    IR 1;\n    default 0;\n}" in text
+    # F9: an empty country ("" -> unresolved client) passes; only listed countries + "" -> 1
+    assert "map $pcdn_country $pcdn_tcc_7 {\n    \"\" 1;\n    DE 1;\n    IR 1;\n    default 0;\n}" in text
     g = loc("/svc")
     assert "set $pcdn_tn grpc;" in g and "if ($pcdn_tcc_7 = 0) { return 403; }" in g
+    assert "set $pcdn_tn_ckey $pcdn_site;" in g   # F13: grpc stream counts one slot
     assert "grpc_pass grpc://pcdn_tn_7_0;" in g and "grpc_set_header X-A \"1\";" in g and "grpc_read_timeout 7200s;" in g
-    assert "limit_conn pcdn_tn_site 500;" in g and "limit_conn pcdn_tn_ip 8;" in g and "limit_rate" not in g
+    assert "grpc_buffer_size 16k;" in g           # F14
+    assert "grpc_next_upstream error timeout;" in g and "grpc_next_upstream_tries 2;" in g  # F28
+    assert "limit_conn pcdn_tn_site2 500;" in g and "limit_conn pcdn_tn_ip2 8;" in g and "limit_rate" not in g
+    assert "limit_req_dry_run" not in g          # F40: skipped via the empty $pcdn_rl_key instead
+    assert "client_body_buffer_size 256k;" in g and "http2_chunk_size 16k;" in g  # F3 / F14
     assert "upstream pcdn_tn_7_0 {\n    server 127.0.0.1:18080 max_fails=0;\n    keepalive 64;" in text
     w = loc("/ws")
     assert 'set $pcdn_tn_target "vpn.example.net:8443";' in w and "proxy_pass https://$pcdn_tn_target;" in w
     assert "proxy_ssl_name vpn.example.net;" in w and "proxy_ssl_verify on;" in w
     assert "proxy_set_header Upgrade $http_upgrade;" in w and "proxy_read_timeout 7200s;" in w
+    assert "client_body_buffer_size" not in w    # F3: only the HTTP/2 body path gets the buffer
     assert "add_header" not in w and "proxy_cache off;" in w and "gzip off;" in w and "brotli off;" in w
     h = loc("/h2")
     assert "grpc_pass grpcs://pcdn_tn_7_1;" in h and "grpc_ssl_name $host;" in h and "grpc_ssl_verify" not in h
     x = loc("/xh")
     assert "set $pcdn_tn_pool \"main\";" in x and "set $pcdn_tn_target $pcdn_tn_upstream;" in x
+    assert 'set $pcdn_tn_prefix "/xh";' in x      # F1: session-affinity prefix, set before target
+    assert x.index('set $pcdn_tn_prefix "/xh";') < x.index("set $pcdn_tn_target $pcdn_tn_upstream;")
+    assert "set $pcdn_tn_ckey $pcdn_tn_isget;" in x   # F13: xhttp counts only the downlink GET
     assert "proxy_pass https://$pcdn_tn_target;" in x and 'proxy_set_header Connection "";' in x
+    assert "proxy_buffer_size 16k;" in x and "client_body_buffer_size 256k;" in x  # F14 / F3
     assert "proxy_buffering off;" in x and "proxy_request_buffering off;" in x and "client_max_body_size 0;" in x
     u = loc("/up")
     assert 'set $pcdn_tn_target "[2a01:4f8::2]:80";' in u and "proxy_pass http://$pcdn_tn_target;" in u
-    # a host on a pool: its own-origin tunnel paths follow the host's pool (no keepalive upstream)
+    # F11: IP-literal pool member (main -> 10.0.0.1:443) gets keepalive upstreams (h1 + h2)
+    assert "upstream pcdn_tn_7_p0_0 {\n    server 10.0.0.1:443 max_fails=0;\n    keepalive 64;" in text
+    assert "upstream pcdn_tn_7_p0_0_h2 {" in text
+    # F1: a host that inherits a pool routes tunnel paths through the tunnel picker, not $pcdn_target
     lb = text.split("server_name lb.example.com;")[1]
-    assert "grpc_pass grpcs://$pcdn_target;" in lb.split('location ^~ "/svc" {', 1)[1].split("\n    }", 1)[0]
+    lbsvc = lb.split('location ^~ "/svc" {', 1)[1].split("\n    }", 1)[0]
+    assert "grpc_pass grpcs://$pcdn_tn_target;" in lbsvc and 'set $pcdn_tn_pool "main";' in lbsvc
+    assert "$pcdn_target" not in lbsvc
     # HTTP/2 and HTTP/1.1 tunnels to the same origin never share keepalive connections
     both = dict(SITE, hosts=site["hosts"][:1], tunnel=dict(TUNNEL, paths=[
         {"id": "a", "path": "/a", "protocol": "grpc"}, {"id": "b", "path": "/b", "protocol": "xhttp"},
@@ -474,9 +586,11 @@ def test_tunnel_render(tmp_path):
     assert t2.count("server 127.0.0.1:18080 max_fails=0;") == 2
     assert "grpc_pass grpc://pcdn_tn_7_0;" in t2 and "proxy_pass http://pcdn_tn_7_1;" in t2
     assert t2.count("grpc_pass grpc://pcdn_tn_7_0;") == 2
-    js = json.loads(agent.render_all({"sites": [site]}, make_cfg(tmp_path))["js/sites.js"]
+    js = json.loads(agent.render_all({"sites": [site]}, cfg)["js/sites.js"]
                     .split("export default ", 1)[1].rstrip().rstrip(";"))
     assert js["7"]["tunnel_paths"] == ["/svc", "/ws", "/h2", "/xh", "/up"]
+    # F11: pool origin carries the keepalive upstream names for the tunnel picker
+    assert js["7"]["pools"]["main"]["origins"][0]["up"] == {"h1": "pcdn_tn_7_p0_0", "h2": "pcdn_tn_7_p0_0_h2"}
 
 
 def test_tunnel_fallback_render(tmp_path):
@@ -489,6 +603,61 @@ def test_tunnel_fallback_render(tmp_path):
     assert "location / { return 404; }" in nf and "location ~" not in nf
     plain, _ = agent.render_site(SITE, make_cfg(tmp_path))
     assert "location ^~ \"/" not in plain and "$pcdn_tn" not in plain
+
+
+def test_tunnel_allowed_countries_fail_open_without_geoip(tmp_path):
+    site = dict(SITE, tunnel=TUNNEL, pools=POOLS, rate_limit_rps=0,
+                hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}])
+    # F9: no GeoIP DB (make_cfg points at a missing file) -> the country gate fails open (no 403)
+    text, _ = agent.render_site(site, make_cfg(tmp_path))
+    assert "$pcdn_tcc_7" not in text
+    # with the DB present the gate is enforced, and an unresolved ("") client still passes
+    db = tmp_path / "g.mmdb"
+    db.write_bytes(b"x")
+    text2, _ = agent.render_site(site, make_cfg(tmp_path, GEOIP_DB=str(db)))
+    assert "if ($pcdn_tcc_7 = 0) { return 403; }" in text2 and '    "" 1;' in text2
+
+
+def test_force_https_excludes_tunnel_paths(tmp_path):
+    cert, key = self_signed(tmp_path)
+    site = dict(SITE, ssl={"cert": cert, "key": key}, tunnel=TUNNEL, pools=POOLS,
+                hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}])
+    text, _ = agent.render_site(site, make_cfg(tmp_path))   # SITE has force_https True
+    assert "map $uri $pcdn_tnp_7 {" in text and 'map "$scheme$pcdn_tnp_7" $pcdn_httpredir_7 {' in text
+    assert "if ($pcdn_httpredir_7) { return 301 https://$host$request_uri; }" in text
+    assert "if ($scheme = http)" not in text               # replaced by the tunnel-aware redirect
+    # a non-tunnel force_https site keeps the plain one-line redirect
+    plain, _ = agent.render_site(dict(SITE, ssl={"cert": cert, "key": key}), make_cfg(tmp_path))
+    assert "if ($scheme = http) { return 301 https://$host$request_uri; }" in plain
+    assert "$pcdn_httpredir" not in plain
+
+
+def test_suspended_tunnel_cut_paths(tmp_path):
+    site = dict(SITE, status="suspended", tunnel={"enabled": True, "cut_paths": ["/vpn", "/ws", "/__pcdn/x"]})
+    text, _ = agent.render_site(site, make_cfg(tmp_path))
+    # F35: cheap, rate-limited, body-less 503 on the tunnel prefixes (reserved /__pcdn dropped)
+    assert 'location ^~ "/vpn" { access_log off; limit_req zone=pcdn_cut burst=5 nodelay; ' \
+           'limit_req_status 503; return 503; }' in text
+    assert 'location ^~ "/ws" {' in text and "__pcdn/x" not in text
+    # error_page is scoped to the website catch-all so cut paths return nginx's tiny built-in 503
+    assert "location / { error_page 503 /suspended.html; return 503; }" in text
+    assert "proxy_pass" not in text
+
+
+def test_sysctl_heredoc(tmp_path):
+    install = (HERE.parent / "install.sh").read_text()
+    block = install.split("# >>> pcdn sysctl", 1)[1].split("# <<< pcdn sysctl", 1)[0]
+    body = block.split("<<'EOF'", 1)[1].split("\nEOF", 1)[0]
+    kv = {}
+    for line in body.splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+    assert kv["net.ipv4.tcp_congestion_control"] == "bbr" and kv["net.core.default_qdisc"] == "fq"
+    assert kv["net.core.somaxconn"] == "65535" and kv["net.ipv4.tcp_keepalive_time"] == "300"
+    assert kv["fs.file-max"] == "9223372036854775807" and "fs.nr_open" not in kv          # F31
+    assert kv["net.ipv4.ip_local_port_range"] == "10240 65535"                            # F18: not widened
+    assert "/etc/sysctl.d/999-pcdn.conf" in install and "rm -f /etc/sysctl.d/99-pcdn.conf" in install  # F30
 
 
 @pytest.mark.skipif(shutil.which("nginx") is None, reason="nginx not installed")
@@ -531,9 +700,10 @@ def test_tunnel_usage_aggregation(tmp_path):
     agent.read_usage(state, str(log))
     [item] = agent.usage_items(state["pending"])
     assert item["requests"] == 6 and item["bytes"] == 5000 + 7000 + 100 + 150 + 999 + 10
-    assert item["tunnel"] == {"sessions": 3, "seconds": 2401, "bytes_up": 900000 + 40100 + 1150 + 200,
+    # F37: grpc/h2/xhttp bill $request_length ($bu); only ws/httpupgrade consult $upstream_bytes_sent
+    assert item["tunnel"] == {"sessions": 3, "seconds": 2401, "bytes_up": 900000 + 40000 + 1000 + 200,
                               "bytes_down": 5000 + 7000 + 100 + 150,
-                              "by_protocol": {"ws": 905000 + 350, "grpc": 47100, "xhttp": 1250}}
+                              "by_protocol": {"ws": 905000 + 350, "grpc": 47000, "xhttp": 1100}}
     json.dumps(state)  # the state file stays JSON
     no_tn = agent.usage_item("x.com|2026-09-28T10:00:00Z", {"bytes": 1, "requests": 1, "cache_hits": 0})
     assert "tunnel" not in no_tn
@@ -609,7 +779,9 @@ def test_periodic_heartbeat_carries_metrics(tmp_path, monkeypatch):
     [body] = a.ctl.bodies
     assert body["applied_version"] == "v1" and body["error"] is None
     assert {"rx_mbps", "tx_mbps", "connections", "load1", "cpus"} <= set(body["metrics"])
-    assert set(body["metrics"]) <= {"rx_mbps", "tx_mbps", "connections", "load1", "cpus", "disk_pct", "mem_pct"}
+    assert set(body["metrics"]) <= {"rx_mbps", "tx_mbps", "connections", "load1", "cpus", "disk_pct",
+                                    "mem_pct", "draining_workers", "sock_tcp", "sock_tw"}
+    assert body["geoip"] is False  # F9: no GeoIP DB in the unit-test cfg
     a.tick()  # within HEARTBEAT_INTERVAL: nothing new
     assert len(a.ctl.bodies) == 1
     a.ctl = RecordingCtl(fail=True)

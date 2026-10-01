@@ -302,7 +302,7 @@ function prepSite(id, s) {
         const p = s.pools[name], h = p.health || {};
         P.pools[name] = {
             name: name, method: p.method === 'ip_hash' ? 'ip_hash' : 'weighted', protocol: p.protocol === 'https' ? 'https' : 'http',
-            origins: (p.origins || []).map(function (o) { return { hp: o.hp, weight: Math.max(1, +o.weight || 1), backup: !!o.backup }; }),
+            origins: (p.origins || []).map(function (o) { return { hp: o.hp, weight: Math.max(1, +o.weight || 1), backup: !!o.backup, up: o.up || null }; }),
             health: { enabled: !!h.enabled, path: h.path || '/', interval: Math.max(1, +h.interval || 10),
                 timeout: Math.min(10, Math.max(1, +h.timeout || 3)), expect: String(h.expect || '2xx,3xx').toLowerCase().split(','),
                 host: h.host || s.domain },
@@ -554,24 +554,53 @@ function isUp(site, pool, o) {
     return (ngx.shared.pcdn_hc.get(hcKey(site, pool, o)) || 0) < HC_FALL;
 }
 
-function upstream(r) { return pick(r, r.variables.pcdn_pool); }
-function tunnelUpstream(r) { return pick(r, r.variables.pcdn_tn_pool); }
+// web load balancer: host:port, ip_hash/weighted-random across the pool (unchanged behaviour).
+function upstream(r) { return pick(r, r.variables.pcdn_pool, null, false, false); }
 
-function pick(r, poolName) {
+// tunnel pool picker. For xhttp/h2 every request of a session must reach the SAME origin, so a
+// session key is parsed out of the path (after the tunnel prefix) and used for a weighted
+// rendezvous (HRW) hash: a health change only moves the sessions on the origin that failed. ws/grpc
+// keep the existing ip_hash/random behaviour (key = null). When a picked IP-literal member has a
+// keepalive upstream (F11), its upstream name is returned instead of host:port.
+function tunnelUpstream(r) {
+    const tn = r.variables.pcdn_tn;
+    const h2 = tn === 'grpc' || tn === 'h2';
+    const ka = tn === 'xhttp' || tn === 'grpc' || tn === 'h2';   // upgraded (ws) conns are never reused
+    let key = null;
+    if (tn === 'xhttp' || tn === 'h2') {
+        const prefix = String(r.variables.pcdn_tn_prefix || '');
+        const m = String(r.uri).substring(prefix.length).match(/^\/+([^\/?]+)/);
+        key = m ? m[1] : String(r.variables.remote_addr);
+    }
+    return pick(r, r.variables.pcdn_tn_pool, key, ka, h2);
+}
+
+function pick(r, poolName, key, keepalive, h2) {
     const site = siteOf(r), pool = site ? site.pools[poolName] : null;
     if (!pool || !pool.origins.length) return '127.0.0.1:9';   // discard port -> 502, never an open proxy
     let cand = pool.origins.filter(function (o) { return !o.backup && isUp(site, pool, o); });
     if (!cand.length) cand = pool.origins.filter(function (o) { return o.backup && isUp(site, pool, o); });
     if (!cand.length) cand = pool.origins.filter(function (o) { return !o.backup; });   // fail open
     if (!cand.length) cand = pool.origins;
-    let total = 0;
-    cand.forEach(function (o) { total += o.weight; });
-    let x = pool.method === 'ip_hash' ? fnv(String(r.variables.remote_addr)) % total : Math.random() * total;
-    for (let i = 0; i < cand.length; i++) {
-        x -= cand[i].weight;
-        if (x < 0) return cand[i].hp;
+    let chosen;
+    // key != null (loose) is false for both null (ws/grpc) and undefined (never passed): only a real
+    // string session key takes the rendezvous branch, so non-tunnel balancing is untouched.
+    if (key != null) {
+        let best = -1;
+        for (let i = 0; i < cand.length; i++) {
+            const o = cand[i];
+            const score = o.weight / -Math.log((fnv(key + '|' + o.hp) + 1) / 4294967297);
+            if (score > best) { best = score; chosen = o; }
+        }
+    } else {
+        let total = 0;
+        cand.forEach(function (o) { total += o.weight; });
+        let x = pool.method === 'ip_hash' ? fnv(String(r.variables.remote_addr)) % total : Math.random() * total;
+        for (let i = 0; i < cand.length; i++) { x -= cand[i].weight; if (x < 0) { chosen = cand[i]; break; } }
+        if (!chosen) chosen = cand[cand.length - 1];
     }
-    return cand[cand.length - 1].hp;
+    if (keepalive && chosen.up) { const n = h2 ? chosen.up.h2 : chosen.up.h1; if (n) return n; }
+    return chosen.hp;
 }
 
 function expectOk(expect, status) {

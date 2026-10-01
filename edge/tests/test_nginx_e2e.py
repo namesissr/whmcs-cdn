@@ -149,11 +149,17 @@ class Edge:
         p = pathlib.Path(self.cfg["ACCESS_LOG"])
         return [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
 
-    def last_log(self, host, marker):
-        for e in reversed(self.log()):
-            if e["h"] == host and marker in e["u"]:
-                return e
-        raise AssertionError(f"no log line for {host} {marker}")
+    def last_log(self, host, marker, timeout=8.0):
+        # the access log is buffered (F23: buffer=64k flush=1s), so a just-written line may take a
+        # moment to reach the file; poll rather than read once.
+        end = time.time() + timeout
+        while True:
+            for e in reversed(self.log()):
+                if e["h"] == host and marker in e["u"]:
+                    return e
+            if time.time() > end:
+                raise AssertionError(f"no log line for {host} {marker}")
+            time.sleep(0.2)
 
 
 def site(sid, host, origin, **sections):
@@ -645,6 +651,8 @@ def test_image_resize(env):
 
 def test_usage_payload_from_real_log(env):
     env.req("waf.test", SQLI + "&m=usage")
+    # the access log is buffered (F23): wait for the line to reach the file before reading it
+    assert wait_for(lambda: any("m=usage" in e.get("u", "") for e in env.log()))
     state = {}
     agent.read_usage(state, env.cfg["ACCESS_LOG"])
     items = agent.usage_items(state["pending"])

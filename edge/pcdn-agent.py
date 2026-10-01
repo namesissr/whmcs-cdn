@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 
 log = logging.getLogger("pcdn-agent")
@@ -97,6 +98,41 @@ DEFAULTS = {
     # idle upstream connections kept per worker to each tunnel origin (gRPC/h2/XHTTP): a warm
     # connection removes a TCP+TLS round-trip from the border on the next stream/request
     "TUNNEL_KEEPALIVE": "64",
+    # F3: per-stream client body buffer for HTTP/2 tunnel uploads (gRPC/h2/XHTTP). The default h2
+    # window is 64k; this raises in-flight upload capacity per stream. Cost ~= concurrent streams ×
+    # size, so install.sh --role tunnel can raise it and low-RAM nodes should lower it to 128k.
+    "TUNNEL_H2_BODY_BUFFER": "256k",
+    # F14: relay buffer for the tunnel data path (proxy_buffer_size / grpc_buffer_size /
+    # http2_chunk_size) and the ssl_buffer_size on pure-tunnel (decoy/404) hosts.
+    "TUNNEL_RELAY_BUFFER": "16k",
+    # F14: http-level ssl_buffer_size; install.sh sets 16k on --role tunnel nodes, 4k elsewhere for
+    # faster TLS first byte on general web traffic.
+    "SSL_BUFFER_SIZE": "4k",
+    # F12: connect timeout for both proxy_pass and grpc_pass tunnel origins (seconds, 3-30).
+    "TUNNEL_CONNECT_TIMEOUT": "10",
+    # N2/F27: client-facing HTTP/2 stream cap per connection on tunnel hosts (a low value forces a
+    # mid-session GOAWAY + reconnect for stream-heavy XHTTP/gRPC tunnels).
+    "TUNNEL_KEEPALIVE_REQUESTS": "10000000",
+    # F5: reload coalescing. A config version is applied only once it has settled (seen on two polls)
+    # or has been pending for RELOAD_MIN_INTERVAL, and never more often than RELOAD_MIN_INTERVAL,
+    # so a burst of site edits collapses into one nginx reload (one GOAWAY to all h2 tunnels).
+    "RELOAD_MIN_INTERVAL": "120",
+    # F5: a freshly-seen version waits at least this long before applying, so sub-debounce bursts of
+    # different versions coalesce.
+    "RELOAD_DEBOUNCE": "5",
+    # F29: seconds the agent polls /__pcdn/confver after a reload before treating it as not applied.
+    "RELOAD_VERIFY": "yes",
+    # F7: usage POST timeout (seconds); strictly greater than Caddy's 120 s header timeout so the
+    # agent never gives up just as the controller responds and replays a batch.
+    "USAGE_TIMEOUT": "150",
+    # F7: drop (and log) an unacknowledged usage batch older than this many days, comfortably inside
+    # the controller's 7-day batch_id dedup window, so a stuck batch cannot be re-applied after its
+    # dedup row is purged.
+    "USAGE_OUTBOX_MAX_DAYS": "6",
+    # F21: defer a reload up to this many seconds when every changed site belongs to another edge
+    # group (and no global file changed and no site was added/removed/suspended or had its cert
+    # rotated), so a tunnel-role node does not reload for general-website edits.
+    "FOREIGN_DEFER": "900",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -185,6 +221,13 @@ def _v6(cfg: dict) -> bool:
     return cfg.get("LISTEN_IPV6", "yes").lower() in ("1", "yes", "true", "on")
 
 
+def geoip_present(cfg: dict) -> bool:
+    """True when the GeoIP country database is installed (F9): tunnel allowed_countries only
+    enforces when it is, and fails open (allow) when it is missing."""
+    geo = cfg.get("GEOIP_DB") or ""
+    return bool(SAFE_FSPATH.match(geo) and os.path.isfile(geo))
+
+
 # ----------------------------------------------------------------- rendering
 
 def render_http(cfg: dict, hc_interval: int = 2) -> str:
@@ -192,8 +235,8 @@ def render_http(cfg: dict, hc_interval: int = 2) -> str:
     hc_interval: js_periodic tick for pool health checks (> the largest check timeout)."""
     with open(asset(cfg, "BASE_TEMPLATE", "nginx/pcdn-base.conf")) as f:
         text = f.read()
-    geo = cfg.get("GEOIP_DB") or ""
-    if SAFE_FSPATH.match(geo) and os.path.isfile(geo):
+    if geoip_present(cfg):
+        geo = cfg["GEOIP_DB"]
         geo_conf = f"geoip2 {geo} {{\n    auto_reload 60m;\n    $pcdn_country country iso_code;\n}}"
     else:  # nginx must start without the database; country rules then never match
         geo_conf = "map $host $pcdn_country {\n    default \"\";\n}"
@@ -206,6 +249,8 @@ def render_http(cfg: dict, hc_interval: int = 2) -> str:
         "DICT_SIZE": cfg["DICT_SIZE"] if SAFE_SIZE.match(cfg["DICT_SIZE"]) else "32m",
         "GEOIP": geo_conf,
         "HC_INTERVAL": str(_int(hc_interval, 2, 2, 11)),
+        "CONNECT_TIMEOUT": str(_int(cfg.get("TUNNEL_CONNECT_TIMEOUT"), 10, 3, 30)),
+        "SSL_BUFFER_SIZE": cfg["SSL_BUFFER_SIZE"] if SAFE_SIZE.match(cfg.get("SSL_BUFFER_SIZE") or "") else "4k",
     }
     if not SAFE_FSPATH.match(subst["NGINX_DIR"]):
         raise ValueError("unsafe NGINX_DIR")
@@ -435,7 +480,10 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     )
     rps = int(site.get("rate_limit_rps") or 0)
     if rps > 0:
-        out.append(f"limit_req_zone $binary_remote_addr zone=pcdn_rl_{sid}:1m rate={rps}r/s;")
+        # F40: key on $pcdn_rl_key (client IP for normal requests, "" for tunnel locations) so the
+        # legacy per-IP limit never touches tunnel streams. New zone name (…rlk) because nginx
+        # rejects a reload that changes an existing zone's key.
+        out.append(f"limit_req_zone $pcdn_rl_key zone=pcdn_rlk_{sid}:1m rate={rps}r/s;")
 
     ssl = site.get("ssl")
     if ssl:
@@ -443,6 +491,16 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         files[f"certs/{sid}.key"] = ssl["key"]
 
     status = site.get("status", "active")
+    # F35: tunnel path prefixes the controller keeps sending while a site is suspended / over_quota,
+    # so those paths answer a cheap rate-limited 503 instead of a full HTML page on every reconnect.
+    cut_paths = []
+    if status in ("suspended", "over_quota"):
+        seen_cut = set()
+        for cp in _sec(site, "tunnel").get("cut_paths") or []:
+            cp = str(cp)
+            if SAFE_TUNNEL_PATH.match(cp) and not cp.startswith("/__pcdn") and cp not in seen_cut:
+                seen_cut.add(cp)
+                cut_paths.append(cp)
     cache, sslo = _legacy_sections(site)
     pools = norm_pools(site)
     origin_proto = "https" if sslo.get("origin_protocol") == "https" else "http"
@@ -563,34 +621,86 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     fallback = tunnel["fallback"] if tunnel else "origin"
     image_on = image_on and fallback == "origin"  # decoy / 404 sites never fetch origin content
     decoy = decoy_page(cfg, domain) if fallback == "decoy" else None
+    geo_ok = geoip_present(cfg)
+    ka = _int(cfg.get("TUNNEL_KEEPALIVE"), 64, 1, 4096)
+    h2_buf = cfg.get("TUNNEL_H2_BODY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_H2_BODY_BUFFER") or "") else "256k"
+    relay_buf = cfg.get("TUNNEL_RELAY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_RELAY_BUFFER") or "") else "16k"
+    resolver = cfg["RESOLVER"] if SAFE_RESOLVER.match(cfg.get("RESOLVER") or "") else "1.1.1.1"
     tn_upstreams = {}  # (h2?, host:port) -> upstream name (keepalive towards IP-literal origins)
+    _up_rendered = set()
     if tunnel and tunnel["allowed_countries"]:
-        out.append(f"map $pcdn_country $pcdn_tcc_{sid} {{\n"
-                   + "".join(f"    {cc} 1;\n" for cc in tunnel["allowed_countries"]) + "    default 0;\n}")
+        # F9: only enforce the country gate when the GeoIP DB is installed; otherwise fail open.
+        # `"" 1;` lets a client the DB cannot resolve pass instead of being 403'd.
+        if geo_ok:
+            out.append(f"map $pcdn_country $pcdn_tcc_{sid} {{\n    \"\" 1;\n"
+                       + "".join(f"    {cc} 1;\n" for cc in tunnel["allowed_countries"]) + "    default 0;\n}")
+        else:
+            log.warning("no GeoIP DB on this edge; tunnel allowed_countries fails open for site %s", sid)
+    # F34: a force_https site with tunnel paths must not 301 its ws/httpupgrade/xhttp clients on
+    # port 80 (they cannot follow a redirect). Map the tunnel prefixes to 1 and skip the redirect
+    # for them; non-tunnel sites keep the plain one-line redirect.
+    force_https_tn = bool(tunnel and tunnel["paths"] and sslo.get("force_https") and ssl)
+    if force_https_tn:
+        # nginx `if` compares a single variable (it cannot concatenate $scheme with the flag), so a
+        # second map combines them: redirect only when scheme is http AND the path is not a tunnel path.
+        alt = "|".join(re.escape(p["path"]) for p in tunnel["paths"])
+        out.append(f"map $uri $pcdn_tnp_{sid} {{\n    volatile;\n    default 0;\n    \"~^(?:{alt})\" 1;\n}}")
+        out.append(f"map \"$scheme$pcdn_tnp_{sid}\" $pcdn_httpredir_{sid} {{\n    volatile;\n"
+                   f"    \"http0\" 1;\n    default 0;\n}}")
 
-    def tn_upstream(hp, h2):
-        # separate pools for HTTP/2 (grpc_pass) and HTTP/1.1 (proxy_pass): a cached keepalive
-        # connection must never be handed to the other protocol
-        if (h2, hp) not in tn_upstreams:
-            name = f"pcdn_tn_{sid}_{len(tn_upstreams)}"
-            tn_upstreams[(h2, hp)] = name
-            # one server: never marked down (max_fails=0). A warm pool of idle keepalive
-            # connections to the VPN origin removes the TCP+TLS handshake across the border from
-            # the next stream; keepalive_requests/keepalive_time keep long VPN sessions from
-            # recycling a working upstream connection mid-use.
-            ka = _int(cfg.get("TUNNEL_KEEPALIVE"), 64, 1, 4096)
+    def _upstream_block(name, hp, h2):
+        # one server: never marked down (max_fails=0). A warm pool of idle keepalive connections to
+        # the VPN origin removes the TCP+TLS handshake across the border from the next stream;
+        # keepalive_requests/keepalive_time keep long VPN sessions from recycling a connection mid-use.
+        # Separate names per (h2, hp): a cached keepalive connection must never cross protocols.
+        if name not in _up_rendered:
+            _up_rendered.add(name)
             out.append(f"upstream {name} {{\n    server {hp} max_fails=0;\n    keepalive {ka};\n"
                        f"    keepalive_timeout 300s;\n    keepalive_requests 1000000;\n"
                        f"    keepalive_time 1h;\n}}")
+        return name
+
+    def tn_upstream(hp, h2):
+        if (h2, hp) not in tn_upstreams:
+            tn_upstreams[(h2, hp)] = _upstream_block(f"pcdn_tn_{sid}_{len(tn_upstreams)}", hp, h2)
         return tn_upstreams[(h2, hp)]
+
+    # F1/F11: give IP-literal pool members keepalive upstreams and session affinity. For every pool
+    # of this tunnel site, render (deterministically named, separate from tn_upstream's counter) a
+    # keepalive upstream per IP-literal member for each keepalive-capable protocol the tunnel uses,
+    # and record the names on the pool origins so tunnelUpstream() in njs returns the upstream name
+    # for the member it picks. Hostname members keep the request-time resolver path.
+    pool_names = sorted(pools)
+    if tunnel:
+        kinds = {p["protocol"] for p in tunnel["paths"]}
+        need_h2 = bool(kinds & {"grpc", "h2"})
+        need_h1 = "xhttp" in kinds
+        for pi, pname in enumerate(pool_names):
+            for oi, o in enumerate(pools[pname]["origins"]):
+                if not IP_LITERAL.match(o["hp"].rsplit(":", 1)[0]):
+                    o["up"] = None
+                    continue
+                up = {"h1": None, "h2": None}
+                base = f"pcdn_tn_{sid}_p{pi}_{oi}"
+                if need_h2:
+                    up["h2"] = _upstream_block(base + "_h2", o["hp"], True)
+                if need_h1:
+                    up["h1"] = _upstream_block(base, o["hp"], False)
+                o["up"] = up if (up["h1"] or up["h2"]) else None
 
     def tunnel_loc(p, proto, pool, target):
         """One `location ^~ <path>` for a tunnel path; host defaults: proto / pool / target."""
         kind, idle = p["protocol"], tunnel["idle_timeout"]
         grpc = kind in ("grpc", "h2")
         keepalive_ok = kind in ("xhttp", "grpc", "h2")  # upgraded (ws) connections are never reused
+        h2buf = kind in ("grpc", "h2", "xhttp")          # HTTP/2 body path (F3)
+        resolved = False   # dest resolved at request time via the nginx resolver
         L = [f"set $pcdn_tn {kind};"]
-        if tunnel["allowed_countries"]:
+        # F13: count only the session-opening request against limit_conn. ws/grpc/h2 sessions and
+        # streams each open one; xhttp counts only the downlink GET ($pcdn_tn_isget), so packet-up
+        # POSTs do not consume a slot and the limit refuses new sessions instead of tearing down old.
+        L.append("set $pcdn_tn_ckey " + ("$pcdn_tn_isget;" if kind == "xhttp" else "$pcdn_site;"))
+        if tunnel["allowed_countries"] and geo_ok:  # F9: no gate at all without a GeoIP DB
             L.append(f"if ($pcdn_tcc_{sid} = 0) {{ return 403; }}")
         o = p["origin"]
         if o:
@@ -599,32 +709,58 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
                 dest = tn_upstream(o["hp"], grpc)
             else:
                 L.append(f"set $pcdn_tn_target {_q(o['hp'])};")  # variable: resolved at request time
-                dest = "$pcdn_tn_target"
+                dest, resolved = "$pcdn_tn_target", not o["ip"]
         elif p["pool"]:
             tls, sni, verify = pools[p["pool"]]["protocol"] == "https", "$host", bool(sslo.get("origin_verify"))
-            L += [f"set $pcdn_tn_pool {_q(p['pool'])};", "set $pcdn_tn_target $pcdn_tn_upstream;"]
-            dest = "$pcdn_tn_target"
+            # F1: prefix + pool set before $pcdn_tn_target so the js_set tunnelUpstream (lazy, cached
+            # on first reference) sees them; xhttp/h2 then stick every request of a session to one
+            # origin via a rendezvous hash on the session id parsed out of the path.
+            L += [f"set $pcdn_tn_pool {_q(p['pool'])};", f"set $pcdn_tn_prefix {_q(p['path'])};",
+                  "set $pcdn_tn_target $pcdn_tn_upstream;"]
+            dest, resolved = "$pcdn_tn_target", True
+        elif pool:
+            # F1: a host that inherits a pool must route its tunnel paths through the tunnel picker
+            # (affinity + keepalive), not the web balancer ($pcdn_target), which splits sessions.
+            tls, sni, verify = pools[pool]["protocol"] == "https", "$host", bool(sslo.get("origin_verify"))
+            L += [f"set $pcdn_tn_pool {_q(pool)};", f"set $pcdn_tn_prefix {_q(p['path'])};",
+                  "set $pcdn_tn_target $pcdn_tn_upstream;"]
+            dest, resolved = "$pcdn_tn_target", True
         else:
             tls, sni, verify = proto == "https", "$host", bool(sslo.get("origin_verify"))
             host_addr = (target or "").rsplit(":", 1)[0]
-            dest = tn_upstream(target, grpc) if not pool and keepalive_ok and IP_LITERAL.match(host_addr) else "$pcdn_target"
+            if keepalive_ok and IP_LITERAL.match(host_addr):
+                dest = tn_upstream(target, grpc)
+            else:
+                dest, resolved = "$pcdn_target", True
+        # N4: IPv6-only tunnel origins are unreachable through the http-level ipv6=off resolver; on a
+        # node that listens on IPv6 (has v6 egress), enable AAAA for the request-time-resolved path
+        # only, leaving proxied web origins on the IPv4-only resolver.
+        if resolved and v6:
+            L.append(f"resolver {resolver} valid=300s;")
         if tunnel["max_connections"]:
-            L.append(f"limit_conn pcdn_tn_site {tunnel['max_connections']};")
+            L.append(f"limit_conn pcdn_tn_site2 {tunnel['max_connections']};")
         if tunnel["max_connections_per_ip"]:
-            L.append(f"limit_conn pcdn_tn_ip {tunnel['max_connections_per_ip']};")
+            L.append(f"limit_conn pcdn_tn_ip2 {tunnel['max_connections_per_ip']};")
         L.append("limit_conn_status 429;")
-        if rps > 0:
-            L.append("limit_req_dry_run on;")  # the legacy per-IP request limit is not for streams
+        # F40: the legacy per-IP limit_req is skipped on tunnel paths via the empty $pcdn_rl_key
+        # (see pcdn-base.conf); no limit_req_dry_run needed and no shared-memory lock is taken.
         # tunnel.per_connection_mbps is not rendered: nginx 1.24 resets limit_rate to 0 for
         # unbuffered proxying (proxy_buffering off, every grpc_pass) and never applies it to
         # upgraded (101) connections, where a limit_rate delay on the 101 response even makes
         # nginx miss the client's close. See docs/EDGE.md.
-        L += ["client_max_body_size 0;", f"client_body_timeout {idle}s;", f"send_timeout {idle}s;",
-              "tcp_nodelay on;", "gzip off;", "brotli off;"]
+        L += ["client_max_body_size 0;"]
+        if h2buf:  # F3: raise per-stream in-flight upload capacity above the 64k default window
+            L.append(f"client_body_buffer_size {h2_buf};")
+        L += [f"client_body_timeout {idle}s;", f"send_timeout {idle}s;",
+              "tcp_nodelay on;", "gzip off;", "brotli off;",
+              f"http2_chunk_size {relay_buf};"]  # F14: larger client-facing HTTP/2 DATA frames
         if grpc:
             L += req_hdrs("grpc_set_header", conn=())
             L += [f"grpc_read_timeout {idle}s;", f"grpc_send_timeout {idle}s;", "grpc_socket_keepalive on;",
-                  "grpc_next_upstream off;", "grpc_intercept_errors off;"]
+                  f"grpc_buffer_size {relay_buf};",  # F14
+                  # F28: allow the safe connect-failure failover (a stream is still never replayed)
+                  "grpc_next_upstream error timeout;", "grpc_next_upstream_tries 2;",
+                  "grpc_next_upstream_timeout 15s;", "grpc_intercept_errors off;"]
             if tls:
                 L += ["grpc_ssl_server_name on;", f"grpc_ssl_name {sni};"]
                 if verify:
@@ -636,8 +772,11 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
                 ("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))
             L += ["proxy_http_version 1.1;"] + req_hdrs("proxy_set_header", conn)
             L += ["proxy_buffering off;", "proxy_request_buffering off;", "proxy_cache off;",
+                  f"proxy_buffer_size {relay_buf};",  # F14
                   f"proxy_read_timeout {idle}s;", f"proxy_send_timeout {idle}s;", "proxy_socket_keepalive on;",
-                  "proxy_next_upstream off;", "proxy_intercept_errors off;"]
+                  # F28: allow the safe connect-failure failover (a stream is still never replayed)
+                  "proxy_next_upstream error timeout;", "proxy_next_upstream_tries 2;",
+                  "proxy_next_upstream_timeout 15s;", "proxy_intercept_errors off;"]
             if tls:
                 L += ["proxy_ssl_server_name on;", f"proxy_ssl_name {sni};"]
                 L += (["proxy_ssl_verify on;", f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
@@ -665,16 +804,35 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
             s.append(f"    ssl_certificate {cfg['NGINX_DIR']}/certs/{sid}.crt;")
             s.append(f"    ssl_certificate_key {cfg['NGINX_DIR']}/certs/{sid}.key;")
         s.append(f"    server_name {name};")
-        s.append(f"    access_log {cfg['ACCESS_LOG']} pcdn;")
+        # F23: buffer the access log so a tunnel stream/packet request does not write an unbuffered
+        # line from the worker event loop; flush often enough that usage accounting barely lags.
+        s.append(f"    access_log {cfg['ACCESS_LOG']} pcdn buffer=64k flush=1s;")
         s.append(f"    set $pcdn_site {sid};")
         s.append("    location = /__pcdn/health { access_log off; return 200 \"ok\\n\"; }")
+        if tunnel and status not in ("suspended", "over_quota"):
+            # F27/N2: raise the client-facing HTTP/2 connection timers for tunnel hosts so idle
+            # tunnels are not closed after 75 s and stream-heavy XHTTP/gRPC connections are not
+            # forced to GOAWAY + reconnect at the 100000-stream cap. Bounded, not unlimited.
+            kreq = _int(cfg.get("TUNNEL_KEEPALIVE_REQUESTS"), 10000000, 1000, 2 ** 31 - 1)
+            s.append("    keepalive_timeout 600s;")
+            s.append("    keepalive_time 6h;")
+            s.append(f"    keepalive_requests {kreq};")
+            s.append(f"    send_timeout {min(tunnel['idle_timeout'], 300)}s;")
+            if fallback in ("decoy", "404") and ssl:
+                # F14: pure-tunnel hosts favour throughput over TLS first-byte latency
+                s.append(f"    ssl_buffer_size {relay_buf};")
 
         if status in ("suspended", "over_quota"):
             page = "suspended.html" if status == "suspended" else "over_quota.html"
-            s.append(f"    root {cfg['PAGES_DIR']};")
-            s.append(f"    error_page 503 /{page};")
-            s.append(f"    location = /{page} {{ internal; add_header Cache-Control no-store always; }}")
-            s.append("    location / { return 503; }")
+            # F35: cheap, rate-limited, body-less 503 on tunnel path prefixes so reconnect storms
+            # cost neither an access-log line nor an HTML page read. error_page is scoped to
+            # `location /` so only the browser-facing catch-all serves the localized page.
+            for cp in cut_paths:
+                s.append(f"    location ^~ {_q(cp)} {{ access_log off; "
+                         f"limit_req zone=pcdn_cut burst=5 nodelay; limit_req_status 503; return 503; }}")
+            s.append(f"    location = /{page} {{ internal; root {cfg['PAGES_DIR']}; "
+                     f"add_header Cache-Control no-store always; }}")
+            s.append(f"    location / {{ error_page 503 /{page}; return 503; }}")
             s.append("}")
             out.append("\n".join(s))
             continue
@@ -688,11 +846,14 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         # security verdict (njs): firewall, hotlink, rate limits, DDoS challenge, WAF
         s.append("    if ($pcdn_verdict !~ \"^(?:ok|log:)\") { rewrite ^ /__pcdn/deny/$pcdn_verdict? last; }")
         if sslo.get("force_https") and ssl:
-            s.append("    if ($scheme = http) { return 301 https://$host$request_uri; }")
+            if force_https_tn:  # F34: redirect http, but never tunnel-path requests
+                s.append(f"    if ($pcdn_httpredir_{sid}) {{ return 301 https://$host$request_uri; }}")
+            else:
+                s.append("    if ($scheme = http) { return 301 https://$host$request_uri; }")
         if image_on:
             s.append("    if ($pcdn_img_w) { rewrite ^ /__pcdn/img$uri last; }")
         if rps > 0:
-            s.append(f"    limit_req zone=pcdn_rl_{sid} burst={rps * 2} nodelay;")
+            s.append(f"    limit_req zone=pcdn_rlk_{sid} burst={rps * 2} nodelay;")
             s.append("    limit_req_status 429;")
         s.append("    proxy_ssl_server_name on;")
         s.append("    proxy_ssl_name $host;")
@@ -807,6 +968,75 @@ def render_all(config: dict, cfg: dict) -> dict:
     return files
 
 
+CONFVER_MARKER = "__PCDN_CONFVER__"
+
+
+def tree_digest(files: dict) -> str:
+    """Order-independent digest of a rendered tree (F20/F29). Rendering is deterministic (sites.js
+    uses sort_keys; decoy {{YEAR}} shifts once a year), so an identical config produces an identical
+    digest and the agent can skip the write/test/reload."""
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        h.update(rel.encode() + b"\0" + files[rel].encode() + b"\0")
+    return h.hexdigest()
+
+
+def render_tree(config: dict, cfg: dict) -> tuple[dict, str]:
+    """Rendered files plus the tree digest. The digest is computed over the tree while http.conf
+    still carries the CONFVER_MARKER placeholder (F29: the digest must not depend on itself), then
+    substituted into the /__pcdn/confver endpoint so the agent can verify the reload took effect."""
+    files = render_all(config, cfg)
+    digest = tree_digest(files)
+    if "http.conf" in files:
+        files["http.conf"] = files["http.conf"].replace(CONFVER_MARKER, digest)
+    return files, digest
+
+
+def _group_digests(files: dict, pattern: str) -> dict:
+    """Per-site digests of the rendered files whose path matches `pattern` (F21)."""
+    groups: dict = {}
+    for rel in sorted(files):
+        m = re.match(pattern, rel)
+        if m:
+            groups.setdefault(m.group(1), []).append(rel)
+    return {sid: tree_digest({rel: files[rel] for rel in rels}) for sid, rels in groups.items()}
+
+
+def site_digests(files: dict) -> dict:
+    """Per-site content digest (config + certs + error pages) for group-aware reload deferral (F21)."""
+    return _group_digests(files, r"^(?:sites|certs|errors)/(\d+)")
+
+
+def cert_digests(files: dict) -> dict:
+    """Per-site certificate/key digest, so a foreign-group site's cert rotation is never deferred."""
+    return _group_digests(files, r"^certs/(\d+)\.")
+
+
+def global_digest(files: dict) -> str:
+    """Digest of the node-global rendered files (base http.conf + njs module): any change here
+    affects every site and must not be deferred (F21)."""
+    return tree_digest({k: files[k] for k in ("http.conf", "js/pcdn.js") if k in files})
+
+
+def verify_reload(cfg: dict, digest: str) -> bool:
+    """Poll /__pcdn/confver (localhost) until it returns the digest of the tree just written, or the
+    RELOAD_VERIFY budget expires (F29). A reload the nginx master rejected keeps serving the old
+    digest, so the caller can retry instead of recording the config as applied."""
+    port = _int(cfg.get("HTTP_PORT"), 80, 1, 65535)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + 10
+    url = f"http://127.0.0.1:{port}/__pcdn/confver"
+    while time.monotonic() < deadline:
+        try:
+            with opener.open(url, timeout=2) as r:
+                if r.read().decode("utf-8", "replace").strip() == digest:
+                    return True
+        except Exception:  # noqa: BLE001 - connection refused mid-reload etc.: keep polling
+            pass
+        time.sleep(0.3)
+    return False
+
+
 # ----------------------------------------------------------------- apply
 
 def run(cmd: str) -> tuple[int, str]:
@@ -842,13 +1072,16 @@ def ensure_cache_dirs(config: dict, cfg: dict):
             shutil.rmtree(os.path.join(base, name), ignore_errors=True)
 
 
-def apply_config(config: dict, cfg: dict) -> str | None:
-    """Atomically swap the rendered tree in; roll back if nginx rejects it."""
+def apply_config(config: dict, cfg: dict, files: dict | None = None, digest: str | None = None) -> str | None:
+    """Atomically swap the rendered tree in; roll back if nginx rejects it. `files`/`digest` may be
+    passed pre-rendered (F20/F29) to avoid a second render; otherwise they are rendered here."""
     root = cfg["NGINX_DIR"].rstrip("/")
     new, old = root + ".new", root + ".old"
     shutil.rmtree(new, ignore_errors=True)
     shutil.rmtree(old, ignore_errors=True)
-    write_tree(new, render_all(config, cfg))
+    if files is None:
+        files, digest = render_tree(config, cfg)
+    write_tree(new, files)
     ensure_cache_dirs(config, cfg)
 
     had_old = os.path.exists(root)
@@ -865,6 +1098,10 @@ def apply_config(config: dict, cfg: dict) -> str | None:
     shutil.rmtree(old, ignore_errors=True)
     if code != 0:
         return "nginx reload failed: " + output[-1500:]
+    # F29: confirm the master actually applied the new tree (a rejected reload keeps the old one).
+    if digest and str(cfg.get("RELOAD_VERIFY", "yes")).lower() in ("1", "yes", "true", "on"):
+        if not verify_reload(cfg, digest):
+            return "nginx reload not applied (see error.log)"
     return None
 
 
@@ -872,7 +1109,8 @@ def bootstrap(cfg: dict):
     """Empty tree so nginx can start before the first successful sync."""
     root = cfg["NGINX_DIR"].rstrip("/")
     if not os.path.exists(os.path.join(root, "http.conf")):
-        write_tree(root, render_all({"sites": []}, cfg))
+        files, _ = render_tree({"sites": []}, cfg)
+        write_tree(root, files)
     os.makedirs(cfg["CACHE_DIR"], exist_ok=True)
 
 
@@ -1097,33 +1335,66 @@ def _account_tunnel(a: dict, e: dict, proto: str, code: int):
         t["seconds"] += max(0.0, float(e.get("rt") or 0))
     except (TypeError, ValueError):
         pass
-    up = max(int(e.get("bu") or 0), _nsum(e.get("ub")))
+    # F37: $request_length ($bu) already counts the request head + body the client sent. Only
+    # ws/httpupgrade omit post-101 upgrade frames from it, so only those consult $upstream_bytes_sent
+    # ($ub); for grpc/h2/xhttp bill $bu and drop the edge-injected header delta / retry re-sends.
+    bu = int(e.get("bu") or 0)
+    up = max(bu, _nsum(e.get("ub"))) if proto in ("ws", "httpupgrade") else (bu or max(bu, _nsum(e.get("ub"))))
     down = int(e.get("b") or 0)
     t["bytes_up"] += up
     t["bytes_down"] += down
     _inc(t["by_protocol"], proto, up + down)
 
 
-def _consume(path: str, pos: int, state: dict, max_bytes: int) -> int:
-    """Aggregate complete lines from path starting at pos; returns the new position."""
-    with open(path, "rb") as f:
-        f.seek(pos)
-        chunk = f.read(max_bytes)
-    end = chunk.rfind(b"\n")
-    if end < 0:
-        return pos
+def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float | None = None) -> int:
+    """Aggregate complete lines from path starting at pos with O(line) memory (F24); returns the new
+    position. Stops after max_bytes or the time budget, so a huge backlog is drained over ticks
+    instead of held in RAM 2-3x on one thread. A partial trailing line is left for the next read."""
     pending = state.setdefault("pending", {})
     events = state.setdefault("events", [])
-    for raw in chunk[: end + 1].splitlines():
-        try:
-            _account(json.loads(raw), pending, events)
-        except (ValueError, KeyError, TypeError, AttributeError):
-            continue
-    return pos + end + 1
+    read = 0
+    with open(path, "rb", buffering=1 << 20) as f:
+        f.seek(pos)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break  # partial line at EOF: re-read it next time
+            pos += len(raw)
+            read += len(raw)
+            try:
+                _account(json.loads(raw), pending, events)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
+            if read >= max_bytes or (deadline is not None and time.monotonic() > deadline):
+                break
+    return pos
 
 
-def read_usage(state: dict, log_path: str, max_bytes: int = 200 * 1024 * 1024) -> None:
+def _drain_rotated(state: dict, log_path: str, max_bytes: int, deadline: float | None) -> bool:
+    """Drain the rotated (.1) file recorded in state across ticks (F24). Returns True while more of
+    it remains (so the caller can defer the live file to the next tick)."""
+    rotated = log_path + ".1"
+    try:
+        rst = os.stat(rotated)
+    except (FileNotFoundError, OSError):
+        state.pop("rot_inode", None), state.pop("rot_pos", None)
+        return False
+    if rst.st_ino != state.get("rot_inode"):
+        state.pop("rot_inode", None), state.pop("rot_pos", None)
+        return False
+    newpos = _consume(rotated, int(state.get("rot_pos", 0)), state, max_bytes, deadline)
+    if newpos >= rst.st_size:  # fully drained
+        state.pop("rot_inode", None), state.pop("rot_pos", None)
+        return False
+    state["rot_pos"] = newpos
+    return True
+
+
+def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, time_budget: float = 5.0) -> None:
     """Consume new access-log lines and merge them into state['pending'] / state['events']."""
+    deadline = time.monotonic() + time_budget
+    # finish any rotated file still being drained from an earlier tick before touching the live file
+    if state.get("rot_inode") is not None and _drain_rotated(state, log_path, max_bytes, deadline):
+        return
     try:
         st = os.stat(log_path)
     except FileNotFoundError:
@@ -1131,17 +1402,13 @@ def read_usage(state: dict, log_path: str, max_bytes: int = 200 * 1024 * 1024) -
     pending = state.setdefault("pending", {})
     pos = state.get("log_pos", 0)
     if state.get("log_inode") not in (None, st.st_ino):
-        # logrotate moved the file: finish the old one (now .1) before starting the new one
-        rotated = log_path + ".1"
-        try:
-            if os.stat(rotated).st_ino == state["log_inode"]:
-                _consume(rotated, pos, state, max_bytes)
-        except FileNotFoundError:
-            pass
+        # logrotate moved the file: record the old one (now .1) to drain across ticks, start new at 0
+        state["rot_inode"], state["rot_pos"] = state["log_inode"], pos
         pos = 0
+        _drain_rotated(state, log_path, max_bytes, deadline)
     elif st.st_size < pos:
         pos = 0  # truncated
-    state["log_pos"] = _consume(log_path, pos, state, max_bytes)
+    state["log_pos"] = _consume(log_path, pos, state, max_bytes, deadline)
     state["log_inode"] = st.st_ino
     if len(pending) > 50000:  # controller unreachable for a long time: keep newest
         for k in sorted(pending, key=lambda k: k.split("|")[1])[: len(pending) - 50000]:
@@ -1347,6 +1614,41 @@ def net_sample(cfg: dict) -> tuple[float, tuple[int, int] | None]:
                                        cfg.get("PROC_NET_DEV", "/proc/net/dev"))
 
 
+def count_draining_workers(proc: str = "/proc") -> int:
+    """Count nginx worker processes still draining after a reload (F5/F6). Each reload leaves a
+    generation pinned by long-lived tunnels; too many means reloads are outpacing shutdown, which
+    the agent uses for reload back-pressure and reports in the heartbeat."""
+    n = 0
+    try:
+        for pid in os.listdir(proc):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(os.path.join(proc, pid, "cmdline"), "rb") as f:
+                    if b"worker process is shutting down" in f.read():
+                        n += 1
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return n
+
+
+def sockstat_counts(path: str = "/proc/net/sockstat") -> tuple[int, int]:
+    """(TCP inuse, TIME_WAIT) from /proc/net/sockstat (F18). O(1); used to watch outbound ephemeral
+    port pressure toward origins. (0, 0) on error."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("TCP:"):
+                    p = line.split()
+                    d = {p[i]: int(p[i + 1]) for i in range(1, len(p) - 1, 2) if p[i + 1].lstrip("-").isdigit()}
+                    return d.get("inuse", 0), d.get("tw", 0)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0, 0
+
+
 def collect_metrics(cfg: dict, prev: tuple | None, cur: tuple | None = None) -> dict:
     """Heartbeat metrics from two net samples (see net_sample). Never raises; missing values are 0."""
     m = {"rx_mbps": 0.0, "tx_mbps": 0.0, "connections": 0, "load1": 0.0, "cpus": 0}
@@ -1374,6 +1676,22 @@ def collect_metrics(cfg: dict, prev: tuple | None, cur: tuple | None = None) -> 
     mem = mem_pct(cfg.get("PROC_MEMINFO", "/proc/meminfo"))
     if mem is not None:
         m["mem_pct"] = mem
+    try:
+        m["draining_workers"] = count_draining_workers(cfg.get("PROC_DIR", "/proc"))  # F5/F6
+    except Exception as e:  # noqa: BLE001
+        log.debug("draining workers: %s", e)
+    try:
+        tcp_inuse, tw = sockstat_counts(cfg.get("PROC_SOCKSTAT", "/proc/net/sockstat"))  # F18
+        m["sock_tcp"], m["sock_tw"] = tcp_inuse, tw
+        lo, hi = 10240, 65535  # default ephemeral range (not widened; F18 is monitoring-only)
+        rng = cfg.get("PORT_RANGE")
+        if isinstance(rng, (tuple, list)) and len(rng) == 2:
+            lo, hi = int(rng[0]), int(rng[1])
+        span = max(1, hi - lo + 1)
+        if tcp_inuse + tw > 0.7 * span:
+            log.warning("ephemeral TCP usage high: inuse=%d tw=%d (>70%% of %d)", tcp_inuse, tw, span)
+    except Exception as e:  # noqa: BLE001
+        log.debug("sockstat: %s", e)
     return m
 
 
@@ -1448,7 +1766,18 @@ def save_state(path: str, state: dict):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
+        f.flush()
+        try:  # F8: durable across power loss, but a filesystem rejecting fsync must not be fatal
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     os.replace(tmp, path)
+
+
+def _new_batch_id() -> str:
+    """Stable idempotency key for a usage batch (F7): the controller dedups on it, and the agent
+    reuses it on every retry/replay of the same batch (persisted in the outbox)."""
+    return uuid.uuid4().hex
 
 
 def bundle_version(cfg: dict) -> str | None:
@@ -1479,26 +1808,119 @@ class Agent:
         self.last_heartbeat = 0.0
         self.net_prev = None
 
+    def _reload_min_interval(self) -> float:
+        """F5 reload back-pressure: base RELOAD_MIN_INTERVAL, doubled (up to 600 s) while more than
+        2×nproc worker generations are still draining, so reloads never outpace worker shutdown."""
+        base = _int(self.cfg.get("RELOAD_MIN_INTERVAL"), 120, 0, 3600)
+        try:
+            if count_draining_workers(self.cfg.get("PROC_DIR", "/proc")) > 2 * (os.cpu_count() or 1):
+                return min(600, base * 2)
+        except Exception:  # noqa: BLE001
+            pass
+        return base
+
+    def _foreign_defer(self, body: dict, files: dict) -> int:
+        """F21: seconds this change may be deferred because every changed site belongs to another
+        edge group; 0 means apply now. Deferral needs a known node GROUP and per-site edge_group from
+        the controller; a global-file change, an added/removed site, a status change or a cert
+        rotation on any changed site force an immediate apply."""
+        group = self.cfg.get("GROUP")
+        if not group:
+            return 0
+        st = self.state
+        cur, prev = site_digests(files), st.get("site_digests") or {}
+        changed = {sid for sid in set(cur) | set(prev) if cur.get(sid) != prev.get(sid)}
+        if not changed:
+            return 0
+        if global_digest(files) != st.get("global_digest"):
+            return 0
+        groups = {str(int(s["id"])): s.get("edge_group") for s in body.get("sites", [])}
+        statuses = {str(int(s["id"])): s.get("status", "active") for s in body.get("sites", [])}
+        cur_certs, prev_certs = cert_digests(files), st.get("cert_digests") or {}
+        for sid in changed:
+            if groups.get(sid) in (None, group):                       # own or unknown group
+                return 0
+            if statuses.get(sid) in ("suspended", "over_quota"):       # serving/blocking change
+                return 0
+            if cur_certs.get(sid) != prev_certs.get(sid):              # cert rotation
+                return 0
+        return _int(self.cfg.get("FOREIGN_DEFER"), 900, 0, 86400)
+
+    def _store_applied(self, body, files, digest, etag, version, rev):
+        st = self.state
+        st["etag"], st["version"], st["render_rev"] = etag, version, rev
+        st["tree_digest"] = digest
+        st["site_digests"], st["cert_digests"] = site_digests(files), cert_digests(files)
+        st["global_digest"] = global_digest(files)
+        for k in ("pending_version", "pending_since"):
+            st.pop(k, None)
+        st["last_reload"] = time.monotonic()
+
     def sync_config(self):
+        cfg, st = self.cfg, self.state
+        rev = render_rev(cfg)
+        root = cfg["NGINX_DIR"].rstrip("/")
+        first_boot = not os.path.isfile(os.path.join(root, "http.conf"))
         headers = {}
-        rev = render_rev(self.cfg)
-        if self.state.get("etag") and os.path.isdir(self.cfg["NGINX_DIR"]) and self.state.get("render_rev") == rev:
-            headers["If-None-Match"] = self.state["etag"]
+        # While a version is pending we re-fetch the full config each poll so we always apply the
+        # newest one (F5); the ETag is only used once everything has settled and applied cleanly.
+        if (st.get("etag") and os.path.isdir(root) and st.get("render_rev") == rev
+                and not st.get("pending_version") and not st.get("last_error")):
+            headers["If-None-Match"] = st["etag"]
         code, hdrs, body = self.ctl.call("GET", "/edge/v1/config", headers=headers)
         if code == 304:
             return
-        err = apply_config(body, self.cfg)
-        self.state["last_error"] = err
-        if err:
-            log.error(err)
-            self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
-                                                                  error=err))
+        version = body["version"]
+        etag = hdrs.get("ETag") or hdrs.get("etag")
+        files, digest = render_tree(body, cfg)
+        now = time.monotonic()
+
+        # F20: an identical rendered tree needs no write/test/reload (covers controller version bumps
+        # for fields the agent never renders, and agent upgrades that change nothing).
+        if (digest == st.get("tree_digest") and os.path.isfile(os.path.join(root, "http.conf"))
+                and not st.get("last_error")):
+            ensure_cache_dirs(body, cfg)
+            st["etag"], st["version"], st["render_rev"] = etag, version, rev
+            for k in ("pending_version", "pending_since"):
+                st.pop(k, None)
+            self._report(version, None)
             return
-        self.state["etag"] = hdrs.get("ETag") or hdrs.get("etag")
-        self.state["version"] = body["version"]
-        self.state["render_rev"] = rev
-        log.info("applied config %s (%d sites)", body["version"][:12], len(body.get("sites", [])))
-        self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=body["version"], error=None))
+
+        def apply_now():
+            err = apply_config(body, cfg, files, digest)
+            st["last_error"] = err
+            if err:
+                log.error(err)
+                self._report(st.get("version"), err)   # keep etag unset so the next poll retries
+                return
+            self._store_applied(body, files, digest, etag, version, rev)
+            log.info("applied config %s (%d sites)", version[:12], len(body.get("sites", [])))
+            self._report(version, None)
+
+        if first_boot or bool(body.get("urgent")):   # bootstrap / security-relevant: apply at once
+            return apply_now()
+
+        # F5 coalescing: hold a freshly-seen version until it settles (unchanged across two polls) or
+        # has been pending for RELOAD_MIN_INTERVAL, and never reload more often than that interval.
+        settled = st.get("pending_version") == version
+        if not settled:
+            st["pending_version"], st["pending_since"] = version, now
+        age = now - st.get("pending_since", now)
+        min_interval = self._reload_min_interval()
+        debounce = _int(cfg.get("RELOAD_DEBOUNCE"), 5, 0, 3600)
+        if age < debounce or not (settled or age >= min_interval):
+            return
+        if now - st.get("last_reload", 0) < min_interval:
+            return
+        defer = self._foreign_defer(body, files)   # F21
+        if defer and age < defer:
+            log.info("deferring foreign-group config %s (%.0fs/%ds)", version[:12], age, defer)
+            self._report(st.get("version"), st.get("last_error"))   # heartbeat during the deferral
+            return
+        apply_now()
+
+    def _report(self, version, error):
+        self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=version, error=error))
 
     def sync_purges(self):
         after = int(self.state.get("purge_id", 0))
@@ -1513,22 +1935,52 @@ class Agent:
             log.info("purge %s %s -> %d entries", it["domain"], what, n)
             self.state["purge_id"] = it["id"]
 
-    def push_usage(self):
-        read_usage(self.state, self.cfg["ACCESS_LOG"])
+    def _enqueue_usage(self):
+        """Move newly-read pending usage / events into the persisted outbox (F7): each entry gets a
+        stable batch_id that is reused on every retry, so a timed-out or replayed POST is deduped by
+        the controller instead of double-billing."""
         pending = self.state.setdefault("pending", {})
         events = self.state.setdefault("events", [])
-        keys = list(pending)
-        # batches respect the controller limits; anything not acknowledged stays for the next try
-        while keys or events:
-            batch, keys = keys[:MAX_ITEMS], keys[MAX_ITEMS:]
-            evs = events[:MAX_EVENTS]
-            body = {"items": [usage_item(k, pending[k]) for k in batch]}
-            if evs:
-                body["events"] = evs
-            self.ctl.call("POST", "/edge/v1/usage", body)
-            for k in batch:
-                del pending[k]
-            del events[: len(evs)]
+        if not pending and not events:
+            return
+        outbox = self.state.setdefault("outbox", [])
+        keys, evs = list(pending), list(events)
+        now = time.time()
+        while keys or evs:
+            bk, keys = keys[:MAX_ITEMS], keys[MAX_ITEMS:]
+            be, evs = evs[:MAX_EVENTS], evs[MAX_EVENTS:]
+            entry = {"id": _new_batch_id(), "ts": now, "items": [usage_item(k, pending[k]) for k in bk], "events": be}
+            outbox.append(entry)
+        pending.clear()
+        del events[:]
+
+    def push_usage(self):
+        read_usage(self.state, self.cfg["ACCESS_LOG"])
+        self._enqueue_usage()
+        # F8: persist the outbox (with its batch_ids and the advanced log_pos) BEFORE the first POST,
+        # so a crash or restart replays the SAME batch rather than a different one. A save failure is
+        # non-fatal (skip pushing this tick) so state persistence issues never kill the agent.
+        try:
+            save_state(self.cfg["STATE_FILE"], self.state)
+        except OSError as e:
+            log.error("state save before usage push failed, skipping push: %s", e)
+            return
+        outbox = self.state.setdefault("outbox", [])
+        max_age = _int(self.cfg.get("USAGE_OUTBOX_MAX_DAYS"), 6, 1, 60) * 86400
+        now, kept = time.time(), []
+        for e in outbox:
+            if now - e.get("ts", now) > max_age:   # bound by the controller's dedup retention window
+                log.warning("dropping usage batch %s older than %d days", e.get("id"), max_age // 86400)
+                continue
+            kept.append(e)
+        outbox[:] = kept
+        timeout = _int(self.cfg.get("USAGE_TIMEOUT"), 150, 10, 600)
+        for entry in list(outbox):
+            body = {"batch_id": entry["id"], "items": entry["items"]}
+            if entry["events"]:
+                body["events"] = entry["events"]
+            self.ctl.call("POST", "/edge/v1/usage", body, timeout=timeout)   # retries reuse batch_id
+            outbox.remove(entry)
 
     def metrics(self) -> dict:
         """Current load; the first call measures the network rate over one second."""
@@ -1547,7 +1999,7 @@ class Agent:
     def _hb(self, **over) -> dict:
         """Base heartbeat body: bundle version + (when configured) region/role, so a fresh node
         self-registers into the right pool (SPEC §11.1). Overrides fill applied_version/error/metrics."""
-        body: dict = {"bundle_version": bundle_version(self.cfg)}
+        body: dict = {"bundle_version": bundle_version(self.cfg), "geoip": geoip_present(self.cfg)}
         if self.cfg.get("REGION"):
             body["region"] = self.cfg["REGION"]
         if self.cfg.get("GROUP"):
@@ -1589,7 +2041,10 @@ class Agent:
                 self.last_usage = time.time()
             except Exception as e:  # noqa: BLE001 - pending usage stays in state for next try
                 log.error("usage push failed: %s", e)
-        save_state(self.cfg["STATE_FILE"], self.state)
+        try:  # F8: a persistence failure must not exit the process (systemd would restart-and-replay)
+            save_state(self.cfg["STATE_FILE"], self.state)
+        except OSError as e:
+            log.error("state save failed: %s", e)
 
     def loop(self):
         while self.running:

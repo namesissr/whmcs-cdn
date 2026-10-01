@@ -1,0 +1,11 @@
+[Unit]
+Description=Pasargad CDN GeoIP database retry (downloads only when the DB is missing)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# F9: retry the download while the country database is absent so an edge that came up without it
+# (failed first download) stops fail-opening allowed_countries as soon as the DB lands. Exits early
+# (no download) when the file already exists.
+ExecStart=/usr/local/sbin/pcdn-geoip-update --if-missing
