@@ -754,3 +754,44 @@ the controller's probe measures reachability from the controller, so it does not
   address, edit/rename it, enable/disable it for maintenance, and remove an additional one; correcting
   the primary uses the existing edit-node form. Persian UI. This is address management + visibility of
   the automatic health-based failover — there is NO "force this IP now" control.
+
+## 13. Observability, audit & operations (wave 5)
+
+Goal: make the platform observable and auditable, and finish the operator documentation. No
+anti-filtering scope. Controller code English; operator/UI text Persian.
+
+### 13.1 Prometheus metrics
+- `GET /metrics` on the controller: Prometheus text format, exposing NO secrets or per-customer
+  identifiers — platform aggregates only: edges total/online/shed/probe_failing; sites total and by
+  effective_status; ssl by status + certs expiring ≤ ALERT_CERT_DAYS; dns last-sync age + error count;
+  scheduler last-run age per job; usage batches ingested (counter); active alerts (gauge); backup
+  last-success age. Auth: if `METRICS_TOKEN` is set, require `Authorization: Bearer <token>`; otherwise
+  the endpoint is open (intended for an internal scrape network). Never lists domains, IPs, tokens.
+
+### 13.2 Audit log
+- `audit_log` table (migration): `id, at, actor` (admin-key label / customer-key id / "system"),
+  `actor_kind` (admin|capi|system), `action` (e.g. site.create, site.plan, site.delete, edge.add,
+  edge.rotate, edge.patch, edge.delete, edge.address.add/del, purge, reseller.flag, reseller.rate,
+  tunnel.enable_existing), `target` (domain/edge name/…), `detail` (JSON, no secrets), `ip`.
+- Admin and customer-API **mutations** are recorded (writes only; reads are not). Secrets, tokens and
+  private keys are never stored in `detail`.
+- `GET /api/v1/audit?limit=&since=&action=&actor=` (admin) returns recent entries newest-first.
+- A scheduler job prunes entries older than `AUDIT_RETENTION_DAYS` (default 90).
+
+### 13.3 Operations
+- `manage backup-verify`: restore the most recent backup into a throwaway database and assert the
+  schema/head and row sanity, so backups are known-restorable. Documented in OPERATIONS.md.
+- A security hardening checklist (docs/SECURITY.md).
+
+### 13.4 Documentation (Persian)
+- `docs/ARCHITECTURE.md` — components (controller, edges, PowerDNS/GeoDNS, Caddy, WHMCS), request &
+  data flow, ports, trust boundaries, tunnel path, HA.
+- `docs/DISASTER_RECOVERY.md` — controller loss, node loss, PostgreSQL restore, encryption-key and
+  PDNS-key handling, DNS failover, step-by-step with the `manage` commands.
+- `docs/SECURITY.md` — hardening checklist (secrets, network, tokens, TLS, backups, least privilege).
+- README gains a short architecture summary + links to the above.
+
+### 13.5 WHMCS admin
+- An «حسابرسی» (audit) page surfacing `GET /api/v1/audit` with filters (action/actor/time), Persian UI.
+- A health panel summarising `GET /healthz/deep` and the key `/metrics` numbers (edges online, ssl
+  expiring, dns sync, backup age) with clear OK/warn colouring.
