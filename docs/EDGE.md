@@ -172,12 +172,19 @@ location ^~ "/my-secret-service" {
   under a tunnel path (`tunnel_paths` in `sites.js`, same prefix test as nginx on the normalised
   `$uri`). The legacy `rate_limit_rps` `limit_req` runs in `limit_req_dry_run` mode there. No
   cache, no response header rules / HSTS / `X-Served-By`, no image rewrite, no gzip/brotli,
-  `proxy_intercept_errors off`, `proxy_next_upstream off` (a stream is never replayed).
-* **Limits.** `limit_conn_zone $pcdn_site` (`pcdn_tn_site`, `tunnel.max_connections`) and
-  `$pcdn_site|$binary_remote_addr` (`pcdn_tn_ip`, `max_connections_per_ip`) are shared zones
-  whose keys include the site id, so sites never share counters. Both count concurrent
-  requests: a WebSocket/HTTPUpgrade session, one gRPC/h2 stream (not one TCP connection), one
-  XHTTP request. Over the limit → 429.
+  `proxy_intercept_errors off`. On a **connect** failure only, tunnel origins fail over to the next
+  peer — `proxy_next_upstream error timeout` / `grpc_next_upstream error timeout`, `*_tries 2`,
+  `*_timeout 15s`; never `non_idempotent` or `http_5xx`, so an in-flight stream is still never
+  replayed (F28). This is a no-op for a single-peer target (one host:port, `max_fails=0`).
+* **Limits.** `limit_conn_zone $pcdn_tn_ckey` (`pcdn_tn_site2`, `tunnel.max_connections`) and
+  `$pcdn_tn_ipkey` = `$pcdn_tn_ckey|$binary_remote_addr` (`pcdn_tn_ip2`, `max_connections_per_ip`)
+  are shared zones whose keys include the site id, so sites never share counters. They count
+  concurrent tunnel **sessions**, not every request (F13): a WebSocket/HTTPUpgrade session and each
+  gRPC/h2 stream count one; for XHTTP only the downlink GET is keyed (`$pcdn_tn_ckey =
+  $pcdn_tn_isget`), so a packet-up POST consumes no slot and reaching the limit refuses a *new*
+  session instead of tearing down an established one. Over the limit → 429. (The zone names carry a
+  `2` suffix because nginx refuses a reload that changes an existing zone's key — a mismatch
+  `nginx -t` does not catch.)
 * **per_connection_mbps is not enforced on nginx 1.24.** nginx resets `limit_rate` to 0 for
   unbuffered responses (`proxy_buffering off` and every `grpc_pass`, see
   `ngx_http_upstream_send_response`) and never applies it to upgraded connections; worse, a
@@ -198,6 +205,38 @@ location ^~ "/my-secret-service" {
   clients must negotiate HTTP/1.1 (Xray does). Plain port 80 speaks HTTP/1.1 only: gRPC / h2
   paths need a certificate.
 
+## Tunnel data-path tunables (buffers & timeouts)
+
+Buffers and timeouts on the tunnel data path are `agent.conf` keys. Defaults suit a mixed
+general/tunnel node; `install.sh --role tunnel` raises the throughput-oriented ones (it writes
+`SSL_BUFFER_SIZE=16k` and `TUNNEL_H2_BODY_BUFFER=512k`). Raise them on dedicated tunnel nodes with
+spare RAM; lower the per-stream buffer on small nodes.
+
+* `TUNNEL_H2_BODY_BUFFER` (default `256k`, F3): per-stream `client_body_buffer_size` for HTTP/2
+  tunnel uploads (gRPC/h2/XHTTP). The default HTTP/2 window is only 64k, which caps a single
+  stream's in-flight upload at 64 KiB; this raises it. The buffer is allocated per active stream
+  whose body has no `Content-Length`, so cost ≈ concurrent streams × size (≈ 2.5 GB for 10k gRPC
+  streams at 256k). Use `128k` on ≤2 GB nodes. Applied only at tunnel locations, never as a
+  server/http-level `http2_body_preread_size`.
+* `TUNNEL_RELAY_BUFFER` (default `16k`, F14): the relay buffer on the tunnel data path
+  (`proxy_buffer_size` / `grpc_buffer_size` and the location-level `http2_chunk_size`). The old 4k
+  buffers cost about 2.3× the CPU per tunneled byte. Costs about +12k per active TLS connection
+  (freed while idle), ≈ 240 MB per 10k WebSocket sessions.
+* `SSL_BUFFER_SIZE` (default `4k`, F14): the http-level `ssl_buffer_size`. Pure-tunnel hosts (whose
+  `tunnel.fallback` is `decoy` or `404`) additionally get `ssl_buffer_size 16k` in their server
+  block. `--role tunnel` sets this to `16k` node-wide; general web nodes keep `4k` for faster TLS
+  first byte.
+* `TUNNEL_CONNECT_TIMEOUT` (default `10`, clamped 3-30 s, F12): drives **both**
+  `proxy_connect_timeout` and `grpc_connect_timeout` for tunnel origins, so a dead origin fails fast
+  instead of hanging on nginx's 60 s gRPC default. Raise to ~15 on a lossy path.
+* `TUNNEL_KEEPALIVE_REQUESTS` (default `10000000`, N2/F27): client-facing HTTP/2 stream cap per
+  connection, emitted in the tunnel server block only (overriding the http-level
+  `keepalive_requests 100000`). A low value forces a mid-session GOAWAY + reconnect for stream-heavy
+  XHTTP/gRPC tunnels; non-tunnel hosts keep the bounded default.
+
+(`TUNNEL_KEEPALIVE`, default 64, is the number of idle **upstream** keepalive connections kept per
+worker to each IP-literal tunnel origin — see the **Origin** bullet above.)
+
 ## Access log
 
 ```
@@ -214,8 +253,12 @@ head only — frames after the 101 are **not** part of `$request_length`) and `u
 (the upgraded frames **are** counted: nginx takes it from the upstream connection's byte
 counter, which the keepalive module resets on reuse). For a gRPC stream that uploaded 30 000
 bytes, `bu` = 30 141 (HTTP/2 DATA is counted in `$request_length`) and `ub` = 30 275. The agent
-therefore uses `bytes_up = max(bu, sum(ub))` per line (both contain the request head, so adding
-them would double count), `bytes_down = b`.
+therefore sets `bytes_up` per line **by protocol** (F37): `ws` / `httpupgrade` use
+`max(bu, sum(ub))`, because frames after the 101 are not in `$request_length` and only `ub` counts
+them; `grpc` / `h2` / `xhttp` use `bu` alone (`$request_length`), because for those `ub` also counts
+the headers the edge injects toward the origin and any retry re-sends, which would over-bill the
+customer. `bytes_down = b`. The client's own forwarded request head is still billed via
+`$request_length` (unavoidable); only the edge-added header delta is removed.
 
 The agent aggregates tunnel lines (`tn` non-empty) per host-hour into the usage item's optional
 `tunnel` object: `sessions` (lines with status 101 or 2xx), `seconds` (sum of `rt`, rounded per
@@ -278,25 +321,47 @@ at `GET /api/v1/edges/{id}/logs`.
 
 ## System tuning (install.sh, idempotent)
 
-* `/etc/sysctl.d/99-pcdn.conf`: BBR + `fq`, `somaxconn` / `tcp_max_syn_backlog` 65535,
+* `/etc/sysctl.d/999-pcdn.conf` (F30: numbered so it sorts after `99-sysctl.conf`; the old
+  `99-pcdn.conf` is `rm`'d on `--upgrade`): BBR + `fq`, `somaxconn` / `tcp_max_syn_backlog` 65535,
   `netdev_max_backlog` 65536, `tcp_fastopen = 3`, `ip_local_port_range 10240 65535`,
   `tcp_tw_reuse`, `tcp_fin_timeout 15`, `tcp_slow_start_after_idle 0`, `tcp_mtu_probing 1`,
   64 MB `rmem_max`/`wmem_max` and `tcp_rmem`/`tcp_wmem` maxima, `tcp_notsent_lowat 128k`,
   keepalive 300 s / 30 s × 5 (dead VPN peers are noticed; `proxy_socket_keepalive` /
   `grpc_socket_keepalive` use it towards origins), `tcp_no_metrics_save 1` and `tcp_sack 1` so a
   bad congestion window from the lossy cross-border path is not cached onto the next connection,
-  `fs.file-max` / `fs.nr_open` 2 M.
+  `fs.file-max = 9223372036854775807` with `fs.nr_open` left at the systemd default (F31: the old
+  2 M cap sat below systemd's own defaults; the per-process `LimitNOFILE` / `worker_rlimit_nofile`
+  are the real limit). After `sysctl --system`, install.sh reads each key back with `sysctl -n`
+  and prints a `warning:` on any mismatch (e.g. a value overridden by `/etc/sysctl.conf`), and
+  attaches `fq` to the default-route interface immediately when it is single-queue (a multiqueue
+  NIC prints a `warning:` to reboot so `default_qdisc=fq` attaches per hardware queue instead).
   `tcp_bbr` is loaded now and at boot (`/etc/modules-load.d/pcdn-bbr.conf`).
-  `/etc/sysctl.d/99-pcdn-conntrack.conf` (`nf_conntrack_max` 1 M, established timeout 1 day) is
-  written only when conntrack is loaded.
+  `/etc/sysctl.d/999-pcdn-conntrack.conf` (`nf_conntrack_max` 1 M, established timeout 1 day) is
+  written unconditionally, and `nf_conntrack` is pinned at boot
+  (`/etc/modules-load.d/pcdn-conntrack.conf`) with `hashsize 262144`
+  (`/etc/modprobe.d/pcdn-conntrack.conf`, also applied live via `/sys`), so conntrack tuning
+  survives netfilter loading after install or a reboot (F19); the old `99-pcdn-conntrack.conf` is
+  removed on `--upgrade`.
+* Default-server `listen` lines (pcdn-base.conf, both HTTP and HTTPS, IPv4 + IPv6):
+  `reuseport backlog=65535 so_keepalive=120s:30s:4`. `reuseport` spreads long-lived tunnel
+  connections across all workers (F4), `backlog=65535` lets the `somaxconn` / `tcp_max_syn_backlog`
+  tuning actually take effect (F16), and `so_keepalive` detects a dead or NAT-expired client after
+  ~4 min and frees its `limit_conn` slot (F17). These options sit only on the `default_server`
+  listens; per-site `listen` lines stay bare, or nginx rejects the reload with "duplicate listen
+  options".
 * `/etc/systemd/system/nginx.service.d/pcdn-limits.conf`: `LimitNOFILE=1048576`.
 * `nginx.conf` (main/events context, between the `# >>> nginx.conf edits` markers):
-  `worker_rlimit_nofile 524288`, `worker_connections 65535`, `multi_accept on`; stock
+  `worker_rlimit_nofile 524288`, `worker_connections 65535`, `multi_accept off` (F4: forcing it
+  **on** piled long-lived tunnel connections onto one worker, capping the node at one core and one
+  65535-connection budget) and `worker_shutdown_timeout 1h` (`--shutdown-timeout`; F6: bounds how
+  many draining worker generations a reload leaves pinned by long-lived tunnels — lower to 20-30m on
+  ≤4 GB nodes, never a value in seconds, which would hard-cut every tunnel on each reload); stock
   `gzip on`, `ssl_protocols`, `ssl_prefer_server_ciphers`, `keepalive_timeout` are commented out
   because http.conf sets them.
 * http.conf (http context): `keepalive_timeout 75s`, `keepalive_requests 100000` (also the
-  per-connection stream cap of HTTP/2 since nginx 1.19.7), `http2_max_concurrent_streams 512`,
-  `reset_timedout_connection on`.
+  per-connection stream cap of HTTP/2 since nginx 1.19.7; tunnel hosts override it per server with
+  `TUNNEL_KEEPALIVE_REQUESTS`), `http2_max_concurrent_streams 512`, `reset_timedout_connection on`,
+  and `proxy_connect_timeout` / `grpc_connect_timeout` = `TUNNEL_CONNECT_TIMEOUT` (10 s, F12).
 
 ## Agent settings (`/etc/pcdn/agent.conf`, or `PCDN_<KEY>` env)
 
@@ -306,6 +371,18 @@ v1 keys plus `HTTP_PORT` (80), `HTTPS_PORT` (443), `RESIZE_PORT` (8089), `RESOLV
 `PURGE_SCAN_MAX` (max cache files scanned per prefix purge before falling back to a full-site
 purge, 500000), `ERROR_LOG` (nginx error log tailed for centralized logs, `/var/log/nginx/error.log`),
 `BUNDLE_VERSION_FILE` (`/etc/pcdn/bundle.version`), `REGION` / `GROUP` (reported on first heartbeat).
+
+Tunnel data-path keys are listed under **Tunnel data-path tunables** above
+(`TUNNEL_H2_BODY_BUFFER` 256k, `TUNNEL_RELAY_BUFFER` 16k, `SSL_BUFFER_SIZE` 4k,
+`TUNNEL_CONNECT_TIMEOUT` 10, `TUNNEL_KEEPALIVE_REQUESTS` 10000000, `TUNNEL_KEEPALIVE` 64). Reload
+and usage keys: `RELOAD_MIN_INTERVAL` (reload-coalescing floor, 120 s, F5), `RELOAD_DEBOUNCE` (a
+freshly-seen version settles this long before applying so sub-debounce bursts coalesce, 5 s, F5),
+`RELOAD_VERIFY` (after a reload, poll `/__pcdn/confver` and retry if the master rejected the reload,
+`yes`, F29), `USAGE_TIMEOUT` (usage POST timeout, 150 s — strictly above Caddy's 120 s header
+timeout so a batch is never replayed, F7), `USAGE_OUTBOX_MAX_DAYS` (drop an unacknowledged usage
+batch older than this, 6 days — inside the controller's 7-day `batch_id` dedup window, F7),
+`FOREIGN_DEFER` (defer a reload up to this long when only another edge group's sites changed and no
+global file changed, 900 s, F21).
 
 ## Usage / events
 

@@ -437,8 +437,15 @@ def test_firewall_and_ratelimit_challenge_actions(env):
     codes = [env.req("fwc.test", f"/api/x?i={i}").status for i in range(4)]
     assert codes == [200, 200, 403, 403]
     assert env.last_log("fwc.test", "i=3")["v"] == "challenge:ratelimit:api"
-    # a solved challenge clears the rate-limit challenge as well
-    c = challenge_data(env.req("fwc.test", "/api/x").text)
+    # a solved challenge clears the rate-limit challenge as well. The limit_req bucket may have
+    # refilled a token between the burst above and here (CI timing), so re-request back-to-back
+    # until a rate-limit challenge is actually served instead of assuming the bucket is still full.
+    c = None
+    for _ in range(12):
+        c = challenge_data(env.req("fwc.test", "/api/x").text)
+        if c:
+            break
+    assert c, "no rate-limit challenge served after re-saturating /api/x"
     v = env.req("fwc.test", "/__pcdn/verify?" + urllib.parse.urlencode({"t": c["t"], "n": solve_pow(c), "r": c["r"]}))
     cookie = v.cookies[0].split(";")[0]
     assert env.req("fwc.test", "/api/x", headers={"Cookie": cookie}).status == 200

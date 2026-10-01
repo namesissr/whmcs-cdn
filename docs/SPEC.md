@@ -327,6 +327,35 @@ Max 20 000 items and 2 000 events per request.
 (e.g. `block:waf:942100`, `challenge:ddos:auto`, `block:ratelimit:login`,
 `log:firewall:r3`). The agent derives security counters and events from `v`.
 
+### Reload discipline (how the edge applies a new config)
+The config body is the unit of propagation, but applying it must not send a GOAWAY to every HTTP/2
+tunnel on each site edit. The agent therefore:
+- **Coalesces reloads** (F5): a new `version` is applied only once it has *settled* (seen on two
+  polls, or pending for `RELOAD_MIN_INTERVAL`, default 120 s) and never more often than
+  `RELOAD_MIN_INTERVAL`; a freshly-seen version first waits `RELOAD_DEBOUNCE` (5 s). A burst of edits
+  collapses into one reload; config latency stays roughly 20-140 s. First boot (no tree yet) applies
+  immediately. The controller additionally rate-limits config/record *writes* on the customer API
+  (`CAPI_CONFIG_RATE`, default 6/min, on top of `CAPI_RATE`) so a client cannot herd fleet-wide
+  reloads; reads, purges and stats stay on `CAPI_RATE`.
+- **Skips no-op reloads** (F20): the agent renders first and compares a SHA-256 digest of the whole
+  tree; a byte-identical result is not written, tested or reloaded (this absorbs version bumps from
+  fields the agent never renders, and agent upgrades). Rendering is deterministic. The digest is
+  recorded only after a successful reload, so a failed apply never suppresses a later corrective one.
+- **Defers foreign-group changes** (F21): every node still receives every site's config (DNS
+  fail-open needs it), but when every changed site belongs to another edge group — and no global file
+  (`http.conf`/`pcdn.js`) changed and no site was added, removed, suspended or had its cert rotated —
+  the apply is deferred up to `FOREIGN_DEFER` (900 s) and folded into the next own-group reload, so a
+  tunnel-role node does not reload for general-website edits. The node keeps heartbeating during the
+  deferral so it is not marked stale.
+- **Bounds draining workers** (F6): `worker_shutdown_timeout` (default `1h`, install flag
+  `--shutdown-timeout`) caps how many generations of draining workers a reload leaves pinned by
+  long-lived tunnels before they are reclaimed. It is main-context (global) and must never be set in
+  seconds (that turns every reload into a hard cut of every tunnel); lower to 20-30m on ≤4 GB nodes.
+- **Verifies the reload** (F29): after the reload command the agent polls a localhost-only
+  `/__pcdn/confver` (which returns the tree digest) for a few seconds; if the nginx master rejected
+  the reload the agent does **not** store the ETag, reports the error in the heartbeat and retries on
+  the next poll, instead of reporting a rejected reload as applied. `RELOAD_VERIFY=no` disables it.
+
 ---------------------------------------------------------------------------
 ## 6. Platform-wide (WHMCS admin panel)
 
@@ -422,6 +451,18 @@ headers-response rewriting/gzip/brotli; firewall *block* rules and `blocked_ips`
 `client_max_body_size 0`; timeouts = idle_timeout; `limit_rate` = per_connection_mbps;
 `limit_conn` per site (`features.max_tunnel_connections`) and per IP (`max_connections_per_ip`);
 TCP_NODELAY; upstream keepalive where the protocol allows.
+
+**Session affinity (xhttp/h2 on multi-origin pools).** For `xhttp` and `h2` paths the edge selects
+the origin per *session*, not per request: it hashes a session id parsed from the request path
+(weighted rendezvous / HRW, so an origin health change only moves the sessions that were on the
+failed origin) and falls back to the client IP when no id can be parsed. This keeps every packet-up
+POST and every stream of one session on one origin. It therefore **requires the client to carry a
+session id in the path** — Xray's XHTTP does, as `/<base>/<session>/<seq>`. A multi-origin `pool`
+(explicit on the path or inherited from the host) or a multi-A origin hostname *without* a path
+session id would otherwise split one session across origins. `ws` and `grpc` are unaffected (each is
+one TCP connection / stream), and a single-origin path needs nothing. The controller returns a
+Persian warning on PUT `tunnel` when an `xhttp`/`h2` path uses a pool with more than one non-backup
+origin.
 
 ### 7.3 Edge config (§5) additions
 Per site: `"tunnel": {...section..., "max_connections": <features.max_tunnel_connections>}`
