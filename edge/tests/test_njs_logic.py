@@ -21,8 +21,9 @@ HARNESS = r"""
 import m from './pcdn.mjs';
 import { T } from './pcdn.mjs';
 const store = {};
-const dict = { get: k => store[k], set: (k, v) => { store[k] = v; }, incr: (k, d, i) => (store[k] = (store[k] === undefined ? i : store[k]) + d) };
-globalThis.ngx = { shared: { pcdn_cnt: dict, pcdn_blk: dict, pcdn_hc: dict } };
+const dict = { get: k => store[k], set: (k, v) => { store[k] = v; }, incr: (k, d, i) => (store[k] = (store[k] === undefined ? i : store[k]) + d),
+  delete: k => { delete store[k]; } };
+globalThis.ngx = { shared: { pcdn_cnt: dict, pcdn_blk: dict, pcdn_hc: dict, pcdn_fair: dict } };
 function req(site, uri, args, extra) {
   extra = extra || {};
   const vars = Object.assign({ pcdn_site: site, remote_addr: '127.0.0.1', request_uri: uri + (args ? '?' + args : ''),
@@ -52,6 +53,24 @@ const out = cases.map(c => {
     return seen;
   }
   if (c.kind === 'hc') { store[c.key] = c.value; return null; }
+  if (c.kind === 'fairset') {
+    const res = {};
+    m.fairSet({ args: { hot: c.hot }, return: code => { res.code = code; } });
+    res.hot = store.hot === undefined ? null : store.hot;
+    return res;
+  }
+  if (c.kind === 'fair') {   // c.opens: [[site, tn, method], ...] -> the $pcdn_tn_fair value of each
+    return c.opens.map(o => m.tunnelFair({ method: o[2] || 'GET', variables: { pcdn_site: o[0], pcdn_tn: o[1] || 'ws' } }));
+  }
+  if (c.kind === 'speed') {
+    const res = {};
+    const r = req(c.site, '/__pcdn/speed/down', '', {});
+    r.args = c.args;
+    r.return = (code, body) => { res.code = code; res.len = body === undefined ? null : body.length; };
+    r.internalRedirect = u => { res.redirect = u; };
+    m.speedDown(r);
+    return res;
+  }
   if (c.kind === 'bodyneed') return m.bodyNeed(req(c.site, c.uri, c.args || '', c.extra));
   if (c.kind === 'inspect') {
     const r = req(c.site, '/__pcdn/body' + c.uri, '', c.extra), res = {};
@@ -507,3 +526,73 @@ def test_transform_header_filter(tmp_path):
     assert res[0] == {"X-Base": "c", "X-Other": "o"}
     assert res[1] == {"Set-Cookie": ["a=1", "b=2"], "X-Base": "b", "X-Other": "o", "X-B": "1"}
     assert res[2] == out
+
+
+# ----------------------------------------------------------------- wave 7 (SPEC §15.2 / §15.6)
+
+def test_speed_paths_skip_challenges_but_not_blocks(tmp_path):
+    fw = {"default_action": "allow", "rules": [
+        {"id": "chal", "action": "challenge", "conditions": [{"field": "path", "op": "starts_with", "value": "/"}]},
+        {"id": "evil", "action": "block", "conditions": [{"field": "header", "name": "X-Evil", "op": "eq", "value": "1"}]}]}
+    build(tmp_path, {"1": site(firewall=fw, waf={"mode": "block", "groups": ALL_GROUPS, "exclusions": [], "off_paths": []},
+                               ddos={"mode": "js", "threshold_rps": 1}),
+                     "2": site(blocked_ips=["127.0.0.0/8"]),
+                     "3": site(firewall={"default_action": "block", "rules": []})})
+    res = run(tmp_path, [
+        {"kind": "verdict", "site": "1", "uri": "/__pcdn/speed/ping", "args": "x=1'%20or%20'1'='1"},
+        {"kind": "verdict", "site": "1", "uri": "/__pcdn/speed/down", "args": "bytes=100",
+         "extra": {"headers": {"User-Agent": "sqlmap/1.7"}}},
+        {"kind": "verdict", "site": "1", "uri": "/__pcdn/speed/up", "extra": {"headers": {"X-Evil": "1"}}},
+        {"kind": "verdict", "site": "1", "uri": "/page"},
+        {"kind": "verdict", "site": "1", "uri": "/__pcdn/verify"},       # other /__pcdn/ paths: untouched
+        {"kind": "verdict", "site": "2", "uri": "/__pcdn/speed/ping"},
+        {"kind": "verdict", "site": "3", "uri": "/__pcdn/speed/ping"},
+    ])
+    assert res == ["ok", "ok", "block:firewall:evil", "challenge:firewall:chal", "ok", "block:firewall:blocked_ips",
+                   "block:firewall:default"]
+
+
+def test_speed_down_validation(tmp_path):
+    build(tmp_path, {"1": site()})
+    size = 10 * 1024 * 1024 + 64
+    res = run(tmp_path, [{"kind": "speed", "site": "1", "args": a} for a in (
+        {"bytes": "1000000"}, {"bytes": "10485760"}, {"bytes": "64"}, {"bytes": "63"}, {"bytes": "1"}, {},
+        {"bytes": "0"}, {"bytes": "10485761"}, {"bytes": "-5"}, {"bytes": "1e6"}, {"bytes": ["1", "2"]})])
+    assert res[0] == {"redirect": f"/__pcdn/speed/file?start={size + 13 - 1000000}"}
+    assert res[1] == {"redirect": f"/__pcdn/speed/file?start={size + 13 - 10485760}"}
+    assert res[2] == {"redirect": f"/__pcdn/speed/file?start={size + 13 - 64}"}
+    assert res[3] == {"code": 200, "len": 63} and res[4] == {"code": 200, "len": 1}
+    assert res[5] == {"redirect": f"/__pcdn/speed/file?start={size + 13 - 1048576}"}   # default 1 MB
+    assert res[6:] == [{"code": 400, "len": None}] * 5
+
+
+def test_fair_share_admission(tmp_path):
+    build(tmp_path, {"1": site(tunnel_paths=["/t"], tunnel_fair=True), "2": site(tunnel_paths=["/t"]),
+                     "3": site(tunnel_paths=["/t"], tunnel_fair=False)})
+    # not hot: nothing refused, everything counted
+    res = run(tmp_path, [{"kind": "fair", "opens": [["1"]] * 50}])
+    assert res[0] == [""] * 50
+    hot = [{"kind": "fairset", "hot": "25"}]
+    # hot, but nobody else opened anything: never refused (nobody to protect)
+    res = run(tmp_path, hot + [{"kind": "fair", "opens": [["1"]] * 50}])
+    assert res[0] == {"code": 204, "hot": 25} and res[1] == [""] * 50
+    # hot, others opened 12: the hog is refused once it has >= 30 opens, holds > 25 % and more than all
+    # the others together; refusals are not counted, so it converges to that line instead of locking out
+    res = run(tmp_path, hot + [{"kind": "fair", "opens": [["2"]] * 12 + [["1"]] * 40 + [["2"]] * 18 + [["1"]] * 5}])
+    v = res[1]
+    assert v[:12] == [""] * 12 and v[12:42] == [""] * 30 and v[42:52] == ["1"] * 10
+    assert v[52:70] == [""] * 18                        # the other site (30 opens, not dominant) is admitted
+    assert v[70] == "" and v[71:] == ["1"] * 4          # 30 vs 30: one more, then 31 > 30 is refused again
+    # two busy sites above 25 % each never starve each other: only a dominant (> 50 %) one is refused
+    res = run(tmp_path, hot + [{"kind": "fair", "opens": [["1"], ["2"]] * 100}])
+    assert res[1] == [""] * 200
+    # xhttp: only the downlink GET is a session opening; packet POSTs are never refused nor counted
+    res = run(tmp_path, hot + [{"kind": "fair", "opens": [["2"]] * 12 + [["1", "xhttp"]] * 40
+                                + [["1", "xhttp", "POST"]] * 5 + [["3"]] * 40}])
+    v = res[1]
+    assert v[12:42] == [""] * 30 and "1" in v[42:52] and v[52:57] == [""] * 5
+    assert v[57:] == [""] * 40                          # fair_share false: never refused
+    # the hot flag is cleared with hot=0 / junk
+    res = run(tmp_path, [{"kind": "fairset", "hot": "25"}, {"kind": "fairset", "hot": "0"},
+                         {"kind": "fairset", "hot": "x"}, {"kind": "fairset", "hot": "101"}])
+    assert [x["hot"] for x in res] == [25, None, None, None]

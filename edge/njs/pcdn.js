@@ -8,6 +8,9 @@
 //   verdict  js_set $pcdn_verdict  — "ok" | "<action>:<source>:<rule>"
 //   upstream js_set $pcdn_upstream — "host:port" chosen from a load-balancer pool
 //   tunnelUpstream js_set $pcdn_tn_upstream — same for the pool of a tunnel path ($pcdn_tn_pool)
+//   tunnelFair js_set $pcdn_tn_fair — "1" refuses a NEW tunnel session while the node is hot (SPEC §15.2)
+//   fairSet                        — js_content of the localhost-only /__pcdn/fair (agent: hot flag)
+//   speedDown / speedUp            — js_content of /__pcdn/speed/down|up (SPEC §15.6)
 //   imgW/imgH/imgQ js_set          — image resize parameters ("" = no resize)
 //   bodyNeed js_set $pcdn_bodychk  — "1" when a WAF pack inspects this request's body (SPEC §14.2)
 //   bodyInspect                    — js_content for /__pcdn/body/*: inspects the body, then proxies
@@ -403,6 +406,7 @@ function prepSite(id, s) {
     P.blocked = (s.blocked_ips || []).map(cidr).filter(Boolean);
     // tunnel path prefixes (nginx "location ^~" on the same normalised $uri)
     P.tunnel = (s.tunnel_paths || []).map(String).filter(function (p) { return p.charAt(0) === '/' && p.length > 1; });
+    P.fair = s.tunnel_fair !== false;   // SPEC §15.2, default on (only tunnel sites carry the key)
     P.minTls13 = s.min_tls === '1.3';
 
     const fw = s.firewall || {};
@@ -542,7 +546,11 @@ function verdict(r) {
 }
 
 function evaluate(r) {
-    if (String(r.uri).indexOf('/__pcdn/') === 0) return 'ok';
+    const uri = String(r.uri);
+    // speed test (SPEC §15.6): like a tunnel path - firewall block rules, blocked_ips and min_tls apply,
+    // challenges / WAF / rate-limit rules / DDoS do not (the measurement must not hit an HTML challenge)
+    const speed = uri.indexOf('/__pcdn/speed/') === 0;
+    if (!speed && uri.indexOf('/__pcdn/') === 0) return 'ok';
     const site = siteOf(r);
     if (!site) return 'ok';
     const ctx = mkctx(r, site);
@@ -550,7 +558,7 @@ function evaluate(r) {
 
     if (site.minTls13 && r.variables.ssl_protocol && r.variables.ssl_protocol !== 'TLSv1.3') return 'block:firewall:min_tls';
     for (let i = 0; i < site.blocked.length; i++) if (inCidr(ctx.ip, site.blocked[i])) return 'block:firewall:blocked_ips';
-    if (site.tunnel.length && inTunnel(site, ctx.path)) return tunnelVerdict(ctx, site);
+    if (speed || (site.tunnel.length && inTunnel(site, ctx.path))) return tunnelVerdict(ctx, site);
 
     // firewall: first matching rule wins; allow short-circuits everything; log continues
     let matched = false;
@@ -610,6 +618,78 @@ function tunnelVerdict(ctx, site) {
     }
     if (site.fwDefault === 'block') return 'block:firewall:default';
     return logged || 'ok';
+}
+
+// ------------------------------------------------------------------ tunnel fair share (SPEC §15.2)
+// nginx 1.24 cannot rate-limit tunnel streams (limit_rate is reset for unbuffered proxying and never
+// applies to upgraded connections), so fair share works on ADMISSION: while the node is hot (the agent
+// sets pcdn_fair "hot" = fair_share_pct when tx >= 85 % of the node capacity) a site whose share of the
+// node's new tunnel sessions over the last 1-2 minutes exceeds fair_share_pct AND exceeds all other
+// sites together (so at most one site - the dominant one - is ever refused, and two busy sites can
+// never starve each other) gets its NEW sessions refused (429) until it is back under that line.
+// Established sessions are never touched, xhttp packet POSTs (which belong to a session) are never
+// refused, refused attempts are not counted (so the share converges to the cap instead of locking the
+// site out), and nothing is refused while the site has fewer than FAIR_MIN_SITE opens in the window
+// or the other sites together fewer than FAIR_MIN_OTHERS (with nobody to protect, refusing only
+// hurts). Any error fails open.
+const FAIR_BUCKET = 60;        // seconds; a decision looks at the current and the previous bucket
+const FAIR_MIN_SITE = 30;
+const FAIR_MIN_OTHERS = 10;
+
+function tunnelFair(r) {
+    try {
+        const v = r.variables;
+        if (v.pcdn_tn === 'xhttp' && r.method !== 'GET') return '';   // same session rule as limit_conn (F13)
+        const id = v.pcdn_site, site = id ? S[id] : null;
+        const d = ngx.shared.pcdn_fair;
+        if (!site || !d) return '';
+        const b = Math.floor(Date.now() / 1000 / FAIR_BUCKET);
+        const pct = d.get('hot') || 0;
+        if (site.fair && pct > 0) {
+            const mine = (d.get('o:' + id + ':' + b) || 0) + (d.get('o:' + id + ':' + (b - 1)) || 0);
+            const all = (d.get('o:*:' + b) || 0) + (d.get('o:*:' + (b - 1)) || 0);
+            const others = all - mine;
+            if (mine >= FAIR_MIN_SITE && others >= FAIR_MIN_OTHERS && mine * 100 > pct * all && mine > others) return '1';
+        }
+        d.incr('o:' + id + ':' + b, 1, 0);
+        d.incr('o:*:' + b, 1, 0);
+    } catch (e) { /* fail open */ }
+    return '';
+}
+
+// /__pcdn/fair?hot=<pct> (localhost only, default server): 1..100 = hot with that fair_share_pct, 0 = not
+function fairSet(r) {
+    const d = ngx.shared.pcdn_fair, pct = Math.floor(+r.args.hot || 0);
+    if (pct >= 1 && pct <= 100) d.set('hot', pct); else d.delete('hot');
+    r.return(204);
+}
+
+// ------------------------------------------------------------------ speed test (SPEC §15.6)
+// down?bytes=N (1..10 MB, default 1 MB): N >= 64 is an internal redirect to the static random file
+// the agent writes (SPEED_FILE_SIZE bytes of os.urandom) through the flv module: "?start=S" serves
+// a 13-byte FLV header + file[S:], so S = SPEED_FILE_SIZE + 13 - N gives exactly N bytes with
+// sendfile and no memory held per request or per worker. Smaller N come from a tiny buffer.
+// up: nginx reads (and drops) the body before the handler runs (client_max_body_size 10m on the
+// location), so the 204 marks the end of the upload.
+const SPEED_MAX = 10 * 1024 * 1024;
+const SPEED_FILE_SIZE = SPEED_MAX + 64;
+const SPEED_SMALL = Buffer.from('7f3a9c21e05bd84612f7aa0394ce5b17d26e08f1c4b9357a2d6e91f0b84c23a5'
+    + 'e1093d7b5fa2c86410ed37b9f25a68c40c9d71e2b356f8a4097c1de25b38fa61', 'hex');
+
+function speedDown(r) {
+    const raw = String(r.args.bytes === undefined ? '1048576' : r.args.bytes);
+    if (!/^[0-9]{1,9}$/.test(raw) || +raw < 1 || +raw > SPEED_MAX) { r.return(400); return; }
+    const n = +raw;
+    if (n < SPEED_SMALL.length) {
+        r.headersOut['Content-Type'] = 'application/octet-stream';
+        r.return(200, SPEED_SMALL.subarray(0, n));
+        return;
+    }
+    r.internalRedirect('/__pcdn/speed/file?start=' + (SPEED_FILE_SIZE + 13 - n));
+}
+
+function speedUp(r) {
+    r.return(r.method === 'POST' ? 204 : 405);
 }
 
 function hotlinkOk(ctx, site) {
@@ -1212,4 +1292,4 @@ function captcha(r) {
 }
 
 export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
-    bodyNeed, bodyInspect, tfHeaders };
+    bodyNeed, bodyInspect, tfHeaders, tunnelFair, fairSet, speedDown, speedUp };

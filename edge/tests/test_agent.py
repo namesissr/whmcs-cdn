@@ -726,6 +726,139 @@ def test_tunnel_usage_aggregation(tmp_path):
     assert "tunnel" not in no_tn
 
 
+# ----------------------------------------------------------------- wave 7 rendering (SPEC §15)
+
+def _loc(text, path):
+    return text.split(f'location ^~ "{path}" {{', 1)[1].split("\n    }", 1)[0]
+
+
+def test_tunnel_quality_render(tmp_path):
+    cfg = make_cfg(tmp_path)
+    site = dict(SITE, tunnel=TUNNEL, pools=POOLS, rate_limit_rps=0)
+    text, _ = agent.render_site(site, cfg)
+    srv = text.split("server {")[1]
+    for path, pid, kind in (("/svc", "g1", "grpc"), ("/ws", "w1", "ws"), ("/h2", "h1", "h2"), ("/xh", "x1", "xhttp"),
+                            ("/up", "u1", "httpupgrade")):
+        loc = _loc(srv, path)
+        # SPEC §15.1: the path id reaches the access log ("tp"), set right after $pcdn_tn
+        assert loc.split("\n")[1:3] == [f"        set $pcdn_tn {kind};", f"        set $pcdn_tp {pid};"], loc
+        # 426 only where an Upgrade is mandatory; xhttp / grpc / h2 semantics unchanged
+        assert ('if ($http_upgrade = "") { return 426; }' in loc) == (kind in ("ws", "httpupgrade")), kind
+        # SPEC §15.2: fair-share admission on every tunnel location (njs node)
+        assert "if ($pcdn_tn_fair) { return 429; }" in loc and "limit_rate" not in loc
+        assert loc.index("set $pcdn_tn_ckey") < loc.index("if ($pcdn_tn_fair)")
+    js = json.loads(agent.render_all({"sites": [site]}, cfg)["js/sites.js"].split("export default ", 1)[1]
+                    .rstrip().rstrip(";"))
+    assert js["7"]["tunnel_fair"] is True
+    off = dict(site, tunnel=dict(TUNNEL, fair_share=False))
+    js = json.loads(agent.render_all({"sites": [off]}, cfg)["js/sites.js"].split("export default ", 1)[1]
+                    .rstrip().rstrip(";"))
+    assert js["7"]["tunnel_fair"] is False
+    assert "tunnel_fair" not in json.loads(agent.render_all({"sites": [SITE]}, cfg)["js/sites.js"]
+                                           .split("export default ", 1)[1].rstrip().rstrip(";"))["7"]
+    # without njs: no fair-share gate (nothing could answer it), the 426 stays
+    bare, _ = agent.render_site(site, make_cfg(tmp_path, NGINX_CAPS=dict(agent.LEGACY_CAPS, modules=["geoip2"])))
+    assert "$pcdn_tn_fair" not in bare and 'if ($http_upgrade = "") { return 426; }' in _loc(bare, "/ws")
+
+
+def test_speed_test_locations(tmp_path):
+    cfg = make_cfg(tmp_path)
+    text, _ = agent.render_site(SITE, cfg)
+    for host in ("example.com", "www.example.com"):
+        srv = text.split(f"server_name {host};")[1].split("\n}", 1)[0]
+        lines = [x.strip() for x in srv.splitlines() if "/__pcdn/speed/" in x]
+        assert [x.split(" {")[0] for x in lines] == ["location = /__pcdn/speed/ping", "location = /__pcdn/speed/down",
+                                                       "location = /__pcdn/speed/file", "location = /__pcdn/speed/up"]
+        ping, down, f, up = lines
+        assert "limit_req zone=pcdn_speedp burst=20 nodelay;" in ping and "return 204;" in ping
+        assert "limit_req zone=pcdn_speed burst=12 nodelay;" in down and "js_content pcdn.speedDown;" in down
+        assert "gzip off; brotli off;" in down and "gzip off; brotli off;" in f
+        assert "internal; flv; max_ranges 0;" in f and f"alias {tmp_path}/speed.bin;" in f
+        assert "client_max_body_size 10485760;" in up and "js_content pcdn.speedUp;" in up
+        for x in lines:   # also the internal file location: its headers are what the browser sees
+            assert 'add_header Cache-Control "no-store, no-transform" always;' in x
+            assert "add_header X-Pcdn-Node $pcdn_node always;" in x
+            # cross-origin (the WHMCS client area): simple CORS, X-Pcdn-Node readable, Resource Timing
+            assert "add_header Access-Control-Allow-Origin * always;" in x
+            assert "add_header Access-Control-Expose-Headers X-Pcdn-Node always;" in x
+            assert "add_header Timing-Allow-Origin * always;" in x
+        # after the reserved-prefix 404, before every proxying location
+        assert srv.index("location ^~ /__pcdn/ { return 404; }") < srv.index("/__pcdn/speed/ping")
+        assert srv.index("/__pcdn/speed/up") < srv.index("location / {") if "location / {" in srv else True
+    # tunnel-only (decoy / 404 fallback) hosts get them too; suspended sites do not
+    nf, _ = agent.render_site(dict(SITE, tunnel=dict(TUNNEL, fallback="404")), cfg)
+    assert "location = /__pcdn/speed/ping" in nf
+    susp, _ = agent.render_site(dict(SITE, status="suspended"), cfg)
+    assert "/__pcdn/speed/" not in susp
+    # no njs: only the ping (down / up need njs)
+    bare, _ = agent.render_site(SITE, make_cfg(tmp_path, NGINX_CAPS=dict(agent.LEGACY_CAPS, modules=[])))
+    assert "/__pcdn/speed/ping" in bare and "/__pcdn/speed/down" not in bare and "brotli" not in bare
+    # an nginx without the flv module: no download endpoint (the rest stays)
+    noflv, _ = agent.render_site(SITE, make_cfg(tmp_path, NGINX_CAPS=dict(agent.LEGACY_CAPS, flv=False)))
+    assert "/__pcdn/speed/up" in noflv and "/__pcdn/speed/down" not in noflv and " flv;" not in noflv
+    assert agent.parse_nginx_v(V_UBUNTU)["flv"] is False
+    assert agent.parse_nginx_v(V_UBUNTU.replace("--with-stream", "--with-http_flv_module --with-stream"))["flv"]
+    with pytest.raises(ValueError):
+        agent.render_site(SITE, make_cfg(tmp_path, SPEED_FILE="/x; include /etc/passwd"))
+
+
+def test_speed_file_written_once(tmp_path):
+    cfg = make_cfg(tmp_path)
+    path = tmp_path / "speed.bin"
+    agent.ensure_speed_file(cfg)
+    assert path.stat().st_size == agent.SPEED_FILE_SIZE and oct(path.stat().st_mode & 0o777) == "0o644"
+    first = path.read_bytes()[:4096]
+    agent.ensure_speed_file(cfg)
+    assert path.read_bytes()[:4096] == first          # never re-written while it has the right size
+    path.write_bytes(b"short")
+    agent.apply_config({"sites": []}, cfg)            # every apply repairs it
+    assert path.stat().st_size == agent.SPEED_FILE_SIZE
+
+
+def test_wave7_http_conf(tmp_path):
+    cfg = make_cfg(tmp_path, NODE_NAME="ir-tehran-1")
+    http = agent.render_all({"sites": []}, cfg)["http.conf"]
+    fmt = [x for x in http.splitlines() if x.startswith("log_format pcdn")][0]
+    # appended at the end: older lines (without tp / uct) still parse, field order otherwise unchanged
+    assert fmt.endswith('"rf":"$http_referer","tp":"$pcdn_tp","uct":"$upstream_connect_time"}\';')
+    assert 'map $uri $pcdn_tp {\n    default "";\n}' in http
+    assert f'map $uri $pcdn_node {{\n    default "{agent.node_tag("ir-tehran-1")}";\n}}' in http
+    assert "ir-tehran-1" not in http
+    node = agent.render_all({"sites": [], "node": {"name": "from-controller"}}, cfg)["http.conf"]
+    assert agent.node_tag("from-controller") in node
+    assert "limit_req_zone $binary_remote_addr zone=pcdn_speed:10m rate=12r/m;" in http
+    assert "js_set $pcdn_tn_fair pcdn.tunnelFair;" in http and "zone=pcdn_fair:4m" in http
+    fair = http.split("location = /__pcdn/fair {", 1)[1].split("}", 1)[0]
+    assert "allow 127.0.0.1;" in fair and "deny all;" in fair and "js_content pcdn.fairSet;" in fair
+    bare = directives(agent.render_http(make_cfg(tmp_path, NGINX_CAPS=dict(agent.LEGACY_CAPS, modules=[]))))
+    assert "/__pcdn/fair" not in bare and 'map $uri $pcdn_tn_fair {\n    default "";\n}' in bare
+
+
+def test_controller_node_block_and_fair_share_field(tmp_path):
+    """Exactly what the controller sends (services.build_edge_config / sections.Tunnel)."""
+    cfg = make_cfg(tmp_path, NODE_NAME="local", CAPACITY_MBPS="300")
+    body = {"node": {"name": "ir-thr-1", "capacity_mbps": 1000, "fair_share_pct": 25}}
+    assert agent.norm_node(body, cfg) == {"capacity_mbps": 1000, "fair_share_pct": 25, "name": "ir-thr-1"}
+    # capacity 0 / name "" from the controller = unknown: the agent.conf fallbacks apply
+    assert agent.norm_node({"node": {"name": "", "capacity_mbps": 0, "fair_share_pct": 25}}, cfg) == \
+        {"capacity_mbps": 300, "fair_share_pct": 25, "name": "local"}
+    http = agent.render_all(dict(body, sites=[]), cfg)["http.conf"]
+    assert agent.node_tag("ir-thr-1") in http and "ir-thr-1" not in http
+    for flag, want in ((None, True), (True, True), (False, False)):
+        t = dict(TUNNEL) if flag is None else dict(TUNNEL, fair_share=flag)
+        assert agent.norm_tunnel(dict(SITE, tunnel=t, pools=POOLS), agent.norm_pools(dict(SITE, pools=POOLS)))[
+            "fair_share"] is want
+
+
+def test_node_block_is_not_a_reload(tmp_path):
+    """Capacity / fair_share_pct are agent-side (hot flag over localhost): changing them never changes
+    the rendered tree; only the node NAME (speed-test tag) is rendered."""
+    cfg = make_cfg(tmp_path, NODE_NAME="n1")
+    a = agent.render_tree({"sites": [SITE], "node": {"capacity_mbps": 100, "fair_share_pct": 25}}, cfg)[1]
+    b = agent.render_tree({"sites": [SITE], "node": {"capacity_mbps": 900, "fair_share_pct": 50}}, cfg)[1]
+    assert a == b
+
+
 # ----------------------------------------------------------------- heartbeat metrics (SPEC §7.4)
 
 PROC_DEV = """Inter-|   Receive                                                |  Transmit

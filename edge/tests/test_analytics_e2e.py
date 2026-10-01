@@ -220,7 +220,8 @@ def test_live_platform_errors_and_logship_end_to_end(env):
     assert [req(port, "logs.test", "/page?token=s3cret", ref) for _ in range(3)] == [200] * 3
     assert req(port, "logs.test", "/boom?x=1") == 500            # origin 5xx
     assert req(port, "logs.test", "/edge500") == 500             # edge-produced 5xx
-    assert req(port, "logs.test", "/tun") == 200                 # tunnel path (ws location)
+    # tunnel path (ws location); since wave 7 a ws path without Upgrade gets the edge's 426 (SPEC §15.1)
+    assert req(port, "logs.test", "/tun", {"Upgrade": "websocket", "Connection": "Upgrade"}) == 200
     req(port, "logs.test", "/__pcdn/verify?t=1&n=1&r=/")          # internal endpoint
     assert req(port, "nolog.test", "/hidden?q=1") == 200          # export disabled for this site
     assert req(port, "dead.test", "/down") == 502                # origin connect failure
@@ -260,8 +261,11 @@ def test_live_platform_errors_and_logship_end_to_end(env):
     for x in live:
         for p, n in x["paths"].items():
             paths[p] = paths.get(p, 0) + n
-        assert set(x) == {"host", "minute", "requests", "bytes", "cache_hits", "status", "countries", "paths"}
+        # SPEC §15.4: the minute with the /tun request also carries the tunnel counters
+        assert set(x) - {"tunnel_attempts", "tunnel_errors"} == {"host", "minute", "requests", "bytes", "cache_hits",
+                                                                  "status", "countries", "paths"}
         assert x["minute"].endswith(":00Z")
+    assert sum(x.get("tunnel_attempts", 0) for x in live) == 1 and sum(x.get("tunnel_errors", 0) for x in live) == 0
     assert paths["/page"] == 3 and all("?" not in p for p in paths)
     assert sum(x["status"].get("5xx", 0) for x in live) >= 3
 

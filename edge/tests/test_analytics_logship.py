@@ -643,3 +643,239 @@ def test_logs_section_never_changes_rendering(tmp_path):
     f2, d2 = agent.render_tree({"sites": [with_logs]}, cfg)
     assert d1 == d2 and f1 == f2
     assert '"us":"$upstream_status"' in f1["http.conf"] and "map $uri $pcdn_page" in f1["http.conf"]
+
+
+# ----------------------------------------------------------------- tunnel quality (SPEC §15.1 / §15.4)
+# Representative lines as real nginx 1.24 writes them (pinned in test_tunnel_quality_e2e.py).
+
+def tline(**kw) -> dict:
+    return line(**dict({"h": "t.com", "u": "/ws", "tn": "ws", "tp": "w1", "pr": "HTTP/1.1", "us": "101",
+                        "uct": "0.004", "s": 101, "rt": 30.5, "b": 500, "bu": 200, "ub": "9000"}, **kw))
+
+
+CLASSIFY = [
+    # (fields, class, why)
+    ({}, "session", "ws upgrade accepted"),
+    ({"tn": "grpc", "pr": "HTTP/2.0", "s": 200, "us": "200"}, "session", "grpc stream"),
+    ({"tn": "xhttp", "s": 200, "us": "502, 200", "uct": "-, 0.003"}, "session", "connect failover then success"),
+    ({"s": 499, "us": "101"}, "session", "client closed an accepted session: clean end"),
+    ({"s": 499, "us": "-", "uct": "-"}, None, "client gave up while the edge was connecting"),
+    ({"s": 502, "us": "502", "uct": "-"}, "origin_refused", "connect() failed (111: Connection refused)"),
+    ({"tn": "grpc", "pr": "HTTP/2.0", "s": 502, "us": "502", "uct": "-"}, "origin_refused", "grpc refused"),
+    ({"s": 502, "us": "502", "uct": "0.009"}, "origin_refused", "closed before a response header"),
+    ({"s": 502, "us": "502, 502", "uct": "-, -"}, "origin_refused", "both attempts refused"),
+    ({"s": 504, "us": "504", "uct": "-"}, "origin_timeout", "connect timeout"),
+    ({"s": 504, "us": "-", "uct": "-"}, "origin_timeout", "timeout without an upstream status"),
+    ({"s": 502, "us": "-", "uct": "-"}, "origin_refused", "502 without an upstream status"),
+    ({"s": 404, "us": "404"}, "origin_error", "origin answered 404"),
+    ({"s": 400, "us": "400"}, "origin_error", "origin answered 400 (not the edge)"),
+    ({"tn": "grpc", "pr": "HTTP/2.0", "s": 500, "us": "500"}, "origin_error", "origin 5xx"),
+    ({"s": 429, "us": "", "uct": ""}, "limit", "limit_conn / fair share"),
+    ({"s": 503, "us": "", "uct": ""}, "limit", "limit_req / F35 cut"),
+    ({"s": 403, "us": "", "uct": ""}, "country", "allowed_countries gate"),
+    ({"s": 426, "us": "", "uct": ""}, "protocol", "ws path without Upgrade (edge 426)"),
+    ({"s": 400, "us": "", "uct": ""}, "protocol", "edge 400"),
+    ({"tn": "grpc", "pr": "HTTP/1.1", "s": 200, "us": "200"}, "protocol", "gRPC path over HTTP/1.1"),
+    ({"tn": "grpc", "pr": "HTTP/1.1", "s": 429, "us": ""}, "protocol", "wrong protocol wins"),
+    ({"tn": "h2", "pr": "HTTP/1.1", "s": 200, "us": "200"}, "session", "h2 path over HTTP/1.1 is allowed"),
+    ({"s": 500, "us": "", "uct": ""}, "edge", "edge 5xx (e.g. unresolvable origin hostname)"),
+    ({"s": 404, "us": "", "uct": ""}, None, "other edge 4xx: not classified"),
+    ({"s": "x"}, None, "garbage status"),
+]
+
+
+@pytest.mark.parametrize("over,cls,why", CLASSIFY, ids=[c[2] for c in CLASSIFY])
+def test_classify_tunnel(over, cls, why):
+    assert agent.classify_tunnel(tline(**over)) == cls, why
+
+
+def test_classify_old_lines_without_new_fields():
+    old = {"t": iso(T0), "h": "t.com", "b": 10, "s": 101, "c": "", "ip": "1.2.3.4", "cc": "IR", "m": "GET",
+           "u": "/ws", "ua": "x", "v": "ok", "tn": "ws", "rt": 1, "bu": 1, "ub": "1"}   # pre-6D, no us/tp/uct
+    assert agent.classify_tunnel(old) == "session" and agent.connect_ms(old) is None
+    assert agent.classify_tunnel(dict(old, s=403)) == "country"
+
+
+def test_connect_ms():
+    assert agent.connect_ms({"uct": "0.004"}) == 4 and agent.connect_ms({"uct": "-, 0.120"}) == 120
+    assert agent.connect_ms({"uct": "-"}) is None and agent.connect_ms({"uct": ""}) is None
+    assert agent.connect_ms({}) is None and agent.connect_ms({"uct": "0.001 : 0.002"}) == 2
+
+
+def test_tunnel_paths_aggregation_and_wire_shape(tmp_path):
+    log = tmp_path / "access.log"
+    rows = [tline(rt=100.4), tline(rt=50.2, uct="0.010"),
+            tline(s=502, us="502", uct="-", rt=0.001, b=300),
+            tline(s=502, us="502", uct="0.020", rt=0.0),                      # connected, closed: counted
+            tline(s=426, us="", uct="", rt=0, b=150, ub=""),
+            tline(tp="g1", tn="grpc", pr="HTTP/2.0", s=504, us="504", uct="-", rt=10),
+            tline(tp="g1", tn="grpc", pr="HTTP/2.0", s=200, us="200", uct="0.002", rt=5, bu=40000, ub="40100"),
+            tline(tp="", s=101),                                               # no path id: totals only
+            tline(tp="BAD ID", s=101),                                         # invalid id: totals only
+            line(u="/", s=200)]                                                 # not a tunnel request
+    rows += [tline(tp=f"p{i}", s=101) for i in range(60)]                     # > 50 path ids
+    write_log(log, rows)
+    state = {}
+    agent.read_usage(state, str(log))
+    item = {i["host"]: i for i in agent.usage_items(state["pending"])}["t.com"]
+    t = item["tunnel"]
+    assert t["sessions"] == 2 + 1 + 2 + 60
+    paths = t["paths"]
+    assert len(paths) == agent.TUNNEL_PATHS_MAX and "w1" in paths and "g1" in paths and "p47" in paths
+    assert "p48" not in paths and "BAD ID" not in paths and "" not in paths
+    w1 = paths["w1"]
+    assert w1 == {"sessions": 2, "seconds": 151, "bytes_up": 9000 * 4 + 200, "bytes_down": 500 * 2 + 300 + 500 + 150,
+                  "abnormal": 0, "connect_ms_sum": 4 + 10 + 20, "connect_n": 3,
+                  "errors": {"origin_refused": 2, "origin_timeout": 0, "origin_error": 0, "limit": 0,
+                             "country": 0, "protocol": 1, "edge": 0}}
+    g1 = paths["g1"]
+    assert g1["sessions"] == 1 and g1["seconds"] == 5 and g1["errors"]["origin_timeout"] == 1
+    assert g1["connect_n"] == 1 and g1["connect_ms_sum"] == 2 and g1["bytes_up"] == 40000 + 200
+    for p in paths.values():   # the controller rejects the whole POST on a negative / non-numeric counter
+        assert all(type(v) is int and v >= 0 for k, v in p.items() if k != "errors")
+        assert list(p["errors"]) == list(agent.TUNNEL_ERRORS) and all(type(v) is int for v in p["errors"].values())
+    json.dumps(state)
+    # by_protocol (bytes) and the path bytes add up for lines with a path id
+    assert sum(p["bytes_up"] + p["bytes_down"] for p in paths.values()) <= sum(t["by_protocol"].values())
+    # a later read of the same hour keeps adding to the same path entries (state round trip)
+    state = json.loads(json.dumps(state))
+    write_log(log, [tline(rt=1)])
+    agent.read_usage(state, str(log))
+    item = {i["host"]: i for i in agent.usage_items(state["pending"])}["t.com"]
+    assert item["tunnel"]["paths"]["w1"]["sessions"] == 3
+
+
+def test_tpath_item_sanitises():
+    p = agent.tpath_item({"sessions": -3, "seconds": 2.6, "connect_ms_sum": "7", "errors": {"limit": 2, "x": 9}})
+    assert p["sessions"] == 0 and p["seconds"] == 3 and p["connect_ms_sum"] == 7
+    assert p["errors"] == dict(dict.fromkeys(agent.TUNNEL_ERRORS, 0), limit=2)
+
+
+def test_live_tunnel_attempts_and_errors(tmp_path):
+    log = tmp_path / "access.log"
+    m1, m2 = T0, T0 + timedelta(minutes=1)
+    rows = [tline(t=iso(m1)), tline(t=iso(m1), s=502, us="502", uct="-"), tline(t=iso(m1), s=504, us="504", uct="-"),
+            tline(t=iso(m1), s=404, us="404"), tline(t=iso(m1), s=429, us="", uct=""),
+            tline(t=iso(m1), s=499, us="-", uct="-"),                      # not classified, still an attempt
+            tline(t=iso(m1), tp="", s=502, us="502"),                      # no path id: not attributed
+            line(t=iso(m1), h="t.com"),                                    # normal request
+            line(t=iso(m2), h="t.com")]                                    # a minute without tunnel lines
+    write_log(log, rows)
+    state = {}
+    agent.read_usage(state, str(log))
+    items = {i["minute"]: i for i in agent.live_items(state["live"], agent.live_cutoff()) if i["host"] == "t.com"}
+    k1, k2 = m1.strftime("%Y-%m-%dT%H:%M:00Z"), m2.strftime("%Y-%m-%dT%H:%M:00Z")
+    assert items[k1]["tunnel_attempts"] == 6 and items[k1]["tunnel_errors"] == 2
+    assert "tunnel_attempts" not in items[k2] and "tunnel_errors" not in items[k2]
+
+
+ERRLOG = [
+    '2026/10/01 19:54:50 [error] 3701#3701: *23 recv() failed (104: Connection reset by peer) while proxying '
+    'upgraded connection, client: 127.0.0.1, server: t.com, request: "GET /ws?ed=2048 HTTP/1.1", upstream: '
+    '"http://127.0.0.1:41969/ws?ed=2048", host: "t.com"',
+    '2026/10/01 19:54:51 [error] 3702#3702: *25 recv() failed (104: Connection reset by peer) while reading '
+    'upstream, client: 127.0.0.1, server: t.com, request: "POST /svc/Tun HTTP/2.0", upstream: '
+    '"grpc://127.0.0.1:32805", host: "t.com"',
+    '2026/10/01 19:54:52 [error] 3702#3702: *26 upstream timed out (110: Connection timed out) while proxying '
+    'upgraded connection, client: 127.0.0.1, server: t.com, request: "GET /ws HTTP/1.1", upstream: '
+    '"http://127.0.0.1:41969/ws", host: "T.com:443"',
+    '2026/10/01 19:54:53 [error] 3702#3702: *27 upstream prematurely closed connection while reading upstream, '
+    'client: 127.0.0.1, server: *.w.com, request: "GET /xh/abc/0 HTTP/1.1", upstream: "http://10.0.0.1:80/xh", '
+    'host: "a.w.com"',
+    # not abnormal ends: before the response header, client side ([info]), unknown host / path, limits
+    '2026/10/01 19:54:44 [error] 3701#3701: *9 connect() failed (111: Connection refused) while connecting to '
+    'upstream, client: 127.0.0.1, server: t.com, request: "GET /ws HTTP/1.1", upstream: "http://127.0.0.1:1/ws", '
+    'host: "t.com"',
+    '2026/10/01 19:54:50 [error] 3702#3702: *21 upstream prematurely closed connection while reading response '
+    'header from upstream, client: 127.0.0.1, server: t.com, request: "GET /ws HTTP/1.1", upstream: '
+    '"http://127.0.0.1:41969/ws", host: "t.com"',
+    '2026/10/01 19:54:50 [info] 3702#3702: *22 recv() failed (104: Connection reset by peer) while proxying '
+    'upgraded connection, client: 127.0.0.1, server: t.com, request: "GET /ws HTTP/1.1", upstream: '
+    '"http://127.0.0.1:41969/ws", host: "t.com"',
+    '2026/10/01 19:54:50 [error] 3702#3702: *28 recv() failed (104: Connection reset by peer) while reading '
+    'upstream, client: 127.0.0.1, server: t.com, request: "GET /page HTTP/1.1", upstream: "http://1.2.3.4/page", '
+    'host: "t.com"',
+    '2026/10/01 19:54:50 [error] 3702#3702: *29 recv() failed (104: Connection reset by peer) while reading '
+    'upstream, client: 127.0.0.1, server: x.com, request: "GET /ws HTTP/1.1", upstream: "http://1.2.3.4/ws", '
+    'host: "x.com"',
+    '2026/10/01 19:54:51 [error] 3701#3701: *35 limiting connections by zone "pcdn_tn_ip2", client: 127.0.0.1, '
+    'server: t.com, request: "GET /ws HTTP/1.1", host: "t.com"',
+]
+TN_CONFIG = {"sites": [
+    {"id": 1, "domain": "t.com", "status": "active", "hosts": [{"name": "t.com", "origin": {"address": "1.2.3.4"}}],
+     "tunnel": {"enabled": True, "paths": [
+         {"id": "w1", "path": "/ws", "protocol": "ws"}, {"id": "g1", "path": "/svc", "protocol": "grpc"},
+         {"id": "w2", "path": "/ws/deep", "protocol": "ws"}]}},
+    {"id": 2, "domain": "w.com", "status": "active", "hosts": [{"name": "*.w.com", "origin": {"address": "1.2.3.4"}}],
+     "tunnel": {"enabled": True, "paths": [{"id": "x1", "path": "/xh", "protocol": "xhttp"}]}},
+    {"id": 3, "domain": "off.com", "status": "active", "hosts": [{"name": "off.com", "origin": {"address": "1.2.3.4"}}],
+     "tunnel": {"enabled": False, "paths": [{"id": "z", "path": "/z", "protocol": "ws"}]}},
+]}
+
+
+def test_tunnel_map_longest_prefix_and_wildcards():
+    m = agent.tunnel_map(TN_CONFIG)
+    assert m["t.com"] == [["/ws/deep", "w2"], ["/svc", "g1"], ["/ws", "w1"]] and "off.com" not in m
+    assert agent._tmap_lookup(m, "t.com", "/ws/deep/x") == "w2" and agent._tmap_lookup(m, "T.com:443", "/ws") == "w1"
+    assert agent._tmap_lookup(m, "a.w.com", "/xh/1") == "x1" and agent._tmap_lookup(m, "w.com", "/xh") is None
+    assert agent._tmap_lookup(m, "t.com", "/other") is None
+
+
+def test_abnormal_ends_from_error_log(tmp_path):
+    cfg = make_cfg(tmp_path)
+    (tmp_path / "error.log").write_text("\n".join(ERRLOG) + "\n")
+    state = {"tunnel_map": agent.tunnel_map(TN_CONFIG)}
+    shipped = agent.collect_logs(state, cfg)
+    assert shipped and all("127.0.0.1" not in ln["msg"] for ln in shipped)   # shipping still redacts
+    hour = datetime.strptime("2026/10/01 19:00:00", "%Y/%m/%d %H:%M:%S").astimezone(timezone.utc) \
+        .strftime("%Y-%m-%dT%H:00:00Z")   # nginx writes local time
+    items = {i["host"]: i for i in agent.usage_items(state["pending"])}
+    assert set(items) == {"t.com", "a.w.com"} and items["t.com"]["hour"] == hour
+    t = items["t.com"]["tunnel"]["paths"]
+    assert t["w1"]["abnormal"] == 2 and t["g1"]["abnormal"] == 1 and "w2" not in t
+    assert items["a.w.com"]["tunnel"]["paths"]["x1"]["abnormal"] == 1
+    assert items["t.com"]["requests"] == 0 and items["t.com"]["tunnel"]["sessions"] == 0
+    # read again: nothing new, nothing double-counted; no map -> nothing counted
+    agent.collect_logs(state, cfg)
+    assert {i["host"]: i for i in agent.usage_items(state["pending"])}["t.com"]["tunnel"]["paths"]["w1"]["abnormal"] == 2
+    assert agent.account_abnormal({}, "\n".join(ERRLOG)) == 0
+
+
+def test_fair_hot_hysteresis_and_node_block(tmp_path):
+    assert agent.fair_hot(850, 1000, False) and not agent.fair_hot(849, 1000, False)
+    assert agent.fair_hot(810, 1000, True) and not agent.fair_hot(799, 1000, True)
+    assert not agent.fair_hot(10_000, 0, True)                      # unknown capacity: never hot
+    cfg = make_cfg(tmp_path, NODE_NAME="ir-1", CAPACITY_MBPS="900", FAIR_SHARE_PCT="30")
+    assert agent.norm_node({}, cfg) == {"capacity_mbps": 900, "fair_share_pct": 30, "name": "ir-1"}
+    assert agent.norm_node({"node": {"capacity_mbps": 2000, "fair_share_pct": 500, "name": "x"}}, cfg) == \
+        {"capacity_mbps": 2000, "fair_share_pct": 100, "name": "x"}
+    assert agent.norm_node({"node": "junk"}, make_cfg(tmp_path))["fair_share_pct"] == 25
+    tag = agent.node_tag("ir-1")
+    assert re.fullmatch(r"[0-9a-f]{8}", tag) and tag == agent.node_tag("ir-1") != agent.node_tag("ir-2")
+
+
+def test_fair_signal_reports_hot_flag_on_localhost(tmp_path, monkeypatch):
+    a = new_agent(tmp_path)
+    a.state["node"] = {"capacity_mbps": 1000, "fair_share_pct": 25, "name": "n"}
+    urls = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            return False
+
+    class Opener:
+        def open(self, url, timeout=0):
+            urls.append(url)
+            return Resp(b"")
+    monkeypatch.setattr(agent.urllib.request, "build_opener", lambda *a: Opener())
+    a.fair_signal({"tx_mbps": 900})
+    a.fair_signal({"tx_mbps": 820})
+    a.fair_signal({"tx_mbps": 100})
+    port = a.cfg["HTTP_PORT"]
+    assert urls == [f"http://127.0.0.1:{port}/__pcdn/fair?hot=25"] * 2 + [f"http://127.0.0.1:{port}/__pcdn/fair?hot=0"]
+    a.cfg["NGINX_CAPS"] = dict(agent.LEGACY_CAPS, nginx="1.24.0", modules=[])   # no njs: nothing to tell
+    a.fair_signal({"tx_mbps": 900})
+    assert len(urls) == 3

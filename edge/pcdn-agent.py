@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -154,6 +155,15 @@ DEFAULTS = {
     "LOGSHIP_INTERVAL": "30",
     # per-POST timeout (seconds); a run starts no new POST after LOGSHIP_RUN_BUDGET seconds
     "LOGSHIP_TIMEOUT": "30",
+    # SPEC §15.2 tunnel fair share / §15.6 speed test. The controller's node block
+    # ({"node": {"capacity_mbps", "fair_share_pct", "name"}}) wins; these are the fallbacks.
+    # CAPACITY_MBPS 0 = unknown: the node is never "hot" and fair share never refuses anything.
+    "CAPACITY_MBPS": "0",
+    "FAIR_SHARE_PCT": "25",
+    # node name hashed into the speed-test X-Pcdn-Node header (empty = the system host name)
+    "NODE_NAME": "",
+    # SPEC §15.6 speed-test random file (10 MiB + 64 B, written once; empty = speed.bin next to STATE_FILE)
+    "SPEED_FILE": "",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -268,7 +278,7 @@ _STATIC_MODULE = {"njs": re.compile(r"--add-module=\S*njs"), "geoip2": re.compil
 WEBP_MODE = "accept_key"
 # what an undetectable nginx is assumed to be: today's distro build (Ubuntu 1.24 + all modules)
 LEGACY_CAPS = {"nginx": None, "http3": False, "early_hints": False, "http2_directive": False,
-               "webp_convert": False, "webp_mode": WEBP_MODE, "modules": sorted(MODULE_FILES)}
+               "webp_convert": False, "webp_mode": WEBP_MODE, "modules": sorted(MODULE_FILES), "flv": True}
 _CAPS_CACHE: dict = {}
 
 
@@ -302,7 +312,9 @@ def parse_nginx_v(text: str, modules_dir: str | None = None, exists=os.path.isfi
     v3 = bool(re.search(r"(?:^|\s)--with-http_v3_module(?:\s|$)", args))
     return {"nginx": ".".join(str(x) for x in ver), "http3": v3 and ver >= (1, 25, 1),
             "early_hints": ver >= (1, 29, 0), "http2_directive": ver >= (1, 25, 1),
-            "webp_convert": False, "webp_mode": WEBP_MODE, "modules": mods}
+            "webp_convert": False, "webp_mode": WEBP_MODE, "modules": mods,
+            # SPEC §15.6: the speed-test download is served through the (static) flv module
+            "flv": bool(re.search(r"(?:^|\s)--with-http_flv_module(?:\s|$)", args))}
 
 
 def nginx_capabilities(cfg: dict) -> dict:
@@ -436,12 +448,50 @@ def render_shield(shield: dict | None, cfg: dict) -> str | None:
 
 # ----------------------------------------------------------------- rendering
 
+FAIR_HOT_PCT = 85      # SPEC §15.2: the node is "hot" at >= 85 % of its capacity (tx_mbps) ...
+FAIR_COOL_PCT = 80     # ... and stays hot until it drops below 80 % (hysteresis, no flapping)
+
+
+def fair_hot(tx_mbps: float, capacity_mbps: int, was_hot: bool) -> bool:
+    """SPEC §15.2 node "hot" state with hysteresis; never hot without a known capacity."""
+    if capacity_mbps <= 0:
+        return False
+    pct = float(tx_mbps) * 100 / capacity_mbps
+    return pct >= FAIR_HOT_PCT or (was_hot and pct >= FAIR_COOL_PCT)
+
+
+def norm_node(config: dict, cfg: dict) -> dict:
+    """Node-wide block of the edge config (SPEC §15.2): {"capacity_mbps", "fair_share_pct", "name"}.
+    Every key is optional; agent.conf CAPACITY_MBPS / FAIR_SHARE_PCT / NODE_NAME are the fallbacks
+    (capacity 0 = unknown: the node is never considered hot, fair share stays idle)."""
+    n = config.get("node") if isinstance(config.get("node"), dict) else {}
+    name = str(n.get("name") or cfg.get("NODE_NAME") or "").strip()
+    if not name:
+        try:
+            name = socket.gethostname()
+        except OSError:
+            name = ""
+    # the controller sends capacity_mbps 0 for "unknown": the agent.conf value (if any) applies then
+    cap = _int(n.get("capacity_mbps"), 0, 0, 10_000_000) or _int(cfg.get("CAPACITY_MBPS"), 0, 0, 10_000_000)
+    return {"capacity_mbps": cap,
+            "fair_share_pct": _int(n.get("fair_share_pct", cfg.get("FAIR_SHARE_PCT")), 25, 1, 100),
+            "name": name[:253]}
+
+
+def node_tag(name: str) -> str:
+    """Speed-test X-Pcdn-Node value (SPEC §15.6): 8 hex chars of a hash of the node NAME. It tells a
+    customer whether two measurements hit the same node; it is never an address and cannot be used
+    to pick or reach a node."""
+    return hashlib.sha256(("pcdn-node|" + name).encode()).hexdigest()[:8]
+
+
 def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bots: bool = False,
-                mtls: bool = False) -> str:
+                mtls: bool = False, node: dict | None = None) -> str:
     """The base http-context config (from the template), see nginx/pcdn-base.conf.
     hc_interval: js_periodic tick for pool health checks (> the largest check timeout).
     shield: the node's normalised shield section (norm_shield) or None.
-    bots / mtls: bots.conf / mtls.conf were rendered and are included (SPEC §14.2)."""
+    bots / mtls: bots.conf / mtls.conf were rendered and are included (SPEC §14.2).
+    node: the normalised node block (norm_node); its name feeds the speed-test X-Pcdn-Node tag."""
     with open(asset(cfg, "BASE_TEMPLATE", "nginx/pcdn-base.conf")) as f:
         text = f.read()
     caps = nginx_capabilities(cfg)
@@ -492,6 +542,7 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
         "EARLY_HINTS": eh_conf,
         "LISTEN_H2": "" if caps["http2_directive"] else " http2",
         "HTTPS_DEFAULT_EXTRA": "\n".join(extra),
+        "NODE_TAG": node_tag((node or norm_node({}, cfg))["name"]),
     }
     if not SAFE_FSPATH.match(subst["NGINX_DIR"]):
         raise ValueError("unsafe NGINX_DIR")
@@ -606,6 +657,8 @@ def norm_tunnel(site: dict, pools: dict) -> dict | None:
         "allowed_countries": sorted({str(c).upper() for c in (t.get("allowed_countries") or [])
                                      if re.match(r"^[A-Za-z]{2}$", str(c))}),
         "fallback": t.get("fallback") if t.get("fallback") in ("decoy", "404") else "origin",
+        # SPEC §15.2 fair share (default on; only `false` turns it off)
+        "fair_share": t.get("fair_share", True) is not False,
     }
 
 
@@ -1075,6 +1128,8 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         extra["bots"] = bots
     if tf_resp:
         extra["tf_resp"] = tf_resp
+    if tunnel:   # SPEC §15.2 (tunnel sites only, so other sites keep a byte-identical entry)
+        extra["tunnel_fair"] = bool(tunnel["fair_share"])
     return dict({
         "domain": site["domain"],
         "secret": str(site.get("secret") or ""),
@@ -1108,6 +1163,73 @@ def render_site(site: dict, cfg: dict, shield: dict | None = None, platform_pull
     """Return (nginx config text, {relative_path: content}) for one site."""
     text, files, _, _ = _render_site(site, cfg, shield, platform_pull)
     return text, files
+
+
+SPEED_MAX_BYTES = 10 * 1024 * 1024   # SPEC §15.6: /__pcdn/speed/down?bytes=N and the upload body, N <= 10 MB
+SPEED_FILE_SIZE = SPEED_MAX_BYTES + 64   # random file the downloads are cut from (pcdn.js SPEED_FILE_SIZE)
+
+
+def speed_file(cfg: dict) -> str:
+    """Path of the speed-test random file (SPEED_FILE, default next to the state file)."""
+    return cfg.get("SPEED_FILE") or os.path.join(os.path.dirname(cfg.get("STATE_FILE") or "/var/lib/pcdn/x"),
+                                                 "speed.bin")
+
+
+def ensure_speed_file(cfg: dict):
+    """Create the speed-test file (SPEED_FILE_SIZE bytes of os.urandom, 0644) once. Outside the
+    rendered tree (that is swapped on every apply) and never re-written while it has the right size.
+    Fail-soft: without it the download endpoint answers 404, nothing else is affected."""
+    path = speed_file(cfg)
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) == SPEED_FILE_SIZE:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            left = SPEED_FILE_SIZE
+            while left > 0:
+                chunk = os.urandom(min(left, 1 << 20))
+                f.write(chunk)
+                left -= len(chunk)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning("speed-test file %s not written: %s", path, e)
+
+
+def speed_locations(cfg: dict, njs_ok: bool, brotli_ok: bool, flv_ok: bool = True) -> list[str]:
+    """Speed-test endpoints of every active site server (SPEC §15.6; diagnostics only). The page runs in
+    the WHMCS client area, a DIFFERENT origin than the customer domain, so every response - also the
+    400 / 405 / 413 / 429 ones (`always`) and the internal file location whose headers the browser
+    sees for downloads - carries Access-Control-Allow-Origin: * (no credentials), exposes X-Pcdn-Node
+    and allows Resource Timing. The app sends only simple requests (GET, POST text/plain, no custom
+    headers), so there is no OPTIONS handler: a preflight gets 204 (ping), 400 (down) or 405 (up),
+    never a 5xx. Extra query arguments (the app's cache-buster "_") are ignored. Per-IP rate limits (pcdn-base.conf zones pcdn_speed / pcdn_speedp),
+    never cached or compressed, logged and counted as normal traffic. X-Pcdn-Node is a hash of the
+    node name ($pcdn_node), never an address. The security verdict still runs at server level: firewall
+    block rules / blocked_ips / default block apply, challenges and the WAF do not (pcdn.js).
+    down?bytes=N: pcdn.speedDown validates N and internally redirects to the static random file
+    through the flv module ("?start=" serves the file from an offset with a 13-byte FLV header, status
+    200, exact Content-Length, sendfile: no per-request or per-worker memory); N < 64 comes from njs."""
+    hdr = ("add_header Cache-Control \"no-store, no-transform\" always; add_header X-Pcdn-Node $pcdn_node always; "
+           "add_header Access-Control-Allow-Origin * always; "
+           "add_header Access-Control-Expose-Headers X-Pcdn-Node always; add_header Timing-Allow-Origin * always;")
+    nz = "gzip off;" + (" brotli off;" if brotli_ok else "")
+    lim = "limit_req zone=pcdn_speed burst=12 nodelay; limit_req_status 429;"
+    out = ["    location = /__pcdn/speed/ping { limit_req zone=pcdn_speedp burst=20 nodelay; limit_req_status 429; "
+           f"{hdr} return 204; }}"]
+    if njs_ok:
+        if flv_ok:   # an nginx built without --with-http_flv_module has no download endpoint (404)
+            path = speed_file(cfg)
+            if not SAFE_FSPATH.match(path):
+                raise ValueError("unsafe SPEED_FILE")
+            out += [f"    location = /__pcdn/speed/down {{ {lim} {nz} {hdr} js_content pcdn.speedDown; }}",
+                    f"    location = /__pcdn/speed/file {{ internal; flv; max_ranges 0; etag off; {nz} "
+                    f"default_type application/octet-stream; {hdr} alias {path}; }}"]
+        out.append(f"    location = /__pcdn/speed/up {{ {lim} client_max_body_size {SPEED_MAX_BYTES}; "
+                   f"client_body_buffer_size 64k; {hdr} js_content pcdn.speedUp; }}")
+    return out
 
 
 def _render_site(site: dict, cfg: dict, shield: dict | None = None,
@@ -1607,13 +1729,24 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         keepalive_ok = kind in ("xhttp", "grpc", "h2")  # upgraded (ws) connections are never reused
         h2buf = kind in ("grpc", "h2", "xhttp")          # HTTP/2 body path (F3)
         resolved = False   # dest resolved at request time via the nginx resolver
-        L = [f"set $pcdn_tn {kind};"]
+        L = [f"set $pcdn_tn {kind};", f"set $pcdn_tp {p['id']};"]   # SPEC §15.1 access-log "tp"
         # F13: count only the session-opening request against limit_conn. ws/grpc/h2 sessions and
         # streams each open one; xhttp counts only the downlink GET ($pcdn_tn_isget), so packet-up
         # POSTs do not consume a slot and the limit refuses new sessions instead of tearing down old.
         L.append("set $pcdn_tn_ckey " + ("$pcdn_tn_isget;" if kind == "xhttp" else "$pcdn_site;"))
         if tunnel["allowed_countries"] and geo_ok:  # F9: no gate at all without a GeoIP DB
             L.append(f"if ($pcdn_tcc_{sid} = 0) {{ return 403; }}")
+        if kind in ("ws", "httpupgrade"):
+            # SPEC §15.1 "protocol": a ws/httpupgrade path without an Upgrade header (a browser, a
+            # probe, an HTTP/2 client - nginx cannot carry WebSocket over HTTP/2) is answered by the
+            # edge with 426 instead of being passed to the origin, so the wrong-protocol case is
+            # visible in the access log. Real ws/httpupgrade clients always send Upgrade.
+            L.append('if ($http_upgrade = "") { return 426; }')
+        if njs_ok:
+            # SPEC §15.2 fair share: "1" only while the node is hot and this site holds more than its
+            # share of the node's NEW tunnel sessions (pcdn.js tunnelFair); refuses only a new session
+            # (never an established one; xhttp packet POSTs are never refused), 429 like limit_conn.
+            L.append("if ($pcdn_tn_fair) { return 429; }")
         o = p["origin"]
         if o:
             tls, sni, verify = o["tls"], o["sni"] or "$host", o["verify"]
@@ -1802,6 +1935,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             s.append("    proxy_intercept_errors on;")
 
         s.append("    location ^~ /__pcdn/ { return 404; }")
+        s += speed_locations(cfg, njs_ok, brotli_ok, bool(caps.get("flv")))
         if njs_ok:
             s.append("    location ^~ /__pcdn/deny/ { internal; js_content pcdn.deny; }")
             s.append("    location = /__pcdn/verify { js_content pcdn.verify; }")
@@ -1968,7 +2102,8 @@ def render_all(config: dict, cfg: dict) -> dict:
     mtls_conf = render_mtls_resizer(resizer_pairs)
     if mtls_conf:
         files["mtls.conf"] = mtls_conf
-    files["http.conf"] = render_http(cfg, max_timeout + 1, shield, bool(bots_conf), bool(mtls_conf))
+    files["http.conf"] = render_http(cfg, max_timeout + 1, shield, bool(bots_conf), bool(mtls_conf),
+                                     norm_node(config, cfg))
     # JSON is valid JS; ensure_ascii keeps U+2028 & co. out of the source
     files["js/sites.js"] = ("// generated by pcdn-agent, do not edit\nexport default "
                             + json.dumps(js_sites, ensure_ascii=True, sort_keys=True) + ";\n")
@@ -2098,6 +2233,7 @@ def apply_config(config: dict, cfg: dict, files: dict | None = None, digest: str
         files, digest = render_tree(config, cfg)
     write_tree(new, files)
     ensure_cache_dirs(config, cfg)
+    ensure_speed_file(cfg)   # SPEC §15.6 (once; outside the swapped tree)
 
     had_old = os.path.exists(root)
     if had_old:
@@ -2127,6 +2263,7 @@ def bootstrap(cfg: dict):
         files, _ = render_tree({"sites": []}, cfg)
         write_tree(root, files)
     os.makedirs(cfg["CACHE_DIR"], exist_ok=True)
+    ensure_speed_file(cfg)
 
 
 def render_rev(cfg: dict) -> str:
@@ -2410,6 +2547,110 @@ def platform_error(e: dict) -> bool:
     return not e.get("pg")
 
 
+# ---- tunnel quality (SPEC §15.1)
+TUNNEL_ERRORS = ("origin_refused", "origin_timeout", "origin_error", "limit", "country", "protocol", "edge")
+ORIGIN_DOWN_ERRORS = ("origin_refused", "origin_timeout")   # SPEC §15.4 live `tunnel_errors`
+TUNNEL_PATHS_MAX = 50                                         # path ids per host-hour
+_ACCEPTED = re.compile(r"^(?:101|2\d\d)$")
+_LIST_SPLIT = re.compile(r"\s*[,:]\s*")
+
+
+def _last_value(v) -> str:
+    """Last entry of an nginx per-attempt list ("502, 101", "0.001 : -"); "" when empty."""
+    parts = [x for x in _LIST_SPLIT.split(str(v or "").strip()) if x]
+    return parts[-1] if parts else ""
+
+
+def classify_tunnel(e: dict) -> str | None:
+    """Outcome of one tunnel access-log line (tn set): "session", one of TUNNEL_ERRORS, or None
+    (not counted either way). Rules, first match wins - pinned against real nginx 1.24 output in
+    test_tunnel_quality_e2e.py ($status / $upstream_status "us" / $upstream_connect_time "uct"):
+
+      1. grpc path over HTTP/1.x ("pr" HTTP/1.0/1.1)       -> protocol (a gRPC client is always HTTP/2;
+                                                              nginx still forwards it, so the status
+                                                              alone cannot tell)
+      2. status 101 or 2xx                                 -> session
+      3. status 499 and the last us is 101/2xx             -> session (client closed an accepted stream:
+                                                              a clean end, never abnormal)
+         status 499 otherwise                              -> None (client gave up first, e.g. while the
+                                                              edge was still connecting)
+      4. no upstream contacted (us "" or absent):
+           429 / 503                                       -> limit (limit_conn per site / per IP, fair
+                                                              share, F35 cut 503)
+           403                                             -> country (the only 403 inside a tunnel
+                                                              location; firewall blocks are rewritten to
+                                                              the deny location and carry no tn)
+           400 / 426                                       -> protocol (426: ws/httpupgrade without
+                                                              Upgrade, answered by the edge)
+           5xx                                             -> edge (e.g. an origin hostname the edge
+                                                              could not resolve)
+           anything else                                   -> None
+      5. last us = 502 (connect refused / reset, "uct" "-", or closed before a response header)
+                                                           -> origin_refused
+         last us = 504 (connect or header timeout)        -> origin_timeout
+         last us not a number ("-"): status 504 -> origin_timeout, 502 -> origin_refused,
+                                     other 5xx -> edge, else None
+         last us any other number (the origin answered, but not 101/2xx: 400/404/5xx ...)
+                                                           -> origin_error
+    An origin that itself answers 502/504 (e.g. its own reverse proxy) is indistinguishable from a
+    connect failure in the access log and is counted as refused / timeout."""
+    try:
+        code = int(e.get("s") or 0)
+    except (TypeError, ValueError):
+        return None
+    if e.get("tn") == "grpc" and str(e.get("pr") or "").startswith("HTTP/1"):
+        return "protocol"
+    if code == 101 or 200 <= code < 300:
+        return "session"
+    us = _last_value(e.get("us"))
+    if code == 499:
+        return "session" if _ACCEPTED.match(us) else None
+    if not us:
+        if code in (429, 503):
+            return "limit"
+        if code == 403:
+            return "country"
+        if code in (400, 426):
+            return "protocol"
+        return "edge" if 500 <= code <= 599 else None
+    if us == "502":
+        return "origin_refused"
+    if us == "504":
+        return "origin_timeout"
+    if not us.isdigit():
+        if code == 504:
+            return "origin_timeout"
+        if code == 502:
+            return "origin_refused"
+        return "edge" if 500 <= code <= 599 else None
+    return "origin_error"
+
+
+def connect_ms(e: dict) -> int | None:
+    """$upstream_connect_time of the attempt that connected (the last one), in ms; None without one."""
+    v = _last_value(e.get("uct"))
+    try:
+        return int(round(float(v) * 1000)) if v and v != "-" else None
+    except ValueError:
+        return None
+
+
+def _new_tpath() -> dict:
+    return {"sessions": 0, "seconds": 0.0, "bytes_up": 0, "bytes_down": 0, "abnormal": 0, "connect_ms_sum": 0,
+            "connect_n": 0, "errors": dict.fromkeys(TUNNEL_ERRORS, 0)}
+
+
+def _tpath(t: dict, pid: str) -> dict | None:
+    """The per-path counters of a host-hour tunnel object (≤ TUNNEL_PATHS_MAX ids; None beyond)."""
+    paths = t.setdefault("paths", {})
+    p = paths.get(pid)
+    if p is None:
+        if len(paths) >= TUNNEL_PATHS_MAX:
+            return None
+        p = paths[pid] = _new_tpath()
+    return p
+
+
 # ---- live minute aggregates (SPEC §14.3.1)
 LIVE_MAX = 5000                    # `live` items per usage POST
 LIVE_TOP = 20                      # top countries / paths per item
@@ -2436,7 +2677,10 @@ def _prune_live(live: dict):
         del live[k]
 
 
-def _account_live(live: dict, host: str, minute: str, nbytes: int, hit: bool, code: int, cc: str, path: str):
+def _account_live(live: dict, host: str, minute: str, nbytes: int, hit: bool, code: int, cc: str, path: str,
+                  tunnel: str | None = None):
+    """tunnel: None for a request without a tunnel path id, else its classify_tunnel() outcome
+    ("" when the line is not counted as a session or an error)."""
     key = f"{host}|{minute}"
     b = live.get(key)
     if b is None:
@@ -2455,6 +2699,12 @@ def _account_live(live: dict, host: str, minute: str, nbytes: int, hit: bool, co
         path = path[:LIVE_PATH_LEN]
         if path in b["paths"] or len(b["paths"]) < LIVE_PATH_TRACK:
             _inc(b["paths"], path)
+    # SPEC §15.4 (controller contract): attempts = every tunnel request attributed to a path id in
+    # this minute, whatever its outcome; errors = the origin_refused + origin_timeout ones among them
+    if tunnel is not None:
+        b["tunnel_attempts"] = b.get("tunnel_attempts", 0) + 1
+        if tunnel in ORIGIN_DOWN_ERRORS:
+            b["tunnel_errors"] = b.get("tunnel_errors", 0) + 1
 
 
 def _top(d: dict, n: int) -> dict:
@@ -2470,15 +2720,19 @@ def live_item(key: str, b: dict) -> dict | None:
 
     def cnt(d):   # the controller rejects the WHOLE usage POST (422) on a negative number
         return {k: max(0, int(v)) for k, v in d.items()}
-    return {"host": host, "minute": minute, "requests": max(0, int(b.get("requests") or 0)),
+    item = {"host": host, "minute": minute, "requests": max(0, int(b.get("requests") or 0)),
             "bytes": max(0, int(b.get("bytes") or 0)), "cache_hits": max(0, int(b.get("cache_hits") or 0)),
             "status": cnt(b.get("status") or {}), "countries": cnt(_top(b.get("countries") or {}, LIVE_TOP)),
             "paths": cnt(_top(b.get("paths") or {}, LIVE_TOP))}
+    if b.get("tunnel_attempts"):   # SPEC §15.4, optional: only minutes with tunnel attempts carry them
+        item["tunnel_attempts"] = max(0, int(b["tunnel_attempts"]))
+        item["tunnel_errors"] = max(0, int(b.get("tunnel_errors") or 0))
+    return item
 
 
 def _live_size(item: dict) -> int:
     """Cheap upper estimate of an item's JSON size (bytes)."""
-    return (160 + len(item["host"]) + sum(len(k) + 12 for k in item["paths"])
+    return (200 + len(item["host"]) + sum(len(k) + 12 for k in item["paths"])
             + 10 * len(item["countries"]) + 12 * len(item["status"]))
 
 
@@ -2570,8 +2824,12 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
     if path and (path in a["paths"] or len(a["paths"]) < PATH_TRACK):
         _inc(a["paths"], path)
     tn = e.get("tn")
+    tcls = live_tn = None
     if tn in TUNNEL_PROTOCOLS:
-        _account_tunnel(a, e, tn, code)
+        tcls = classify_tunnel(e)
+        _account_tunnel(a, e, tn, code, tcls)
+        if e.get("tp"):
+            live_tn = tcls or ""
     parts = str(e.get("v") or "ok").split(":", 2)
     if len(parts) == 3 and parts[0] in ("block", "challenge", "captcha", "log"):
         action, source, rule = parts
@@ -2583,7 +2841,7 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
                        "source": source, "rule": rule, "user_agent": str(e.get("ua") or "")[:512]})
     # best-effort extras last, so nothing in them can cut the hourly / security accounting short
     if live is not None and minute >= cutoff:
-        _account_live(live, host, minute, nbytes, hit, code, cc, path)
+        _account_live(live, host, minute, nbytes, hit, code, cc, path, live_tn)
     if ship is not None:
         try:
             ship.offer(e, host, dt, raw)
@@ -2596,7 +2854,7 @@ def _nsum(v) -> int:
     return sum(int(x) for x in re.findall(r"\d+", str(v or "")))
 
 
-def _account_tunnel(a: dict, e: dict, proto: str, code: int):
+def _account_tunnel(a: dict, e: dict, proto: str, code: int, tcls: str | None = None):
     """Tunnel counters of a host-hour (SPEC §7.3). One log line = one tunnel request: a whole
     WebSocket / HTTPUpgrade session or gRPC / h2 stream, or one XHTTP request.
     Bytes from the client: $request_length counts request bodies (HTTP/1.1 and HTTP/2) but not
@@ -2618,6 +2876,27 @@ def _account_tunnel(a: dict, e: dict, proto: str, code: int):
     t["bytes_up"] += up
     t["bytes_down"] += down
     _inc(t["by_protocol"], proto, up + down)
+    # SPEC §15.1 per path id ("tp"; lines without it - pre-wave-7 - only feed the totals above)
+    pid = str(e.get("tp") or "")
+    if not pid or not SAFE_ID.match(pid):
+        return
+    p = _tpath(t, pid)
+    if p is None:
+        return
+    p["bytes_up"] += up
+    p["bytes_down"] += down
+    if tcls == "session":
+        p["sessions"] += 1
+        try:
+            p["seconds"] += max(0.0, float(e.get("rt") or 0))
+        except (TypeError, ValueError):
+            pass
+    elif tcls in TUNNEL_ERRORS:
+        p["errors"][tcls] = p["errors"].get(tcls, 0) + 1
+    ms = connect_ms(e)
+    if ms is not None:   # every tunnel request whose (last) upstream connect succeeded, whatever came next
+        p["connect_ms_sum"] += ms
+        p["connect_n"] += 1
 
 
 def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float | None = None,
@@ -2711,9 +2990,25 @@ def usage_item(key: str, a) -> dict:
         t = a["tunnel"]
         item["tunnel"] = {"sessions": t["sessions"], "seconds": int(round(t["seconds"])), "bytes_up": t["bytes_up"],
                           "bytes_down": t["bytes_down"], "by_protocol": dict(t["by_protocol"])}
+        if t.get("paths"):   # SPEC §15.1 (optional; pre-wave-7 agents omit it)
+            item["tunnel"]["paths"] = {pid: tpath_item(p) for pid, p in sorted(t["paths"].items())}
     if a["paths"]:
         item["paths"] = dict(sorted(a["paths"].items(), key=lambda kv: (-kv[1], kv[0]))[:PATHS_PER_ITEM])
     return item
+
+
+def tpath_item(p: dict) -> dict:
+    """Wire shape of one `tunnel.paths` entry (SPEC §15.1): integers only, all seven error keys."""
+    def n(v):
+        try:
+            return max(0, int(round(float(v or 0))))
+        except (TypeError, ValueError):
+            return 0
+    errs = p.get("errors") or {}
+    return {"sessions": n(p.get("sessions")), "seconds": n(p.get("seconds")), "bytes_up": n(p.get("bytes_up")),
+            "bytes_down": n(p.get("bytes_down")), "abnormal": n(p.get("abnormal")),
+            "connect_ms_sum": n(p.get("connect_ms_sum")), "connect_n": n(p.get("connect_n")),
+            "errors": {k: n(errs.get(k)) for k in TUNNEL_ERRORS}}
 
 
 def usage_items(pending: dict) -> list[dict]:
@@ -3177,8 +3472,9 @@ def parse_error_lines(text: str) -> list[dict]:
     return out
 
 
-def read_error_log(state: dict, path: str) -> list[dict]:
-    """New WARN/ERROR/crit lines since the last offset (handles rotation/truncation). Fail-soft."""
+def read_error_log(state: dict, path: str, raw_hook=None) -> list[dict]:
+    """New WARN/ERROR/crit lines since the last offset (handles rotation/truncation). Fail-soft.
+    raw_hook(text): sees the raw, unredacted new text first (tunnel abnormal-end accounting)."""
     try:
         st = os.stat(path)
     except (FileNotFoundError, OSError):
@@ -3207,7 +3503,87 @@ def read_error_log(state: dict, path: str) -> list[dict]:
     except OSError as e:
         log.debug("error-log read: %s", e)
         return []
+    if raw_hook is not None:
+        try:
+            raw_hook(text)
+        except Exception as e:  # noqa: BLE001 - never let accounting break log shipping
+            log.debug("error-log hook: %s", e)
     return parse_error_lines(text)
+
+
+# SPEC §15.1 `abnormal`: nginx 1.24 logs an established tunnel session that the ORIGIN ended badly with
+# the same $status / $upstream_status as a clean end (101 / 200), so the access log cannot tell. The
+# error log can: an [error] line "... while proxying upgraded connection" (ws / httpupgrade after the
+# 101: upstream reset, upstream idle timeout) or "... while reading upstream" (grpc / h2 / xhttp
+# response body: upstream reset, premature close, read timeout). Client-side failures of the same
+# phases are logged at [info] (nginx logs client connection errors at info), and failures before a
+# response header ("while connecting to upstream", "while reading response header from upstream")
+# are already origin_refused / origin_timeout in the access log, so they are not matched here.
+# The line is attributed to the path id by host + longest tunnel prefix of its request path.
+ABNORMAL_RE = re.compile(r'^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[error\] .* while (?:proxying upgraded connection|'
+                         r'reading upstream), .*?request: "[A-Z]{1,16} (\S+) [^"]*".*, host: "([^"]+)"\s*$')
+
+
+def tunnel_map(config: dict) -> dict:
+    """{host: [[prefix, path id], ...] longest prefix first} for the abnormal-end attribution."""
+    out = {}
+    for site in config.get("sites", []):
+        try:
+            tn = norm_tunnel(site, norm_pools(site))
+        except Exception:  # noqa: BLE001 - a broken site entry never stops the others
+            tn = None
+        if not tn:
+            continue
+        prefixes = sorted(([p["path"], p["id"]] for p in tn["paths"]), key=lambda x: (-len(x[0]), x[0]))
+        for h in site.get("hosts") or []:
+            name = str(h.get("name") or "").lower() if isinstance(h, dict) else ""
+            if name and SAFE_NAME.match(name):
+                out[name] = prefixes
+    return out
+
+
+def _tmap_lookup(tmap: dict, host: str, path: str) -> str | None:
+    host = host.lower().split(":", 1)[0]
+    prefixes = tmap.get(host)
+    if prefixes is None:   # wildcard host entries ("*.example.com")
+        for name, pre in tmap.items():
+            if name.startswith("*.") and host.endswith(name[1:]):
+                prefixes = pre
+                break
+    for prefix, pid in prefixes or ():
+        if path.startswith(prefix):
+            return pid
+    return None
+
+
+def account_abnormal(state: dict, text: str) -> int:
+    """Add the abnormal tunnel-session ends found in raw error-log text to the pending host-hours
+    (tunnel.paths[id].abnormal). Returns how many were counted."""
+    tmap = state.get("tunnel_map") or {}
+    if not tmap or " while " not in text:
+        return 0
+    pending = state.setdefault("pending", {})
+    n = 0
+    for raw in text.splitlines():
+        m = ABNORMAL_RE.match(raw.strip())
+        if not m:
+            continue
+        ts, uri, host = m.groups()
+        pid = _tmap_lookup(tmap, host, uri.split("?", 1)[0])
+        if not pid:
+            continue
+        try:   # nginx writes the error log in local time
+            hour = (datetime.strptime(ts, "%Y/%m/%d %H:%M:%S").astimezone(timezone.utc)
+                    .strftime("%Y-%m-%dT%H:00:00Z"))
+        except (ValueError, OverflowError, OSError):
+            continue
+        a = _bucket(pending, f"{host.lower().split(':', 1)[0]}|{hour}")
+        t = a.setdefault("tunnel", {"sessions": 0, "seconds": 0.0, "bytes_up": 0, "bytes_down": 0, "by_protocol": {}})
+        p = _tpath(t, pid)
+        if p is not None:
+            p["abnormal"] += 1
+            n += 1
+    return n
 
 
 def _read_tail(path: str, pos: int) -> str:
@@ -3225,7 +3601,7 @@ def collect_logs(state: dict, cfg: dict) -> list[dict]:
     De-dup is against the fingerprints of the last batch so an identical repeating line is not
     re-sent every cycle. Never raises."""
     try:
-        lines = read_error_log(state, cfg.get("ERROR_LOG") or "")
+        lines = read_error_log(state, cfg.get("ERROR_LOG") or "", lambda text: account_abnormal(state, text))
     except Exception as e:  # noqa: BLE001 - log shipping must never break the agent
         log.debug("collect error log failed: %s", e)
         lines = []
@@ -3577,6 +3953,11 @@ class Agent:
             self.logship.update_config(body)
         except Exception as e:  # noqa: BLE001 - never let log export break config sync
             log.error("logship config update failed: %s", e)
+        try:   # SPEC §15.1/§15.2: agent-side only (abnormal-end attribution, fair-share hot flag)
+            st["tunnel_map"] = tunnel_map(body)
+            st["node"] = norm_node(body, cfg)
+        except Exception as e:  # noqa: BLE001
+            log.error("tunnel map / node block update failed: %s", e)
         version = body["version"]
         etag = hdrs.get("ETag") or hdrs.get("etag")
         body = with_cached_bot_ranges(body, st)   # SPEC §14.2: keep the last good crawler ranges
@@ -3759,9 +4140,32 @@ class Agent:
             extra["logship"] = self.logship.stats()
         except Exception:  # noqa: BLE001 - informational only
             pass
+        m = self.metrics()
+        try:
+            self.fair_signal(m)
+        except Exception as e:  # noqa: BLE001 - fair share is best-effort and fails open
+            log.debug("fair share signal: %s", e)
         self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
                                                              error=self.state.get("last_error"),
-                                                             metrics=self.metrics(), **extra))
+                                                             metrics=m, **extra))
+
+    def fair_signal(self, m: dict):
+        """SPEC §15.2: tell nginx (localhost /__pcdn/fair, pcdn.js tunnelFair) whether the node is hot:
+        tx_mbps >= 85 % of the node capacity; it stays hot until tx drops below 80 %. Sent on every
+        heartbeat; the flag expires in nginx (180 s zone timeout) if the agent stops sending it."""
+        if not has_module(self.cfg, "njs"):
+            return
+        node = self.state.get("node") or norm_node({}, self.cfg)
+        was = bool(self.state.get("fair_hot"))
+        self.state["fair_hot"] = hot = fair_hot(m.get("tx_mbps") or 0, node["capacity_mbps"], was)
+        if hot != was:
+            log.info("node %s (tx %.0f of %d Mbps): tunnel fair share %s", "hot" if hot else "no longer hot",
+                     m.get("tx_mbps") or 0, node["capacity_mbps"],
+                     f"active at {node['fair_share_pct']} %" if hot else "idle")
+        port = _int(self.cfg.get("HTTP_PORT"), 80, 1, 65535)
+        url = f"http://127.0.0.1:{port}/__pcdn/fair?hot={node['fair_share_pct'] if hot else 0}"
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=2) as r:
+            r.read()
 
     def ship_logs(self):
         """Ship new WARN/ERROR/crit lines to the controller (SPEC §11.2). Fail-soft: never raises."""

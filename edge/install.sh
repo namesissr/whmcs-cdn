@@ -22,7 +22,8 @@
 #   --cc bbr|cubic     TCP congestion control (default bbr)
 #   --upgrade          update an installed edge in place: controller, token, ports, IPv6, cache
 #                      size, region, role, --http3 and --cc are read from /etc/pcdn/agent.conf
-#                      (flags still override); LOGSHIP_* tunables set there are kept
+#                      (flags still override); LOGSHIP_*, CAPACITY_MBPS, FAIR_SHARE_PCT,
+#                      NODE_NAME and SPEED_FILE set there are kept
 #   --distro-nginx     same as --no-http3 (the default)
 set -euo pipefail
 
@@ -83,7 +84,10 @@ if [ "$UPGRADE" = yes ]; then
   v="$(conf HTTPS_PORT)"; [ -n "$v" ] && HTTPS_PORT="$v"
   if [ -z "$TCP_CC" ]; then v="$(conf TCP_CC)"; case "$v" in bbr|cubic) TCP_CC="$v" ;; esac; fi
   if [ -z "$HTTP3" ]; then v="$(conf HTTP3)"; case "$v" in yes|no) HTTP3="$v" ;; esac; fi
-  KEEP_CONF="$(grep -E '^LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)=' /etc/pcdn/agent.conf || true)"
+  # kept across --upgrade: log-export tunables (SPEC §14.3.2) and the wave-7 node settings an operator
+  # may have added (SPEC §15.2 fair-share capacity / share, §15.6 speed-test node name / file)
+  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE)=' \
+    /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
 HTTP3="${HTTP3:-no}"
@@ -329,6 +333,9 @@ else
 fi
 # F30: 999- so it sorts after /etc/sysctl.d/99-sysctl.conf at boot; drop the old 99- name on upgrade.
 rm -f /etc/sysctl.d/99-pcdn.conf
+# default_qdisc fq is required by bbr and stays the default (SPEC §15.2): per-flow fair queueing on
+# the NIC is what keeps one busy tunnel from starving the others at the packet level; nginx 1.24
+# cannot rate-limit tunnel streams itself (see docs/EDGE.md, fair share).
 # >>> pcdn sysctl (edge/tests/test_agent.py runs this heredoc; it expands only ${TCP_CC})
 cat > /etc/sysctl.d/999-pcdn.conf <<EOF
 net.core.default_qdisc = fq
