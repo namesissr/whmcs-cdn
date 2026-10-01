@@ -7,11 +7,12 @@ elector (app/leader.py) whether this instance leads; followers just wait.
 
 import logging
 import threading
+import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, delete, or_, select
 
-from . import alerts, dnsbuild, geocheck, nscheck, ssl, uptime
+from . import alerts, dnsbuild, geocheck, live, logexport, nscheck, ssl, uptime, webhooks
 from .config import settings
 from .db import SessionLocal
 from .leader import instance_id, make_elector
@@ -244,6 +245,13 @@ def job_ssl(db):
         site.ssl_status = "active" if had_cert else "failed"
         site.ssl_error = error = str(e)[-2000:]
         site.updated_at = utcnow()
+    # webhooks (SPEC §14.3.3), queued in the same transaction; never the certificate or key
+    if error is None:
+        webhooks.emit(db, site, "ssl.issued", {
+            "renewal": had_cert, "names": [domain, f"*.{domain}"],
+            "expires_at": site.ssl_expires_at.isoformat() + "Z" if site.ssl_expires_at else None})
+    else:
+        webhooks.emit(db, site, "ssl.failed", {"renewal": had_cert, "error": error[-500:]})
     db.commit()
     key = f"ssl_failed:{domain}"
     if error is None:
@@ -279,6 +287,9 @@ def job_cleanup(db):
     db.execute(delete(UsageBatch).where(UsageBatch.received_at < utcnow() - timedelta(days=7)))
     uptime.prune(db)
     prune_events(db)
+    # SPEC §14.3: live analytics minute buckets live 24 h, webhook delivery rows 7 days
+    live.prune(db)
+    webhooks.prune(db)
     db.commit()
 
 
@@ -401,13 +412,30 @@ def job_bot_ranges(db, now: datetime | None = None, force: bool = False):
     botranges.refresh(db, now=now, force=force)
 
 
+def job_webhooks(db, now: datetime | None = None, wait: bool = False):
+    """Hand due webhook deliveries to the delivery workers (SPEC §14.3.3, leader only). Runs every
+    tick and in the ~30 s fast lane between ticks; the HTTP requests happen on worker threads, so
+    a slow receiver never delays this scheduler."""
+    return webhooks.run_due(db, now=now, wait=wait)
+
+
+def job_log_export(db, now: datetime | None = None, wait: bool = False):
+    """Upload every completed hour of spooled access logs to the customers' buckets (SPEC §14.3.2,
+    leader only): failures retry every 10 min, chunks older than 72 h are dropped and counted. The
+    uploads run on worker threads."""
+    return logexport.run_uploads(db, now=now, wait=wait)
+
+
 # metrics: per-job last-completed timestamps are stored in the State table under this prefix
 # (read by routes_metrics for pcdn_scheduler_job_last_run_age_seconds)
 JOBRUN_PREFIX = "jobrun:"
 
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
 JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_cleanup,
-        job_prune_audit, job_ssl, job_backup, job_origin_pull, job_bot_ranges]
+        job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks, job_log_export, job_bot_ranges]
+# run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
+FAST_JOBS = [job_webhooks]
+FAST_INTERVAL = 30.0
 
 
 def _record_job_run(name: str):
@@ -453,6 +481,20 @@ def run_once():
             _record_job_run(job.__name__)
 
 
+def run_fast():
+    """The fast lane between two full ticks (FAST_JOBS). Failures are logged; the full tick's
+    job_failed alerting covers the same jobs."""
+    for job in FAST_JOBS:
+        db = SessionLocal()
+        try:
+            job(db)
+        except Exception:  # noqa: BLE001
+            log.exception("fast job %s failed", job.__name__)
+            db.rollback()
+        finally:
+            db.close()
+
+
 def record_run():
     db = SessionLocal()
     try:
@@ -471,12 +513,14 @@ current: "Scheduler | None" = None
 
 
 class Scheduler(threading.Thread):
-    def __init__(self, elector=None, interval: float | None = None, work=None):
+    def __init__(self, elector=None, interval: float | None = None, work=None, fast_work=None):
         super().__init__(daemon=True, name="pcdn-scheduler")
         self.stop_event = threading.Event()
         self.elector = elector if elector is not None else make_elector()
         self.interval = settings.scheduler_interval if interval is None else interval
         self.work = work or run_once
+        # the fast lane only accompanies the real job list (a custom `work` gets none by default)
+        self.fast_work = fast_work if fast_work is not None else (run_fast if work is None else None)
         self.is_leader = False
 
     def tick(self) -> bool:
@@ -502,9 +546,25 @@ class Scheduler(threading.Thread):
                     self.tick()
                 except Exception:  # noqa: BLE001
                     log.exception("scheduler tick failed")
-                self.stop_event.wait(self.interval)
+                self.wait_interval()
         finally:
             self.release()
+
+    def wait_interval(self):
+        """Sleep until the next full tick; meanwhile, while leading, run the fast lane (webhook
+        deliveries) every FAST_INTERVAL seconds. Returns early when stopped."""
+        deadline = time.monotonic() + self.interval
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self.stop_event.wait(min(FAST_INTERVAL, remaining)):
+                return
+            if self.fast_work is not None and self.is_leader and deadline - time.monotonic() > 1:
+                try:
+                    self.fast_work()
+                except Exception:  # noqa: BLE001
+                    log.exception("scheduler fast lane failed")
 
     def release(self):
         try:

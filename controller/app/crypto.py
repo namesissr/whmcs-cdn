@@ -119,7 +119,9 @@ def rotate(value: str | None) -> str | None:
 
 # ------------------------------------------------------------------ bulk operations
 
-# encrypted columns of the sites table (ORM attribute names)
+# encrypted columns of the sites table (ORM attribute names). sites.integration_secrets is a JSON
+# document whose values are each encrypted (log-export S3 secret key, webhook signing secrets,
+# SPEC §14.3); site_secrets.map_values / values / drop_unreadable handle it below.
 SITE_SECRETS = ("ssl_key_stored", "secret_stored", "origin_client_key_stored")
 # `state` rows holding a JSON document whose listed fields are encrypted secrets (the platform
 # origin-pull CA + client certificate keys, SPEC §14.2; see origin_pull.py)
@@ -177,8 +179,11 @@ def status(db) -> dict:
     except CryptoError as e:
         out["error"] = str(e)
         out["readable"] = False
+    from . import site_secrets
+
     values = [v for row in db.execute(select(*(getattr(Site, a) for a in SITE_SECRETS))) for v in row]
     values += [doc.get(f) for _, doc, fields in _state_docs(db) for f in fields]
+    values += [v for site in _secret_rows(db) for v in site_secrets.values(site)]
     sample = None
     for v in values:
         if not v:
@@ -201,6 +206,8 @@ def encrypt_existing(db) -> int:
     """Encrypt every plaintext secret with the primary key. Returns the number of values changed."""
     if not enabled():
         raise CryptoError("DATA_ENCRYPTION_KEY is not set")
+    from . import site_secrets
+
     changed = 0
     for site in _secret_rows(db):
         for attr in SITE_SECRETS:
@@ -208,6 +215,7 @@ def encrypt_existing(db) -> int:
             if v and not is_encrypted(v):
                 setattr(site, attr, encrypt(v))
                 changed += 1
+        changed += site_secrets.map_values(site, encrypt, plaintext_only=True)
     changed += _map_state_secrets(db, encrypt, plaintext_only=True)
     db.commit()
     return changed
@@ -217,6 +225,8 @@ def rotate_all(db) -> int:
     """Re-encrypt every secret with the primary key (after adding a new key in front)."""
     if not enabled():
         raise CryptoError("DATA_ENCRYPTION_KEY is not set")
+    from . import site_secrets
+
     changed = 0
     for site in _secret_rows(db):
         for attr in SITE_SECRETS:
@@ -224,6 +234,7 @@ def rotate_all(db) -> int:
             if v:
                 setattr(site, attr, rotate(v))
                 changed += 1
+        changed += site_secrets.map_values(site, rotate, plaintext_only=False)
     changed += _map_state_secrets(db, rotate, plaintext_only=False)
     db.commit()
     return changed
@@ -264,6 +275,12 @@ def drop_unreadable(db) -> list[str]:
             touched = True
         if not _readable(site.secret_stored):
             site.secret = pysecrets.token_hex(32)
+            touched = True
+        # log-export secret key / webhook signing secrets: forgotten; the customer re-enters the key
+        # and rotates the webhook secrets (GET then shows secret_key_set / secret_set false)
+        from . import site_secrets
+
+        if site_secrets.drop_unreadable(site, _readable):
             touched = True
         if touched:
             affected.append(site.domain)

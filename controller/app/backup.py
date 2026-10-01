@@ -233,6 +233,19 @@ class S3Client:
         if r.status_code >= 300:
             raise BackupError(f"S3 PUT {key}: HTTP {r.status_code} {r.text[:300]}")
 
+    def put_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream"):
+        """PUT an in-memory object (log export, SPEC §14.3.2). Same SigV4 path-style signing as
+        put_file; redirects are never followed (a 3xx is an error)."""
+        url, upath = self._url_and_path(key)
+        headers = self.sign("PUT", url, upath, {}, hashlib.sha256(data).hexdigest())
+        headers["Content-Type"] = content_type
+        r = self.http.put(url, headers=headers, content=data)
+        if r.status_code >= 300:
+            raise BackupError(f"S3 PUT {key}: HTTP {r.status_code} {r.text[:300]}")
+
+    def close(self):
+        self.http.close()
+
     def list(self, prefix: str = "") -> list[dict]:
         out, token = [], None
         while True:

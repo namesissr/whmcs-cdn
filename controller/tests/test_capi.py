@@ -228,3 +228,24 @@ def test_admin_key_rejected_on_capi_and_customer_key_rejected_on_admin(client):
     assert client.get("/api/v1/ping", headers=auth(key)).status_code == 401
     assert client.get("/api/v1/sites/example.com/records", headers=auth(key)).status_code == 401
     assert client.get("/edge/v1/config", headers=auth(key)).status_code == 401
+
+
+def test_deleted_site_leaves_no_key_or_data_for_a_reused_id(client):
+    """SQLite enforces no foreign keys and may hand a deleted site's id to the next site: the old
+    customer's API key, usage and events must never carry over to it."""
+    first = make_site(client, "old.example")
+    key = new_key(client, "old.example")["key"]
+    ingest(client, "old.example")
+    assert client.delete("/api/v1/sites/old.example").status_code == 200
+    second = make_site(client, "new.example")
+    assert client.get(f"{CAPI}/analytics", headers=auth(key)).status_code == 401
+    if second["id"] == first["id"]:   # the id really was reused (SQLite)
+        assert client.get("/api/v1/sites/new.example/apikeys").json() == []
+        totals = client.get("/api/v1/sites/new.example/analytics?period=24h").json()["totals"]
+        assert totals["requests"] == 0
+
+
+def test_no_public_admin_api_docs(client):
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404, path
+    assert client.get(f"{CAPI}/openapi.json").status_code == 200

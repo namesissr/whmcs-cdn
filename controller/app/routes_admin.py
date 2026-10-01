@@ -10,13 +10,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import bundle, dnsbuild, nscheck, pdns, sections
+from . import bundle, dnsbuild, nscheck, pdns, sections, webhooks
 from .audit import record_audit
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
 from .models import ApiKey, AuditLog, Edge, EdgeAddress, Record, Site, UsageHourly, utcnow
 from .services import (
+    delete_platform_data,
+    lock_site,
     refresh_quota,
     month_start,
     queue_purge,
@@ -86,6 +88,10 @@ class FeaturesIn(BaseModel):
     edge_group: Literal["general", "tunnel"] | None = None
     max_transform_rules: int | None = Field(default=None, ge=0, le=1000)
     max_redirects: int | None = Field(default=None, ge=0, le=10000)
+    # analytics & platform (SPEC §14.3)
+    log_export: bool | None = None
+    max_webhooks: int | None = Field(default=None, ge=0, le=sections.WEBHOOKS_MAX)
+    sla_target: float | None = Field(default=None, ge=0, le=100)
 
 
 class Plan(BaseModel):
@@ -281,7 +287,7 @@ def read_site(domain: str, db: Session = Depends(get_db)):
 
 @router.patch("/sites/{domain}/plan")
 def update_plan(domain: str, plan: Plan, request: Request, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+    site = lock_site(db, get_site(db, domain))  # read-modify-write of site.features
     group = sections.features_of(site)["edge_group"]
     apply_plan(site, plan)
     # a raised/lowered bandwidth limit takes effect now, not on the next scheduler tick
@@ -312,7 +318,7 @@ def update_reseller(domain: str, body: ResellerIn, request: Request, db: Session
 @router.patch("/sites/{domain}/settings")
 def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_db)):
     """v1 settings endpoint; values are written into the cache/ssl sections."""
-    site = get_site(db, domain)
+    site = lock_site(db, get_site(db, domain))  # read-modify-write of site.config
     data = body.model_dump(exclude_none=True)
     if "blocked_ips" in data:
         ips = []
@@ -342,7 +348,9 @@ def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_d
 
 @router.post("/sites/{domain}/suspend")
 def suspend(domain: str, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+    site = lock_site(db, get_site(db, domain))  # one webhook per transition, also when concurrent
+    if not site.suspended:  # webhook on the transition only (SPEC §14.3.3)
+        webhooks.emit(db, site, "site.suspended", {"status": "suspended"})
     site.suspended = True
     db.commit()
     return {"ok": True}
@@ -350,8 +358,10 @@ def suspend(domain: str, db: Session = Depends(get_db)):
 
 @router.post("/sites/{domain}/unsuspend")
 def unsuspend(domain: str, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
-    site.suspended = False
+    site = lock_site(db, get_site(db, domain))
+    if site.suspended:
+        site.suspended = False
+        webhooks.emit(db, site, "site.unsuspended", {"status": site.effective_status})
     db.commit()
     return {"ok": True}
 
@@ -360,6 +370,7 @@ def unsuspend(domain: str, db: Session = Depends(get_db)):
 def delete_site(domain: str, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     name = site.domain
+    delete_platform_data(db, site.id)
     db.delete(site)
     db.commit()
     _audit(db, request, "site.delete", name)

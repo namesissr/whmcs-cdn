@@ -31,6 +31,8 @@ DETAIL_WHITELIST = {
     "everything", "urls", "prefixes", "items", "fields",
     # bulk imports (e.g. redirects CSV): replace | append
     "mode",
+    # webhooks / log export (SPEC §14.3): which hook, and the outcome of a test
+    "hook_id", "ok",
 }
 # a key containing any of these substrings is never stored, as a second line of defence
 _SECRET_HINTS = ("secret", "token", "key", "password", "passphrase", "cert", "hash", "private")

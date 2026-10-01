@@ -14,14 +14,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from . import origin_pull, pdns, sections, ssl, tunnel
+from . import logexport, origin_pull, pdns, sections, ssl, tunnel, webhooks
 from .audit import record_audit
 from .auth import require_admin
 from .config import settings
 from .db import get_db
 from .models import Incident, IncidentUpdate, Record, SecurityEvent, Site, UsageHourly, utcnow
 from .routes_admin import RecordIn, _record_from, bad, get_site
-from .services import site_to_dict, sync_site_dns
+from .services import lock_site, site_to_dict, sync_site_dns
 from .validation import ValidationError
 
 router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
@@ -62,17 +62,38 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
                      response: Response | None = None) -> dict:
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
-    pools_in_use = {r.pool for r in site.records if r.pool}
     try:
-        value = sections.validate_section(site, section, body, pools_in_use)
+        outbound = section in sections.OUTBOUND_SECTIONS
+        if outbound:
+            # SSRF check of the outbound URLs first: it resolves DNS and needs no site state, so it
+            # must not run while the site row is locked
+            parsed = sections.dump(sections.SECTIONS[section].model_validate(body))
+            sections.check_targets(section, parsed)
+        # every PUT rewrites the whole site.config document: validate and merge against the row as
+        # locked now, never a copy loaded earlier, so concurrent writers cannot drop each other's
+        # sections (lost update)
+        site = lock_site(db, site)
+        pools_in_use = {r.pool for r in site.records if r.pool}
+        value = sections.validate_section(site, section, body, pools_in_use, vet=not outbound)
     except pydantic.ValidationError as e:
         _pydantic_422(e)
     except PermissionError as e:
         raise HTTPException(403, str(e))
     except ValidationError as e:
         bad(e)
+    new_secrets = None
+    if section == "logs":  # write-only secret_key: stored encrypted outside the section (SPEC §14.3.2)
+        value = logexport.apply_write(site, value)
+    elif section == "webhooks":  # ids + signing secrets assigned by the controller (SPEC §14.3.3)
+        value, new_secrets = webhooks.apply_write(site, value)
     sections.store_section(site, section, value)
     db.commit()
+    if section in ("logs", "webhooks"):
+        # the stored view: secrets never returned, only secret_key_set / secret_set; the secrets of
+        # newly created webhooks are shown this once
+        value = sections.get_section(site, section)
+        if new_secrets is not None:
+            value["new_secrets"] = new_secrets
     if section == "ssl" and value["origin_client_auth"] == "platform":
         # create the platform origin-pull CA now (once), so the CA the customer downloads next is the
         # one the edges' client certificate chains to; a failure here is retried on the next edge poll
@@ -194,7 +215,7 @@ def upload_origin_client(domain: str, body: CustomCert, request: Request, db: Se
 @router.delete("/sites/{domain}/ssl/origin-client")
 def remove_origin_client(domain: str, request: Request, db: Session = Depends(get_db)):
     """Forget the custom origin client certificate; a site still set to custom is switched to off."""
-    site = get_site(db, domain)
+    site = lock_site(db, get_site(db, domain))  # read-modify-write of site.config below
     if not site.origin_client_cert and not site.origin_client_key_stored:
         raise HTTPException(404, "گواهی کلاینت مبدأ ثبت نشده است")
     site.origin_client_cert = site.origin_client_key_stored = site.origin_client_expires_at = None
@@ -234,6 +255,7 @@ def import_redirects_of(db: Session, site: Site, text: str, mode: str,
     swaps the whole list, append adds after the existing rules. Plan limit -> 403."""
     if mode not in ("replace", "append"):
         bad(ValidationError("mode باید replace یا append باشد"))
+    site = lock_site(db, site)  # append merges with the rules as stored now (write_section_of keeps it)
     existing = [] if mode == "replace" else sections.get_section(site, "redirects")["rules"]
     rules, errors = sections.parse_redirects_csv(text, existing)
     if errors:
@@ -382,6 +404,9 @@ def dnssec_toggle(domain: str, body: DnssecIn, request: Request, db: Session = D
 # ------------------------------------------------------------------ analytics
 
 PERIODS = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+# security sources always present (zero-filled) in analytics totals; `bots` = bot management
+# (SPEC §14.2). Any other source an edge reports is still summed in.
+SECURITY_SOURCES = ("waf", "firewall", "ratelimit", "challenge", "ddos", "hotlink", "bots")
 
 
 def _loads(s: str) -> dict:
@@ -402,7 +427,7 @@ def site_analytics(db: Session, site: Site, period: str) -> dict:
 
     totals = {"requests": 0, "bytes": 0, "cache_hits": 0,
               "status": {k: 0 for k in ("2xx", "3xx", "4xx", "5xx")},
-              "security": {k: 0 for k in ("waf", "firewall", "ratelimit", "challenge", "ddos", "hotlink")}}
+              "security": {k: 0 for k in SECURITY_SOURCES}}
     buckets: dict[str, dict] = {}
     countries, paths, codes = Counter(), Counter(), Counter()
     for row in rows:
@@ -457,7 +482,7 @@ def platform_analytics(period: str = "24h", db: Session = Depends(get_db)):
 
     totals = {"requests": 0, "bytes": 0, "cache_hits": 0,
               "status": {k: 0 for k in ("2xx", "3xx", "4xx", "5xx")},
-              "security": {k: 0 for k in ("waf", "firewall", "ratelimit", "challenge", "ddos", "hotlink")}}
+              "security": {k: 0 for k in SECURITY_SOURCES}}
     buckets: dict[str, dict] = {}
     sec_buckets: Counter = Counter()
     countries = Counter()

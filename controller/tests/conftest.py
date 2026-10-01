@@ -145,6 +145,78 @@ def pg_url():
 
 
 @pytest.fixture()
+def s3_server():
+    """A local moto S3 server with bucket `pcdn` (region ir-thr-at1); backups and log export."""
+    moto_server = pytest.importorskip("moto.server")
+    import boto3
+
+    server = moto_server.ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    host, port = server.get_host_and_port()
+    endpoint = f"http://{host}:{port}"
+    # moto keeps its state per process: start every test from an empty S3
+    httpx.post(f"{endpoint}/moto-api/reset", trust_env=False)
+    boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="AK", aws_secret_access_key="SK",
+                 region_name="ir-thr-at1").create_bucket(
+        Bucket="pcdn", CreateBucketConfiguration={"LocationConstraint": "ir-thr-at1"})
+    yield endpoint
+    server.stop()
+
+
+# ---------------------------------------------------------------- analytics & platform (SPEC §14.3)
+
+@pytest.fixture()
+def fake_dns(monkeypatch):
+    """The SSRF guard's resolver (app.netguard.resolver, its test-only injection point) -> a mutable
+    table (tests may change it, e.g. to simulate DNS rebinding); unknown names do not resolve."""
+    import socket
+
+    from app import netguard
+    from tests.platform_helpers import FAKE_DNS
+
+    table = {k: list(v) for k, v in FAKE_DNS.items()}
+
+    def resolve(host, port):
+        if host in table:
+            return list(table[host])
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(netguard, "resolver", resolve)
+    return table
+
+
+@pytest.fixture()
+def local_vet(monkeypatch):
+    """Test-only guard hook (app.netguard.vet): URLs on LOCAL_HOST / 127.0.0.1 (any scheme) are
+    'vetted' to 127.0.0.1, so the real code path (PinnedTransport, signing, no redirects, S3 SigV4)
+    runs against a local server; every other URL still goes through the real guard."""
+    from app import netguard
+    from tests.platform_helpers import LOCAL_HOST
+
+    real = netguard.default_vet
+
+    def vet(url):
+        u = httpx.URL(url)
+        host = u.raw_host.decode()
+        if host in (LOCAL_HOST, "127.0.0.1"):
+            port = u.port or (443 if u.scheme == "https" else 80)
+            return netguard.Target(url=url, scheme=u.scheme, host=host, port=port, ips=["127.0.0.1"])
+        return real(url)
+
+    monkeypatch.setattr(netguard, "vet", vet)
+
+
+@pytest.fixture()
+def receiver():
+    """A local HTTP endpoint (tests.platform_helpers.Receiver) recording every request."""
+    from tests.platform_helpers import Receiver
+
+    r = Receiver()
+    yield r
+    r.close()
+
+
+@pytest.fixture()
 def alert_settings(monkeypatch):
     """Reset alert channel settings (tests opt into the channels they need)."""
     from app import alerts

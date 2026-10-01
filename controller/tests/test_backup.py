@@ -194,23 +194,7 @@ def test_local_retention(tmp_path):
     assert backup.prune_local(str(tmp_path), 0) == []
 
 
-# ------------------------------------------------------------------ S3
-
-@pytest.fixture()
-def s3_server():
-    moto_server = pytest.importorskip("moto.server")
-    import boto3
-
-    server = moto_server.ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    host, port = server.get_host_and_port()
-    endpoint = f"http://{host}:{port}"
-    boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="AK", aws_secret_access_key="SK",
-                 region_name="ir-thr-at1").create_bucket(
-        Bucket="pcdn", CreateBucketConfiguration={"LocationConstraint": "ir-thr-at1"})
-    yield endpoint
-    server.stop()
-
+# ------------------------------------------------------------------ S3 (s3_server fixture: conftest.py)
 
 def test_sigv4_matches_botocore(monkeypatch):
     pytest.importorskip("botocore")

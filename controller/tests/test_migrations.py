@@ -51,23 +51,24 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
     # 0008: sites.reseller_client_id / reseller_label; 0014: custom origin client certificate
-    # (authenticated origin pulls, SPEC §14.2)
+    # (authenticated origin pulls, SPEC §14.2); 0015: integration secrets + quota warning (SPEC §14.3)
     site_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "sites")
-    assert site_added == ["origin_client_cert", "origin_client_expires_at", "origin_client_key",
-                          "reseller_client_id", "reseller_label"], diff
+    assert site_added == ["integration_secrets", "origin_client_cert", "origin_client_expires_at",
+                          "origin_client_key", "quota_warned_at", "reseller_client_id", "reseller_label"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
     # 0010: edge_addresses (multi-address edges / health-based failover);
-    # 0011: usage_batches (idempotent usage reports, F7); 0012: audit_log (SPEC §13.2)
+    # 0011: usage_batches (idempotent usage reports, F7); 0012: audit_log (SPEC §13.2);
+    # 0015: analytics_minute, log_spool, webhook_delivery (analytics & platform, SPEC §14.3)
     tables = {d[1].name for d in flat if d[0] == "add_table"}
     assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses",
-            "usage_batches", "audit_log"} <= tables, diff
+            "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery"} <= tables, diff
     # 0002: sites.secret String(64) -> Text
     assert any(d[0] == "modify_type" and d[2:4] == ("sites", "secret") for d in flat), diff
     # nothing else changed between 0001 and head
     other = [d for d in flat if d[0] not in ("add_column", "add_table", "modify_type")
              and not (d[0] == "add_index" and d[1].table.name in
                       ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses",
-                       "usage_batches", "audit_log"))]
+                       "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery"))]
     assert other == [], other
 
 
@@ -94,6 +95,11 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
         assert tuple(c.execute(text(
             "SELECT origin_client_cert, origin_client_key, origin_client_expires_at FROM sites")).one()) \
             == (None, None, None)
+        # 0015: no integration secret / quota warning on existing sites; the new tables are empty
+        assert tuple(c.execute(text("SELECT integration_secrets, quota_warned_at FROM sites")).one()) \
+            == (None, None)
+        for table in ("analytics_minute", "log_spool", "webhook_delivery"):
+            assert c.execute(text(f"SELECT count(*) FROM {table}")).scalar() == 0
         # 0003/0004/0005/0013 fill in the new edge columns of existing edges
         assert tuple(c.execute(text(
             'SELECT "group", capacity_mbps, shed, load_high, cpu_high, metrics, probe_fail, probe_ok,'

@@ -37,8 +37,13 @@ DEFAULT_FEATURES = {
     # rules & security (SPEC §14.2)
     "max_transform_rules": 10,
     "max_redirects": 100,
+    # analytics & platform (SPEC §14.3)
+    "log_export": True,           # section `logs` may be enabled
+    "max_webhooks": 10,           # items of section `webhooks`, 0 = none
+    "sla_target": 99.9,           # monthly availability target (%) of the SLA report
 }
 EDGE_GROUPS = ("general", "tunnel")
+WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
 
 
 class Strict(BaseModel):
@@ -63,6 +68,9 @@ class Features(Strict):
     edge_group: Literal["general", "tunnel"] = "general"
     max_transform_rules: int = Field(10, ge=0, le=1000)
     max_redirects: int = Field(100, ge=0, le=10000)
+    log_export: bool = True
+    max_webhooks: int = Field(10, ge=0, le=WEBHOOKS_MAX)
+    sla_target: float = Field(99.9, ge=0, le=100)
 
 
 # ------------------------------------------------------------------ sections
@@ -1067,6 +1075,148 @@ class Bots(Strict):
     block_empty_ua: bool = True
 
 
+# ------------------------------------------------------------------ analytics & platform (SPEC §14.3)
+
+S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+LOG_PREFIX_RE = re.compile(r"^[A-Za-z0-9/_.-]{0,128}$")
+S3_REGION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+S3_KEY_RE = re.compile(r"^[\x21-\x7e]*$")  # printable ASCII without spaces
+
+
+def _outbound_url(v: str, what: str) -> str:
+    """Syntax of an outbound URL only: no DNS here, because this also runs on every read of the
+    stored section. The policy — https only, every resolved address public (SSRF guard) — is
+    netguard.vet, run by validate_section on every write and again before every delivery/upload."""
+    import httpx
+
+    if not v or any(ch.isspace() or ord(ch) < 0x20 for ch in v):
+        raise ValueError(f"{what} لازم است و نباید فاصله داشته باشد")
+    try:
+        u = httpx.URL(v)
+    except Exception:  # noqa: BLE001 - httpx.InvalidURL
+        raise ValueError(f"{what} نامعتبر است") from None
+    if u.scheme not in ("http", "https") or not u.raw_host:
+        raise ValueError(f"{what} باید آدرس کامل https:// باشد")
+    return v
+
+
+class Logs(Strict):
+    """Log export (SPEC §14.3.2). `secret_key` is write-only: it is stored encrypted outside the
+    section (site_secrets) and GET returns "" plus `secret_key_set`; a PUT with ""/omitted keeps the
+    stored key. `secret_key_set` is output only and ignored on input."""
+    enabled: bool = False
+    s3_endpoint: str = Field("", max_length=512)
+    region: str = "us-east-1"
+    bucket: str = Field("", max_length=63)
+    prefix: str = Field("", max_length=128)
+    access_key: str = Field("", max_length=128)
+    secret_key: str = Field("", max_length=256)
+    secret_key_set: bool | None = None
+    anonymize_ip: bool = True
+    sample_rate: float = Field(1.0, ge=0.01, le=1)
+
+    @field_validator("s3_endpoint")
+    @classmethod
+    def _endpoint(cls, v):
+        v = (v or "").strip()
+        if not v:
+            return ""
+        if "?" in v or "#" in v:
+            raise ValueError("آدرس S3 نباید رشته پرس‌وجو (?) یا # داشته باشد")
+        return _outbound_url(v, "آدرس S3").rstrip("/")
+
+    @field_validator("region")
+    @classmethod
+    def _region(cls, v):
+        v = (v or "").strip() or "us-east-1"
+        if not S3_REGION_RE.match(v):
+            raise ValueError("ناحیه (region) فقط حروف انگلیسی، عدد، - و _ (حداکثر ۶۴ کاراکتر) می‌تواند باشد")
+        return v
+
+    @field_validator("bucket")
+    @classmethod
+    def _bucket(cls, v):
+        v = (v or "").strip()
+        if v and (not S3_BUCKET_RE.match(v) or ".." in v or re.match(r"^\d+\.\d+\.\d+\.\d+$", v)):
+            raise ValueError("نام باکت نامعتبر است (۳ تا ۶۳ حرف کوچک انگلیسی، عدد، نقطه و خط تیره؛ با حرف یا "
+                             "عدد شروع و تمام شود)")
+        return v
+
+    @field_validator("prefix")
+    @classmethod
+    def _prefix(cls, v):
+        v = (v or "").strip()
+        if not LOG_PREFIX_RE.match(v) or ".." in v:
+            raise ValueError("پیشوند فقط حروف انگلیسی، عدد و / _ . - (حداکثر ۱۲۸ کاراکتر، بدون ..) می‌تواند باشد")
+        return v
+
+    @field_validator("access_key", "secret_key")
+    @classmethod
+    def _key(cls, v):
+        v = (v or "").strip()
+        if not S3_KEY_RE.match(v):
+            raise ValueError("کلید دسترسی نامعتبر است (فقط کاراکترهای چاپ‌پذیر انگلیسی بدون فاصله)")
+        return v
+
+    @model_validator(mode="after")
+    def _complete(self):
+        if self.enabled and not (self.s3_endpoint and self.bucket and self.access_key):
+            raise ValueError("برای فعال‌سازی خروجی لاگ، آدرس S3، نام باکت و هر دو کلید لازم است")
+        return self
+
+
+WEBHOOK_EVENTS = ("purge.completed", "ssl.issued", "ssl.failed", "quota.warning", "quota.exceeded",
+                  "site.suspended", "site.unsuspended", "attack.detected")
+WEBHOOK_ID_RE = re.compile(r"^wh_[0-9a-f]{8}$")
+
+
+class WebhookItem(Strict):
+    """One webhook (SPEC §14.3.3). `id` is assigned by the controller when missing/unknown; the
+    signing secret is controller-generated and stored outside the section (site_secrets).
+    `secret_set` is output only and ignored on input."""
+    id: str | None = Field(None, max_length=64)
+    url: str = Field(max_length=512)
+    events: list[Literal[WEBHOOK_EVENTS]] = Field(min_length=1, max_length=50)
+    enabled: bool = True
+    description: str = Field("", max_length=100)
+    secret_set: bool | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _id(cls, v):
+        v = (v or "").strip()
+        return v if WEBHOOK_ID_RE.match(v) else None  # anything else: a new item
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v):
+        return _outbound_url((v or "").strip(), "آدرس وب‌هوک")
+
+    @field_validator("events")
+    @classmethod
+    def _events(cls, v):
+        return list(dict.fromkeys(v))
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, v):
+        v = (v or "").strip()
+        _no_controls(v, "توضیح")
+        return v
+
+
+class Webhooks(Strict):
+    items: list[WebhookItem] = Field(default_factory=list, max_length=WEBHOOKS_MAX)
+
+    @field_validator("items")
+    @classmethod
+    def _unique(cls, v):
+        ids = [i.id for i in v if i.id]
+        if len(ids) != len(set(ids)):
+            raise ValueError("شناسه وب‌هوک‌ها باید یکتا باشد")
+        return v
+
+
 SECTIONS: dict[str, type[BaseModel]] = {
     "cache": Cache,
     "ssl": Ssl,
@@ -1084,11 +1234,13 @@ SECTIONS: dict[str, type[BaseModel]] = {
     "transform": Transform,
     "redirects": Redirects,
     "bots": Bots,
+    "logs": Logs,
+    "webhooks": Webhooks,
 }
 
 # section -> feature flag that must be on to write it
 FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
-                 "tunnel": "tunnel"}
+                 "tunnel": "tunnel", "logs": "log_export"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -1142,15 +1294,39 @@ def all_config(site) -> dict:
             out[name] = dump(model.model_validate(stored.get(name, {})))
         except Exception:  # noqa: BLE001 - corrupt/legacy data falls back to defaults
             out[name] = dump(model())
-    return out
+    return redact(site, out)
+
+
+def redact(site, cfg: dict) -> dict:
+    """Write-only secrets (SPEC §14.3): never a value, only whether one is stored."""
+    from . import site_secrets
+
+    if "logs" in cfg:
+        cfg["logs"] = dict(cfg["logs"], secret_key="", secret_key_set=site_secrets.has_logs_secret(site))
+    if "webhooks" in cfg:
+        ids = site_secrets.webhook_secret_ids(site)
+        cfg["webhooks"] = {**cfg["webhooks"],
+                           "items": [dict(i, secret_set=i["id"] in ids) for i in cfg["webhooks"]["items"]]}
+    return cfg
+
+
+def storable(name: str, value: dict) -> dict:
+    """The section as stored: write-only / output-only fields removed."""
+    if name == "logs":
+        return {k: v for k, v in value.items() if k not in ("secret_key", "secret_key_set")}
+    if name == "webhooks":
+        return {**value, "items": [{k: v for k, v in i.items() if k != "secret_set"} for i in value["items"]]}
+    return value
 
 
 def get_section(site, name: str) -> dict:
     return all_config(site)[name]
 
 
-def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None = None) -> dict:
-    """Validate a section against schema + plan. Raises ValidationError / PermissionError."""
+def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None = None,
+                     vet: bool = True) -> dict:
+    """Validate a section against schema + plan. Raises ValidationError / PermissionError.
+    `vet=False` skips the outbound-URL SSRF check (the caller ran check_targets already)."""
     model = SECTIONS.get(name)
     if model is None:
         raise KeyError(name)
@@ -1164,7 +1340,8 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
             raise PermissionError("این قابلیت در پلن شما فعال نیست")
     limits = {"firewall": ("rules", "max_firewall_rules"), "ratelimit": ("rules", "max_ratelimit_rules"),
               "pagerules": ("rules", "max_page_rules"), "pools": ("pools", "max_pools"),
-              "transform": ("rules", "max_transform_rules"), "redirects": ("rules", "max_redirects")}
+              "transform": ("rules", "max_transform_rules"), "redirects": ("rules", "max_redirects"),
+              "webhooks": ("items", "max_webhooks")}
     if name in limits:
         key, feat = limits[name]
         if len(value[key]) > feats[feat]:
@@ -1182,7 +1359,42 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
     if name == "ssl" and value["hsts"]["preload"] and not (
             value["hsts"]["include_subdomains"] and value["hsts"]["max_age"] >= 31536000):
         raise ValidationError("preload نیازمند includeSubDomains و max-age حداقل یک سال است")
+    if name == "logs" and value["enabled"] and not (value["secret_key"] or _has_logs_secret(site)):
+        raise ValidationError("برای فعال‌سازی خروجی لاگ، کلید مخفی (secret_key) لازم است")
+    if vet:
+        check_targets(name, value)
     return value
+
+
+# sections whose values name outbound targets the controller itself contacts (SSRF guard)
+OUTBOUND_SECTIONS = ("logs", "webhooks")
+
+
+def check_targets(name: str, value: dict) -> None:
+    """SSRF check of a section's outbound URLs (SPEC §14.3.2/§14.3.3): https, host resolving only
+    to public addresses. Needs no site state, so writers run it BEFORE locking the site row (DNS can
+    be slow). Raises ValidationError."""
+    if name == "logs" and value["s3_endpoint"]:
+        _vet_url(value["s3_endpoint"], "آدرس S3")
+    if name == "webhooks":
+        for i, item in enumerate(value["items"]):
+            _vet_url(item["url"], f"وب‌هوک شماره {i + 1}")
+
+
+def _has_logs_secret(site) -> bool:
+    from . import site_secrets
+
+    return site_secrets.has_logs_secret(site)
+
+
+def _vet_url(url: str, what: str) -> None:
+    """SSRF check on save (SPEC §14.3.2/§14.3.3): https, host resolving only to public addresses."""
+    from . import netguard
+
+    try:
+        netguard.vet(url)
+    except netguard.UnsafeTarget as e:
+        raise ValidationError(f"{what}: {e}") from None
 
 
 def _pool_multi_origin(site, pool_name: str) -> bool:
@@ -1296,7 +1508,7 @@ def _is_enabled(name: str, value: dict) -> bool:
         return value["enabled"] or value["auto_webp"]
     if name == "pools":
         return bool(value["pools"])
-    if name == "tunnel":
+    if name in ("tunnel", "logs"):
         return value["enabled"]
     return True
 

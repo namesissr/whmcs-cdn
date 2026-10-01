@@ -5,14 +5,21 @@ The key resolves to exactly one site and every call is scoped to that site only;
 carries a subset of the scopes {purge, stats, dns} and an endpoint checks its scope (403
 otherwise). All logic (purge, analytics, events, records, config) is reused from the admin
 routes so behaviour/validation never drifts between the two surfaces.
+
+SPEC §14.3.5: `GET /capi/v1/site` (any scope), `GET /capi/v1/analytics/live` (stats) and the
+public `GET /capi/v1/openapi.json` describing these routes only (bearer security scheme).
 """
 
+import math
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.openapi.utils import get_openapi
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import sections
 from .audit import record_audit
 from .auth import hash_token
 from .config import settings
@@ -27,6 +34,7 @@ from .routes_admin import (
     purge_site,
     update_record_of,
 )
+from .routes_platform import live_of
 from .routes_v2 import (
     csv_body,
     import_redirects_of,
@@ -35,6 +43,7 @@ from .routes_v2 import (
     site_events,
     write_section_of,
 )
+from .validation import fqdn
 
 router = APIRouter(prefix="/capi/v1")
 
@@ -48,12 +57,18 @@ _hits: dict[int, list[float]] = {}
 _config_hits: dict[int, list[float]] = {}
 
 
+def retry_after(window: list[float], now: float) -> dict[str, str]:
+    """`Retry-After` for a full 60 s sliding window: seconds until its oldest hit leaves it."""
+    return {"Retry-After": str(max(1, math.ceil(window[0] + 60 - now)) if window else 60)}
+
+
 def _sliding(store: dict[int, list[float]], key_id: int, limit: int, label: str):
     now = time.monotonic()
     window = store.setdefault(key_id, [])
     window[:] = [t for t in window if t > now - 60]
     if len(window) >= limit:
-        raise HTTPException(429, f"محدودیت نرخ {label} ({limit} در دقیقه) رد شد؛ کمی بعد دوباره تلاش کنید")
+        raise HTTPException(429, f"محدودیت نرخ {label} ({limit} در دقیقه) رد شد؛ کمی بعد دوباره تلاش کنید",
+                            headers=retry_after(window, now))
     window.append(now)
 
 
@@ -67,14 +82,20 @@ def _rate_limit_config(key: ApiKey) -> ApiKey:
     return key
 
 
-def resolve_key(authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> ApiKey:
+# the bearer scheme also documents the auth in the customer OpenAPI document (SPEC §14.3.5)
+bearer = HTTPBearer(auto_error=False, scheme_name="bearerAuth",
+                    description="Customer API key of one service: `Authorization: Bearer pcdn_…`")
+
+
+def resolve_key(credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+                db: Session = Depends(get_db)) -> ApiKey:
     """Resolve the bearer key to a non-revoked ApiKey, rate-limit it and update last_used_at.
 
     Only customer keys ('pcdn_...') are accepted here; the admin key never resolves. Unknown or
     revoked keys -> 401 JSON {"detail": ...}."""
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if credentials is None or not credentials.credentials:
         raise HTTPException(401, "missing bearer token")
-    token = authorization[7:].strip()
+    token = credentials.credentials.strip()
     if not token.startswith("pcdn_"):
         raise HTTPException(401, "invalid api key")
     key = db.scalar(select(ApiKey).where(ApiKey.key_hash == hash_token(token), ApiKey.revoked.is_(False)))
@@ -110,6 +131,32 @@ def _audit(db: Session, request: Request, key: ApiKey, action: str, detail: dict
                  detail=detail, ip=ip)
 
 
+# ------------------------------------------------------------------ site (any scope, SPEC §14.3.5)
+
+def cname_target(site: Site) -> str | None:
+    """The hostname another name can CNAME to in order to be served like this site's proxied
+    hosts: the apex when it is proxied, else the first proxied hostname; None without one."""
+    proxied = [r for r in site.records if r.proxied and r.type in ("A", "AAAA", "CNAME")]
+    rec = next((r for r in proxied if r.name == "@"), proxied[0] if proxied else None)
+    return fqdn(rec.name, site.domain) if rec is not None else None
+
+
+@router.get("/site")
+def site_info(key: ApiKey = Depends(resolve_key)):
+    site = _site(key)
+    return {
+        "domain": site.domain,
+        "status": site.effective_status,
+        "suspended": bool(site.suspended),
+        "plan": {"bandwidth_limit_gb": site.bandwidth_limit_gb, "max_records": site.max_records,
+                 "ssl_allowed": site.ssl_allowed, "rate_limit_rps": site.rate_limit_rps,
+                 "features": sections.features_of(site)},
+        "nameservers": settings.nameservers,
+        "cname_target": cname_target(site),
+        "ssl_status": site.ssl_status,
+    }
+
+
 # ------------------------------------------------------------------ purge (scope: purge)
 
 @router.post("/purge")
@@ -131,6 +178,13 @@ def analytics(period: str = "24h", key: ApiKey = Depends(require_scope("stats"))
 @router.get("/events")
 def events(limit: int = 100, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
     return site_events(db, _site(key), limit)
+
+
+@router.get("/analytics/live")
+def analytics_live(minutes: int = 60, key: ApiKey = Depends(require_scope("stats")),
+                   db: Session = Depends(get_db)):
+    """Per-minute series of the last `minutes` (1..1440) minutes (SPEC §14.3.1)."""
+    return live_of(db, _site(key), minutes)
 
 
 # ------------------------------------------------------------------ records + config (scope: dns)
@@ -186,3 +240,23 @@ def import_redirects(request: Request, response: Response, mode: str | None = No
     result = import_redirects_of(db, _site(_rate_limit_config(key)), body["csv"], mode, response)
     _audit(db, request, key, "redirects.import", {"count": result["imported"], "mode": mode})
     return result
+
+
+# ------------------------------------------------------------------ OpenAPI (public, SPEC §14.3.5)
+
+_openapi: dict | None = None
+
+
+@router.get("/openapi.json", include_in_schema=False)
+def openapi():
+    """OpenAPI 3 document of the /capi/v1 routes only (no admin or edge paths), with the bearer
+    security scheme. Public: it describes the API, it grants nothing."""
+    global _openapi
+    if _openapi is None:
+        _openapi = get_openapi(
+            title="Pasargad CDN customer API", version="1",
+            description="Per-service API (SPEC §10.1 / §14.3.5). Authenticate with "
+                        "`Authorization: Bearer pcdn_…`; every call acts on that key's site only. "
+                        "Scopes: purge, stats, dns.",
+            routes=[r for r in router.routes if getattr(r, "path", "").startswith(router.prefix + "/")])
+    return _openapi

@@ -24,7 +24,7 @@ def test_sections_defaults_and_roundtrip(client):
     assert s["plan"]["features"]["max_page_rules"] == 10
     assert set(s["config"]) == {"cache", "ssl", "waf", "ddos", "firewall", "ratelimit", "pagerules", "pools",
                                 "headers", "hotlink", "image", "errorpages", "tunnel",
-                                "transform", "redirects", "bots"}
+                                "transform", "redirects", "bots", "logs", "webhooks"}
     assert s["config"]["cache"]["level"] == "standard"
 
     fw = {"default_action": "allow", "rules": [
@@ -288,7 +288,8 @@ def test_platform_analytics(client):
     assert a["period"] == "24h"
     assert a["totals"]["requests"] == 15 and a["totals"]["bytes"] == 1500 and a["totals"]["cache_hits"] == 7
     assert a["totals"]["status"]["2xx"] == 8 and a["totals"]["status"]["4xx"] == 2
-    assert a["totals"]["security"] == {"waf": 2, "firewall": 3, "ratelimit": 1, "challenge": 0, "ddos": 0, "hotlink": 0}
+    assert a["totals"]["security"] == {"waf": 2, "firewall": 3, "ratelimit": 1, "challenge": 0, "ddos": 0,
+                                       "hotlink": 0, "bots": 0}
     assert a["countries"][0] == {"code": "IR", "requests": 14}
     assert a["sites"][0] == {"domain": "example.com", "requests": 10, "bytes": 1000}
     assert {s["domain"] for s in a["sites"]} == {"example.com", "other.org"}

@@ -19,7 +19,7 @@ from sqlalchemy import func, select
 from . import alerts
 from .config import settings
 from .db import SessionLocal
-from .models import AuditLog, Edge, Site, State, utcnow
+from .models import AuditLog, Edge, LogSpool, Site, State, WebhookDelivery, utcnow
 
 log = logging.getLogger("pcdn.metrics")
 
@@ -198,6 +198,21 @@ def _collect(out: _Out) -> None:
                        "Rows currently held in the audit log.")
         except Exception:  # noqa: BLE001
             log.exception("metrics: audit block failed")
+            db.rollback()
+
+        # webhooks + log export (SPEC §14.3): platform totals only, never a domain or URL ------
+        try:
+            counts = dict(db.execute(select(WebhookDelivery.status, func.count(WebhookDelivery.id))
+                                     .where(WebhookDelivery.status.in_(("pending", "failed")))
+                                     .group_by(WebhookDelivery.status)).all())
+            for status in ("pending", "failed"):
+                out.metric("pcdn_webhook_deliveries", int(counts.get(status, 0)),
+                           "Webhook deliveries held (last 7 days) by status.", labels={"status": status})
+            out.metric("pcdn_log_export_pending_records",
+                       int(db.scalar(select(func.coalesce(func.sum(LogSpool.records), 0))) or 0),
+                       "Access-log records spooled for upload to customer buckets.")
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: webhooks/log export block failed")
             db.rollback()
     finally:
         db.close()

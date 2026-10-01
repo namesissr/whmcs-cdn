@@ -200,5 +200,13 @@ class Settings:
     bot_ranges_enabled: bool = field(default_factory=lambda: _bool("BOT_RANGES_ENABLED", True))
     bot_ranges_stale_days: int = field(default_factory=lambda: int(os.getenv("BOT_RANGES_STALE_DAYS") or 3))
 
+    # analytics & platform (SPEC §14.3): per-site hourly cap on access-log records spooled for the
+    # customer's log export (excess is counted as dropped), and the number of security events per
+    # 5 minutes above which a site's `attack.detected` webhook fires (at most once per hour per site)
+    log_export_max_per_hour: int = field(
+        default_factory=lambda: max(0, int(os.getenv("LOG_EXPORT_MAX_PER_HOUR") or 500000)))
+    attack_events_per_5m: int = field(
+        default_factory=lambda: max(1, int(os.getenv("ATTACK_EVENTS_PER_5M") or 1000)))
+
 
 settings = Settings()

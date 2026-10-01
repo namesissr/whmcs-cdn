@@ -1,10 +1,12 @@
 """API polled by edge agents."""
 
+import hashlib
 import ipaddress
 import json
 import logging
 import re
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, Field, field_validator
@@ -13,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import live, logexport, webhooks
 from .auth import require_edge
 from .db import get_db
 from .models import Edge, Purge, SecurityEvent, Site, State, UsageBatch, UsageHourly, utcnow
@@ -240,6 +243,21 @@ class UsageItem(BaseModel):
     paths: Counts = {}
     security: Counts = {}
     tunnel: TunnelUsage | None = None
+    # SPEC §14.3.1: responses with status >= 500 the edge produced itself (no upstream status, no
+    # security action); origin errors never count. Summed into the hourly details for the SLA report.
+    platform_errors: int = Field(default=0, ge=0, le=BIG)
+
+
+class LiveItem(BaseModel):
+    """One 1-minute aggregate of one host (SPEC §14.3.1); top ≤20 countries / paths."""
+    host: str = Field(max_length=253)
+    minute: datetime
+    requests: int = Field(default=0, ge=0, le=BIG)
+    bytes: int = Field(default=0, ge=0, le=BIG)
+    cache_hits: int = Field(default=0, ge=0, le=BIG)
+    status: Counts = {}
+    countries: Counts = {}
+    paths: Counts = {}
 
 
 class EventIn(BaseModel):
@@ -263,6 +281,9 @@ class UsageIn(BaseModel):
     # counted at most once. Optional and pattern-validated: pre-upgrade agents omit it and keep the
     # existing at-least-once behaviour (SHARED CONTRACT: field name `batch_id`, 32 lowercase hex).
     batch_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
+    # SPEC §14.3.1: 1-minute aggregates per host for the live analytics; pre-6D agents omit it.
+    # Same transaction and batch_id dedup as the rest of the body.
+    live: list[LiveItem] = Field(default_factory=list, max_length=5000)
 
 
 DETAIL_KEYS = ("status", "codes", "countries", "paths", "security")
@@ -270,6 +291,9 @@ MAX_KEYS = {"codes": 60, "countries": 250, "paths": 200}
 
 
 def _merge_details(current: dict, add: dict) -> dict:
+    pe = add.get("platform_errors")
+    if pe:
+        current["platform_errors"] = int(current.get("platform_errors") or 0) + max(int(pe), 0)
     for key in DETAIL_KEYS:
         src = add.get(key) or {}
         if not src:
@@ -316,6 +340,8 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
             return {"ok": True, "duplicate": True, "accepted": 0, "events": 0}
     domains = {d: i for i, d in db.execute(select(Site.id, Site.domain)).all()}
     agg: dict[tuple[int, datetime], dict] = {}
+    # security events per site in this batch (attack.detected webhook, SPEC §14.3.3)
+    security: dict[int, dict[str, int]] = {}
     for it in body.items:
         sid = _site_for_host(it.host, domains)
         if sid is None:
@@ -327,6 +353,10 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         a["r"] += it.requests
         a["h"] += it.cache_hits
         _merge_details(a["d"], it.model_dump())
+        for k, v in it.security.items():
+            if v > 0:
+                src = security.setdefault(sid, {})
+                src[k] = src.get(k, 0) + v
     for (sid, hour), a in agg.items():
         row = db.scalar(select(UsageHourly).where(
             UsageHourly.site_id == sid, UsageHourly.edge_id == edge.id, UsageHourly.hour == hour))
@@ -343,6 +373,7 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
                 current = {}
             row.details = json.dumps(_merge_details(current, a["d"]))
     accepted_events = 0
+    event_counts: dict[int, int] = {}
     for ev in body.events:
         sid = _site_for_host(ev.host, domains)
         if sid is None:
@@ -350,7 +381,19 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         db.add(SecurityEvent(site_id=sid, edge_id=edge.id, ts=_naive(ev.t), ip=ev.ip, country=ev.country.upper(),
                              method=ev.method, host=ev.host.lower(), path=ev.path, action=ev.action,
                              source=ev.source, rule=ev.rule, user_agent=ev.user_agent))
+        event_counts[sid] = event_counts.get(sid, 0) + 1
         accepted_events += 1
+    # live analytics (SPEC §14.3.1): minute buckets, same transaction + batch_id dedup as above
+    live_buckets = 0
+    if body.live:
+        live_buckets = live.ingest(db, [{**it.model_dump(), "minute": _naive(it.minute)} for it in body.live],
+                                   lambda h: _site_for_host(h, domains), _merge_details)
+    # attack.detected: the counters are authoritative; events (a sample) cover agents without them
+    for sid in set(security) | set(event_counts):
+        n = max(sum(security.get(sid, {}).values()), event_counts.get(sid, 0))
+        site = db.get(Site, sid)
+        if site is not None:
+            webhooks.note_security(db, site, n, security.get(sid))
     edge.last_seen_at = utcnow()
     # metrics: monotonic count of usage batches ingested (SPEC §13.1); duplicates returned earlier
     row = db.get(State, "metrics:usage_batches")
@@ -362,7 +405,35 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         except ValueError:
             row.value = "1"
     db.commit()
-    return {"ok": True, "accepted": len(agg), "events": accepted_events}
+    return {"ok": True, "accepted": len(agg), "events": accepted_events, "live": live_buckets}
+
+
+# ------------------------------------------------------------------ log export (SPEC §14.3.2)
+
+class LogShipIn(BaseModel):
+    """`{batch_id, records}`: ≤5000 sampled access-log records of sites with logs.enabled. Records
+    are validated one by one (a malformed record is skipped, never the whole batch)."""
+    batch_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    records: list[Any] = Field(default_factory=list, max_length=logexport.MAX_RECORDS_PER_POST)
+
+
+def _logship_key(batch_id: str) -> str:
+    """Dedup key in usage_batches, namespaced so a logship id can never collide with a usage id."""
+    return hashlib.sha256(b"logship:" + batch_id.encode()).hexdigest()[:32]
+
+
+@router.post("/logship")
+def logship(body: LogShipIn, edge: Edge = Depends(require_edge), db: Session = Depends(get_db)):
+    db.add(UsageBatch(edge_id=edge.id, batch_id=_logship_key(body.batch_id)))
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": True, "duplicate": True, "accepted": 0, "dropped": 0, "ignored": 0, "invalid": 0}
+    domains = {d: i for i, d in db.execute(select(Site.id, Site.domain)).all()}
+    out = logexport.ingest(db, body.records, lambda h: _site_for_host(h, domains))
+    db.commit()
+    return {"ok": True, **out}
 
 
 def _naive(dt: datetime) -> datetime:

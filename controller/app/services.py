@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import botranges, dnsbuild, origin_pull, pdns, sections
+from . import botranges, dnsbuild, logexport, origin_pull, pdns, sections, webhooks
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -195,6 +195,18 @@ def sync_all_dns(db: Session, server_errors: dict[int, str] | None = None) -> in
     return failed
 
 
+def lock_site(db: Session, site: Site) -> Site:
+    """Re-read the site row with SELECT … FOR UPDATE, refreshing the in-memory object from the
+    locked row, before any read-modify-write of its JSON columns (config, features,
+    integration_secrets). Concurrent writers to the same site then serialize instead of silently
+    overwriting each other's sections (each PUT rewrites the whole site.config document). The lock is
+    held until the caller commits / rolls back. SQLite ignores FOR UPDATE (it serializes writers
+    itself); the refresh still applies there."""
+    locked = db.scalar(select(Site).where(Site.id == site.id).with_for_update()
+                       .execution_options(populate_existing=True))
+    return locked if locked is not None else site
+
+
 def month_start(now: datetime | None = None) -> datetime:
     now = now or utcnow()
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -212,13 +224,32 @@ def usage_totals(db: Session, site_id: int, start: datetime, end: datetime | Non
     return {"bytes": int(b), "requests": int(r), "cache_hits": int(h)}
 
 
-def refresh_quota(db: Session, site: Site) -> bool:
-    """Recompute over_quota for this month; returns True when it changed. Caller commits."""
+QUOTA_WARNING_PERCENT = 80
+
+
+def refresh_quota(db: Session, site: Site, now: datetime | None = None) -> bool:
+    """Recompute over_quota for this month; returns True when it changed. Caller commits.
+
+    Quota transitions emit webhooks (SPEC §14.3.3): `quota.exceeded` when the site goes over its
+    bandwidth limit, `quota.warning` once per month when usage reaches 80 % of it first."""
+    now = now or utcnow()
     over = False
+    used = limit = 0
     if site.bandwidth_limit_gb > 0:
-        used = usage_totals(db, site.id, month_start())["bytes"]
-        over = used >= site.bandwidth_limit_gb * 1024**3
+        used = usage_totals(db, site.id, month_start(now))["bytes"]
+        limit = site.bandwidth_limit_gb * 1024**3
+        over = used >= limit
     changed = over != site.over_quota
+    if limit > 0:
+        data = {"used_bytes": used, "limit_bytes": limit, "percent": round(used * 100 / limit, 1),
+                "month": now.strftime("%Y-%m")}
+        warned = site.quota_warned_at is not None and site.quota_warned_at >= month_start(now)
+        if over and not site.over_quota:
+            webhooks.emit(db, site, "quota.exceeded", data, now)
+            site.quota_warned_at = now  # no separate warning for the rest of this month
+        elif not over and used * 100 >= limit * QUOTA_WARNING_PERCENT and not warned:
+            webhooks.emit(db, site, "quota.warning", data, now)
+            site.quota_warned_at = now
     site.over_quota = over
     return changed
 
@@ -490,6 +521,8 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "transform": cfg["transform"],
             "redirects": cfg["redirects"],
             "bots": cfg["bots"],
+            # log export (SPEC §14.3.2): sampling only — never the endpoint, bucket or keys
+            "logs": logexport.edge_block(site, cfg["logs"], feats),
         })
     body = {
         "sites": out,
@@ -535,7 +568,31 @@ def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str])
     return t
 
 
+def delete_platform_data(db: Session, site_id: int) -> None:
+    """Remove a deleted site's per-site rows: API keys, usage, security events, purges, live
+    analytics, log spool, webhook deliveries and their state. PostgreSQL cascades the rows itself,
+    but SQLite enforces no foreign keys and may reuse the id for the next site, which must never
+    inherit another customer's API keys, logs or events. Records go with the ORM cascade of
+    Site.records. Caller commits."""
+    from sqlalchemy import delete
+
+    from .models import AnalyticsMinute, ApiKey, LogSpool, Purge, SecurityEvent, UsageHourly, WebhookDelivery
+
+    for model in (ApiKey, UsageHourly, SecurityEvent, Purge, AnalyticsMinute, LogSpool, WebhookDelivery):
+        db.execute(delete(model).where(model.site_id == site_id))
+    keys = [logexport.STATUS_KEY.format(site_id), logexport.DROPPED_KEY.format(site_id),
+            webhooks.ATTACK_KEY.format(site_id)]
+    db.execute(delete(State).where(State.key.in_(keys)))
+
+
 def queue_purge(db: Session, site: Site, urls: list[str],
-                prefixes: list[str] | None = None, everything: bool = False):
-    db.add(Purge(site_id=site.id, urls=json.dumps(urls),
-                 prefixes=json.dumps(prefixes or []), everything=everything))
+                prefixes: list[str] | None = None, everything: bool = False) -> Purge:
+    """Queue a purge for every edge (they poll /edge/v1/purges) and emit `purge.completed`
+    (SPEC §14.3.3) in the same transaction. Caller commits."""
+    p = Purge(site_id=site.id, urls=json.dumps(urls), prefixes=json.dumps(prefixes or []), everything=everything)
+    db.add(p)
+    db.flush()
+    webhooks.emit(db, site, "purge.completed", {
+        "purge_id": p.id, "urls": urls, "prefixes": prefixes or [],
+        "everything": bool(everything or (not urls and not prefixes))})
+    return p

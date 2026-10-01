@@ -7,7 +7,9 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -71,6 +73,13 @@ class Site(Base):
     origin_client_cert: Mapped[str | None] = mapped_column(Text, nullable=True)
     origin_client_key_stored: Mapped[str | None] = mapped_column("origin_client_key", Text, nullable=True)
     origin_client_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # write-only integration secrets (SPEC §14.3): JSON {"logs": <log export S3 secret key>,
+    # "webhooks": {"wh_…": <signing secret>}}; every value is encrypted at rest like ssl_key (see
+    # site_secrets.py / crypto.SITE_JSON_SECRETS) and is never returned by any GET, edge config or audit
+    integration_secrets: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # when the quota.warning webhook (80 % of bandwidth_limit_gb) was last emitted; once per month
+    quota_warned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -391,3 +400,58 @@ class AuditLog(Base):
     target: Mapped[str | None] = mapped_column(String(253), nullable=True)  # domain / edge name / ...
     detail: Mapped[str] = mapped_column(Text, default="{}")  # JSON, secret-free
     ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+
+class AnalyticsMinute(Base):
+    """Near-real-time per-site minute buckets (SPEC §14.3.1), summed over every edge's `live`
+    aggregates. Kept for 24 h (job_cleanup). `details` = {"status", "countries", "paths"} capped
+    like UsageHourly.details."""
+
+    __tablename__ = "analytics_minute"
+
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), primary_key=True)
+    minute: Mapped[datetime] = mapped_column(DateTime, primary_key=True, index=True)
+    requests: Mapped[int] = mapped_column(BigInteger, default=0)
+    bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_hits: Mapped[int] = mapped_column(BigInteger, default=0)
+    details: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class LogSpool(Base):
+    """One gzip JSON-lines chunk of a site's access-log records for one hour (SPEC §14.3.2): one
+    row per /edge/v1/logship POST per site/hour. The leader uploads every completed hour as one
+    object (the chunks concatenated: gzip members form a valid gzip stream) and deletes the rows;
+    failed uploads keep them, chunks older than 72 h are dropped (counted)."""
+
+    __tablename__ = "log_spool"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    hour: Mapped[datetime] = mapped_column(DateTime, index=True)  # UTC hour the records belong to
+    records: Mapped[int] = mapped_column(Integer, default=0)
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class WebhookDelivery(Base):
+    """One webhook event for one hook (SPEC §14.3.3). `payload` holds the exact JSON body that is
+    sent (and signed) on every attempt. pending rows are picked up by the leader's webhook job when
+    next_attempt_at is due; rows are kept 7 days."""
+
+    __tablename__ = "webhook_delivery"
+    __table_args__ = (Index("ix_webhook_delivery_due", "status", "next_attempt_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    delivery_id: Mapped[str] = mapped_column(String(24), unique=True)  # "dlv_" + 16 hex (X-Pcdn-Delivery)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    hook_id: Mapped[str] = mapped_column(String(16))
+    event: Mapped[str] = mapped_column(String(32))
+    event_id: Mapped[str] = mapped_column(String(24))  # "evt_" + 16 hex, the body's `id`
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(10), default="pending")  # pending | ok | failed
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

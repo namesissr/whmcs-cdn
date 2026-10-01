@@ -3,7 +3,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import routes_admin, routes_bundle, routes_capi, routes_edge, routes_metrics, routes_ops, routes_v2
+from . import (
+    routes_admin,
+    routes_bundle,
+    routes_capi,
+    routes_edge,
+    routes_metrics,
+    routes_ops,
+    routes_platform,
+    routes_v2,
+)
 from .config import settings
 from .db import init_db
 
@@ -58,9 +67,14 @@ async def lifespan(app: FastAPI):
         sched.stop()
 
 
-app = FastAPI(title="Pasargad CDN Controller", version="1.1.0", lifespan=lifespan)
+# no public /docs, /redoc or /openapi.json: they would map every admin and edge route for anyone.
+# Customers get the schema of their own API at /capi/v1/openapi.json (SPEC §14.3.5).
+app = FastAPI(title="Pasargad CDN Controller", version="1.1.0", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 app.include_router(routes_admin.router)
 app.include_router(routes_v2.router)
+# analytics & platform (SPEC §14.3): live analytics, log export, webhooks, SLA
+app.include_router(routes_platform.router)
 # public, unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)
 app.include_router(routes_v2.public_router)
 app.include_router(routes_capi.router)
