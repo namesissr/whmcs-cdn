@@ -97,6 +97,7 @@ function pasargadcdn_ConfigOptions()
  *   Edge Group — "general" | "tunnel"
  *   L4 Proxy — yes/no; L4 Apps — number (SPEC §16.4)
  *   Storage GB — number / dropdown «50|50 GB» (SPEC §16.8 features.storage_gb)
+ *   Edge Functions — yes/no; Max Functions — number (SPEC §16.9 features.edge_functions / max_functions)
  * Products saved before v2 have empty configoption5..14, i.e. every v2
  * feature off / 0 until the admin ticks them; likewise products saved before
  * tunnel mode (configoption15..19 empty) get tunnel off, group "general".
@@ -178,6 +179,16 @@ function pasargadcdn_plan(array $params): array
     // without it the controller default 0 = no storage applies). Clamped to the controller's 0..1000000.
     if (isset($co['Storage GB']) && $co['Storage GB'] !== '') {
         $plan['features']['storage_gb'] = min(1000000, max(0, (int) $co['Storage GB']));
+    }
+    // SPEC §16.9 edge functions: configurable options «Edge Functions» (yes/no) and «Max Functions»
+    // (number) → features.edge_functions / max_functions, sent ONLY when the product has the option
+    // (older controllers: extra="forbid"; without them the controller defaults apply: off, 0).
+    // Clamped to the controller's 0..32 (sections.FUNCTIONS_MAX, the edge's per-site cap).
+    if (isset($co['Edge Functions'])) {
+        $plan['features']['edge_functions'] = (bool) $co['Edge Functions'];
+    }
+    if (isset($co['Max Functions']) && $co['Max Functions'] !== '') {
+        $plan['features']['max_functions'] = min(32, max(0, (int) $co['Max Functions']));
     }
     // Controller ranges (SPEC §7.1) — out-of-range values would make Create/ChangePackage fail.
     $f = &$plan['features'];
@@ -902,6 +913,9 @@ function pasargadcdn_features_text(array $f): string
     if (!empty($f['storage_gb'])) {
         $txt .= sprintf(' · storage: %d GB', $f['storage_gb']);
     }
+    if (!empty($f['edge_functions'])) {
+        $txt .= sprintf(' · edge functions: %d', $f['max_functions'] ?? 0);
+    }
     if (($f['edge_group'] ?? 'general') !== 'general') {
         $txt .= ' · edge group: ' . $f['edge_group'];
     }
@@ -1014,7 +1028,7 @@ function pasargadcdn_assets(string $base, string $lang = 'fa'): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js'])),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js'])),
     ];
 }
 

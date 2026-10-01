@@ -89,6 +89,14 @@ class I18n
         'باکت %s برای این سرویس وجود ندارد' => 'Bucket %s does not exist for this service',
         'فضای ذخیره‌سازی روی این کنترلر پیکربندی نشده است' => 'Object storage is not configured on this controller',
         'مبدأ فضای ذخیره‌سازی (storage) فقط برای رکوردهای A، AAAA و CNAME پروکسی‌شده مجاز است' => 'A storage origin is only allowed on proxied A, AAAA and CNAME records',
+        // SPEC §16.9 edge functions — controller details (translated by controller(), see below)
+        'این قابلیت در پلن شما فعال نیست' => 'This feature is not included in your plan',
+        'حداکثر %s مورد در پلن شما مجاز است' => 'Your plan allows at most %s items',
+        'مجموع کد توابع این سایت حداکثر %s کیلوبایت است' => 'The total code of this site\'s functions is limited to %s KB',
+        'مسیر تابع «%s» (%s) با مسیر تونل «%s» (%s) هم‌پوشانی دارد' => 'The route of function “%s” (%s) overlaps tunnel path “%s” (%s)',
+        'توابع لبه با تونلی که پاسخ پیش‌فرض آن decoy یا 404 است اجرا نمی‌شوند؛ fallback تونل را origin کنید یا توابع را خاموش کنید'
+            => 'Edge functions do not run while the tunnel answers unknown paths with a decoy or 404; set the tunnel fallback to origin or turn functions off',
+        'hours باید بین 1 و %s باشد' => 'hours must be between 1 and %s',
         // templates/clientarea.tpl
         'برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.' => 'Enable JavaScript in your browser to manage the CDN.',
         'در حال بارگذاری پنل CDN…' => 'Loading the CDN panel…',

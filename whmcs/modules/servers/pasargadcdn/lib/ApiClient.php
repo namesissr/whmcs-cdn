@@ -241,7 +241,9 @@ class ApiClient
      * once), private keys of custom certificates, and (SPEC §14.3) the log-export
      * S3 keys in `logs` bodies plus webhook signing secrets — `new_secrets` of a
      * webhooks PUT, the `secret` of a rotation and any `whsec_…` value; (SPEC §16.8) the
-     * `secret_key` (and `access_key`) of a storage bucket create / rotate-key answer.
+     * `secret_key` (and `access_key`) of a storage bucket create / rotate-key answer; (SPEC §16.9) the
+     * `code` of edge functions (customer source, up to 8 MB per site, may embed the customer's own
+     * tokens) — the log keeps ids, routes, sizes and hashes only, like the controller's audit.
      */
     public static function redact($text)
     {
@@ -250,6 +252,11 @@ class ApiClient
         }
         $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key|transform_secret|tsig_secret)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
         $text = (string) preg_replace('/"new_secrets"\s*:\s*\{[^{}]*\}/', '"new_secrets":"***"', $text);
+        // possessive: linear on megabytes of escaped JavaScript; a PCRE failure logs nothing rather than the code
+        $text = preg_replace('/"code"\s*:\s*"(?:[^"\\\\]++|\\\\.)*+"/', '"code":"***"', $text);
+        if (!is_string($text)) {
+            return '';
+        }
         $text = (string) preg_replace('/whsec_[0-9A-Za-z]+/', 'whsec_***', $text);
         // Wave 8 (SPEC §16.6): image transform secrets (imgsec_ + hex) wherever they appear
         $text = (string) preg_replace('/imgsec_[0-9A-Za-z]+/', 'imgsec_***', $text);

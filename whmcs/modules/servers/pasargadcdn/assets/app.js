@@ -1,7 +1,7 @@
 /*
  * Pasargad CDN — client-area app shell (vanilla JS, no dependencies).
  *
- * Script order (see pasargadcdn_assets()): ui.js → pages.js → rules.js → reports.js →
+ * Script order (see pasargadcdn_assets()): ui.js → pages.js → rules.js → reports.js → … → functions.js →
  * tutorials.js → tunnel.js → … → app.js. Boot data comes from <script id="pcdn-boot"> (see
  * pasargadcdn_ClientArea); every call goes through api.php, which pins the
  * request to this service's domain. Data only reaches the DOM through
@@ -81,6 +81,8 @@
     { title: t('ذخیره‌سازی'), items: ['storage'] },
     // Wave 6B (SPEC §14.2): shown only when the controller returns the section (see available()).
     { title: t('قوانین'), items: ['redirects', 'transform'] },
+    // SPEC §16.9: «توابع لبه» once the controller's plan features carry edge_functions (functions.js).
+    { title: t('توسعه'), items: ['functions'] },
     { title: t('امنیت'), items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
     { title: t('SSL و هدرها'), items: ['ssl', 'headers', 'errorpages'] },
     // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.

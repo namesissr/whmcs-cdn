@@ -124,7 +124,8 @@ final class Admin
         }
         $body = '';
         if ($method === 'POST' || $method === 'PUT') {
-            $body = (string) self::readBody(ClientApi::MAX_BODY + 1);
+            // 256 KB, or 9 MB for PUT config/functions (SPEC §16.9 edge-function code) — ClientApi::maxBody
+            $body = (string) self::readBody(ClientApi::maxBody($method, is_string($get['path'] ?? null) ? $get['path'] : '') + 1);
         }
         $query = $get;
         unset($query['module'], $query['page'], $query['service'], $query['id'], $query['path'], $query['token']);

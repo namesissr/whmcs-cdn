@@ -37,9 +37,16 @@ class ClientApi
 {
     const MAX_BODY = 262144; // 256 KB
 
+    /**
+     * SPEC §16.9: body limit of PUT config/functions only — the whole section with every function's
+     * code (up to 32 × 256 KiB of UTF-8, i.e. 8 MiB, plus JSON escaping); every other call keeps
+     * MAX_BODY. See maxBody().
+     */
+    const MAX_BODY_FUNCTIONS = 9437184; // 9 MB
+
     // Wave 6B (SPEC §14.2) added transform, redirects and bots; Wave 6D (§14.3) logs and webhooks;
-    // Wave 8 (§16.4/§16.5/§16.7) l4 (TCP/UDP apps), video and dns_secondary.
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary';
+    // Wave 8 (§16.4/§16.5/§16.7) l4 (TCP/UDP apps), video and dns_secondary; §16.9 functions (edge functions).
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary|functions';
 
     /** Webhook ids are assigned by the controller: "wh_" + 8 hex (SPEC §14.3.3). */
     const WEBHOOK_ID = 'wh_[0-9a-f]{8}';
@@ -63,6 +70,8 @@ class ClientApi
             // SPEC §16.8 object storage: overview + buckets (never a secret — the controller returns
             // secret_key only in the create / rotate-key answers)
             'storage', 'storage/buckets',
+            // SPEC §16.9 edge functions: invocations / CPU / errors of the last `hours` (read-only)
+            'functions/stats',
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
@@ -99,6 +108,8 @@ class ClientApi
         // Wave 7: quality hours 1..744 (the app uses 24/168/720), tunnel usage days 1..90 (the app uses 30).
         'tunnel/quality' => ['hours' => '/^([1-9]|[1-9][0-9]|[1-6][0-9]{2}|7[0-3][0-9]|74[0-4])$/D'],
         'tunnel/usage' => ['days' => '/^([1-9]|[1-8][0-9]|90)$/D'],
+        // SPEC §16.9: functions stats hours 1..744 (the app uses 24 and 168)
+        'functions/stats' => ['hours' => '/^([1-9]|[1-9][0-9]|[1-6][0-9]{2}|7[0-3][0-9]|74[0-4])$/D'],
     ];
 
     /** Answer for a write by a read-only team member (SPEC §14.3.7). */
@@ -209,7 +220,7 @@ class ClientApi
         $body = null;
         if ($method === 'POST' || $method === 'PUT') {
             $raw = (string) ($req['body'] ?? '');
-            if (strlen($raw) > self::MAX_BODY) {
+            if (strlen($raw) > self::maxBody($method, $path)) {
                 return self::fail(413, 'حجم درخواست بیش از حد مجاز است.');
             }
             $data = $raw === '' ? [] : json_decode($raw, true, 64);
@@ -377,6 +388,16 @@ class ClientApi
         }
         $data = json_decode($raw, true, 64);
         return is_array($data) ? $data : null;
+    }
+
+    /**
+     * Largest request body accepted for this call: MAX_BODY_FUNCTIONS for PUT config/functions (the
+     * edge-functions section carries every function's code, SPEC §16.9), MAX_BODY for everything else.
+     * The entry points (api.php, the admin addon) read at most maxBody() + 1 bytes.
+     */
+    public static function maxBody(string $method, string $path): int
+    {
+        return strtoupper($method) === 'PUT' && $path === 'config/functions' ? self::MAX_BODY_FUNCTIONS : self::MAX_BODY;
     }
 
     public static function allowed(string $method, string $path): bool

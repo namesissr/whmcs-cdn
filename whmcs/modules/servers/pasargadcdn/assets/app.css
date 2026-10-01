@@ -1511,6 +1511,37 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 #pcdn-app.pc-narrow .pcdn-st-bfacts > div { flex-direction: column; gap: 2px; }
 #pcdn-app.pc-narrow .pcdn-st-bfacts dd { text-align: start; }
 
+/* SPEC §16.9 edge functions (functions.js): list, code editor (textarea + line numbers), stats */
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-meta .pcdn-fn-err { white-space: normal; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-total { margin-top: 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-editor { border: 1px solid var(--pc-code-border); border-radius: 10px; overflow: hidden; background: var(--pc-code-bg); color: var(--pc-code-fg); min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-editor:focus-within { outline: 2px solid var(--pc-code-focus); outline-offset: 1px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-editor-main { display: flex; height: 380px; min-width: 0; direction: ltr; }
+:is(#pcdn-app, #pcdn-layer).pcdn .pcdn-fn-gutter { margin: 0; padding: 10px 8px 24px; min-width: 3.4em; flex: none; overflow: hidden; text-align: right; user-select: none;
+  font-family: var(--pc-mono); font-size: 12.5px; line-height: 20px; color: var(--pc-code-icon); background: var(--pc-code-head); border-inline-end: 1px solid var(--pc-code-line); white-space: pre; }
+:is(#pcdn-app, #pcdn-layer).pcdn textarea.pcdn-fn-code { flex: 1; min-width: 0; height: 100%; margin: 0; padding: 10px 12px; border: 0; border-radius: 0; resize: none; outline: none; box-shadow: none;
+  background: transparent; color: var(--pc-code-fg); caret-color: var(--pc-code-bright); font-family: var(--pc-mono); font-size: 12.5px; line-height: 20px;
+  white-space: pre; overflow: auto; overflow-wrap: normal; tab-size: 2; -moz-tab-size: 2; text-align: left; direction: ltr; }
+:is(#pcdn-app, #pcdn-layer).pcdn textarea.pcdn-fn-code::selection { background: var(--pc-code-line); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-editor-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 14px; padding: 4px 10px; font-size: 11.5px; line-height: 1.6;
+  color: var(--pc-code-muted); background: var(--pc-code-head); border-top: 1px solid var(--pc-code-line); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-pos { font-family: var(--pc-mono); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-size { margin-inline-start: auto; font-weight: 600; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-size.is-near { color: #fbbf24; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-size.is-over { color: #f87171; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-codefield.has-error .pcdn-fn-editor { border-color: var(--pc-danger); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-tpls .pcdn-chips-row { flex-wrap: wrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-routehint p { margin: 4px 0 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-h { margin: 14px 0 6px; font-size: 14px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-h:first-child { margin-top: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-api li, :is(#pcdn-app, #pcdn-layer) .pcdn-fn-limits li { overflow-wrap: anywhere; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-stats { display: flex; flex-direction: column; gap: 14px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fn-test .pcdn-codeblock, #pcdn-app .pcdn-fnpage .pcdn-codeblock { margin: 8px 0; min-width: 0; }
+@media (max-width: 600px) {
+  #pcdn-layer .pcdn-fn-editor-main { height: 300px; }
+  #pcdn-layer .pcdn-fn-editor-bar .pcdn-fn-tabmode { display: none; }
+}
+
 /* ------------------------------------------------------------------ English / LTR (SPEC §16.10)
    The rules above use logical properties, so an LTR page mirrors by itself; these cover what
    cannot be logical (the root direction, the select arrow image, list counters). */

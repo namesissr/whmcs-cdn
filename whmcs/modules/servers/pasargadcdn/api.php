@@ -26,14 +26,15 @@ function pasargadcdn_api_client_id(): int
 }
 
 $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
-$body = '';
-if ($method === 'POST' || $method === 'PUT') {
-    // Read one byte past the limit so ClientApi can reject oversized bodies.
-    $body = (string) file_get_contents('php://input', false, null, 0, ClientApi::MAX_BODY + 1);
-}
 $str = function ($v) {
     return is_string($v) ? $v : '';
 };
+$body = '';
+if ($method === 'POST' || $method === 'PUT') {
+    // Read one byte past the limit so ClientApi can reject oversized bodies. The limit is 256 KB,
+    // except PUT config/functions (SPEC §16.9: every function's code, up to 9 MB) — ClientApi::maxBody.
+    $body = (string) file_get_contents('php://input', false, null, 0, ClientApi::maxBody($method, $str($_GET['path'] ?? '')) + 1);
+}
 $query = $_GET;
 unset($query['id'], $query['path'], $query['rsid'], $query['rop']);
 
