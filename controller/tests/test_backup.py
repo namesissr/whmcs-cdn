@@ -319,6 +319,31 @@ def test_backup_job_schedule_failure_alert_and_recovery(client, env, alert_setti
     assert deep["backup"]["enabled"] is True and deep["backup"]["failing"] is False
 
 
+def test_manage_backup_verify_cli(client, env, capsys):
+    from app import manage
+
+    # no backups yet -> fails cleanly, non-zero, with a clear message (never crashes)
+    with pytest.raises(SystemExit) as e:
+        manage.main(["backup-verify"])
+    assert "no local backups" in str(e.value.code)
+
+    client.post("/api/v1/sites", json={"domain": "example.com", "origin_ip": "93.184.216.34"})
+    assert manage.main(["backup", "--no-upload"]) == 0
+    capsys.readouterr()
+    # the newest backup restores into a throwaway SQLite DB at head
+    assert manage.main(["backup-verify"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("OK:") and "throwaway SQLite" in out and migrate.head_revision() in out
+
+    # a tampered/non-backup file fails cleanly
+    bad = env / "backups" / "pcdn-backup-20260101T000000Z.tar.gz"
+    bad.write_bytes(b"not a real archive")
+    with pytest.raises(SystemExit) as e:
+        manage.main(["backup-verify", str(bad)])
+    # a non-zero exit (string message or code 1), never a crash
+    assert e.value.code != 0 and "FAIL" in str(e.value.code)
+
+
 def test_manage_backup_and_restore_cli(client, env, capsys):
     from app import manage
 

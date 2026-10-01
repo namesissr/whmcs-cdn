@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import routes_admin, routes_bundle, routes_capi, routes_edge, routes_ops, routes_v2
+from . import routes_admin, routes_bundle, routes_capi, routes_edge, routes_metrics, routes_ops, routes_v2
 from .config import settings
 from .db import init_db
 
@@ -67,6 +67,8 @@ app.include_router(routes_ops.router)
 app.include_router(routes_ops.health_router)
 # public, unauthenticated: the secret-free edge bundle (SPEC §11.1)
 app.include_router(routes_bundle.router)
+# public (optional METRICS_TOKEN): platform-aggregate Prometheus metrics (SPEC §13.1)
+app.include_router(routes_metrics.router)
 
 
 @app.get("/healthz")

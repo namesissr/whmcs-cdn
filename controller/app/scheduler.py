@@ -148,6 +148,9 @@ def job_edges(db):
     current = ",".join(edge_dns_state(e) for e in edges) + "|" + dns_signature()
     dirty = db.get(State, DNS_DIRTY_KEY) is not None
     if current == _state(db, "online_edges") and not dirty:
+        # DNS already matches the live edge set: record the freshness for the /metrics age
+        _set_state(db, "dns:last_sync_at", utcnow().isoformat())
+        db.commit()
         return
     if current != _state(db, "online_edges"):
         log.info("edge set changed -> %s", current or "(none)")
@@ -158,6 +161,7 @@ def job_edges(db):
     if failed == 0:
         _set_state(db, "online_edges", current)
         _set_state(db, "online_edge_ids", ",".join(sorted(str(e.id) for e in edges)))
+        _set_state(db, "dns:last_sync_at", utcnow().isoformat())  # metrics: DNS last-sync age
         row = db.get(State, DNS_DIRTY_KEY)
         if row is not None:
             db.delete(row)
@@ -243,7 +247,13 @@ def job_ssl(db):
     db.commit()
     key = f"ssl_failed:{domain}"
     if error is None:
+        from .audit import record_audit
+
         alerts.resolve_alert(key, f"گواهی {domain} با موفقیت صادر/تمدید شد.")
+        # scheduler-driven mutation (SPEC §13.2): actor "system"; never stores the key/cert
+        record_audit(db, actor="system", actor_kind="system",
+                     action="ssl.renew" if had_cert else "ssl.issue", target=domain,
+                     detail={"ssl_source": site.ssl_source})
     else:
         what = "تمدید" if had_cert else "صدور"
         extra = " گواهی قبلی هنوز معتبر است و سرو می‌شود." if had_cert else ""
@@ -269,6 +279,17 @@ def job_cleanup(db):
     db.execute(delete(UsageBatch).where(UsageBatch.received_at < utcnow() - timedelta(days=7)))
     uptime.prune(db)
     prune_events(db)
+    db.commit()
+
+
+def job_prune_audit(db):
+    """Delete audit_log rows older than AUDIT_RETENTION_DAYS (SPEC §13.2, leader only)."""
+    from .models import AuditLog
+
+    days = settings.audit_retention_days
+    if days <= 0:
+        return
+    db.execute(delete(AuditLog).where(AuditLog.at < utcnow() - timedelta(days=days)))
     db.commit()
 
 
@@ -359,7 +380,25 @@ def job_probe(db, now: datetime | None = None, force: bool = False):
     db.commit()
 
 
-JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_cleanup, job_ssl, job_backup]
+# metrics: per-job last-completed timestamps are stored in the State table under this prefix
+# (read by routes_metrics for pcdn_scheduler_job_last_run_age_seconds)
+JOBRUN_PREFIX = "jobrun:"
+
+JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_cleanup,
+        job_prune_audit, job_ssl, job_backup]
+
+
+def _record_job_run(name: str):
+    """Note that job `name` completed, for the scheduler-per-job age metric (SPEC §13.1)."""
+    db = SessionLocal()
+    try:
+        _set_state(db, JOBRUN_PREFIX + name, utcnow().isoformat())
+        db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("could not record run of job %s", name)
+        db.rollback()
+    finally:
+        db.close()
 
 
 def run_once():
@@ -389,6 +428,7 @@ def run_once():
                                f"{type(failed).__name__}: {str(failed)[:600]}\nجزئیات در لاگ کنترلر.")
         else:
             alerts.resolve_alert(key, f"کار {job.__name__} دوباره بدون خطا اجرا شد.")
+            _record_job_run(job.__name__)
 
 
 def record_run():

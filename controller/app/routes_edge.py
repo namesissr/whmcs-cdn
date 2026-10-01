@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from .auth import require_edge
 from .db import get_db
-from .models import Edge, Purge, SecurityEvent, Site, UsageBatch, UsageHourly, utcnow
+from .models import Edge, Purge, SecurityEvent, Site, State, UsageBatch, UsageHourly, utcnow
 from .services import build_edge_config, record_metrics
 
 router = APIRouter(prefix="/edge/v1")
@@ -306,6 +306,15 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
                              source=ev.source, rule=ev.rule, user_agent=ev.user_agent))
         accepted_events += 1
     edge.last_seen_at = utcnow()
+    # metrics: monotonic count of usage batches ingested (SPEC §13.1); duplicates returned earlier
+    row = db.get(State, "metrics:usage_batches")
+    if row is None:
+        db.add(State(key="metrics:usage_batches", value="1"))
+    else:
+        try:
+            row.value = str(int(row.value or "0") + 1)
+        except ValueError:
+            row.value = "1"
     db.commit()
     return {"ok": True, "accepted": len(agg), "events": accepted_events}
 

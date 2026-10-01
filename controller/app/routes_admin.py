@@ -5,16 +5,17 @@ import json
 from datetime import datetime, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import bundle, dnsbuild, nscheck, pdns, sections
+from .audit import record_audit
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
-from .models import ApiKey, Edge, EdgeAddress, Record, Site, UsageHourly, utcnow
+from .models import ApiKey, AuditLog, Edge, EdgeAddress, Record, Site, UsageHourly, utcnow
 from .services import (
     refresh_quota,
     month_start,
@@ -40,6 +41,18 @@ router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
 def bad(e: Exception):
     raise HTTPException(422, str(e))
+
+
+def _client_ip(request: Request | None) -> str | None:
+    return request.client.host if request is not None and request.client else None
+
+
+def _audit(db: Session, request: Request | None, action: str, target: str | None = None,
+           detail: dict | None = None) -> None:
+    """Record an admin mutation (SPEC §13.2). The admin surface has a single key, so the actor
+    label is simply "admin"; secrets are stripped by record_audit."""
+    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target,
+                 detail=detail, ip=_client_ip(request))
 
 
 def get_site(db: Session, domain: str) -> Site:
@@ -212,7 +225,7 @@ def ping(db: Session = Depends(get_db)):
 # ------------------------------------------------------------------ sites
 
 @router.post("/sites", status_code=201)
-def create_site(body: SiteCreate, db: Session = Depends(get_db)):
+def create_site(body: SiteCreate, request: Request, db: Session = Depends(get_db)):
     try:
         domain = normalize_domain(body.domain)
         origin = validate_ip(body.origin_ip, 4) if body.origin_ip else None
@@ -231,6 +244,8 @@ def create_site(body: SiteCreate, db: Session = Depends(get_db)):
         ]
     db.add(site)
     db.commit()
+    _audit(db, request, "site.create", site.domain,
+           {"external_id": body.external_id, "reseller_client_id": body.reseller_client_id})
     err = sync_site_dns(db, site)
     return {**site_to_dict(db, site), "dns_error": err}
 
@@ -260,20 +275,21 @@ def read_site(domain: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/sites/{domain}/plan")
-def update_plan(domain: str, plan: Plan, db: Session = Depends(get_db)):
+def update_plan(domain: str, plan: Plan, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     group = sections.features_of(site)["edge_group"]
     apply_plan(site, plan)
     # a raised/lowered bandwidth limit takes effect now, not on the next scheduler tick
     refresh_quota(db, site)
     db.commit()
+    _audit(db, request, "site.plan", site.domain, plan.model_dump(exclude_none=True))
     if sections.features_of(site)["edge_group"] != group:
         sync_site_dns(db, site)  # the site is now answered by the other group of edges
     return site_to_dict(db, site)
 
 
 @router.patch("/sites/{domain}/reseller")
-def update_reseller(domain: str, body: ResellerIn, db: Session = Depends(get_db)):
+def update_reseller(domain: str, body: ResellerIn, request: Request, db: Session = Depends(get_db)):
     """Set or clear the reseller tag on a site (SPEC §10.5). Only provided fields change;
     pass an explicit null to clear one."""
     site = get_site(db, domain)
@@ -283,6 +299,8 @@ def update_reseller(domain: str, body: ResellerIn, db: Session = Depends(get_db)
     if "reseller_label" in fields:
         site.reseller_label = _clean_label(body.reseller_label)
     db.commit()
+    _audit(db, request, "reseller.flag", site.domain,
+           {"reseller_client_id": site.reseller_client_id, "reseller_label": site.reseller_label})
     return site_to_dict(db, site)
 
 
@@ -334,11 +352,12 @@ def unsuspend(domain: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/sites/{domain}")
-def delete_site(domain: str, db: Session = Depends(get_db)):
+def delete_site(domain: str, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     name = site.domain
     db.delete(site)
     db.commit()
+    _audit(db, request, "site.delete", name)
     if settings.pdns_enabled:
         try:
             pdns.client().delete_zone(name)
@@ -393,8 +412,12 @@ def purge_site(db: Session, site: Site, body: PurgeIn) -> dict:
 
 
 @router.post("/sites/{domain}/purge")
-def purge(domain: str, body: PurgeIn, db: Session = Depends(get_db)):
-    return purge_site(db, get_site(db, domain), body)
+def purge(domain: str, body: PurgeIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = purge_site(db, site, body)
+    _audit(db, request, "purge", site.domain,
+           {"everything": body.everything, "urls": len(body.urls), "prefixes": len(body.prefixes)})
+    return result
 
 
 @router.get("/sites/{domain}/usage")
@@ -681,7 +704,7 @@ def _edge_install(edge: Edge, token: str) -> str:
 
 
 @router.post("/edges", status_code=201)
-def create_edge(body: EdgeIn, db: Session = Depends(get_db)):
+def create_edge(body: EdgeIn, request: Request, db: Session = Depends(get_db)):
     try:
         ipv4 = validate_ip(body.ipv4, 4)
         ipv6 = validate_ip(body.ipv6, 6) if body.ipv6 else None
@@ -694,12 +717,14 @@ def create_edge(body: EdgeIn, db: Session = Depends(get_db)):
                 group=body.group, capacity_mbps=body.capacity_mbps)
     db.add(edge)
     db.commit()
+    _audit(db, request, "edge.add", edge.name,
+           {"region": edge.region, "group": edge.group, "capacity_mbps": edge.capacity_mbps})
     # DNS changes once the edge sends its first heartbeat
     return {**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)}
 
 
 @router.post("/edges/batch", status_code=201)
-def batch_create_edges(body: EdgeBatchIn, db: Session = Depends(get_db)):
+def batch_create_edges(body: EdgeBatchIn, request: Request, db: Session = Depends(get_db)):
     """Create N edges in one call (SPEC §11.1). IPs are unknown at batch time (the node reports
     itself on first heartbeat); each edge gets a unique name and its one-time token + install
     one-liner. Names are name_prefix + index, skipping names already taken."""
@@ -721,6 +746,8 @@ def batch_create_edges(body: EdgeBatchIn, db: Session = Depends(get_db)):
         db.flush()
         out.append({**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)})
     db.commit()
+    _audit(db, request, "edge.add", body.name_prefix,
+           {"count": body.count, "region": body.region, "group": body.group})
     return {"edges": out}
 
 
@@ -733,19 +760,21 @@ def edge_install_oneliner(token: str, region: str = "global", role: str = "gener
 
 
 @router.post("/edges/{edge_id}/rotate-token")
-def rotate_edge_token(edge_id: int, db: Session = Depends(get_db)):
+def rotate_edge_token(edge_id: int, request: Request, db: Session = Depends(get_db)):
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")
     token = new_token()
     edge.token_hash = hash_token(token)
     db.commit()
+    # the new token is NEVER written to the audit log
+    _audit(db, request, "edge.rotate", edge.name)
     return {"token": token}
 
 
 @router.patch("/edges/{edge_id}")
-def update_edge(edge_id: int, enabled: bool | None = None, body: EdgePatch | None = Body(default=None),
-                db: Session = Depends(get_db)):
+def update_edge(edge_id: int, request: Request, enabled: bool | None = None,
+                body: EdgePatch | None = Body(default=None), db: Session = Depends(get_db)):
     """JSON body {enabled?, group?, capacity_mbps?, region?}; v1 clients send ?enabled=true|false."""
     edge = db.get(Edge, edge_id)
     if edge is None:
@@ -759,16 +788,19 @@ def update_edge(edge_id: int, enabled: bool | None = None, body: EdgePatch | Non
         setattr(edge, k, v)
     update_shed(edge)
     db.commit()
+    _audit(db, request, "edge.patch", edge.name, {"fields": sorted(changes), **changes})
     return {"ok": True, "dns_failed": sync_all_dns(db), "edge": edge_to_dict(edge)}
 
 
 @router.delete("/edges/{edge_id}")
-def delete_edge(edge_id: int, db: Session = Depends(get_db)):
+def delete_edge(edge_id: int, request: Request, db: Session = Depends(get_db)):
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")
+    name = edge.name
     db.delete(edge)
     db.commit()
+    _audit(db, request, "edge.delete", name)
     return {"ok": True, "dns_failed": sync_all_dns(db)}
 
 
@@ -836,7 +868,7 @@ def list_edge_addresses(edge_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/edges/{edge_id}/addresses", status_code=201)
-def add_edge_address(edge_id: int, body: EdgeAddressIn, db: Session = Depends(get_db)):
+def add_edge_address(edge_id: int, body: EdgeAddressIn, request: Request, db: Session = Depends(get_db)):
     """Add an additional address to a node (SPEC §12.4). Validated, family-matched, and rejected
     when the address already belongs to any edge."""
     edge = _get_edge(db, edge_id)
@@ -849,12 +881,13 @@ def add_edge_address(edge_id: int, body: EdgeAddressIn, db: Session = Depends(ge
     a = EdgeAddress(edge_id=edge.id, family=body.family, ip=ip, label=_clean_addr_label(body.label))
     db.add(a)
     db.commit()
+    _audit(db, request, "edge.address.add", edge.name, {"family": a.family, "ip": a.ip, "address_id": a.id})
     db.refresh(edge)
     return {"address": address_to_dict(a), "edge": edge_to_dict(edge), "dns_failed": sync_all_dns(db)}
 
 
 @router.patch("/edges/{edge_id}/addresses/{address_id}")
-def update_edge_address(edge_id: int, address_id: int, body: EdgeAddressPatch,
+def update_edge_address(edge_id: int, address_id: int, body: EdgeAddressPatch, request: Request,
                         db: Session = Depends(get_db)):
     """Edit / rename / enable / disable an additional address (SPEC §12.4). The family is fixed;
     a changed IP starts its health over. `enabled=false` withdraws it from DNS immediately."""
@@ -881,17 +914,55 @@ def update_edge_address(edge_id: int, address_id: int, body: EdgeAddressPatch,
     if changes.get("enabled") is not None:
         a.enabled = changes["enabled"]
     db.commit()
+    _audit(db, request, "edge.address.patch", edge.name,
+           {"address_id": a.id, "family": a.family, "ip": a.ip, "fields": sorted(changes)})
     db.refresh(edge)
     return {"address": address_to_dict(a), "edge": edge_to_dict(edge), "dns_failed": sync_all_dns(db)}
 
 
 @router.delete("/edges/{edge_id}/addresses/{address_id}")
-def delete_edge_address(edge_id: int, address_id: int, db: Session = Depends(get_db)):
+def delete_edge_address(edge_id: int, address_id: int, request: Request, db: Session = Depends(get_db)):
     """Remove an additional address (SPEC §12.4). The primary cannot be deleted."""
     edge = _get_edge(db, edge_id)
     a = db.get(EdgeAddress, address_id)
     if a is None or a.edge_id != edge.id:
         raise HTTPException(404, "address not found")
+    ip, family = a.ip, a.family
     db.delete(a)
     db.commit()
+    _audit(db, request, "edge.address.del", edge.name, {"address_id": address_id, "family": family, "ip": ip})
     return {"ok": True, "dns_failed": sync_all_dns(db)}
+
+
+# ------------------------------------------------------------------ audit log (SPEC §13.2)
+
+AUDIT_MAX_LIMIT = 500
+
+
+def audit_to_dict(e: AuditLog) -> dict:
+    try:
+        detail = json.loads(e.detail or "{}")
+    except ValueError:
+        detail = {}
+    return {"id": e.id, "at": e.at.isoformat() + "Z" if e.at else None, "actor": e.actor,
+            "actor_kind": e.actor_kind, "action": e.action, "target": e.target,
+            "detail": detail, "ip": e.ip}
+
+
+@router.get("/audit")
+def list_audit(limit: int = 100, since: str | None = None, action: str | None = None,
+               actor: str | None = None, db: Session = Depends(get_db)):
+    """Recent audit entries, newest first (SPEC §13.2). `since` is an ISO-8601 timestamp."""
+    limit = max(1, min(limit, AUDIT_MAX_LIMIT))
+    q = select(AuditLog).order_by(AuditLog.id.desc())
+    if action:
+        q = q.where(AuditLog.action == action)
+    if actor:
+        q = q.where(AuditLog.actor == actor)
+    if since:
+        try:
+            dt = datetime.fromisoformat(since.replace("Z", "").strip())
+        except ValueError:
+            bad(ValidationError("since باید یک زمان ISO-8601 باشد"))
+        q = q.where(AuditLog.at >= dt)
+    return [audit_to_dict(e) for e in db.scalars(q.limit(limit))]

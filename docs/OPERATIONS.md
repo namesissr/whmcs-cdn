@@ -295,6 +295,15 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/a
 
 - در خروجی `/healthz/deep`، فیلد `backup.last_success_age_hours` نباید از ۲۶ بیشتر باشد.
 - هر چند وقت یک بار یک نسخه را روی سرور آزمایشی بازیابی کنید (بخش بعد). پشتیبانی که آزمایش نشده، قابل اتکا نیست.
+- برای اینکه «قابل بازیابی بودن» آخرین نسخه را بدون دست زدن به دیتابیس زنده بسنجید:
+  ```bash
+  docker compose --profile tools run --rm --no-deps tools python -m app.manage backup-verify
+  ```
+  این دستور آخرین نسخه (محلی یا ابری، و در صورت رمزگذاری با `BACKUP_PASSPHRASE`) را رمزگشایی و باز
+  می‌کند، نسخهٔ کنترلر را در یک دیتابیس SQLite موقت بازیابی می‌کند و مطابقت نسخهٔ Alembic با head و سلامت
+  اولیهٔ جدول‌ها را بررسی می‌کند. اگر پشتیبان از PostgreSQL باشد (قابل بازگردانی در SQLite نیست) فقط
+  رمزگشایی و ساختار و شمارهٔ نسخه بررسی می‌شود. در پایان `OK` یا `FAIL` چاپ می‌کند و در صورت خطا با کد
+  خروج غیرصفر خارج می‌شود (مناسب برای cron). مسیر یا `s3:<key>` دلخواه را هم می‌توان به‌عنوان آرگومان داد.
 - برای باز کردن یک نسخه بدون تغییر در هیچ دیتابیسی:
   ```bash
   docker compose --profile tools run --rm --no-deps tools python -m app.manage restore /data/backups/<file> \

@@ -182,6 +182,11 @@ class Settings:
     # high availability
     instance_name: str = field(default_factory=lambda: os.getenv("INSTANCE_NAME", ""))
 
+    # observability (SPEC §13): optional bearer token guarding GET /metrics (empty = open, for an
+    # internal scrape network). The audit log is pruned after this many days.
+    metrics_token: str = field(default_factory=lambda: os.getenv("METRICS_TOKEN", ""))
+    audit_retention_days: int = field(default_factory=lambda: int(os.getenv("AUDIT_RETENTION_DAYS") or 90))
+
     # customer API (SPEC §10.1): per-key requests allowed per minute (in-process sliding window)
     capi_rate: int = field(default_factory=lambda: int(os.getenv("CAPI_RATE", "60")))
     # a tighter per-key limit for config/record *writes* only (F5): a burst of these bumps the edge

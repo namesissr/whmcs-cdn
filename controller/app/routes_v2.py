@@ -8,12 +8,13 @@ import dns.exception
 import dns.rdatatype
 import dns.zone
 import pydantic
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from . import pdns, sections, ssl, tunnel
+from .audit import record_audit
 from .auth import require_admin
 from .config import settings
 from .db import get_db
@@ -28,6 +29,14 @@ router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 def _pydantic_422(e: pydantic.ValidationError):
     raise HTTPException(422, [{"loc": list(err["loc"]), "msg": err["msg"].removeprefix("Value error, ")}
                               for err in e.errors()])
+
+
+def _audit(db: Session, request: Request, action: str, target: str | None = None,
+           detail: dict | None = None) -> None:
+    """Record an admin mutation on the v2 surface (SPEC §13.2)."""
+    ip = request.client.host if request.client else None
+    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target,
+                 detail=detail, ip=ip)
 
 
 # ------------------------------------------------------------------ sections
@@ -76,9 +85,12 @@ def read_section(domain: str, section: str, db: Session = Depends(get_db)):
 
 
 @router.put("/sites/{domain}/config/{section}")
-def write_section(domain: str, section: str, body: dict, response: Response,
+def write_section(domain: str, section: str, body: dict, response: Response, request: Request,
                   db: Session = Depends(get_db)):
-    return write_section_of(db, get_site(db, domain), section, body, response)
+    site = get_site(db, domain)
+    result = write_section_of(db, site, section, body, response)
+    _audit(db, request, "config.update", site.domain, {"section": section})
+    return result
 
 
 # ------------------------------------------------------------------ tunnel mode (SPEC §7.5)
@@ -105,7 +117,7 @@ class CustomCert(BaseModel):
 
 
 @router.put("/sites/{domain}/ssl/custom")
-def upload_cert(domain: str, body: CustomCert, db: Session = Depends(get_db)):
+def upload_cert(domain: str, body: CustomCert, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     if not sections.features_of(site)["custom_ssl"]:
         raise HTTPException(403, "گواهی اختصاصی در پلن شما فعال نیست")
@@ -117,11 +129,13 @@ def upload_cert(domain: str, body: CustomCert, db: Session = Depends(get_db)):
     site.ssl_expires_at = info["expires_at"]
     site.ssl_status, site.ssl_source, site.ssl_error = "active", "custom", None
     db.commit()
+    # NB: the certificate and (especially) the private key are never written to the audit log
+    _audit(db, request, "ssl.custom.upload", site.domain, {"ssl_source": "custom"})
     return site_to_dict(db, site)["ssl"]
 
 
 @router.delete("/sites/{domain}/ssl/custom")
-def remove_cert(domain: str, db: Session = Depends(get_db)):
+def remove_cert(domain: str, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     if site.ssl_source != "custom":
         raise HTTPException(404, "گواهی اختصاصی ثبت نشده است")
@@ -129,6 +143,7 @@ def remove_cert(domain: str, db: Session = Depends(get_db)):
     site.ssl_source, site.ssl_error = None, None
     site.ssl_status = "pending" if site.ssl_allowed and site.ns_verified_at else "none"
     db.commit()
+    _audit(db, request, "ssl.custom.remove", site.domain)
     return site_to_dict(db, site)["ssl"]
 
 
@@ -235,7 +250,7 @@ def dnssec_status(domain: str, db: Session = Depends(get_db)):
 
 
 @router.post("/sites/{domain}/dnssec")
-def dnssec_toggle(domain: str, body: DnssecIn, db: Session = Depends(get_db)):
+def dnssec_toggle(domain: str, body: DnssecIn, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     if body.enabled and not sections.features_of(site)["dnssec"]:
         raise HTTPException(403, "DNSSEC در پلن شما فعال نیست")
@@ -253,6 +268,7 @@ def dnssec_toggle(domain: str, body: DnssecIn, db: Session = Depends(get_db)):
         info = None
     site.dnssec_enabled = body.enabled
     db.commit()
+    _audit(db, request, "dnssec", site.domain, {"dnssec": body.enabled})
     return info or {"enabled": body.enabled, "ds": [], "dnskey": None}
 
 

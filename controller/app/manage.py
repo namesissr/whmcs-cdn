@@ -10,6 +10,7 @@
     python -m app.manage backups                      list local and remote backups
     python -m app.manage restore <file|s3:KEY> --yes [--passphrase P] [--no-controller]
                                   [--pdns [PATH]] [--acme [PATH]] [--extract DIR]
+    python -m app.manage backup-verify [FILE|s3:KEY]  prove the latest backup is restorable
 
     python -m app.manage gen-key                      print a new DATA_ENCRYPTION_KEY
     python -m app.manage encryption-status            plaintext / encrypted secret counts
@@ -148,6 +149,103 @@ def cmd_restore(a):
     print(json.dumps({"restored": res["restored"], "backup_created_at": res["manifest"].get("created_at"),
                       "warnings": res["manifest"].get("warnings", [])}, indent=2, ensure_ascii=False))
     print("next: start the controllers and re-sync DNS (see docs/OPERATIONS.md)")
+
+
+def cmd_backup_verify(a):
+    """Prove the latest backup is restorable (SPEC §13.3): decrypt + extract it, then — for a
+    SQLite controller dump — restore it into a THROWAWAY database and assert the Alembic head and
+    a row sanity check. For a PostgreSQL dump (which cannot be replayed into SQLite) the closest
+    safe check is done: the archive decrypts, the manifest is at head and the dump is non-empty.
+    The live database is NEVER touched. Prints OK / FAIL and exits non-zero on failure."""
+    from sqlalchemy import create_engine, inspect, text
+
+    from . import backup, migrate
+    from .config import settings
+
+    passphrase = a.passphrase
+    if passphrase == "-":
+        passphrase = getpass.getpass("backup passphrase: ")
+
+    with tempfile.TemporaryDirectory(prefix="pcdn-verify-") as tmp:
+        # locate the archive: an explicit path/s3 key, else the newest local, else the newest remote
+        path = a.file
+        if path is None:
+            names = backup.list_local(a.dir)
+            if names:
+                path = os.path.join(a.dir or settings.backup_dir, names[-1])
+            else:
+                s3 = backup.S3Client.from_settings()
+                if s3 is None:
+                    sys.exit("FAIL: no local backups found and BACKUP_S3_* is not configured")
+                keys = sorted(o["key"] for o in s3.list(settings.backup_s3_prefix)
+                              if backup.NAME_RE.match(o["key"][len(settings.backup_s3_prefix):]))
+                if not keys:
+                    sys.exit("FAIL: no backups found locally or in object storage")
+                path = os.path.join(tmp, os.path.basename(keys[-1]))
+                print(f"downloading s3:{keys[-1]} ...")
+                s3.download(keys[-1], path)
+        elif path.startswith("s3:"):
+            s3 = backup.S3Client.from_settings()
+            if s3 is None:
+                sys.exit("FAIL: BACKUP_S3_* is not configured")
+            key = path[3:]
+            path = os.path.join(tmp, os.path.basename(key))
+            print(f"downloading s3:{key} ...")
+            s3.download(key, path)
+        if not os.path.exists(path):
+            sys.exit(f"FAIL: backup not found: {path}")
+
+        head = migrate.head_revision()
+        try:
+            out, manifest = backup.open_archive(path, passphrase, tmp)
+        except backup.BackupError as e:
+            sys.exit(f"FAIL: cannot open backup: {e}")
+
+        contents = manifest.get("contents", {})
+        controller = contents.get("controller")
+        if not controller:
+            sys.exit("FAIL: backup has no controller database")
+        rev = manifest.get("alembic_revision")
+        problems = []
+        if rev != head:
+            problems.append(f"manifest alembic_revision {rev!r} != current head {head!r}")
+        src = os.path.join(out, controller["file"])
+        if not os.path.exists(src):
+            sys.exit(f"FAIL: controller dump {controller['file']!r} missing from archive")
+
+        kind = controller.get("kind")
+        if kind == "sqlite":
+            target = os.path.join(tmp, "verify.sqlite3")
+            backup.restore_controller_db(src, "sqlite", url=f"sqlite:///{target}")
+            eng = create_engine(f"sqlite:///{target}")
+            try:
+                db_rev = migrate.current_revision(eng)
+                tables = set(inspect(eng).get_table_names())
+                if db_rev != head:
+                    problems.append(f"restored database is at {db_rev!r}, not head {head!r}")
+                for t in ("sites", "edges", "state"):
+                    if t not in tables:
+                        problems.append(f"restored database is missing the {t!r} table")
+                with eng.connect() as conn:
+                    for t in ("sites", "edges"):
+                        if t in tables:
+                            conn.execute(text(f"SELECT count(*) FROM {t}"))  # row sanity
+            finally:
+                eng.dispose()
+            mode = "full restore into a throwaway SQLite database"
+        else:
+            if os.path.getsize(src) <= 0:
+                problems.append("controller dump is empty")
+            mode = (f"decrypt + structure check only (the controller dump is a {kind} pg_dump, "
+                    "which can only be replayed into a throwaway PostgreSQL database)")
+
+        if problems:
+            print("FAIL: backup verification failed:", file=sys.stderr)
+            for p in problems:
+                print(f"  - {p}", file=sys.stderr)
+            sys.exit(1)
+        print(f"OK: backup {os.path.basename(path)} verified ({mode}).")
+        print(f"    created_at={manifest.get('created_at')}  revision={rev}  head={head}")
 
 
 def cmd_gen_key(a):
@@ -314,6 +412,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--extract", metavar="DIR", help="also copy the decrypted contents to DIR")
     s.add_argument("--yes", action="store_true", help="confirm overwriting data")
     s.set_defaults(fn=cmd_restore)
+    s = sub.add_parser("backup-verify", help="prove the latest backup restores cleanly (safe, never touches the live DB)")
+    s.add_argument("file", nargs="?", help="archive path or s3:<key> (default: the newest backup)")
+    s.add_argument("--dir", help="where to look for local backups (default BACKUP_DIR)")
+    s.add_argument("--passphrase", help="decryption passphrase ('-' to prompt; default BACKUP_PASSPHRASE)")
+    s.set_defaults(fn=cmd_backup_verify)
 
     sub.add_parser("gen-key", help="print a new Fernet key").set_defaults(fn=cmd_gen_key)
     sub.add_parser("encryption-status", help="secret encryption status").set_defaults(fn=cmd_encryption_status)

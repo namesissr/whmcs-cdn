@@ -351,3 +351,22 @@ class State(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, default="")
+
+
+class AuditLog(Base):
+    """Append-only record of platform mutations (SPEC §13.2). Writes only — reads are never
+    audited. `detail` is a small JSON document from which secrets, tokens and private keys are
+    always stripped (see audit.record_audit). Old rows are pruned by the scheduler after
+    AUDIT_RETENTION_DAYS."""
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    # admin-key label / customer-key id-or-name / "system"
+    actor: Mapped[str] = mapped_column(String(120), default="")
+    actor_kind: Mapped[str] = mapped_column(String(16), default="admin")  # admin | capi | system
+    action: Mapped[str] = mapped_column(String(64), index=True)  # e.g. site.create, edge.add, purge
+    target: Mapped[str | None] = mapped_column(String(253), nullable=True)  # domain / edge name / ...
+    detail: Mapped[str] = mapped_column(Text, default="{}")  # JSON, secret-free
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)

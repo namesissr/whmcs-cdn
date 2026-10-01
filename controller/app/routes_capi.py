@@ -9,10 +9,11 @@ routes so behaviour/validation never drifts between the two surfaces.
 
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .audit import record_audit
 from .auth import hash_token
 from .config import settings
 from .db import get_db
@@ -93,11 +94,24 @@ def _site(key: ApiKey) -> Site:
     return key.site
 
 
+def _audit(db: Session, request: Request, key: ApiKey, action: str, detail: dict | None = None) -> None:
+    """Record a customer-API mutation (SPEC §13.2). The actor is the key's name (or id) and the
+    target is always the key's own site; secrets are stripped by record_audit."""
+    actor = key.name or f"key:{key.id}"
+    ip = request.client.host if request.client else None
+    record_audit(db, actor=actor, actor_kind="capi", action=action, target=key.site.domain,
+                 detail=detail, ip=ip)
+
+
 # ------------------------------------------------------------------ purge (scope: purge)
 
 @router.post("/purge")
-def purge(body: PurgeIn, key: ApiKey = Depends(require_scope("purge")), db: Session = Depends(get_db)):
-    return purge_site(db, _site(key), body)
+def purge(body: PurgeIn, request: Request, key: ApiKey = Depends(require_scope("purge")),
+          db: Session = Depends(get_db)):
+    result = purge_site(db, _site(key), body)
+    _audit(db, request, key, "purge",
+           {"everything": body.everything, "urls": len(body.urls), "prefixes": len(body.prefixes)})
+    return result
 
 
 # ------------------------------------------------------------------ analytics + events (scope: stats)
@@ -120,19 +134,27 @@ def list_records(key: ApiKey = Depends(require_scope("dns"))):
 
 
 @router.post("/records", status_code=201)
-def add_record(body: RecordIn, key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
-    return add_record_of(db, _site(_rate_limit_config(key)), body)
+def add_record(body: RecordIn, request: Request, key: ApiKey = Depends(require_scope("dns")),
+               db: Session = Depends(get_db)):
+    result = add_record_of(db, _site(_rate_limit_config(key)), body)
+    _audit(db, request, key, "record.create", {"type": body.type})
+    return result
 
 
 @router.patch("/records/{record_id}")
-def update_record(record_id: int, body: RecordIn, key: ApiKey = Depends(require_scope("dns")),
-                  db: Session = Depends(get_db)):
-    return update_record_of(db, _site(_rate_limit_config(key)), record_id, body)
+def update_record(record_id: int, body: RecordIn, request: Request,
+                  key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
+    result = update_record_of(db, _site(_rate_limit_config(key)), record_id, body)
+    _audit(db, request, key, "record.update", {"record_id": record_id, "type": body.type})
+    return result
 
 
 @router.delete("/records/{record_id}")
-def delete_record(record_id: int, key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
-    return delete_record_of(db, _site(_rate_limit_config(key)), record_id)
+def delete_record(record_id: int, request: Request, key: ApiKey = Depends(require_scope("dns")),
+                  db: Session = Depends(get_db)):
+    result = delete_record_of(db, _site(_rate_limit_config(key)), record_id)
+    _audit(db, request, key, "record.delete", {"record_id": record_id})
+    return result
 
 
 @router.get("/config/{section}")
@@ -141,6 +163,8 @@ def read_section(section: str, key: ApiKey = Depends(require_scope("dns"))):
 
 
 @router.put("/config/{section}")
-def write_section(section: str, body: dict, response: Response, key: ApiKey = Depends(require_scope("dns")),
-                  db: Session = Depends(get_db)):
-    return write_section_of(db, _site(_rate_limit_config(key)), section, body, response)
+def write_section(section: str, body: dict, response: Response, request: Request,
+                  key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
+    result = write_section_of(db, _site(_rate_limit_config(key)), section, body, response)
+    _audit(db, request, key, "config.update", {"section": section})
+    return result
