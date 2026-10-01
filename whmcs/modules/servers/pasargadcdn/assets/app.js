@@ -1,8 +1,8 @@
 /*
  * Pasargad CDN — client-area app shell (vanilla JS, no dependencies).
  *
- * Script order (see templates/clientarea.tpl): ui.js → pages.js → reports.js →
- * tutorials.js → tunnel.js → app.js. Boot data comes from <script id="pcdn-boot"> (see
+ * Script order (see pasargadcdn_assets()): ui.js → pages.js → rules.js → reports.js →
+ * tutorials.js → tunnel.js → … → app.js. Boot data comes from <script id="pcdn-boot"> (see
  * pasargadcdn_ClientArea); every call goes through api.php, which pins the
  * request to this service's domain. Data only reaches the DOM through
  * textContent / createElement.
@@ -68,19 +68,23 @@
     { title: 'DNS', items: ['dns', 'dnssec'] },
     { title: 'تونل', items: ['tunnel'] },
     { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'pools'] },
-    { title: 'امنیت', items: ['firewall', 'waf', 'ddos', 'ratelimit', 'hotlink'] },
+    // Wave 6B (SPEC §14.2): shown only when the controller returns the section (see available()).
+    { title: 'قوانین', items: ['redirects', 'transform'] },
+    { title: 'امنیت', items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
     { title: 'SSL و هدرها', items: ['ssl', 'headers', 'errorpages'] },
     { title: 'گزارش‌ها', items: ['analytics', 'events', 'usage', 'statement'] },
     { title: 'توسعه‌دهندگان', items: ['apikeys'] }
   ];
   if (RESELLER) NAV.unshift({ title: 'نمایندگی', items: ['reseller'] });
   var pages = P.pages = P.pages || {};
-  function page(id) { return pages[id] || pages.overview; }
+  function page(id) { return available(id) ? pages[id] : pages.overview; }
   function locked(id) { var p = pages[id]; return !!(p && p.lock && p.lock(features())); }
+  /** A registered page this controller supports (feature-detected pages declare hidden(site)). */
+  function available(id) { var p = pages[id]; return !!p && !(p.hidden && p.hidden(S.site)); }
 
   function readHash() {
     var m = /^#pcdn=([a-z]+)(?:\/([a-z0-9_-]+))?$/.exec(window.location.hash || '');
-    return m && pages[m[1]] ? { page: m[1], sub: m[2] || '' } : null;
+    return m && available(m[1]) ? { page: m[1], sub: m[2] || '' } : null;
   }
   function writeHash(replace) {
     var hs = '#pcdn=' + S.page + (S.sub ? '/' + S.sub : '');
@@ -96,7 +100,7 @@
     o = o || {};
     return guard().then(function (ok) {
       if (!ok) { if (o.fromHistory) writeHash(true); return false; }
-      S.page = pages[id] ? id : 'overview';
+      S.page = available(id) ? id : 'overview';
       S.sub = sub || '';
       if (!o.fromHistory) writeHash(false);
       renderAll();
@@ -141,7 +145,11 @@
     hotlink: { enabled: false, extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'mp4'], allowed_referers: [], allow_empty: true },
     image: { enabled: false, quality: 85, max_width: 2000, auto_webp: false },
     errorpages: { '5xx': null, '4xx': null },
-    tunnel: { enabled: false, paths: [], idle_timeout: 3600, per_connection_mbps: 0, max_connections_per_ip: 0, allowed_countries: [], fallback: 'origin' }
+    tunnel: { enabled: false, paths: [], idle_timeout: 3600, per_connection_mbps: 0, max_connections_per_ip: 0, allowed_countries: [], fallback: 'origin' },
+    // Wave 6B (SPEC §14.2) — their pages are hidden unless the controller returns the section.
+    transform: { rules: [] },
+    redirects: { rules: [] },
+    bots: { mode: 'off', allow_verified: true, block_empty_ua: true }
   };
   function config(section) {
     var c = S.site && S.site.config && S.site.config[section];
@@ -297,8 +305,9 @@
   }
   function navTree(onPick) {
     return NAV.map(function (g) {
-      return h('div', { className: 'pcdn-nav-group' }, h('div', { className: 'pcdn-nav-title', text: g.title }),
-        g.items.map(function (id) { return navItem(id, onPick); }));
+      var items = g.items.filter(available);
+      return items.length ? h('div', { className: 'pcdn-nav-group' }, h('div', { className: 'pcdn-nav-title', text: g.title }),
+        items.map(function (id) { return navItem(id, onPick); })) : null;
     });
   }
 
@@ -652,7 +661,8 @@
   function modeLabel(kind, mode) {
     var M = {
       waf: { off: ['خاموش', 'muted'], detect: ['فقط ثبت', 'warning'], block: ['مسدودسازی', 'success'] },
-      ddos: { off: ['خاموش', 'muted'], auto: ['خودکار', 'success'], js: ['زیر حمله (چالش JS)', 'warning'], captcha: ['کپچا برای همه', 'warning'] }
+      ddos: { off: ['خاموش', 'muted'], auto: ['خودکار', 'success'], js: ['زیر حمله (چالش JS)', 'warning'], captcha: ['کپچا برای همه', 'warning'] },
+      bots: { off: ['خاموش', 'muted'], log: ['فقط ثبت', 'warning'], challenge: ['چالش', 'success'], block: ['مسدودسازی', 'success'] }
     };
     return (M[kind] || {})[mode] || [mode || '—', 'muted'];
   }
@@ -863,6 +873,7 @@
     append(c.body, h('div', { className: 'pcdn-schips' },
       f.waf ? chip('waf', 'WAF', w[0], w[1]) : chip('waf', 'WAF', 'در پلن نیست', 'muted'),
       f.ddos ? chip('ddos', 'حفاظت DDoS', d[0], d[1]) : chip('ddos', 'حفاظت DDoS', 'در پلن نیست', 'muted'),
+      cfg.bots && typeof cfg.bots === 'object' ? (function (b) { return chip('bots', 'مدیریت ربات‌ها', b[0], b[1]); })(modeLabel('bots', cfg.bots.mode || 'off')) : null,
       chip('firewall', 'قوانین فایروال', fw.length ? num(fw.filter(function (r) { return r.enabled; }).length) + ' قانون فعال' : 'بدون قانون', fw.length ? 'success' : 'muted'),
       chip('ratelimit', 'محدودیت نرخ', rl.length ? num(rl.length) + ' قانون' : 'بدون قانون', rl.length ? 'success' : 'muted'),
       chip('ssl', 'HTTPS اجباری', ssl.force_https ? 'روشن' : 'خاموش', ssl.force_https ? 'success' : 'muted'),

@@ -209,6 +209,32 @@ class ApiClient
     }
 
     /**
+     * A public, non-JSON controller file (e.g. GET /origin-pull-ca.pem, SPEC §14.2) as text.
+     * Sent without the admin key (the file is public) and refused past $max bytes.
+     * Returns [http status, body] — body is null when it was larger than $max.
+     */
+    public function rawText(string $method, string $path, int $max = 262144): array
+    {
+        $ch = curl_init($this->baseUrl . $path);
+        $opts = $this->curlOptions($method, null);
+        $opts[CURLOPT_HTTPHEADER] = ['Accept: application/x-pem-file, text/plain;q=0.9, */*;q=0.1'];
+        $opts[CURLOPT_MAXFILESIZE] = $max;
+        curl_setopt_array($ch, $opts);
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        if (function_exists('logModuleCall')) {
+            logModuleCall('pasargadcdn', $method . ' ' . $path, null, self::redact(is_string($raw) ? substr($raw, 0, 4096) : $raw), null, [$this->apiKey]);
+        }
+        if ($raw === false) {
+            throw new ApiException('اتصال به سرور CDN برقرار نشد: ' . $err);
+        }
+        return [$code, strlen((string) $raw) > $max ? null : (string) $raw];
+    }
+
+    /**
      * Secrets never reach the WHMCS module log: edge tokens (shown to the admin
      * once), private keys of custom certificates.
      */

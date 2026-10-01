@@ -32,18 +32,27 @@ class ClientApi
 {
     const MAX_BODY = 262144; // 256 KB
 
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel';
+    // Wave 6B (SPEC §14.2) added transform, redirects and bots.
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots';
 
     /** method => [sub-path regex relative to /api/v1/sites/{domain}, ...] */
     const ROUTES = [
         'GET' => [
             '', 'config/(?:' . self::SECTIONS . ')', 'records', 'records/export', 'dnssec',
-            'analytics', 'events', 'usage', 'tunnel/stats', 'apikeys',
+            'analytics', 'events', 'usage', 'tunnel/stats', 'apikeys', 'origin-pull-ca',
         ],
-        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys'],
-        'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom'],
-        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}'],
+        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import'],
+        'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
+        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client'],
     ];
+
+    /**
+     * Whitelisted sub-paths that are NOT under /api/v1/sites/{domain}: public, site-independent
+     * controller files fetched server-side so the browser never needs (or learns) the controller
+     * URL. Same login/CSRF/ownership rules as every other path. sub-path => controller path.
+     */
+    const PUBLIC_FILES = ['origin-pull-ca' => '/origin-pull-ca.pem'];
+    const MAX_PEM = 65536;
 
     /** Query parameters the client may pass, per sub-path, with their allowed values. */
     const QUERY = [
@@ -185,6 +194,9 @@ class ClientApi
             ];
             // Admin pages keep every controller call within 10 s.
             $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params, $admin ? 10 : 20);
+            if (isset(self::PUBLIC_FILES[$path])) {
+                return self::pemFile($api, self::PUBLIC_FILES[$path]);
+            }
             [$code, $data] = $api->raw($method, $target, $body);
         } catch (\Throwable $e) {
             self::log($method . ' ' . $target, $e->getMessage());
@@ -205,6 +217,38 @@ class ClientApi
             return $code < 300 ? [$code, ['ok' => true]] : self::fail($code, 'درخواست توسط سرور CDN رد شد (HTTP ' . $code . ')');
         }
         return [$code, $data];
+    }
+
+    /**
+     * A public certificate file of the controller (SPEC §14.2: the CA that signs the platform's
+     * origin-pull client certificate), returned as JSON {pem, filename, fingerprint_sha256} for
+     * the client app to offer as a download. Only well-formed CERTIFICATE blocks pass — anything
+     * else (an HTML error page, a key) is refused.
+     */
+    private static function pemFile($api, string $file): array
+    {
+        if (!method_exists($api, 'rawText')) {
+            return self::fail(502, 'دریافت گواهی از سرور CDN ممکن نشد.');
+        }
+        [$code, $text] = $api->rawText('GET', $file, self::MAX_PEM);
+        if ($code === 404) {
+            return self::fail(404, 'سرور CDN هنوز گواهی CA اتصال مبدأ را منتشر نکرده است.');
+        }
+        if ($code !== 200 || !is_string($text)) {
+            self::log('GET ' . $file, 'HTTP ' . $code);
+            return self::fail(502, 'دریافت گواهی از سرور CDN ممکن نشد (HTTP ' . $code . ')');
+        }
+        $pem = trim(str_replace("\r\n", "\n", $text)) . "\n";
+        $block = '-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+\/=\s]+?)-----END CERTIFICATE-----';
+        if (strlen($pem) > self::MAX_PEM || stripos($pem, 'PRIVATE KEY') !== false
+            || !preg_match('/\A(?:' . $block . '\s*)+\z/', $pem) || !preg_match('/' . $block . '/', $pem, $m)) {
+            self::log('GET ' . $file, 'unexpected body');
+            return self::fail(502, 'پاسخ سرور CDN گواهی معتبری نبود.');
+        }
+        // SHA-256 of the first certificate (DER) so the customer can check the file they install.
+        $der = base64_decode((string) preg_replace('/\s+/', '', $m[1]), true);
+        $fp = $der === false || $der === '' ? null : implode(':', str_split(strtoupper(hash('sha256', $der)), 2));
+        return [200, ['pem' => $pem, 'filename' => 'pasargadcdn-origin-pull-ca.pem', 'fingerprint_sha256' => $fp]];
     }
 
     const RESELLER_OPS = ['list', 'create', 'delete', 'report'];

@@ -113,7 +113,12 @@
     star: 'M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.8z',
     certificate: 'M4 4h16v11H4z|M8 8h8|M8 11h5|M16 14a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5|M14.5 18.5 14 22l2-1 2 1-.5-3.5',
     tunnel: 'M3 20V12a9 9 0 0 1 18 0v8|M7.5 20v-7.5a4.5 4.5 0 0 1 9 0V20|M2 20h20|M12 4v2',
-    qr: 'M4 4h6v6H4z|M14 4h6v6h-6z|M4 14h6v6H4z|M14 14h2.5v2.5H14z|M18 18h2v2h-2z|M18 14h2|M14 19.5h2'
+    qr: 'M4 4h6v6H4z|M14 4h6v6h-6z|M4 14h6v6H4z|M14 14h2.5v2.5H14z|M18 18h2v2h-2z|M18 14h2|M14 19.5h2',
+    // Wave 6B (SPEC §14.2)
+    bot: 'M5 8.5h14v11H5z|M12 4.5v4|M12 4.5h.01|M9 13h.01|M15 13h.01|M9.5 16.5h5|M2.5 12.5v3|M21.5 12.5v3',
+    redirect: 'M4 6.5h10a5 5 0 0 1 0 10H7|M10 13.5l-3 3 3 3',
+    swap: 'M7 4 3 8l4 4|M3 8h14|M17 12l4 4-4 4|M21 16H7',
+    package: 'M12 3 4 7v10l8 4 8-4V7z|M4 7l8 4 8-4|M12 11v10|M8 5l8 4'
   };
   function icon(name, cls) {
     var svg = s('svg', { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor',
@@ -237,7 +242,12 @@
     // Wave 6A (SPEC §14.1)
     stale_while_revalidate: 'به‌روزرسانی در پس‌زمینه', stale_if_error: 'نسخه قدیمی هنگام خطای سرور اصلی', shield: 'Origin Shield',
     key_device: 'نسخه جدا برای موبایل', key_cookies: 'کوکی‌های کلید کش', key_query_allow: 'پارامترهای مجاز کلید کش',
-    http3: 'HTTP/3', auto_webp: 'تبدیل خودکار به WebP', preload: 'Preload', as: 'نوع منبع'
+    http3: 'HTTP/3', auto_webp: 'تبدیل خودکار به WebP', preload: 'Preload', as: 'نوع منبع',
+    // Wave 6B (SPEC §14.2)
+    match: 'تطبیق', actions: 'اقدام', countries: 'کشورها', regex: 'عبارت منظم', replacement: 'مسیر جدید', source: 'مبدأ',
+    target: 'مقصد', status: 'کد وضعیت', preserve_query: 'حفظ Query String', packs: 'بسته‌های آماده', mode: 'حالت',
+    allow_verified: 'ربات‌های تأییدشده', block_empty_ua: 'User-Agent خالی', origin_client_auth: 'احراز هویت مبدأ', csv: 'CSV',
+    include_subdomains: 'زیردامنه‌ها', enabled: 'فعال'
   };
   /** Controller errors → {summary, items:[{path, label, msg}]}. */
   function parseErrors(data, status) {

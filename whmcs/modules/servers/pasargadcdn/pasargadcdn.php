@@ -934,7 +934,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'rules.js', 'reports.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
     ];
 }
 

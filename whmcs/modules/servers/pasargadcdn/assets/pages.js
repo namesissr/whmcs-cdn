@@ -2,6 +2,8 @@
  * Pasargad CDN — configuration pages (cache, page rules, image, pools, firewall,
  * WAF, DDoS, rate limit, hotlink, SSL, headers, error pages).
  * Registers into window.PCDN.pages; app.js provides the shell (PCDN.app) at render time.
+ * The Wave 6B (SPEC §14.2) cards on the WAF and SSL pages come from rules.js (PCDN.sec6b),
+ * which in turn reuses this file's building blocks through PCDN.kit.
  */
 (function () {
   'use strict';
@@ -703,6 +705,8 @@
     { id: 'strict', title: 'سخت‌گیرانه', icon: 'shieldBolt', desc: 'همه گروه‌ها با حساسیت ۲؛ امنیت بیشتر ولی احتمال مسدودسازی اشتباه بالاتر.', v: { mode: 'block', paranoia: 2, groups: ALL_GROUPS } }
   ];
   function sameSet(a, b) { a = (a || []).slice().sort(); b = (b || []).slice().sort(); return JSON.stringify(a) === JSON.stringify(b); }
+  /** Wave 6B (§14.2) hooks from rules.js; absent → the 6A behaviour. */
+  function sec6b() { return P.sec6b || {}; }
   function renderWaf(Aa) {
     var f = Aa.sectionForm('waf', function (d, f2) {
       d.groups = d.groups || [];
@@ -735,8 +739,10 @@
             return row;
           })) : null,
           P.btn('افزودن استثنا', { icon: 'plus', size: 'sm', write: true, onclick: function () { d.exclusions.push({ rule_id: 0, path: '' }); adv.setOpen(true); f2.redraw(); } }))]);
-      return [levels, mode, adv];
-    });
+      // Managed rule packs (§14.2) — only when the controller's waf section carries `packs`.
+      var packs = sec6b().wafPacks ? sec6b().wafPacks(d, f2, Aa) : null;
+      return [levels, mode, packs, adv];
+    }, { validate: sec6b().validateWaf });
     return f.el;
   }
 
@@ -873,6 +879,8 @@
       var c = P.card({ title: 'تنظیمات HTTPS', icon: 'lock', id: 'settings' });
       append(c.body, [
         P.toggle(d, 'force_https', 'انتقال خودکار HTTP به HTTPS', { help: certOk ? 'همه بازدیدهای http:// با ریدایرکت ۳۰۱ به https:// منتقل می‌شوند.' : 'تا وقتی گواهی فعال نشود اعمال نمی‌شود.' }),
+        // HSTS presets (§14.2): client-side only, they fill the existing ssl.hsts fields.
+        sec6b().hstsPresets ? sec6b().hstsPresets(d, f2) : null,
         P.toggle(d.hsts, 'enabled', 'HSTS', { help: 'مرورگرها تا پایان مدت تعیین‌شده فقط با HTTPS به سایت وصل می‌شوند؛ خاموش کردنش فوری اثر نمی‌کند.', onchange: f2.redraw }),
         d.hsts.enabled ? h('div', { className: 'pcdn-subpanel' },
           P.duration(d.hsts, 'max_age', 'مدت (max-age)', { min: 0, picks: [[86400, '۱ روز (آزمایشی)'], [15552000, '۶ ماه'], [31536000, '۱ سال']] }),
@@ -897,8 +905,10 @@
             (certOk ? '' : ' تا وقتی گواهی SSL فعال نشود اعمال نمی‌شود.'))
         ]);
       }
-      return [c, h3];
-    });
+      // Authenticated origin pulls (§14.2) — only when the controller knows ssl.origin_client_auth.
+      var mtls = sec6b().mtlsCard ? sec6b().mtlsCard(d, f2, Aa) : null;
+      return [c, h3, mtls];
+    }, { validate: sec6b().validateSsl });
 
     var custom;
     if (!feat.custom_ssl) {
@@ -1005,6 +1015,11 @@
     d.foot.appendChild(P.btn('بستن', { onclick: function () { d.close(); } }));
     d.focusFirst();
   }
+
+  // ------------------------------------------------------------------ shared with rules.js (Wave 6B pages)
+
+  P.kit = { has: has, editDrawer: editDrawer, ruleList: ruleList, presets: presets, limitText: limitText, chipsOf: chipsOf,
+    word: word, stripNew: stripNew, move: move, METHODS: METHODS };
 
   // ------------------------------------------------------------------ registry
 
