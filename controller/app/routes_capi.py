@@ -37,7 +37,9 @@ from .routes_admin import (
 from .routes_platform import live_of
 from .routes_tunnel import quality_of, usage_of
 from .routes_v2 import (
+    config_audit,
     csv_body,
+    functions_stats_of,
     image_secret_create_of,
     image_secret_delete_of,
     import_redirects_of,
@@ -211,6 +213,14 @@ def tunnel_health(key: ApiKey = Depends(require_scope("stats")), db: Session = D
     return tunnel_quality.health(db, _site(key))
 
 
+# ------------------------------------------------------------------ edge functions (scope: stats, SPEC §16.9)
+
+@router.get("/functions/stats")
+def functions_stats(hours: int = 24, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Invocations, CPU ms, errors and timeouts of the site's edge functions, last `hours` (1..744)."""
+    return functions_stats_of(db, _site(key), hours)
+
+
 # ------------------------------------------------------------------ records + config (scope: dns)
 
 @router.get("/records")
@@ -251,7 +261,7 @@ def read_section(section: str, key: ApiKey = Depends(require_scope("dns"))):
 def write_section(section: str, body: dict, response: Response, request: Request,
                   key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
     result = write_section_of(db, _site(_rate_limit_config(key)), section, body, response)
-    _audit(db, request, key, "config.update", {"section": section})
+    _audit(db, request, key, "config.update", config_audit(section, result))
     return result
 
 

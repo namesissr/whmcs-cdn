@@ -84,6 +84,8 @@ class Capabilities(BaseModel):
     avif: bool = False
     image_transform: bool = False
     net_guard: bool = False
+    # SPEC §16.9: pcdn-fn installed (install.sh --functions) and its sandbox self-test passing
+    edge_functions: bool = False
 
     @field_validator("l4_port_range", mode="before")
     @classmethod
@@ -339,6 +341,18 @@ class VideoUsage(BaseModel):
     cache_hits: int = Field(0, ge=0, le=BIG)
 
 
+FUNCTION_COUNTERS = ("invocations", "cpu_ms", "errors", "timeouts")
+
+
+class FunctionsUsage(BaseModel):
+    """Edge function invocations of one host-hour (SPEC §16.9); unknown keys are ignored. `errors`
+    and `timeouts` are disjoint (a timed-out invocation is not also an error)."""
+    invocations: int = Field(0, ge=0, le=BIG, strict=True)
+    cpu_ms: int = Field(0, ge=0, le=BIG, strict=True)
+    errors: int = Field(0, ge=0, le=BIG, strict=True)
+    timeouts: int = Field(0, ge=0, le=BIG, strict=True)
+
+
 class UsageItem(BaseModel):
     host: str
     hour: datetime
@@ -360,6 +374,8 @@ class UsageItem(BaseModel):
     l4: dict[str, L4AppUsage] = {}
     # SPEC §16.5: the video share of `bytes` (breakdown only, not billed twice)
     video: VideoUsage | None = None
+    # SPEC §16.9 (optional): edge function invocations of this host-hour (not billed as bytes)
+    functions: FunctionsUsage | None = None
 
     @field_validator("l4", mode="before")
     @classmethod
@@ -442,6 +458,11 @@ def _merge_details(current: dict, add: dict) -> dict:
         dst = current.setdefault("video", {})
         for k in ("bytes", "requests", "cache_hits"):
             dst[k] = int(dst.get(k) or 0) + max(int(vd.get(k) or 0), 0)
+    fn = add.get("functions")
+    if fn:
+        dst = current.setdefault("functions", {})
+        for k in FUNCTION_COUNTERS:
+            dst[k] = int(dst.get(k) or 0) + max(int(fn.get(k) or 0), 0)
     if add.get("l4"):
         apps = current.setdefault("l4", {})
         for app_id, c in add["l4"].items():

@@ -279,5 +279,12 @@ class Settings:
     # only for a MinIO on a private network without TLS (never over the internet): allow http://
     storage_insecure_http: bool = field(default_factory=lambda: _bool("STORAGE_INSECURE_HTTP", False))
 
+    # SPEC §16.9 edge functions: total UTF-8 code of one site's `functions` section (every item,
+    # enabled or not) in KiB. Each function is capped at 256 KiB and a site at 32 functions by the
+    # edge itself, so the default (8192 = 32 x 256) never refuses what the edge would run; lower it to
+    # keep the edge config (it carries every site's code to every node) small. Clamped to 256..8192.
+    functions_max_site_kb: int = field(
+        default_factory=lambda: min(8192, max(256, int(os.getenv("FUNCTIONS_MAX_SITE_KB") or 8192))))
+
 
 settings = Settings()

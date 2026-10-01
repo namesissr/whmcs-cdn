@@ -97,6 +97,9 @@ class FeaturesIn(BaseModel):
     max_l4_apps: int | None = Field(default=None, ge=0, le=sections.L4_APPS_MAX)
     # object storage (SPEC §16.8): GB of storage, 0 = none
     storage_gb: int | None = Field(default=None, ge=0, le=1000000)
+    # edge functions (SPEC §16.9): section `functions` and how many items it may hold
+    edge_functions: bool | None = None
+    max_functions: int | None = Field(default=None, ge=0, le=sections.FUNCTIONS_MAX)
 
 
 class Plan(BaseModel):

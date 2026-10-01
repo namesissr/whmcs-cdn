@@ -1,5 +1,6 @@
 """Per-site configuration sections (SPEC §2) — validation, defaults, plan limits."""
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -46,10 +47,14 @@ DEFAULT_FEATURES = {
     "max_l4_apps": 0,
     # SPEC §16.8: object storage quota of the site in GB (GiB), 0 = no storage product
     "storage_gb": 0,
+    # SPEC §16.9: edge functions (section `functions`), sandboxed JS run by pcdn-fn on the edges
+    "edge_functions": False,
+    "max_functions": 0,
 }
 EDGE_GROUPS = ("general", "tunnel")
 WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
 L4_APPS_MAX = 100  # hard cap of section `l4` apps, whatever the plan says
+FUNCTIONS_MAX = 32  # hard cap of section `functions` items (the edge's FN_MAX_PER_SITE)
 
 
 class Strict(BaseModel):
@@ -80,6 +85,8 @@ class Features(Strict):
     l4_proxy: bool = False
     max_l4_apps: int = Field(0, ge=0, le=L4_APPS_MAX)
     storage_gb: int = Field(0, ge=0, le=1000000)
+    edge_functions: bool = False
+    max_functions: int = Field(0, ge=0, le=FUNCTIONS_MAX)
 
 
 # ------------------------------------------------------------------ sections
@@ -1415,6 +1422,121 @@ class Webhooks(Strict):
         return v
 
 
+# ------------------------------------------------------------------ edge functions (SPEC §16.9)
+#
+# Validated exactly like the edge's norm_functions (edge/pcdn-agent.py), only stricter, so nothing the
+# controller accepts is silently skipped by the edge: the route is a path prefix bound with nginx
+# `location ^~`, the code is UTF-8 JavaScript run by pcdn-fn in a sandboxed QuickJS process.
+
+FUNCTION_ROUTE_RE = re.compile(r"/[A-Za-z0-9._~/-]{0,255}")  # fullmatch (the edge's FN_ROUTE)
+FUNCTION_CODE_MAX = 256 * 1024     # bytes of UTF-8 source per function (the edge's FN_MAX_CODE)
+FUNCTION_ON_ERROR = Literal["502", "origin"]
+# output-only fields of a function item in the API views (never stored, ignored on input)
+FUNCTION_OUTPUT_FIELDS = ("code_bytes", "sha256")
+
+
+def function_route_problem(route: str) -> str | None:
+    """Why the edge would skip this route, or None (mirrors norm_functions)."""
+    if not FUNCTION_ROUTE_RE.fullmatch(route):
+        return ("مسیر تابع باید با / شروع شود و فقط حروف انگلیسی، عدد و . _ ~ / - داشته باشد "
+                "(حداکثر ۲۵۶ کاراکتر، مثل /api/auth)")
+    if route.lower().startswith("/__pcdn"):
+        return "مسیرهای /__pcdn رزرو شده‌اند"
+    segs = route.split("/")[1:-1] if route.endswith("/") else route.split("/")[1:]
+    if "//" in route or any(x in (".", "..") for x in segs):
+        return "مسیر تابع نباید // یا بخش‌های . و .. داشته باشد"
+    return None
+
+
+def routes_nest(a: str, b: str) -> bool:
+    """The edge's overlap test of a function route and a tunnel path (plain string prefixes)."""
+    return a.startswith(b) or b.startswith(a)
+
+
+class FunctionItem(Strict):
+    id: str = Field(pattern=ID_RE)
+    route: str
+    code: str
+    enabled: bool = True
+    timeout_ms: int = Field(50, ge=1, le=200, strict=True)   # CPU milliseconds per invocation
+    memory_mb: int = Field(32, ge=8, le=128, strict=True)    # JS heap per invocation
+    on_error: FUNCTION_ON_ERROR | None = None                # None = the section's on_error
+
+    @field_validator("route")
+    @classmethod
+    def _route(cls, v):
+        problem = function_route_problem(v)
+        if problem:
+            raise ValueError(problem)
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def _code(cls, v):
+        if not v.strip():
+            raise ValueError("کد تابع خالی است")
+        try:
+            raw = v.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("کد تابع باید متن UTF-8 معتبر باشد") from None
+        if len(raw) > FUNCTION_CODE_MAX:
+            raise ValueError(f"کد هر تابع حداکثر {FUNCTION_CODE_MAX // 1024} کیلوبایت است")
+        return v
+
+
+class Functions(Strict):
+    enabled: bool = False
+    on_error: FUNCTION_ON_ERROR = "502"   # fail closed: a broken auth function never opens the origin
+    items: list[FunctionItem] = Field(default_factory=list, max_length=FUNCTIONS_MAX)
+
+    @field_validator("items")
+    @classmethod
+    def _unique(cls, v):
+        ids = [f.id for f in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError("شناسه توابع باید یکتا باشد")
+        routes = [f.route for f in v]
+        if len(routes) != len(set(routes)):
+            raise ValueError("مسیر توابع باید یکتا باشد")
+        return v
+
+
+def _strip_function_outputs(data):
+    """Accept a GET -> PUT round trip: drop the output-only code_bytes / sha256 of each item."""
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return data
+    return {**data, "items": [{k: v for k, v in i.items() if k not in FUNCTION_OUTPUT_FIELDS}
+                              if isinstance(i, dict) else i for i in data["items"]]}
+
+
+def function_facts(code: str) -> dict:
+    raw = code.encode("utf-8", "surrogatepass")
+    return {"code_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def functions_view(fn: dict, code: bool = True) -> dict:
+    """The functions section as the API shows it: each item with its output-only code_bytes and
+    sha256; `code=False` leaves the bodies out (whole-site views: GET /config, the site object —
+    the code is read from GET .../config/functions)."""
+    return {**fn, "items": [{**{k: v for k, v in i.items() if code or k != "code"}, **function_facts(i["code"])}
+                            for i in fn["items"]]}
+
+
+def config_view(cfg: dict) -> dict:
+    """A whole-site config view (all_config output) without the function bodies."""
+    if "functions" in cfg:
+        cfg = {**cfg, "functions": functions_view(cfg["functions"], code=False)}
+    return cfg
+
+
+def functions_audit(value: dict) -> dict:
+    """Audit detail of a functions write: ids, count and sizes, never the code."""
+    return {"section": "functions", "enabled": value["enabled"], "count": len(value["items"]),
+            "items": [{"id": i["id"], "route": i["route"], "enabled": i["enabled"],
+                       "code_bytes": len(i["code"].encode("utf-8", "surrogatepass"))}
+                      for i in value["items"]]}
+
+
 SECTIONS: dict[str, type[BaseModel]] = {
     "cache": Cache,
     "ssl": Ssl,
@@ -1438,11 +1560,14 @@ SECTIONS: dict[str, type[BaseModel]] = {
     "l4": L4,
     "video": Video,
     "dns_secondary": DnsSecondary,
+    # SPEC §16.9
+    "functions": Functions,
 }
 
 # section -> feature flag that must be on to write it
 FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
-                 "tunnel": "tunnel", "logs": "log_export", "l4": "l4_proxy"}
+                 "tunnel": "tunnel", "logs": "log_export", "l4": "l4_proxy",
+                 "functions": "edge_functions"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -1539,6 +1664,8 @@ def storable(name: str, value: dict) -> dict:
         return {**value, "tsig": {k: v for k, v in value["tsig"].items() if k not in ("secret", "secret_set")}}
     if name == "l4":
         return {**value, "apps": [{k: v for k, v in a.items() if k != "hostname"} for a in value["apps"]]}
+    if name == "functions":
+        return _strip_function_outputs(value)
     return value
 
 
@@ -1555,6 +1682,8 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
         raise KeyError(name)
     feats = features_of(site)
     gate = FEATURE_GATES.get(name)
+    if name == "functions":
+        data = _strip_function_outputs(data)
     parsed = model.model_validate(data)
     value = dump(parsed)
     if gate and not feats[gate]:
@@ -1564,7 +1693,8 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
     limits = {"firewall": ("rules", "max_firewall_rules"), "ratelimit": ("rules", "max_ratelimit_rules"),
               "pagerules": ("rules", "max_page_rules"), "pools": ("pools", "max_pools"),
               "transform": ("rules", "max_transform_rules"), "redirects": ("rules", "max_redirects"),
-              "webhooks": ("items", "max_webhooks"), "l4": ("apps", "max_l4_apps")}
+              "webhooks": ("items", "max_webhooks"), "l4": ("apps", "max_l4_apps"),
+              "functions": ("items", "max_functions")}
     if name in limits:
         key, feat = limits[name]
         if len(value[key]) > feats[feat]:
@@ -1579,6 +1709,10 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
             raise ValidationError(f"استخر {', '.join(sorted(missing))} در رکوردها استفاده شده است")
     if name == "tunnel":
         _check_tunnel(site, value, feats)
+        _check_tunnel_vs_functions(get_section(site, "functions"), value)
+    if name == "functions":
+        _check_functions(value)
+        _check_tunnel_vs_functions(value, get_section(site, "tunnel"))
     if name == "ssl" and value["hsts"]["preload"] and not (
             value["hsts"]["include_subdomains"] and value["hsts"]["max_age"] >= 31536000):
         raise ValidationError("preload نیازمند includeSubDomains و max-age حداقل یک سال است")
@@ -1726,6 +1860,35 @@ def _check_tunnel(site, value: dict, feats: dict):
             raise ValidationError(f"استخر {p['pool']} در بخش استخرها (pools) تعریف نشده است")
 
 
+def _check_functions(value: dict):
+    """The functions section as a whole (SPEC §16.9): the operator's total code budget per site."""
+    from .config import settings
+
+    total = sum(len(i["code"].encode("utf-8")) for i in value["items"])
+    cap = settings.functions_max_site_kb * 1024
+    if total > cap:
+        raise ValidationError(f"مجموع کد توابع این سایت حداکثر {settings.functions_max_site_kb} کیلوبایت است")
+
+
+def _functions_live(fn: dict) -> bool:
+    return bool(fn.get("enabled")) and any(i.get("enabled", True) for i in fn.get("items") or [])
+
+
+def _check_tunnel_vs_functions(fn: dict, tn: dict):
+    """A function route must not equal or nest with a tunnel path (the edge would skip the function:
+    tunnel paths keep their own location), and functions never run while a tunnel with a decoy / 404
+    fallback is on (the edge serves no origin content then). Checked on both sides: a functions PUT
+    against the stored tunnel section and a tunnel PUT against the stored functions."""
+    for f in fn.get("items") or []:
+        for p in tn.get("paths") or []:
+            if routes_nest(f["route"], p["path"]):
+                raise ValidationError(f"مسیر تابع «{f['id']}» ({f['route']}) با مسیر تونل «{p['id']}» "
+                                      f"({p['path']}) هم‌پوشانی دارد")
+    if tn.get("enabled") and tn.get("fallback", "origin") != "origin" and _functions_live(fn):
+        raise ValidationError("توابع لبه با تونلی که پاسخ پیش‌فرض آن decoy یا 404 است اجرا نمی‌شوند؛ "
+                              "fallback تونل را origin کنید یا توابع را خاموش کنید")
+
+
 def _check_l4(site, value: dict):
     """Ports of the l4 section: inside L4_PORT_RANGE and not reserved; app hostnames must not clash
     with the site's own records. Uniqueness across sites is enforced by l4.apply_write (409)."""
@@ -1770,6 +1933,8 @@ def _is_enabled(name: str, value: dict) -> bool:
         return bool(value["apps"])
     if name in ("tunnel", "logs"):
         return value["enabled"]
+    if name == "functions":
+        return value["enabled"] or bool(value["items"])
     return True
 
 

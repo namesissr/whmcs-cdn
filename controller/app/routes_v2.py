@@ -15,7 +15,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import dns_secondary, images, l4, logexport, origin_pull, pdns, sections, ssl, tunnel, webhooks
+from . import dns_secondary, edge_functions, images, l4, logexport, origin_pull, pdns, sections, ssl, tunnel, webhooks
 from .audit import record_audit
 from .auth import require_admin
 from .config import settings
@@ -48,7 +48,8 @@ def _audit(db: Session, request: Request, action: str, target: str | None = None
 
 @router.get("/sites/{domain}/config")
 def read_config(domain: str, db: Session = Depends(get_db)):
-    return sections.all_config(get_site(db, domain))
+    # every section; the function bodies only in GET .../config/functions (SPEC §16.9)
+    return sections.config_view(sections.all_config(get_site(db, domain)))
 
 
 # section handlers factored so the admin and customer APIs share identical validation/logic
@@ -56,7 +57,10 @@ def read_config(domain: str, db: Session = Depends(get_db)):
 def read_section_of(site: Site, section: str) -> dict:
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
-    return sections.get_section(site, section)
+    value = sections.get_section(site, section)
+    if section == "functions":  # + output-only code_bytes / sha256 per item (SPEC §16.9)
+        value = sections.functions_view(value)
+    return value
 
 
 def write_section_of(db: Session, site: Site, section: str, body: dict,
@@ -126,6 +130,8 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
         value = sections.get_section(site, section)
         if new_secrets is not None:
             value["new_secrets"] = new_secrets
+    if section == "functions":
+        value = sections.functions_view(value)
     if section == "ssl" and value["origin_client_auth"] == "platform":
         # create the platform origin-pull CA now (once), so the CA the customer downloads next is the
         # one the edges' client certificate chains to; a failure here is retried on the next edge poll
@@ -155,8 +161,16 @@ def write_section(domain: str, section: str, body: dict, response: Response, req
                   db: Session = Depends(get_db)):
     site = get_site(db, domain)
     result = write_section_of(db, site, section, body, response)
-    _audit(db, request, "config.update", site.domain, {"section": section})
+    _audit(db, request, "config.update", site.domain, config_audit(section, result))
     return result
+
+
+def config_audit(section: str, value: dict) -> dict:
+    """Audit detail of a section write: the section name; for functions also the ids, count and code
+    sizes (never the code, SPEC §16.9)."""
+    if section == "functions":
+        return sections.functions_audit(value)
+    return {"section": section}
 
 
 # ------------------------------------------------------------------ images v2 (SPEC §16.6)
@@ -196,6 +210,20 @@ def image_secret_delete(domain: str, request: Request, db: Session = Depends(get
     result = image_secret_delete_of(db, site)
     _audit(db, request, "image.transform_secret", site.domain, {"mode": "remove"})
     return result
+
+
+# ------------------------------------------------------------------ edge functions (SPEC §16.9)
+
+def functions_stats_of(db: Session, site: Site, hours: int) -> dict:
+    if not 1 <= hours <= edge_functions.MAX_HOURS:
+        bad(ValidationError(f"hours باید بین 1 و {edge_functions.MAX_HOURS} باشد"))
+    return edge_functions.stats(db, site, hours)
+
+
+@router.get("/sites/{domain}/functions/stats")
+def functions_stats(domain: str, hours: int = 24, db: Session = Depends(get_db)):
+    """Invocations, CPU ms, errors and timeouts of the site's edge functions, last `hours` (1..744)."""
+    return functions_stats_of(db, get_site(db, domain), hours)
 
 
 # ------------------------------------------------------------------ tunnel mode (SPEC §7.5)

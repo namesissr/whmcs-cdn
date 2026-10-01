@@ -25,7 +25,7 @@ def test_sections_defaults_and_roundtrip(client):
     assert set(s["config"]) == {"cache", "ssl", "waf", "ddos", "firewall", "ratelimit", "pagerules", "pools",
                                 "headers", "hotlink", "image", "errorpages", "tunnel",
                                 "transform", "redirects", "bots", "logs", "webhooks",
-                                "l4", "video", "dns_secondary"}
+                                "l4", "video", "dns_secondary", "functions"}
     assert s["config"]["cache"]["level"] == "standard"
 
     fw = {"default_action": "allow", "rules": [

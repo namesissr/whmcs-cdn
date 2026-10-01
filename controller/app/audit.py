@@ -34,6 +34,8 @@ DETAIL_WHITELIST = {
     # webhooks / log export (SPEC §14.3): which hook, and the outcome of a test
     "hook_id", "ok",
 }
+# NB "items" is also how a functions write is audited (SPEC §16.9): [{id, route, enabled, code_bytes}],
+# never the code itself (sections.functions_audit)
 # a key containing any of these substrings is never stored, as a second line of defence
 _SECRET_HINTS = ("secret", "token", "key", "password", "passphrase", "cert", "hash", "private")
 

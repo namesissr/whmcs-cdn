@@ -261,7 +261,8 @@ def refresh_quota(db: Session, site: Site, now: datetime | None = None) -> bool:
 
 def site_to_dict(db: Session, site: Site) -> dict:
     usage = usage_totals(db, site.id, month_start())
-    config = sections.all_config(site)
+    # the function bodies are left out of the site object (SPEC §16.9: up to 8 MB of code per site)
+    config = sections.config_view(sections.all_config(site))
     cache, ssl_opts = config["cache"], config["ssl"]
     return {
         "id": site.id,
@@ -552,6 +553,8 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "bots": cfg["bots"],
             # log export (SPEC §14.3.2): sampling only — never the endpoint, bucket or keys
             "logs": logexport.edge_block(site, cfg["logs"], feats),
+            # SPEC §16.9 edge functions (run by pcdn-fn on nodes installed with --functions)
+            "functions": functions_for_edge(site, cfg["functions"], feats),
         })
     body = {
         "sites": out,
@@ -584,6 +587,21 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
     # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     return {"version": version, **body}
+
+
+def functions_for_edge(site: Site, fn: dict, feats: dict) -> dict:
+    """Functions section as the edges get it (SPEC §16.9): the plan folded in (no edge_functions ->
+    off, at most max_functions items), only enabled items, each with its effective on_error (an
+    explicit null would make the edge skip the item). Off for a site that is not active: the edge
+    ignores them there, so their code does not travel."""
+    off = {"enabled": False, "on_error": fn["on_error"], "items": []}
+    if not fn["enabled"] or not feats["edge_functions"] or site.effective_status != "active":
+        return off
+    items = [{"id": i["id"], "route": i["route"], "code": i["code"], "enabled": True,
+              "timeout_ms": i["timeout_ms"], "memory_mb": i["memory_mb"],
+              "on_error": i["on_error"] or fn["on_error"]}
+             for i in fn["items"][: feats["max_functions"]] if i["enabled"]]
+    return {"enabled": bool(items), "on_error": fn["on_error"], "items": items}
 
 
 def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str]) -> dict:
