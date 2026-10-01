@@ -421,6 +421,20 @@
 .pcdna .pcdna-health-n small { font-size: 12px; font-weight: 600; color: var(--a-muted); }
 .pcdna .pcdna-health-l { font-size: 11.5px; color: var(--a-text-2); }
 .pcdna .pcdna-health-notes { margin: 0 0 4px; }
+.pcdna .pcdna-health-tile.pcdna-t-muted .pcdna-health-n { color: var(--a-muted); }
+.pcdna .pcdna-health-tile .pcdna-health-n small { font-size: 11px; }
+/* ---- سلامت سامانه (§13.5) ---- */
+.pcdna .pcdna-health-warns { margin-top: 10px; }
+.pcdna .pcdna-health-warns > summary { cursor: pointer; font-weight: 600; font-size: 13px; color: var(--a-text-2); }
+.pcdna .pcdna-health-warns .pcdna-warnlist { margin-top: 8px; }
+.pcdna .pcdna-health-warns .pcdna-warnlist span[dir="ltr"] { word-break: break-word; }
+/* ---- حسابرسی (§13.5) ---- */
+.pcdna .pcdna-audit td { vertical-align: top; }
+.pcdna .pcdna-audit .pcdna-nowrap { white-space: nowrap; }
+.pcdna .pcdna-audit-detail { font-size: 12px; color: var(--a-text-2); max-width: 320px; }
+.pcdna .pcdna-audit-detail .pcdna-kv { display: inline-block; margin: 0 0 2px; padding: 1px 6px; border-radius: 6px;
+  background: var(--a-surface-2); border: 1px solid var(--a-border); overflow-wrap: anywhere; }
+.pcdna .pcdna-audit-detail .pcdna-kv b { color: var(--a-text); font-weight: 600; }
 @media (max-width: 1180px) {
   .pcdna .pcdna-edges .pcdna-spark { display: none; }
   .pcdna .pcdna-edges td.pcdna-uptime-cell { min-width: 0; }

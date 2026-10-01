@@ -17,7 +17,7 @@ if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
  */
 final class Admin
 {
-    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'settings', 'manage', 'api'];
+    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'settings', 'manage', 'api'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -91,6 +91,12 @@ final class Admin
                 break;
             case 'status':
                 $body = Pages::status($state);
+                break;
+            case 'health':
+                $body = Pages::health();
+                break;
+            case 'audit':
+                $body = Pages::audit($get);
                 break;
             case 'settings':
                 $body = Pages::settings();

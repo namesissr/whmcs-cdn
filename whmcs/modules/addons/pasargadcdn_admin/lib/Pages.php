@@ -27,6 +27,8 @@ final class Pages
         'resellers' => ['نمایندگان', 'users'],
         'events' => ['رویدادهای امنیتی', 'shield'],
         'status' => ['وضعیت و رخدادها', 'activity'],
+        'health' => ['سلامت سامانه', 'heart'],
+        'audit' => ['حسابرسی', 'history'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
     ];
 
@@ -2616,6 +2618,322 @@ final class Pages
             return '<details class="pcdna-incident is-resolved"><summary>' . $head . '</summary><div class="pcdna-incident-detail">' . $desc . $timeline . '</div></details>';
         }
         return '<div class="pcdna-incident is-open">' . $inner . '</div>';
+    }
+
+    // ------------------------------------------------------------------ §13.5 audit log
+
+    /** Known mutating actions (SPEC §13.2) → Persian labels for the filter dropdown and the table. */
+    const AUDIT_ACTIONS = [
+        'site.create' => 'ساخت سایت',
+        'site.plan' => 'تغییر پلن سایت',
+        'site.delete' => 'حذف سایت',
+        'edge.add' => 'افزودن نود',
+        'edge.rotate' => 'چرخش توکن نود',
+        'edge.patch' => 'ویرایش نود',
+        'edge.delete' => 'حذف نود',
+        'edge.address.add' => 'افزودن آدرس نود',
+        'edge.address.del' => 'حذف آدرس نود',
+        'purge' => 'پاکسازی کش',
+        'reseller.flag' => 'فعال‌سازی نماینده',
+        'reseller.rate' => 'تغییر نرخ نماینده',
+        'tunnel.enable_existing' => 'فعال‌سازی تونل سرویس‌های موجود',
+    ];
+    /** actor_kind → [label, tone]. */
+    const AUDIT_KINDS = ['admin' => ['مدیر', 'brand'], 'capi' => ['API مشتری', 'violet'], 'system' => ['سیستم', 'muted']];
+    /** time-range filter → seconds before now (mapped to the controller's ?since=). */
+    const AUDIT_RANGES = ['24h' => ['۲۴ ساعت گذشته', 86400], '7d' => ['۷ روز گذشته', 604800],
+        '30d' => ['۳۰ روز گذشته', 2592000], 'all' => ['همهٔ زمان‌ها', 0]];
+
+    /**
+     * «حسابرسی»: the controller audit log (SPEC §13.2/§13.5), newest-first, with
+     * action/actor/time filters. Read-only; the filter form is GET (no mutation,
+     * so inherently CSRF-safe) and the data is fetched through the same ≤10 s,
+     * per-request-memoised path the other pages use.
+     */
+    public static function audit(array $get): string
+    {
+        $action = array_key_exists((string) ($get['action'] ?? ''), self::AUDIT_ACTIONS) ? (string) $get['action'] : '';
+        $actor = View::clip(Env::input($get['actor'] ?? ''), 100);
+        $range = array_key_exists((string) ($get['range'] ?? ''), self::AUDIT_RANGES) ? (string) $get['range'] : '7d';
+        $limit = (int) ($get['limit'] ?? 100);
+        $limit = in_array($limit, [50, 100, 200, 500], true) ? $limit : 100;
+
+        $actions = ['' => 'همهٔ کنش‌ها'] + self::AUDIT_ACTIONS;
+        $ranges = [];
+        foreach (self::AUDIT_RANGES as $k => [$lbl]) {
+            $ranges[$k] = $lbl;
+        }
+        $h = '<form method="get" action="addonmodules.php" class="pcdna-filters"><input type="hidden" name="module" value="' . View::e(Env::MODULE) . '">'
+            . '<input type="hidden" name="page" value="audit">'
+            . View::select('action', $actions, $action, ' aria-label="کنش"')
+            . '<label class="pcdna-search">' . View::icon('search') . '<input type="search" name="actor" class="pcdna-input" dir="ltr" value="' . View::e($actor) . '" placeholder="عامل (مثلاً admin:root یا capi:۱۲)" aria-label="عامل"></label>'
+            . View::select('range', $ranges, $range, ' aria-label="بازه زمانی"')
+            . View::select('limit', [50 => '۵۰ مورد', 100 => '۱۰۰ مورد', 200 => '۲۰۰ مورد', 500 => '۵۰۰ مورد'], $limit, ' aria-label="تعداد"')
+            . '<button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('search') . '<span>اعمال</span></button></form>';
+
+        $ping = self::ping();
+        if (!$ping['ok']) {
+            return $h . self::ctlError($ping);
+        }
+        $query = array_filter(['limit' => $limit, 'action' => $action, 'actor' => $actor], function ($v) {
+            return $v !== '' && $v !== null;
+        });
+        $secs = self::AUDIT_RANGES[$range][1];
+        if ($secs > 0) {
+            $query['since'] = gmdate('Y-m-d\TH:i:s\Z', time() - $secs);
+        }
+        $path = '/api/v1/audit?' . http_build_query($query);
+        $r = self::fetch([$path])[$path];
+        // Older controller without the audit endpoint: feature-detect on 404 and degrade gracefully.
+        if (($r['code'] ?? 0) === 404) {
+            return $h . View::card('حسابرسی', View::alert('warn', 'این نسخه از کنترلر هنوز از گزارش حسابرسی (<code dir="ltr">/api/v1/audit</code>) پشتیبانی نمی‌کند. پس از به‌روزرسانی کنترلر، رخدادهای مدیریتی اینجا نمایش داده می‌شوند.'), '', 'pcdna-flush', 'history');
+        }
+        if (!self::ok($r)) {
+            return $h . View::alert('bad', 'گزارش حسابرسی دریافت نشد: ' . View::e((string) $r['error']));
+        }
+        $entries = array_values(array_filter((array) $r['data'], 'is_array'));
+        // The controller returns newest-first; sort defensively so the order is guaranteed regardless.
+        usort($entries, function ($a, $b) {
+            return strcmp((string) ($b['at'] ?? ''), (string) ($a['at'] ?? ''));
+        });
+        $body = $entries ? self::auditTable($entries)
+            : View::emptyState('رخدادی با این فیلتر پیدا نشد', 'فیلترها را تغییر دهید یا بازهٔ زمانی را گسترده‌تر کنید.', 'history');
+        return $h . View::card('حسابرسی (' . View::n(count($entries)) . ' مورد)', $body, '', 'pcdna-flush', 'history');
+    }
+
+    private static function auditTable(array $entries): string
+    {
+        $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-audit"><thead><tr>'
+            . '<th>زمان</th><th>کنش</th><th>هدف</th><th>عامل</th><th>IP</th><th>جزئیات</th></tr></thead><tbody>';
+        foreach ($entries as $e) {
+            $act = (string) ($e['action'] ?? '');
+            $actLabel = self::AUDIT_ACTIONS[$act] ?? ($act !== '' ? $act : '—');
+            [$kLabel, $kTone] = self::AUDIT_KINDS[(string) ($e['actor_kind'] ?? '')] ?? [(string) ($e['actor_kind'] ?? '—'), 'muted'];
+            $target = (string) ($e['target'] ?? '');
+            $ip = (string) ($e['ip'] ?? '');
+            $actor = (string) ($e['actor'] ?? '');
+            $actorCell = View::badge($kLabel, $kTone) . ($actor !== '' ? ' ' . View::ltr($actor) : '');
+            $h .= '<tr><td class="pcdna-nowrap">' . View::e(View::date($e['at'] ?? '', true)) . '</td>'
+                . '<td><span class="pcdna-badge pcdna-t-muted" title="' . View::e($act) . '">' . View::e($actLabel) . '</span></td>'
+                . '<td>' . ($target !== '' ? View::ltr($target) : '<span class="pcdna-muted">—</span>') . '</td>'
+                . '<td>' . $actorCell . '</td>'
+                . '<td>' . ($ip !== '' ? View::ltr($ip) : '<span class="pcdna-muted">—</span>') . '</td>'
+                . '<td class="pcdna-audit-detail">' . self::auditDetail($e['detail'] ?? null) . '</td></tr>';
+        }
+        return $h . '</tbody></table></div>';
+    }
+
+    /** Compact, escaped rendering of the (secret-free) JSON `detail` field. */
+    private static function auditDetail($detail): string
+    {
+        if ($detail === null || $detail === '' || $detail === []) {
+            return '<span class="pcdna-muted">—</span>';
+        }
+        if (is_array($detail)) {
+            $parts = [];
+            foreach ($detail as $k => $v) {
+                if (is_array($v)) {
+                    $v = json_encode($v, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                } elseif (is_bool($v)) {
+                    $v = $v ? 'true' : 'false';
+                }
+                $parts[] = '<span class="pcdna-kv"><b>' . View::e((string) $k) . '</b>: ' . View::e(View::clip((string) $v, 80)) . '</span>';
+            }
+            return implode(' ', $parts);
+        }
+        return '<code dir="ltr">' . View::e(View::clip((string) $detail, 160)) . '</code>';
+    }
+
+    // ------------------------------------------------------------------ §13.5 system health panel
+
+    /**
+     * «سلامت سامانه»: platform health summarising GET /healthz/deep (SPEC §13.1/§13.5).
+     * Prefers the JSON /healthz/deep over scraping /metrics. Every field is optional —
+     * an older controller that omits a block degrades to «نامشخص» instead of erroring.
+     */
+    public static function health(): string
+    {
+        $ping = self::ping();
+        if (!$ping['ok']) {
+            return self::ctlError($ping);
+        }
+        $r = self::fetch(['/healthz/deep']);
+        $rr = $r['/healthz/deep'];
+        // /healthz/deep answers 200 (ok) or 503 (down) but always carries a JSON body with `status`.
+        $deep = is_array($rr['data'] ?? null) && isset($rr['data']['status']) ? (array) $rr['data'] : null;
+        if ($deep === null) {
+            if (($rr['code'] ?? 0) === 404) {
+                return View::card('سلامت سامانه', View::alert('warn', 'این نسخه از کنترلر <code dir="ltr">/healthz/deep</code> را ارائه نمی‌کند؛ پس از به‌روزرسانی، خلاصهٔ سلامت سامانه اینجا نمایش داده می‌شود.'), '', 'pcdna-flush', 'heart');
+            }
+            return View::card('سلامت سامانه', View::alert('bad', 'وضعیت سلامت سامانه دریافت نشد: ' . View::e((string) ($rr['error'] ?? 'پاسخ نامعتبر'))), '', 'pcdna-flush', 'heart');
+        }
+        return self::healthPanel($deep);
+    }
+
+    /** Builds the banner + health tiles + technical-details block from a /healthz/deep body. */
+    public static function healthPanel(array $deep): string
+    {
+        [$ovLabel, $ovTone] = ['سالم', 'ok'];
+        if (($deep['status'] ?? 'ok') === 'degraded') {
+            [$ovLabel, $ovTone] = ['اختلال جزئی', 'warn'];
+        } elseif (($deep['status'] ?? 'ok') === 'down') {
+            [$ovLabel, $ovTone] = ['خطا — سامانه در دسترس نیست', 'bad'];
+        }
+        $banner = '<div class="pcdna-status-banner pcdna-t-' . $ovTone . '" data-health-status="' . View::e((string) ($deep['status'] ?? '')) . '">'
+            . View::dot($ovTone) . '<strong>' . View::e($ovLabel) . '</strong>'
+            . '<span class="pcdna-status-when">' . View::ltr(Env::controllerUrl()) . '</span></div>';
+
+        $tiles = '<div class="pcdna-health-tiles">';
+        $na = '<span class="pcdna-muted">نامشخص</span>';
+
+        // 1) edges online / enabled
+        if (is_array($deep['edges'] ?? null)) {
+            $ed = $deep['edges'];
+            $on = (int) ($ed['online'] ?? 0);
+            $en = (int) ($ed['enabled'] ?? 0);
+            $tone = $en > 0 && $on === 0 ? 'bad' : ($on < $en ? 'warn' : 'ok');
+            $tiles .= self::healthTile($tone, 'online', View::n($on) . '<small> / ' . View::n($en) . '</small>', 'نود آنلاین از فعال');
+            // 2) probe failing
+            $pf = isset($ed['probe_failing']) ? (int) $ed['probe_failing'] : null;
+            $tiles .= $pf === null ? self::healthTile('muted', 'probe_failing', $na, 'نود ناسالم در بررسی سلامت')
+                : self::healthTile($pf > 0 ? 'warn' : 'ok', 'probe_failing', View::n($pf), 'نود ناسالم در بررسی سلامت');
+        } else {
+            $tiles .= self::healthTile('muted', 'online', $na, 'نود آنلاین از فعال');
+        }
+
+        // 3) DNS sync (optional `dns` block, else PowerDNS reachability from `pdns`)
+        $tiles .= self::dnsTile($deep);
+
+        // 4) SSL expiring soon (optional `ssl` block)
+        if (is_array($deep['ssl'] ?? null)) {
+            $ssl = $deep['ssl'];
+            $exp = (int) ($ssl['expiring'] ?? 0);
+            $expired = (int) ($ssl['expired'] ?? 0);
+            $failed = (int) ($ssl['failed'] ?? 0);
+            $tone = ($expired > 0 || $failed > 0) ? 'bad' : ($exp > 0 ? 'warn' : 'ok');
+            $val = View::n($exp) . ($expired > 0 ? ' <small>(' . View::n($expired) . ' منقضی)</small>' : ($failed > 0 ? ' <small>(' . View::n($failed) . ' ناموفق)</small>' : ''));
+            $tiles .= self::healthTile($tone, 'ssl', $val, 'گواهی SSL رو به انقضا');
+        } else {
+            $tiles .= self::healthTile('muted', 'ssl', $na, 'گواهی SSL رو به انقضا');
+        }
+
+        // 5) backup last-success age
+        if (is_array($deep['backup'] ?? null)) {
+            $b = $deep['backup'];
+            $failing = !empty($b['failing']);
+            $ageH = isset($b['last_success_age_hours']) ? (float) $b['last_success_age_hours'] : null;
+            $enabled = $b['enabled'] ?? true;
+            $tone = $failing ? 'bad' : (!$enabled ? 'muted' : ($ageH === null || $ageH > 26 ? 'warn' : 'ok'));
+            $val = $ageH === null ? ($enabled ? '<span class="pcdna-muted">—</span>' : 'خاموش') : self::humanAge((int) round($ageH * 3600));
+            $tiles .= self::healthTile($tone, 'backup', $val, 'آخرین پشتیبان موفق');
+        } else {
+            $tiles .= self::healthTile('muted', 'backup', $na, 'آخرین پشتیبان موفق');
+        }
+
+        // 6) scheduler
+        if (is_array($deep['scheduler'] ?? null)) {
+            $s = $deep['scheduler'];
+            $role = (string) ($s['role'] ?? '');
+            $age = isset($s['last_run_age_seconds']) ? (int) $s['last_run_age_seconds'] : null;
+            $roleLabels = ['leader' => 'رهبر', 'follower' => 'پیرو', 'disabled' => 'غیرفعال', 'not-running' => 'متوقف'];
+            $stale = $age !== null && $age > 3600;
+            $tone = in_array($role, ['not-running'], true) ? 'bad'
+                : ($role === 'disabled' ? 'muted' : ($stale ? 'warn' : 'ok'));
+            $val = '<span style="font-size:14px">' . View::e($roleLabels[$role] ?? ($role ?: '—')) . '</span>'
+                . ($age !== null ? ' <small>' . self::humanAge($age) . '</small>' : '');
+            $tiles .= self::healthTile($tone, 'scheduler', $val, 'زمان‌بند (Scheduler)');
+        } else {
+            $tiles .= self::healthTile('muted', 'scheduler', $na, 'زمان‌بند (Scheduler)');
+        }
+
+        // extra (also from /healthz/deep): open alerts + DB migrations
+        if (is_array($deep['alerts'] ?? null)) {
+            $open = (int) ($deep['alerts']['open'] ?? 0);
+            $crit = (int) ($deep['alerts']['critical'] ?? 0);
+            $tone = $crit > 0 ? 'bad' : ($open > 0 ? 'warn' : 'ok');
+            $val = View::n($open) . ($crit > 0 ? ' <small>(' . View::n($crit) . ' بحرانی)</small>' : '');
+            $tiles .= self::healthTile($tone, 'alerts', $val, 'هشدار باز کنترلر');
+        }
+        if (is_array($deep['database'] ?? null)) {
+            $db = $deep['database'];
+            $pending = isset($db['revision'], $db['head']) && $db['revision'] !== $db['head'];
+            $okDb = !empty($db['ok']);
+            $tone = !$okDb ? 'bad' : ($pending ? 'warn' : 'ok');
+            $val = '<span style="font-size:14px">' . ($okDb ? ($pending ? 'مهاجرت معلق' : 'سالم') : 'خطا') . '</span>';
+            $tiles .= self::healthTile($tone, 'database', $val, 'پایگاه‌داده / مهاجرت‌ها');
+        }
+        $tiles .= '</div>';
+
+        // controller warnings (operator diagnostics from the controller) in a collapsed, Persian-headed block
+        $warnings = array_values(array_filter((array) ($deep['warnings'] ?? []), 'is_string'));
+        $wh = '';
+        if ($warnings) {
+            $items = '';
+            foreach ($warnings as $w) {
+                $items .= '<li>' . View::icon('warn') . '<span dir="ltr">' . View::e($w) . '</span></li>';
+            }
+            $wh = '<details class="pcdna-health-warns"><summary>' . View::n(count($warnings)) . ' یادداشت فنی از کنترلر</summary>'
+                . '<ul class="pcdna-warnlist">' . $items . '</ul></details>';
+        } else {
+            $wh = '<p class="pcdna-okline">' . View::icon('check') . '<span>کنترلر هیچ هشدار سلامتی گزارش نکرده است.</span></p>';
+        }
+
+        $hint = '<p class="pcdna-muted pcdna-small">این خلاصه از <code dir="ltr">GET /healthz/deep</code> کنترلر خوانده می‌شود (ترجیحاً به‌جای متن Prometheus در <code dir="ltr">/metrics</code>). فیلدهای در دسترس‌نبوده با «نامشخص» نمایش داده می‌شوند.</p>';
+        return View::card('سلامت سامانه', $banner . $tiles . $wh . $hint, '', '', 'heart');
+    }
+
+    private static function healthTile(string $tone, string $key, string $value, string $label): string
+    {
+        return '<div class="pcdna-health-tile pcdna-t-' . $tone . '" data-health="' . View::e($key) . '">'
+            . '<span class="pcdna-health-n">' . $value . '</span>'
+            . '<span class="pcdna-health-l">' . View::e($label) . '</span></div>';
+    }
+
+    private static function dnsTile(array $deep): string
+    {
+        $na = '<span class="pcdna-muted">نامشخص</span>';
+        if (is_array($deep['dns'] ?? null)) {
+            $d = $deep['dns'];
+            $errors = (int) ($d['errors'] ?? 0);
+            $ok = array_key_exists('ok', $d) ? !empty($d['ok']) : $errors === 0;
+            $age = isset($d['last_sync_age_seconds']) ? (int) $d['last_sync_age_seconds'] : null;
+            $stale = $age !== null && $age > 3600;
+            $tone = (!$ok || $errors > 0) ? 'bad' : ($stale ? 'warn' : 'ok');
+            $val = $age !== null ? self::humanAge($age) : ($ok ? '<span style="font-size:14px">به‌روز</span>' : '<span style="font-size:14px">خطا</span>');
+            if ($errors > 0) {
+                $val .= ' <small>(' . View::n($errors) . ' خطا)</small>';
+            }
+            return self::healthTile($tone, 'dns', $val, 'همگام‌سازی DNS');
+        }
+        // Fall back to PowerDNS reachability if the controller exposes it.
+        if (is_array($deep['pdns'] ?? null)) {
+            $servers = array_values(array_filter($deep['pdns'], 'is_array'));
+            $down = count(array_filter($servers, function ($s) {
+                return empty($s['ok']);
+            }));
+            $tone = $down > 0 ? 'bad' : 'ok';
+            $val = $down > 0 ? '<span style="font-size:14px">' . View::n($down) . ' سرور قطع</span>' : '<span style="font-size:14px">در دسترس</span>';
+            return self::healthTile($tone, 'dns', $val, 'سرورهای DNS (PowerDNS)');
+        }
+        return self::healthTile('muted', 'dns', $na, 'همگام‌سازی DNS');
+    }
+
+    /** "۳ ساعت پیش" / "۲٫۵ روز پیش" / "لحظاتی پیش" from an age in seconds. */
+    private static function humanAge(int $seconds): string
+    {
+        if ($seconds < 0) {
+            $seconds = 0;
+        }
+        if ($seconds < 120) {
+            return 'لحظاتی پیش';
+        }
+        if ($seconds < 3600) {
+            return View::n((int) floor($seconds / 60)) . ' دقیقه پیش';
+        }
+        if ($seconds < 86400) {
+            return View::n($seconds / 3600, 1) . ' ساعت پیش';
+        }
+        return View::n($seconds / 86400, 1) . ' روز پیش';
     }
 
     // ------------------------------------------------------------------ 7. settings & diagnostics
