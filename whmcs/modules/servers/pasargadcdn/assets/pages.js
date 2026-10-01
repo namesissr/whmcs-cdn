@@ -498,8 +498,9 @@
             ')؛ پس اگر سرور اصلی خودش نسخه WebP می‌سازد، به هر مرورگر نسخه درست می‌رسد.')
         ]);
       }
-      return [c, webp];
-    });
+      // Images v2 (SPEC §16.6, w8.js): AVIF, smart crop, URL transform parameters and signed URLs.
+      return [c, webp].concat(P.w8 ? P.w8.imageCards(d, f2) : []);
+    }, { serialize: function (x) { return P.w8 ? P.w8.imageSerialize(x) : x; } });
     return f.el;
   }
 

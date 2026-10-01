@@ -68,11 +68,14 @@
   function features() { return (S.site && S.site.plan && S.site.plan.features) || {}; }
   var NAV = [
     { title: 'شروع', items: ['overview', 'help'] },
-    { title: 'DNS', items: ['dns', 'dnssec'] },
+    // Wave 8 (SPEC §16.7): «DNS ثانویه» once the controller returns config.dns_secondary (w8.js).
+    { title: 'DNS', items: ['dns', 'dnssec', 'secondary'] },
     // Wave 7 (SPEC §15.7): quality / usage / speed test appear once the controller answers tunnel/health
     // (tunnelq.js P.w7.probe); the browser-only config checker needs no endpoint.
     { title: 'تونل', items: ['tunnel', 'tquality', 'tusage', 'tconfig', 'speedtest'] },
-    { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'pools'] },
+    { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'video', 'pools'] },
+    // Wave 8 (SPEC §16.4 / §16.5): TCP/UDP apps and video delivery, shown only when the controller returns `l4` / `video`.
+    { title: 'TCP/UDP', items: ['tcpudp'] },
     // Wave 6B (SPEC §14.2): shown only when the controller returns the section (see available()).
     { title: 'قوانین', items: ['redirects', 'transform'] },
     { title: 'امنیت', items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
@@ -992,7 +995,7 @@
   function recordBody(r) {
     var proxied = !!PROXYABLE[r.type] && !!r.proxied;
     var hc = !proxied && (r.type === 'A' || r.type === 'AAAA') && !!r.health_check;
-    return {
+    var b = {
       name: String(r.name || '@').trim() || '@', type: r.type, content: String(r.content || '').trim(),
       ttl: Number(r.ttl) || 300,
       priority: (r.type === 'MX' || r.type === 'SRV') && r.priority !== null && r.priority !== undefined && r.priority !== '' ? Number(r.priority) : null,
@@ -1002,6 +1005,8 @@
       health_check: hc,
       health_port: hc && r.health_port ? Number(r.health_port) : null
     };
+    // Wave 8 (SPEC §16.7): weight + health check (type/path) on non-proxied A/AAAA/CNAME — only for a controller that knows them.
+    return P.w8 ? P.w8.recordBodyExtra(r, b) : b;
   }
   function fqdn(name) { return !name || name === '@' ? S.site.domain : name + '.' + S.site.domain; }
   function typeBadge(t) { return h('span', { className: 'pcdn-type pcdn-type-' + String(t).toLowerCase(), text: t }); }
@@ -1013,6 +1018,11 @@
   function renderDns() {
     var site = S.site, recs = site.records || [], max = (site.plan || {}).max_records || 0;
     var out = [];
+    // Wave 8 (SPEC §16.7): the zone is transferred from the customer's own primary — these records are not served.
+    if (P.w8 && P.w8.secondaryMode()) {
+      out.push(P.alertBox('warning', [h('strong', { text: 'DNS اصلی این دامنه جای دیگری است. ' }),
+        'زون با انتقال (AXFR) از سرور DNS شما کپی می‌شود و رکوردهای این صفحه پاسخ داده نمی‌شوند. ', goLink('secondary', 'تنظیمات DNS ثانویه')], { icon: 'swap' }));
+    }
     var proxiedCount = recs.filter(function (r) { return r.proxied; }).length;
     var mailProxied = recs.filter(function (r) { return r.proxied && MAILISH.test(String(r.name || '').split('.')[0]); });
     if (recs.length && !proxiedCount) {
@@ -1090,8 +1100,10 @@
     if (r.priority !== null && r.priority !== undefined && (r.type === 'MX' || r.type === 'SRV')) x.push(['اولویت', String(r.priority)]);
     if (r.pool) x.push(['استخر', r.pool]);
     if (r.origin_port) x.push(['پورت', String(r.origin_port)]);
-    if (r.health_check) x.push(['بررسی سلامت', String(r.health_port || 80)]);
-    return x.length ? h('span', { className: 'pcdn-rextras' }, x.map(function (e) { return h('span', { className: 'pcdn-mini' }, e[0] + ': ', ltr(e[1])); })) : null;
+    if (r.health_check) x.push(['بررسی سلامت', (r.health_protocol && r.health_protocol !== 'tcp' ? r.health_protocol.toUpperCase() + ' ' : '') + String(r.health_port || (r.health_protocol === 'https' ? 443 : 80))]);
+    if (P.w8) x = x.concat(P.w8.recordExtras(r));
+    var hb = P.w8 ? P.w8.recordHealthBadge(r) : null;
+    return x.length || hb ? h('span', { className: 'pcdn-rextras' }, x.map(function (e) { return h('span', { className: 'pcdn-mini' }, e[0] + ': ', ltr(e[1])); }), hb) : null;
   }
   function proxyCell(r) {
     if (!PROXYABLE[r.type]) return h('span', { className: 'pcdn-proxy-na', text: 'فقط DNS' });
@@ -1202,6 +1214,8 @@
           }
           if (!r.pool) g2.appendChild(P.input(r, 'origin_port', 'پورت سرور اصلی', { type: 'number', min: 1, max: 65535, nullable: true, placeholder: '80 / 443', help: 'خالی بگذارید تا بر اساس پروتکل (۸۰ یا ۴۴۳) انتخاب شود.' }));
           px.appendChild(g2);
+        } else if (P.w8 && P.w8.recordsV2()) {
+          px.appendChild(P.w8.recordFields(r, draw));
         } else if (r.type === 'A' || r.type === 'AAAA') {
           px.appendChild(P.toggle(r, 'health_check', 'بررسی سلامت', { help: 'اگر چند رکورد هم‌نام دارید، فقط آدرس‌هایی که پورتشان پاسخ می‌دهد در DNS برگردانده می‌شوند.', onchange: draw }));
           if (r.health_check) px.appendChild(P.input(r, 'health_port', 'پورت بررسی سلامت', { type: 'number', min: 1, max: 65535, nullable: true, placeholder: '80' }));
@@ -1219,6 +1233,14 @@
     function submit() {
       clear(errBox);
       P.clearErrors(form);
+      var probs = P.w8 ? P.w8.recordProblems(recordBody(r), r) : [];
+      if (probs.length) {
+        var rest0 = P.placeErrors(ctx, probs);
+        if (rest0.length) errBox.appendChild(P.alertBox('danger', h('ul', { className: 'pcdn-errlist' }, rest0.map(function (x) { return h('li', { text: x.msg }); }))));
+        var bad0 = form.querySelector('[aria-invalid]');
+        if (bad0) bad0.focus();
+        return;
+      }
       var body = recordBody(r);
       var p = orig ? api('PUT', 'records/' + orig.id, body) : api('POST', 'records', body);
       P.busy(save, p).then(function (res) {

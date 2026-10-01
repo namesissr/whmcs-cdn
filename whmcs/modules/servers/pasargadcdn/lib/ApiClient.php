@@ -245,9 +245,11 @@ class ApiClient
         if (!is_string($text) || $text === '') {
             return $text;
         }
-        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key|transform_secret|tsig_secret)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
         $text = (string) preg_replace('/"new_secrets"\s*:\s*\{[^{}]*\}/', '"new_secrets":"***"', $text);
         $text = (string) preg_replace('/whsec_[0-9A-Za-z]+/', 'whsec_***', $text);
+        // Wave 8 (SPEC §16.6): image transform secrets (imgsec_ + hex) wherever they appear
+        $text = (string) preg_replace('/imgsec_[0-9A-Za-z]+/', 'imgsec_***', $text);
         // One-time edge tokens can also appear embedded in install/bootstrap one-liner strings
         // (e.g. the batch response's `install`), so mask the token value wherever it occurs.
         $text = (string) preg_replace('/edge_[0-9a-f]{16,}/', 'edge_***', $text);

@@ -160,6 +160,15 @@ function pasargadcdn_plan(array $params): array
     if (isset($co['Edge Group']) && in_array($co['Edge Group'], ['general', 'tunnel'], true)) {
         $plan['features']['edge_group'] = $co['Edge Group'];
     }
+    // Wave 8 (SPEC §16.4) TCP/UDP proxy: configurable options only — the keys are sent ONLY when the
+    // product has the option, so an older controller (Features extra="forbid") never receives them;
+    // without the options the controller defaults apply (l4_proxy off, 0 apps).
+    if (isset($co['L4 Proxy'])) {
+        $plan['features']['l4_proxy'] = (bool) $co['L4 Proxy'];
+    }
+    if (isset($co['L4 Apps']) && $co['L4 Apps'] !== '') {
+        $plan['features']['max_l4_apps'] = min(100, max(0, (int) $co['L4 Apps']));
+    }
     // Controller ranges (SPEC §7.1) — out-of-range values would make Create/ChangePackage fail.
     $f = &$plan['features'];
     $f['max_tunnel_paths'] = min(50, max(0, $f['max_tunnel_paths']));
@@ -877,6 +886,9 @@ function pasargadcdn_features_text(array $f): string
             !empty($f['max_tunnel_connections']) ? (string) $f['max_tunnel_connections'] : '∞',
             !empty($f['tunnel_max_mbps']) ? (string) $f['tunnel_max_mbps'] : '∞');
     }
+    if (!empty($f['l4_proxy'])) {
+        $txt .= sprintf(' · TCP/UDP: %d apps', $f['max_l4_apps'] ?? 0);
+    }
     if (($f['edge_group'] ?? 'general') !== 'general') {
         $txt .= ' · edge group: ' . $f['edge_group'];
     }
@@ -963,7 +975,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
     ];
 }
 

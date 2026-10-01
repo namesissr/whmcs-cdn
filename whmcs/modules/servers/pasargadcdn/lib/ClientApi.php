@@ -32,8 +32,9 @@ class ClientApi
 {
     const MAX_BODY = 262144; // 256 KB
 
-    // Wave 6B (SPEC §14.2) added transform, redirects and bots; Wave 6D (§14.3) logs and webhooks.
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks';
+    // Wave 6B (SPEC §14.2) added transform, redirects and bots; Wave 6D (§14.3) logs and webhooks;
+    // Wave 8 (§16.4/§16.5/§16.7) l4 (TCP/UDP apps), video and dns_secondary.
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary';
 
     /** Webhook ids are assigned by the controller: "wh_" + 8 hex (SPEC §14.3.3). */
     const WEBHOOK_ID = 'wh_[0-9a-f]{8}';
@@ -49,9 +50,13 @@ class ClientApi
             'tunnel/quality', 'tunnel/usage', 'tunnel/health',
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
-            'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)'],
+            'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
+            // Wave 8 (SPEC §16.6): new image transform secret (returned once, never logged — ApiClient::redact)
+            'image/transform-secret'],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
-        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client'],
+        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client',
+            // Wave 8 (SPEC §16.6): forget the image transform secret (unsigned transforms allowed again)
+            'image/transform-secret'],
     ];
 
     /**

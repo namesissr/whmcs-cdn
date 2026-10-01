@@ -124,7 +124,10 @@
     send: 'M21 3 10.5 13.5|M21 3l-6.5 18-4-7.5L3 9.5z',
     printer: 'M7 9V3.5h10V9|M7 17.5H4.5V10.5A1.5 1.5 0 0 1 6 9h12a1.5 1.5 0 0 1 1.5 1.5v7H17|M7 14h10v6.5H7z|M16.5 12h.01',
     fileText: 'M6 3h8l4 4v14H6z|M14 3v4h4|M9 12h6|M9 15.5h6|M9 8.5h2',
-    calendar: 'M4 5.5h16V20H4z|M4 10h16|M8.5 3.5v4|M15.5 3.5v4|M8 14h.01|M12 14h.01|M16 14h.01'
+    calendar: 'M4 5.5h16V20H4z|M4 10h16|M8.5 3.5v4|M15.5 3.5v4|M8 14h.01|M12 14h.01|M16 14h.01',
+    // Wave 8 (SPEC §16.4 / §16.5)
+    port: 'M8 3.5v4.5|M16 3.5v4.5|M5.5 8h13v3.5a6.5 6.5 0 0 1-13 0z|M12 18v2.5',
+    play: C + '|M10 8.5v7l6-3.5z'
   };
   function icon(name, cls) {
     var svg = s('svg', { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor',
@@ -257,7 +260,13 @@
     // Wave 6D (SPEC §14.3)
     s3_endpoint: 'نشانی سرویس', region: 'ناحیه', bucket: 'نام باکت', prefix: 'پیشوند', access_key: 'کلید دسترسی',
     secret_key: 'کلید مخفی', anonymize_ip: 'ناشناس‌سازی آی‌پی', sample_rate: 'نرخ نمونه‌برداری', items: 'وب‌هوک',
-    events: 'رویدادها', description: 'توضیح', minutes: 'بازه', month: 'ماه', limit: 'تعداد'
+    events: 'رویدادها', description: 'توضیح', minutes: 'بازه', month: 'ماه', limit: 'تعداد',
+    // Wave 8 (SPEC §16.4–§16.7)
+    apps: 'برنامه', protocol: 'پروتکل', edge_port: 'پورت روی CDN', origin: 'سرور مقصد', proxy_protocol: 'PROXY protocol',
+    ip_allow: 'آی‌پی‌های مجاز', idle_timeout: 'مهلت بیکاری', segment_ttl: 'مدت کش قطعه‌ها', manifest_ttl: 'مدت کش فهرست پخش',
+    prefetch_next: 'پیش‌بارگذاری قطعهٔ بعدی', avif: 'AVIF', smart_crop: 'برش هوشمند', primaries: 'سرورهای اصلی', tsig: 'TSIG',
+    algorithm: 'الگوریتم', secret: 'کلید مخفی', allow_axfr: 'آی‌پی‌های مجاز AXFR', health_type: 'نوع بررسی سلامت',
+    health_path: 'مسیر بررسی سلامت', health_check: 'بررسی سلامت'
   };
   /** Controller errors → {summary, items:[{path, label, msg}]}. */
   function parseErrors(data, status) {
