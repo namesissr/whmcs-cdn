@@ -280,6 +280,143 @@ resource "pcdn_record" "www" {
 	}
 }
 
+// SPEC §16.7: weighted / failover records and the controller probe. Every PATCH must carry weight,
+// health_protocol and health_path (PATCH replaces the whole record), the defaulted health_path must not
+// cause a perpetual diff, and the computed `health` object is read back without ever planning a change.
+func TestAccRecord_weightedHealth(t *testing.T) {
+	requireTerraform(t)
+	f := newFakeController(t)
+	var aID int64
+	captureA := func(s *terraform.State) (err error) {
+		aID, err = recordID(s, "pcdn_record.a")
+		return err
+	}
+	cfg := func(body string) string {
+		return providerConfig(f) + `resource "pcdn_record" "a" {
+  name    = "app"
+  type    = "A"
+  content = "185.1.2.3"
+` + body + "\n}\n" + `resource "pcdn_record" "b" {
+  name         = "app"
+  type         = "A"
+  content      = "185.1.2.4"
+  weight       = 0
+  health_check = true
+}
+resource "pcdn_record" "c" {
+  name         = "alt"
+  type         = "CNAME"
+  content      = "origin1.example.net"
+  weight       = 50
+  health_check = true
+}
+`
+	}
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				// health_path is not configured: the controller stores "/" for an https probe and the
+				// plan predicts it (the post-apply empty-plan check proves there is no diff)
+				Config: cfg(`  weight          = 70
+  health_check    = true
+  health_protocol = "https"
+  health_port     = 443`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("pcdn_record.a", "weight", "70"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health_protocol", "https"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health_path", "/"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.ok", "true"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.ms", "12"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.advertised", "true"),
+					resource.TestCheckResourceAttr("pcdn_record.b", "weight", "0"),
+					resource.TestCheckNoResourceAttr("pcdn_record.b", "health_protocol"),
+					resource.TestCheckNoResourceAttr("pcdn_record.b", "health_path"),
+					resource.TestCheckResourceAttr("pcdn_record.c", "health_check", "true"),
+					checkFakeRecord(f, "pcdn_record.a", "weight", 70),
+					checkFakeRecord(f, "pcdn_record.a", "health_path", "/"),
+					checkFakeRecord(f, "pcdn_record.c", "weight", 50),
+				),
+			},
+			{
+				// an unrelated change (ttl) must send weight/protocol/path back, not null them
+				Config: cfg(`  weight          = 70
+  ttl             = 600
+  health_check    = true
+  health_protocol = "https"
+  health_port     = 443`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureA,
+					checkFakeRecord(f, "pcdn_record.a", "ttl", 600),
+					checkFakeRecord(f, "pcdn_record.a", "weight", 70),
+					checkFakeRecord(f, "pcdn_record.a", "health_protocol", "https"),
+					checkFakeRecord(f, "pcdn_record.a", "health_path", "/"),
+					checkFakeRecord(f, "pcdn_record.a", "health_port", 443),
+				),
+			},
+			{
+				// the probe result changes on the controller: refresh updates `health`, plans nothing
+				PreConfig: func() {
+					f.setRecordField(aID, "health", map[string]any{"ok": false, "ms": nil, "fail": int64(3),
+						"at": "2026-10-01T10:05:00Z", "error": "timeout", "advertised": false})
+				},
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.ok", "false"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.fail", "3"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.error", "timeout"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health.advertised", "false"),
+				),
+			},
+			{
+				Config: cfg(`  weight          = 70
+  ttl             = 600
+  health_check    = true
+  health_protocol = "https"
+  health_port     = 443`),
+				PlanOnly: true,
+			},
+			{
+				// explicit path, then switching to tcp clears the path; dropping weight unweights it
+				Config: cfg(`  weight          = 30
+  health_check    = true
+  health_protocol = "http"
+  health_path     = "/healthz"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					checkFakeRecord(f, "pcdn_record.a", "weight", 30),
+					checkFakeRecord(f, "pcdn_record.a", "health_path", "/healthz"),
+					resource.TestCheckResourceAttr("pcdn_record.a", "health_path", "/healthz"),
+				),
+			},
+			{
+				Config: cfg(`  health_check    = true
+  health_protocol = "tcp"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("pcdn_record.a", "weight"),
+					resource.TestCheckNoResourceAttr("pcdn_record.a", "health_path"),
+					checkFakeRecord(f, "pcdn_record.a", "weight", nil),
+					checkFakeRecord(f, "pcdn_record.a", "health_path", nil),
+					checkFakeRecord(f, "pcdn_record.a", "health_protocol", "tcp"),
+				),
+			},
+			{
+				// health_check off: the computed health object becomes null
+				Config: cfg(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("pcdn_record.a", "health.ok"),
+					resource.TestCheckNoResourceAttr("pcdn_record.a", "health_protocol"),
+					checkFakeRecord(f, "pcdn_record.a", "health_check", false),
+				),
+			},
+			{
+				ResourceName:      "pcdn_record.c",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
 func TestAccRecord_validation(t *testing.T) {
 	requireTerraform(t)
 	f := newFakeController(t)
@@ -308,6 +445,40 @@ func TestAccRecord_validation(t *testing.T) {
 		{"health_port without health_check", `type = "A"
   content = "185.1.2.3"
   health_port = 8080`, `health_port requires health_check = true`},
+		{"weight on proxied", `type = "A"
+  content = "185.1.2.3"
+  proxied = true
+  weight = 10`, `weight is for DNS-only records`},
+		{"weight on TXT", `type = "TXT"
+  content = "x"
+  weight = 10`, `weight is not supported for this record type`},
+		{"weight out of range", `type = "A"
+  content = "185.1.2.3"
+  weight = 101`, `weight`},
+		{"health_check on lone CNAME", `name = "app"
+  type = "CNAME"
+  content = "origin.example.net"
+  health_check = true`, `health_check on a CNAME needs weight`},
+		{"health_check on TXT", `type = "TXT"
+  content = "x"
+  health_check = true`, `health_check needs an A, AAAA or CNAME record`},
+		{"health_protocol without health_check", `type = "A"
+  content = "185.1.2.3"
+  health_protocol = "http"`, `health_protocol requires health_check = true`},
+		{"health_protocol invalid", `type = "A"
+  content = "185.1.2.3"
+  health_check = true
+  health_protocol = "icmp"`, `value must be one of`},
+		{"health_path with tcp", `type = "A"
+  content = "185.1.2.3"
+  health_check = true
+  health_protocol = "tcp"
+  health_path = "/up"`, `health_path requires health_protocol http or https`},
+		{"health_path bad pattern", `type = "A"
+  content = "185.1.2.3"
+  health_check = true
+  health_protocol = "http"
+  health_path = "up now"`, `must start with /`},
 		{"lower-case type", `type = "a"
   content = "185.1.2.3"`, `value must be one of`},
 		{"ttl too low", `type = "A"

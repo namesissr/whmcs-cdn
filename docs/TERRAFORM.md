@@ -169,8 +169,46 @@ resource "pcdn_record" "spf" {
 ```
 
 ویژگی‌ها دقیقاً همان `RecordIn` کنترلر است: `type`، `content`، `name` (پیش‌فرض `@`)، `ttl` (۶۰ تا ۸۶۴۰۰،
-پیش‌فرض ۳۰۰)، `priority`، `proxied`، `pool`، `origin_port`، `health_check` و `health_port`. تغییر هر ویژگی
-(حتی `type`) با `PATCH` و بدون حذف و ساخت دوباره انجام می‌شود و شناسهٔ رکورد ثابت می‌ماند.
+پیش‌فرض ۳۰۰)، `priority`، `proxied`، `pool`، `origin_port`، `health_check`، `health_port` و (SPEC §16.7)
+`weight`، `health_protocol` و `health_path`. تغییر هر ویژگی (حتی `type`) با `PATCH` و بدون حذف و ساخت دوباره
+انجام می‌شود و شناسهٔ رکورد ثابت می‌ماند؛ provider همیشه کل رکورد (از جمله `weight` و تنظیمات probe) را
+می‌فرستد تا هیچ فیلدی ناخواسته پاک نشود.
+
+#### رکوردهای وزن‌دار / failover (SPEC §16.7)
+
+```hcl
+# دو مقصد با وزن ۷۰/۳۰؛ کنترلر هر ۶۰ ثانیه با HTTPS بررسی می‌کند و عضو ناسالم را از پاسخ DNS
+# کنار می‌گذارد (هرگز همه را)
+resource "pcdn_record" "app_a" {
+  name            = "app"
+  type            = "A"
+  content         = "185.1.2.10"
+  weight          = 70
+  health_check    = true
+  health_protocol = "https"
+  health_port     = 443
+  health_path     = "/healthz"   # اگر ندهید برای http/https همان "/" است
+}
+
+resource "pcdn_record" "app_b" {
+  name            = "app"
+  type            = "A"
+  content         = "185.1.2.11"
+  weight          = 30
+  health_check    = true
+  health_protocol = "https"
+}
+
+output "app_a_up" {
+  value = pcdn_record.app_a.health.ok   # فقط‌خواندنی: ok، ms، fail، checked_at، error، advertised
+}
+```
+
+- `weight` (۰ تا ۱۰۰؛ ۰ = پشتیبان) فقط برای رکوردهای A/AAAA/CNAME **بدون پروکسی**؛ چند CNAME هم‌نام فقط
+  وقتی مجازند که همه وزن‌دار باشند. `health_check` روی CNAME فقط همراه `weight` معنا دارد.
+- `health_protocol` (`tcp`/`http`/`https`) فقط با `health_check = true` و `health_path` فقط با `http`/`https`.
+- `health` نتیجهٔ آخرین بررسی کنترلر است (بدون `health_check` خالی)؛ در هر refresh به‌روز می‌شود و هیچ‌وقت
+  باعث تغییر در plan نمی‌شود.
 
 ### بخش تنظیمات — `pcdn_config_section`
 
@@ -315,7 +353,9 @@ terraform import pcdn_config_section.cache cache  # نام بخش
   نشوند.
 - **ترکیب‌های نامعتبر رکورد پیش از apply رد می‌شوند**: `proxied` برای نوعی غیر از A/AAAA/CNAME، `pool` یا
   `origin_port` بدون `proxied = true`، `origin_port` همراه `pool`، `priority` برای نوعی غیر از MX/SRV،
-  `health_check` روی رکورد پروکسی یا غیر A/AAAA، و `health_port` بدون `health_check`.
+  `health_check` روی رکورد پروکسی یا غیر A/AAAA/CNAME (و CNAME بدون `weight`)، `health_port` یا
+  `health_protocol` بدون `health_check`، `health_path` بدون probe از نوع `http`/`https`، و `weight` روی
+  رکورد پروکسی یا نوعی غیر از A/AAAA/CNAME.
 - **خطای همگام‌سازی DNS** (`dns_error`) خطا نیست: رکورد ذخیره شده و کنترلر خودش دوباره تلاش می‌کند؛ provider
   فقط هشدار می‌دهد.
 

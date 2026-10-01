@@ -45,3 +45,24 @@ resource "pcdn_record" "origin_b" {
   health_check = true
   health_port  = 443
 }
+
+# Weighted set with HTTP(S) probes by the controller (SPEC §16.7): 70/30 split, unhealthy members are
+# withdrawn from the answer (never all of them). health_path defaults to "/" for http/https.
+resource "pcdn_record" "app_a" {
+  name            = "app"
+  type            = "A"
+  content         = "185.1.2.20"
+  weight          = 70
+  health_check    = true
+  health_protocol = "https"
+  health_path     = "/healthz"
+}
+
+resource "pcdn_record" "app_b" {
+  name            = "app"
+  type            = "A"
+  content         = "185.1.2.21"
+  weight          = 30
+  health_check    = true
+  health_protocol = "https"
+}

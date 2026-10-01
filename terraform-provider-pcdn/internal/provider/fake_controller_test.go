@@ -225,6 +225,8 @@ func (f *fakeController) dnsErr() any {
 var (
 	fakeNameRE = regexp.MustCompile(`^(\*\.)?([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$`)
 	fakePoolRE = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
+	// RecordIn.health_path (SPEC §16.7)
+	fakeHealthPathRE = regexp.MustCompile(`^/[^\s"'<>\\]*$`)
 )
 
 func (f *fakeController) writeRecord(w http.ResponseWriter, r *http.Request, id int64) {
@@ -252,6 +254,23 @@ func (f *fakeController) writeRecord(w http.ResponseWriter, r *http.Request, id 
 	}
 	if pool, ok := in["pool"].(string); ok && !fakePoolRE.MatchString(pool) {
 		errs = append(errs, map[string]any{"loc": []any{"body", "pool"}, "msg": "String should match pattern '^[a-z0-9_-]{1,32}$'"})
+	}
+	// SPEC §16.7 fields: weight 0..100, health_protocol Literal, health_path pattern/max_length
+	var weight any
+	if v, ok := in["weight"].(float64); ok {
+		if v < 0 || v > 100 {
+			errs = append(errs, map[string]any{"loc": []any{"body", "weight"}, "msg": "Input should be less than or equal to 100"})
+		}
+		weight = int64(v)
+	}
+	proto, _ := in["health_protocol"].(string)
+	if _, present := in["health_protocol"]; present && in["health_protocol"] != nil &&
+		proto != "tcp" && proto != "http" && proto != "https" {
+		errs = append(errs, map[string]any{"loc": []any{"body", "health_protocol"}, "msg": "Input should be 'tcp', 'http' or 'https'"})
+	}
+	hpath, _ := in["health_path"].(string)
+	if hp, ok := in["health_path"].(string); ok && (len(hp) > 512 || !fakeHealthPathRE.MatchString(hp)) {
+		errs = append(errs, map[string]any{"loc": []any{"body", "health_path"}, "msg": "String should match pattern"})
 	}
 	if len(errs) > 0 {
 		detail(w, 422, errs)
@@ -329,6 +348,11 @@ func (f *fakeController) writeRecord(w http.ResponseWriter, r *http.Request, id 
 		detail(w, 422, "CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است؛ از ALIAS استفاده کنید")
 		return
 	}
+	weighted := weight != nil
+	if weighted && (proxied || (rtype != "A" && rtype != "AAAA" && rtype != "CNAME")) {
+		detail(w, 422, "وزن (weight) فقط برای رکوردهای A، AAAA و CNAME بدون پروکسی مجاز است")
+		return
+	}
 	var pool, originPort, healthPort any
 	if v, ok := in["pool"].(string); ok && proxied {
 		pool = v
@@ -337,9 +361,26 @@ func (f *fakeController) writeRecord(w http.ResponseWriter, r *http.Request, id 
 		originPort = int64(v)
 	}
 	hc, _ := in["health_check"].(bool)
-	health := hc && !proxied && (rtype == "A" || rtype == "AAAA")
+	health := hc && !proxied && (rtype == "A" || rtype == "AAAA" || rtype == "CNAME")
+	if rtype == "CNAME" && health && !weighted {
+		health = false // a lone CNAME has nothing to fail over to
+	}
 	if v, ok := in["health_port"].(float64); ok && health {
 		healthPort = int64(v)
+	}
+	var protocol, healthPath, healthObj any
+	if health && proto != "" {
+		protocol = proto
+	}
+	if protocol == "http" || protocol == "https" {
+		if hpath == "" {
+			hpath = "/"
+		}
+		healthPath = hpath
+	}
+	if health {
+		healthObj = map[string]any{"ok": true, "ms": int64(12), "fail": int64(0), "at": "2026-10-01T10:00:00Z",
+			"error": nil, "advertised": true}
 	}
 	status := 200
 	if id == 0 {
@@ -350,6 +391,7 @@ func (f *fakeController) writeRecord(w http.ResponseWriter, r *http.Request, id 
 	rec := map[string]any{
 		"id": id, "name": n, "type": rtype, "content": content, "ttl": int64(ttl), "priority": priority,
 		"proxied": proxied, "pool": pool, "origin_port": originPort, "health_check": health, "health_port": healthPort,
+		"weight": weight, "health_protocol": protocol, "health_path": healthPath, "health": healthObj,
 	}
 	f.records[id] = rec
 	out := map[string]any{"dns_error": f.dnsErr()}
@@ -366,7 +408,8 @@ func (f *fakeController) addRecord(rec map[string]any) int64 {
 	f.nextID++
 	rec["id"] = f.nextID
 	for k, v := range map[string]any{"ttl": int64(300), "priority": nil, "proxied": false, "pool": nil,
-		"origin_port": nil, "health_check": false, "health_port": nil} {
+		"origin_port": nil, "health_check": false, "health_port": nil, "weight": nil, "health_protocol": nil,
+		"health_path": nil, "health": nil} {
 		if _, ok := rec[k]; !ok {
 			rec[k] = v
 		}

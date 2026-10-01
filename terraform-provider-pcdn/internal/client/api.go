@@ -23,6 +23,22 @@ type Record struct {
 	OriginPort  *int64  `json:"origin_port"`
 	HealthCheck bool    `json:"health_check"`
 	HealthPort  *int64  `json:"health_port"`
+	// SPEC §16.7: weighted / failover sets and the controller's probe (null on older controllers)
+	Weight         *int64        `json:"weight"`
+	HealthProtocol *string       `json:"health_protocol"`
+	HealthPath     *string       `json:"health_path"`
+	Health         *RecordHealth `json:"health"`
+}
+
+// RecordHealth is the controller's last probe of a record with health_check (read-only; null
+// without health_check). Every field may be null before the first probe.
+type RecordHealth struct {
+	OK         *bool   `json:"ok"`
+	MS         *int64  `json:"ms"`
+	Fail       *int64  `json:"fail"`
+	At         *string `json:"at"`
+	Error      *string `json:"error"`
+	Advertised *bool   `json:"advertised"`
 }
 
 // RecordInput is the controller's RecordIn body. POST and PATCH both take the FULL record
@@ -38,6 +54,11 @@ type RecordInput struct {
 	OriginPort  *int64  `json:"origin_port"`
 	HealthCheck bool    `json:"health_check"`
 	HealthPort  *int64  `json:"health_port"`
+	// SPEC §16.7. Always sent (null = unset): PATCH replaces the whole record, so leaving them out
+	// would clear values set elsewhere only by accident of omission.
+	Weight         *int64  `json:"weight"`
+	HealthProtocol *string `json:"health_protocol"`
+	HealthPath     *string `json:"health_path"`
 }
 
 // RecordResult is the reply of a record create/update: the stored record plus `dns_error`, a
