@@ -455,6 +455,8 @@ class Tunnel(Strict):
     max_connections_per_ip: int = Field(0, ge=0, le=10000)
     allowed_countries: list[str] = Field(default_factory=list, max_length=250)
     fallback: Literal["origin", "decoy", "404"] = "origin"
+    # SPEC §15.2: share-based admission of new tunnel sessions while the node is hot
+    fair_share: bool = True
 
     @field_validator("paths")
     @classmethod

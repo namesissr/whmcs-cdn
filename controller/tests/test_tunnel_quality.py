@@ -468,3 +468,19 @@ def test_capacity_p95_alert_hysteresis_and_overview(client, alert_settings):
     # the next day runs again without force
     assert run(force=False, when=now + timedelta(days=1)) is not None
     assert scheduler.job_capacity in scheduler.JOBS and scheduler.job_tunnel_origin in scheduler.JOBS
+
+
+def test_edge_config_node_block_and_fair_share_default(client):
+    """SPEC §15.2/§15.6: each edge gets its own name/capacity and the fair-share percent; the tunnel
+    section carries fair_share (default on)."""
+    from tests.test_api import add_edge
+
+    tok = add_edge(client, name="fs-edge", ip="5.160.9.9")
+    cfg = client.get("/edge/v1/config", headers={"Authorization": f"Bearer {tok}"}).json()
+    assert cfg["node"]["name"] == "fs-edge"
+    assert cfg["node"]["fair_share_pct"] == 25
+    assert isinstance(cfg["node"]["capacity_mbps"], int)
+    r = client.post("/api/v1/sites", json={"domain": "fs.example", "origin_ip": "93.184.216.34", "plan": {}})
+    assert r.status_code == 201
+    t = client.get("/api/v1/sites/fs.example/config/tunnel").json()
+    assert t["fair_share"] is True

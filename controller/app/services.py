@@ -541,6 +541,13 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
         # node-wide platform client certificate for authenticated origin pulls (SPEC §14.2): the
         # client cert + key only (never the CA key), present only while a site uses mode platform
         "origin_pull": origin_pull.client_pair() if platform_pull else None,
+        # the requesting node itself (SPEC §15.2/§15.6): its capacity for tunnel fair share (0 =
+        # unknown, fair share never engages) and its name (hashed by the edge for X-Pcdn-Node)
+        "node": {
+            "name": edge.name if edge is not None else "",
+            "capacity_mbps": int(edge.capacity_mbps or 0) if edge is not None else 0,
+            "fair_share_pct": settings.fair_share_pct,
+        },
     }
     # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()

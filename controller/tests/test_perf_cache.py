@@ -457,8 +457,11 @@ def test_config_version_per_edge_and_etag(client):
     b = mk_edge(client, "b", "5.160.1.2")
     s1 = mk_edge(client, "s1", "5.160.2.1", shield=True)
     ca, cb, cs = (edge_cfg(client, x["token"]) for x in (a, b, s1))
-    # identical bodies (same peers, same self) -> same version; the shield's own view differs
-    assert ca["version"] == cb["version"] and ca["version"] != cs["version"]
+    # identical bodies apart from the per-node `node` block (SPEC §15.2) -> same view; the shield's
+    # own view differs. Every node therefore has its own version/ETag.
+    view = lambda c: {k: v for k, v in c.items() if k not in ("version", "node")}  # noqa: E731
+    assert view(ca) == view(cb) and view(ca) != view(cs)
+    assert ca["node"]["name"] == "a" and cb["node"]["name"] == "b"
     # unchanged -> 304 with the same ETag (no reload)
     r = edge_get(client, a["token"], "/edge/v1/config", headers={"If-None-Match": f'"{ca["version"]}"'})
     assert r.status_code == 304

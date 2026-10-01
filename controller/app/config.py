@@ -220,6 +220,10 @@ class Settings:
         default_factory=lambda: float(os.getenv("CAPACITY_ALERT_PERCENT") or 70))
     capacity_resolve_percent: float = field(
         default_factory=lambda: float(os.getenv("CAPACITY_RESOLVE_PERCENT") or 60))
+    # SPEC §15.2 tunnel fair share: while a node is hot, a site holding more than this share of the
+    # node's new tunnel sessions is throttled at admission (edge config `node.fair_share_pct`)
+    fair_share_pct: int = field(
+        default_factory=lambda: min(100, max(1, int(os.getenv("FAIR_SHARE_PCT") or 25))))
 
 
 settings = Settings()

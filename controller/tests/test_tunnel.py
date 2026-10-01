@@ -50,7 +50,8 @@ def test_features_defaults_and_plan_patch(client):
     assert (f["tunnel"], f["max_tunnel_paths"], f["max_tunnel_connections"], f["tunnel_max_mbps"],
             f["edge_group"]) == (False, 10, 0, 0, "general")
     assert s["config"]["tunnel"] == {"enabled": False, "paths": [], "idle_timeout": 3600, "per_connection_mbps": 0,
-                                     "max_connections_per_ip": 0, "allowed_countries": [], "fallback": "origin"}
+                                     "max_connections_per_ip": 0, "allowed_countries": [], "fallback": "origin",
+                                     "fair_share": True}
     r = client.patch(f"{S}/plan", json={"features": {"tunnel": True, "edge_group": "tunnel", "tunnel_max_mbps": 20}})
     assert r.status_code == 200 and r.json()["plan"]["features"]["edge_group"] == "tunnel"
     for bad in ({"edge_group": "vip"}, {"max_tunnel_paths": 51}, {"max_tunnel_connections": -1},
