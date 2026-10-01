@@ -971,3 +971,118 @@ General CDN capabilities for website customers. Defaults keep today's behaviour 
   "manage products" permission gets a read-only app: the boot payload carries `readonly: true`, write
   controls are hidden/disabled, and `api.php` refuses every non-GET call with 403 for that user (server
   side, independent of the UI). Owners and WHMCS versions without sub-users keep full access.
+
+## 15. Wave 7: tunnel quality, diagnostics & usability
+
+Scope: quality, reliability, transparency and ease of setup for tunnel (VPN-over-CDN) customers.
+Explicitly out of scope: anything whose purpose is evading filtering/blocking, hiding or rotating
+node addresses, or choosing nodes by "what is not blocked". Node selection stays health/load driven.
+
+### 15.1 Edge: tunnel quality telemetry
+Per host-hour, per tunnel **path id**, the edge adds to the usage item's `tunnel` object:
+```json
+"paths": {"grpc1": {"sessions": 12, "seconds": 5400, "bytes_up": 1, "bytes_down": 2,
+                     "abnormal": 1, "connect_ms_sum": 840, "connect_n": 12,
+                     "errors": {"origin_refused": 0, "origin_timeout": 1, "origin_error": 0,
+                                "limit": 0, "country": 0, "protocol": 0, "edge": 0}}}
+```
+- A request is attributed to a path id by the edge (it knows which tunnel location matched; log field
+  `"tp"` = path id, `""` for non-tunnel requests). ≤ 50 path ids per host-hour.
+- `sessions`: tunnel requests that reached the origin and were accepted (101 / 2xx).
+- `abnormal`: accepted sessions that ended with a non-clean end (nginx `$status` 499 after an
+  accepted upgrade is a client close and is NOT abnormal; abnormal = upstream reset/timeout on an
+  established session: `$upstream_status` 502/504 after bytes were exchanged, or `rt` ≥ idle_timeout
+  − 1 s with an upstream error). Keep the rule simple, documented and unit-tested.
+- `connect_ms_sum` / `connect_n`: sum / count of `$upstream_connect_time` (ms) for tunnel requests
+  that connected (log field `"uct"`).
+- `errors` (each a request count), classification:
+  - `origin_refused`: no connection to the origin (upstream status 502 with no upstream connect
+    time / connection refused or reset before response);
+  - `origin_timeout`: upstream status 504 or connect timeout;
+  - `origin_error`: the origin answered but not with 101/2xx (e.g. 400/404/5xx from origin);
+  - `limit`: 429/503 produced by limit_conn / limit_req / the per-site or per-IP connection caps;
+  - `country`: 403 from `allowed_countries`;
+  - `protocol`: the client spoke the wrong protocol for the path (e.g. no `Upgrade` on ws/httpupgrade,
+    non-HTTP/2 on grpc/h2) — 400/426 produced by the edge;
+  - `edge`: any other edge-generated 5xx on a tunnel path.
+- Pre-wave-7 agents omit `paths`; the controller treats it as optional. Old log lines without
+  `tp`/`uct` still parse.
+
+### 15.2 Edge: fair share & tunnel stream hygiene
+- New edge config per site `tunnel.fair_share` (bool, default true): tunnel `limit_rate` is never
+  above the plan cap, and when the node is above 85 % of its capacity (from its own heartbeat
+  metrics: tx_mbps vs the edge capacity in the config) new tunnel connections of a site that holds
+  more than `fair_share_pct` (node config, default 25) % of the node's tunnel connections get
+  `limit_rate` = max(per_connection cap, node capacity / active tunnel connections). Implemented
+  with an njs/agent-rendered map; must never drop established connections.
+- install.sh: default qdisc `fq` (already needed by bbr) stays; document it.
+
+### 15.3 Controller: tunnel quality API
+- Store `tunnel.paths` per hourly usage (merge like other details, ≤ 50 path ids).
+- `GET /api/v1/sites/{domain}/tunnel/quality?hours=24` (1..744) and `GET /capi/v1/tunnel/quality`
+  (scope stats) →
+```json
+{"hours": 24, "paths": [{"id": "grpc1", "path": "/x", "protocol": "grpc", "sessions": 12,
+  "avg_session_s": 450.0, "abnormal_pct": 8.333, "connect_ms_avg": 70.0,
+  "errors": {...}, "error_total": 1, "success_pct": 92.308,
+  "top_issue": "origin_timeout" | null, "advice": "<Persian, one sentence>" | null}],
+ "edges": [{"name": "edge-1", "sessions": 7, "abnormal_pct": 0.0, "connect_ms_avg": 60.0,
+            "error_total": 0}],
+ "series": [{"t": "<hour ISO>", "sessions": 3, "errors": 0, "abnormal": 0}]}
+```
+  `success_pct = 100 × sessions / (sessions + error_total)` (null without data); `advice` maps the
+  dominant error to a fixed Persian sentence (e.g. origin_refused → «سرور شما روی پورت مسیر اتصال را
+  رد می‌کند؛ سرویس Xray/sing-box و پورت را بررسی کنید.»). Path ids no longer configured are reported
+  with `"removed": true`.
+- `GET /api/v1/sites/{domain}/tunnel/usage?days=30` (1..90) and capi equivalent →
+  `{"days": [{"date", "bytes_up", "bytes_down", "sessions", "by_protocol": {...}, "by_path": {...}}],
+    "month": {"used_bytes", "limit_bytes" | null, "forecast_bytes", "forecast_exhaust_date" | null}}`.
+  Forecast = month-to-date average daily total × days in month (null limit → no exhaust date).
+
+### 15.4 Controller: origin-down detection & notifications
+- Leader job every minute over the hourly + live data of the last 5 minutes per tunnel site: when
+  ≥ 10 tunnel attempts and ≥ 80 % of them are `origin_refused`/`origin_timeout`, the site's tunnel
+  origin is DOWN (state per site in `state`); when attempts in the last 5 min are ≥ 5 and origin
+  errors < 20 %, it is UP again. Edges send the live per-minute `tunnel_errors` / `tunnel_attempts`
+  counters in their `live` items (new optional fields) so detection uses minute data.
+- Transitions emit webhook events `tunnel.origin_down` / `tunnel.origin_up` (added to the webhooks
+  event list, data `{paths: [...ids], attempts, origin_errors, since}`) and are listed in
+  `GET /api/v1/events?type=tunnel` (new event type, admin) so WHMCS can e-mail the client.
+  At most one down notification per site per 30 min (flapping guard).
+- `GET /api/v1/sites/{domain}/tunnel/health` → `{state: "up"|"down"|"unknown", since, last_check}`.
+
+### 15.5 Controller: capacity alert (operator)
+- Leader job daily: for each edge group, the 95th percentile of hourly tunnel+total tx over the last
+  3 days vs the group's summed capacity. ≥ 70 % → admin alert (Telegram/SMTP, existing alert
+  system, dedup) «ظرفیت گروه X به ۷۰٪ رسیده؛ نود اضافه کنید»; resolves below 60 %. Also exposed on
+  `GET /api/v1/overview` as `capacity: [{group, p95_mbps, capacity_mbps, pct}]`.
+
+### 15.6 Speed test (diagnostics only)
+- Edge serves, on every site that has tunnel enabled or always (cheap):
+  `GET /__pcdn/speed/ping` → 204, `GET /__pcdn/speed/down?bytes=N` (N ≤ 10 MB, random-ish
+  incompressible body, `Cache-Control: no-store`), `POST /__pcdn/speed/up` (body ≤ 10 MB discarded,
+  204). Rate-limited per IP (e.g. 6 tests/min), not logged as usage-billable? → they ARE counted as
+  normal traffic (simplest, honest). Response header `X-Pcdn-Node: <edge name hash, not IP>`.
+- The client app page measures latency (10 pings), download and upload against the customer's own
+  domain (whatever node DNS gives) and shows results with plain-language interpretation. It never
+  lists, probes or recommends specific node addresses.
+
+### 15.7 WHMCS client area
+- **کیفیت تونل** page: per-path cards (success %, abnormal %, connect latency, top issue + advice),
+  per-edge table, hourly chart; period 24h/7d/30d.
+- **مصرف تونل**: daily chart by protocol/path, month forecast and exhaust date.
+- **بررسی کانفیگ سرور**: the customer pastes an Xray or sing-box server JSON; it is parsed **in the
+  browser only** (never sent to WHMCS or the controller; nothing stored) and checked against the
+  site's tunnel paths: inbound protocol/transport ↔ path protocol, path/serviceName match, listen
+  port ↔ path origin port, TLS expectations (origin.tls), xhttp mode hints, common mistakes. Findings
+  in Persian with fix suggestions. Private keys/UUIDs are never displayed back in full.
+- **تست سرعت** page (15.6).
+- **App templates**: client setup tutorials/QR for v2rayNG, NekoBox, Hiddify, Streisand, v2rayN,
+  sing-box, Shadowrocket (existing tutorials extended), each with short steps.
+- **Origin-down e-mail**: WHMCS cron reads `GET /api/v1/events?type=tunnel&since=` and sends the
+  service owner the e-mail template «قطعی سرور پشت تونل» / «اتصال دوباره برقرار شد» (created by the
+  wizard), deduped per event id.
+- **Tunnel traffic add-on**: wizard creates an add-on product «بسته‌ی ترافیک افزوده» with
+  configurable sizes (10/50/100 GB, admin-priced); when its invoice is paid the service's controller
+  cap for the current month is raised by that amount (same mechanism as prepaid top-ups, logged,
+  idempotent per invoice item), shown on the wallet card and statement.
