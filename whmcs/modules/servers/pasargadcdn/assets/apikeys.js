@@ -17,6 +17,7 @@
   // Public documentation of the customer API (docs/API.md in the repository).
   var DOCS_URL = 'https://docs.pasargadmizban.com/cdn/api';
   var CAPI_HOST = 'https://cdn-api.pasargadmizban.com';
+  var OPENAPI_URL = CAPI_HOST + '/capi/v1/openapi.json';
   var MAX_KEYS = 5;
   var SCOPES = [
     ['purge', 'پاکسازی کش', 'ارسال درخواست پاکسازی کش (‎/capi/v1/purge)'],
@@ -142,7 +143,11 @@
         P.copyBtn(curlSnippet(null), 'کپی دستور', { text: 'کپی', done: 'کپی شد' })),
       h('p', { className: 'pcdn-muted pcdn-small' }, 'دسترسی هر کلید محدود به همین سرویس است. راهنمای کامل هر بخش (purge / stats / dns): ',
         h('a', { className: 'pcdn-link pcdn-apikeys-docs', href: DOCS_URL, target: '_blank', rel: 'noopener noreferrer', 'data-ro-ok': '1' },
-          h('span', { text: 'مستندات API' }), icon('external')))
+          h('span', { text: 'مستندات API' }), icon('external'))),
+      // SPEC §14.3.5: machine-readable description of the same customer API (no auth needed), e.g. for code generators
+      h('p', { className: 'pcdn-muted pcdn-small' }, 'مشخصات ماشینی API برای ابزارهای تولید کد و Postman: ',
+        h('a', { className: 'pcdn-link pcdn-apikeys-openapi', href: OPENAPI_URL, target: '_blank', rel: 'noopener noreferrer', 'data-ro-ok': '1' },
+          h('span', { text: 'OpenAPI (openapi.json)' }), icon('external')))
     ]);
     return c;
   }

@@ -40,6 +40,9 @@
   var OWN_SITE = boot.site || null;  // the reseller's own service site, to return to after managing a sub-site
   var OWN_ACTIVE = !!boot.active;
   var ADDFUNDS_URL = ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
+  // §14.3.7 team access: a WHMCS user without the manage-products permission gets a read-only app
+  // (api.php refuses their writes with 403 regardless; this only keeps the UI honest).
+  var READONLY = !!boot.readonly && !ADMIN;
   function money(v) {
     v = Number(v) || 0;
     return (v >= 100 ? num(Math.round(v)) : num(Math.round(v * 100) / 100)) + (WALLET && WALLET.currency ? ' ' + WALLET.currency : '');
@@ -72,8 +75,9 @@
     { title: 'قوانین', items: ['redirects', 'transform'] },
     { title: 'امنیت', items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
     { title: 'SSL و هدرها', items: ['ssl', 'headers', 'errorpages'] },
-    { title: 'گزارش‌ها', items: ['analytics', 'events', 'usage', 'statement'] },
-    { title: 'توسعه‌دهندگان', items: ['apikeys'] }
+    // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.
+    { title: 'گزارش‌ها', items: ['analytics', 'events', 'sla', 'usage', 'statement'] },
+    { title: 'یکپارچه‌سازی و API', items: ['webhooks', 'logs', 'apikeys'] }
   ];
   if (RESELLER) NAV.unshift({ title: 'نمایندگی', items: ['reseller'] });
   var pages = P.pages = P.pages || {};
@@ -161,13 +165,25 @@
   }
   function edgeIps() { return (S.site && Array.isArray(S.site.edge_ips)) ? S.site.edge_ips.filter(function (x) { return typeof x === 'string'; }) : []; }
 
-  /** Read-only mode for services that are not Active. */
+  /** Read-only mode for services that are not Active, and for read-only team members (§14.3.7). */
+  var WRITE_SEL = 'input,select,textarea,button[data-write]', TEAM_SEL = WRITE_SEL + ',button[data-team-write]';
   function lockWrites(el) {
-    if (S.active || !el) return;
-    Array.prototype.forEach.call(el.querySelectorAll('input,select,textarea,button[data-write]'), function (x) {
+    if ((S.active && !READONLY) || !el) return;
+    var sel = READONLY ? TEAM_SEL : WRITE_SEL;
+    if (el.matches && el.matches(sel) && !el.hasAttribute('data-ro-ok')) el.disabled = true;
+    Array.prototype.forEach.call(el.querySelectorAll(sel), function (x) {
       if (!x.hasAttribute('data-ro-ok')) x.disabled = true;
     });
   }
+  // Read-only team member: also lock write controls that pages add later (async lists, dialogs, drawers).
+  if (READONLY && window.MutationObserver) {
+    var roObs = new window.MutationObserver(function (muts) {
+      muts.forEach(function (m) { Array.prototype.forEach.call(m.addedNodes, function (n) { if (n.nodeType === 1) lockWrites(n); }); });
+    });
+    roObs.observe(root, { childList: true, subtree: true });
+    if (P.getLayer) roObs.observe(P.getLayer(), { childList: true, subtree: true });
+  }
+  if (READONLY) root.classList.add('pcdn-ro');
 
   function reloadSite() {
     return api('GET', '').then(function (res) {
@@ -231,7 +247,7 @@
       updateSaveBar();
       if (Math.abs(window.pageYOffset - y) > 2) window.scrollTo(0, y);
     };
-    f.dirty = function () { return S.active && snap(f.draft) !== f.original; };
+    f.dirty = function () { return S.active && !READONLY && snap(f.draft) !== f.original; };
     f.reset = function () { clear(f.summary); f.load(); f.redraw(); };
     f.save = function (button) {
       clear(f.summary);
@@ -321,6 +337,7 @@
 
   var mainEl = null;
   function renderAll() {
+    leavePage();
     S.form = null;
     clear(root);
     if (!S.site) { renderFatal(); return; }
@@ -372,11 +389,28 @@
       g.tut ? h('div', { className: 'pcdn-guide-foot' }, tutLink(g.tut, 'مطالعه آموزش کامل')) : null);
   }
 
+  /** Cleanup callbacks of the page being left (timers of the live analytics etc.). */
+  var leaving = [];
+  function onLeave(fn) { if (typeof fn === 'function') leaving.push(fn); }
+  function leavePage() {
+    var fns = leaving;
+    leaving = [];
+    fns.forEach(function (fn) { try { fn(); } catch (e) { /* a page's cleanup never blocks navigation */ } });
+  }
+
+  function readonlyBanner() {
+    return h('div', { className: 'pcdn-alert pcdn-alert-info pcdn-ro-banner', role: 'note', 'data-readonly': '1' }, icon('lock'),
+      h('div', { className: 'pcdn-alert-body' }, h('strong', { text: 'دسترسی فقط‌خواندنی — ' }),
+        'برای تغییر تنظیمات از مالک حساب بخواهید دسترسی مدیریت محصولات را بدهد.'));
+  }
+
   function renderMain() {
+    leavePage();
     clear(mainEl);
     S.form = null;
     var id = S.page, p = page(id);
     var banner = null, adminBar = ADMIN ? adminBanner() : (RSITE ? resellerSubBanner() : null);
+    var roBar = READONLY ? readonlyBanner() : null;
     if (!S.active) banner = P.alertBox('warning', [h('strong', { text: 'این سرویس فعال نیست. ' }), 'اطلاعات فقط قابل مشاهده است و امکان تغییر تنظیمات وجود ندارد.'], { icon: 'lock' });
     else if (S.site.status === 'suspended') banner = P.alertBox('danger', 'این سرویس در CDN معلق است و بازدیدکنندگان صفحه تعلیق را می‌بینند.');
     else if (S.site.status === 'over_quota' && WALLET) banner = P.alertBox('danger', [
@@ -386,7 +420,7 @@
       h('div', { className: 'pcdn-banner-actions' }, WALLET.limit_reached ? h('a', { href: UPGRADE_URL, className: 'pcdn-btn pcdn-btn-primary', 'data-ro-ok': '1', text: 'ارتقای پلن' }) : addFundsBtn())], { icon: 'ban' });
     else if (S.site.status === 'over_quota') banner = P.alertBox('danger', [h('strong', { text: 'ترافیک ماهانه تمام شده است. ' }), 'برای ادامه سرویس‌دهی، پلن را ارتقا دهید. ',
       h('a', { href: UPGRADE_URL, className: 'pcdn-link', text: 'ارتقای پلن' })]);
-    append(mainEl, [adminBar, banner, pageHead(p, id)]);
+    append(mainEl, [adminBar, roBar, banner, pageHead(p, id)]);
     var body = h('div', { className: 'pcdn-page', 'data-panel': id });
     mainEl.appendChild(body);
     if (locked(id)) append(body, upgradePanel(p));
@@ -1455,7 +1489,8 @@
     upgradeUrl: UPGRADE_URL, modeLabel: modeLabel, ensureAnalytics: ensureAnalytics, secTotal: secTotal, serviceId: SID,
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
-    reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; }
+    reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
+    readonly: READONLY, onLeave: onLeave
   };
 
   // ------------------------------------------------------------------ boot

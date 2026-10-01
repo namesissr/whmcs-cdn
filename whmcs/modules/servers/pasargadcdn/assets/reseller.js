@@ -17,6 +17,9 @@
   if (!P.h) return;
   var h = P.h, append = P.append, clear = P.clear, icon = P.icon, num = P.num, num1 = P.num1, api = P.api;
 
+  /** Marks a reseller write button so a read-only team member (§14.3.7) gets it disabled; api.php refuses the op anyway. */
+  function team(b) { b.setAttribute('data-team-write', '1'); return b; }
+
   function money(v, unit) {
     v = Number(v) || 0;
     var s = v >= 100 ? num(Math.round(v)) : num(Math.round(v * 100) / 100);
@@ -89,7 +92,7 @@
       row('آی‌پی سرور اصلی (Origin)', 'آدرس IPv4 عمومی سروری که محتوای سایت روی آن است.', origin),
       row('نام مشتری نهایی', 'برای شناسایی این سایت در گزارش‌ها؛ فقط شما آن را می‌بینید.', label),
       msg,
-      h('div', { className: 'pcdn-row-actions' }, submit)
+      h('div', { className: 'pcdn-row-actions' }, team(submit))
     ]);
     return c;
   }
@@ -120,7 +123,7 @@
         h('td', { text: s.label || '—' }),
         h('td', { className: 'pcdn-num', text: num1(Number(s.gb) || 0) }),
         h('td', { className: 'pcdn-num', text: money(s.cost, unit) }),
-        h('td', null, h('div', { className: 'pcdn-row-actions' }, manage, del))));
+        h('td', null, h('div', { className: 'pcdn-row-actions' }, manage, team(del)))));
     });
     append(c.body, h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table' },
       h('caption', { className: 'pcdn-sr', text: 'فهرست زیرسایت‌های نمایندگی' }),

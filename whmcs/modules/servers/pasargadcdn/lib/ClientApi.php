@@ -32,16 +32,22 @@ class ClientApi
 {
     const MAX_BODY = 262144; // 256 KB
 
-    // Wave 6B (SPEC §14.2) added transform, redirects and bots.
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots';
+    // Wave 6B (SPEC §14.2) added transform, redirects and bots; Wave 6D (§14.3) logs and webhooks.
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks';
+
+    /** Webhook ids are assigned by the controller: "wh_" + 8 hex (SPEC §14.3.3). */
+    const WEBHOOK_ID = 'wh_[0-9a-f]{8}';
 
     /** method => [sub-path regex relative to /api/v1/sites/{domain}, ...] */
     const ROUTES = [
         'GET' => [
             '', 'config/(?:' . self::SECTIONS . ')', 'records', 'records/export', 'dnssec',
             'analytics', 'events', 'usage', 'tunnel/stats', 'apikeys', 'origin-pull-ca',
+            // Wave 6D (SPEC §14.3.1–§14.3.4)
+            'analytics/live', 'logs/status', 'webhooks/deliveries', 'sla',
         ],
-        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import'],
+        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
+            'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)'],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
         'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client'],
     ];
@@ -60,7 +66,14 @@ class ClientApi
         'events' => ['limit' => '/^([1-9][0-9]{0,2}|1000)$/D'],
         'usage' => ['days' => '/^([1-9][0-9]{0,2})$/D'],
         'tunnel/stats' => ['hours' => '/^(24|168|720)$/D'],
+        // Wave 6D: live minutes 1..1440 (the app uses 15/60/360/1440), deliveries limit 1..200, SLA month YYYY-MM.
+        'analytics/live' => ['minutes' => '/^([1-9][0-9]{0,2}|1[0-3][0-9]{2}|14[0-3][0-9]|1440)$/D'],
+        'webhooks/deliveries' => ['limit' => '/^([1-9][0-9]?|1[0-9]{2}|200)$/D'],
+        'sla' => ['month' => '/^[0-9]{4}-(0[1-9]|1[0-2])$/D'],
     ];
+
+    /** Answer for a write by a read-only team member (SPEC §14.3.7). */
+    const READONLY_DETAIL = 'دسترسی شما به این سرویس فقط‌خواندنی است؛ برای تغییر تنظیمات از مالک حساب بخواهید دسترسی «مدیریت محصولات» را به شما بدهد.';
 
     /**
      * @param array $req [
@@ -68,6 +81,8 @@ class ClientApi
      *   'body' => raw request body, 'csrf' => X-PCDN-CSRF header,
      *   'session_csrf' => token stored in the session, 'client_id' => logged-in client id or 0,
      *   'admin_id' => WHMCS admin id (admin mode only — set by the addon, never from input),
+     *   'readonly' => true for a WHMCS user without the manage-products permission (TeamAccess, §14.3.7):
+     *                 every non-GET call is refused with 403 before anything else happens,
      * ]
      * @param callable|null $clientFactory fn(array $serverParams): ApiClient (tests)
      * @return array [http status, response array]
@@ -85,6 +100,12 @@ class ClientApi
         $sessionToken = (string) ($req['session_csrf'] ?? '');
         if ($sessionToken === '' || !hash_equals($sessionToken, (string) ($req['csrf'] ?? ''))) {
             return self::fail(403, 'درخواست نامعتبر است، صفحه را دوباره بارگذاری کنید.');
+        }
+        // Team access (SPEC §14.3.7): a read-only WHMCS user may only read — this covers config
+        // writes, purges, records, API keys, webhook tests/rotation and the reseller ops alike,
+        // whatever the UI shows. Admin mode is never read-only.
+        if (!$admin && !empty($req['readonly']) && $method !== 'GET') {
+            return self::fail(403, self::READONLY_DETAIL);
         }
         // Reseller-level operations (list / create / delete sub-site, rolled-up report).
         // Not tied to a controller sub-path, so handled before the site whitelist.

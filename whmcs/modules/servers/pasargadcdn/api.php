@@ -11,8 +11,10 @@
 require __DIR__ . '/../../../init.php';
 require_once __DIR__ . '/pasargadcdn.php';
 require_once __DIR__ . '/lib/ClientApi.php';
+require_once __DIR__ . '/lib/TeamAccess.php';
 
 use PasargadCdn\ClientApi;
+use PasargadCdn\TeamAccess;
 
 function pasargadcdn_api_client_id(): int
 {
@@ -53,6 +55,10 @@ $rop = $str($_GET['rop'] ?? '');
     'client_id' => pasargadcdn_api_client_id(),
     'reseller_site_id' => $rsid,
     'reseller_op' => $rop,
+    // SPEC §14.3.7: a WHMCS user who is not the account owner and lacks "manageproducts" may only
+    // read; ClientApi refuses every non-GET call for them (server side, whatever the UI shows).
+    // Only writes need the decision, so reads (e.g. the 30 s live-analytics poll) skip the lookup.
+    'readonly' => $method !== 'GET' && TeamAccess::readonly(),
 ]);
 
 http_response_code($code);

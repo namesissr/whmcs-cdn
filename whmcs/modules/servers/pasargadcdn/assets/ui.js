@@ -118,7 +118,13 @@
     bot: 'M5 8.5h14v11H5z|M12 4.5v4|M12 4.5h.01|M9 13h.01|M15 13h.01|M9.5 16.5h5|M2.5 12.5v3|M21.5 12.5v3',
     redirect: 'M4 6.5h10a5 5 0 0 1 0 10H7|M10 13.5l-3 3 3 3',
     swap: 'M7 4 3 8l4 4|M3 8h14|M17 12l4 4-4 4|M21 16H7',
-    package: 'M12 3 4 7v10l8 4 8-4V7z|M4 7l8 4 8-4|M12 11v10|M8 5l8 4'
+    package: 'M12 3 4 7v10l8 4 8-4V7z|M4 7l8 4 8-4|M12 11v10|M8 5l8 4',
+    // Wave 6D (SPEC §14.3)
+    webhook: 'M9.5 8.5a3 3 0 1 1 5.2 2.1L12 15|M6.2 13.6a3 3 0 1 0 3.3 4.4h5.5|M14.5 18a3 3 0 1 0 3.2-3.9L15 9.6',
+    send: 'M21 3 10.5 13.5|M21 3l-6.5 18-4-7.5L3 9.5z',
+    printer: 'M7 9V3.5h10V9|M7 17.5H4.5V10.5A1.5 1.5 0 0 1 6 9h12a1.5 1.5 0 0 1 1.5 1.5v7H17|M7 14h10v6.5H7z|M16.5 12h.01',
+    fileText: 'M6 3h8l4 4v14H6z|M14 3v4h4|M9 12h6|M9 15.5h6|M9 8.5h2',
+    calendar: 'M4 5.5h16V20H4z|M4 10h16|M8.5 3.5v4|M15.5 3.5v4|M8 14h.01|M12 14h.01|M16 14h.01'
   };
   function icon(name, cls) {
     var svg = s('svg', { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor',
@@ -247,7 +253,11 @@
     match: 'تطبیق', actions: 'اقدام', countries: 'کشورها', regex: 'عبارت منظم', replacement: 'مسیر جدید', source: 'مبدأ',
     target: 'مقصد', status: 'کد وضعیت', preserve_query: 'حفظ Query String', packs: 'بسته‌های آماده', mode: 'حالت',
     allow_verified: 'ربات‌های تأییدشده', block_empty_ua: 'User-Agent خالی', origin_client_auth: 'احراز هویت مبدأ', csv: 'CSV',
-    include_subdomains: 'زیردامنه‌ها', enabled: 'فعال'
+    include_subdomains: 'زیردامنه‌ها', enabled: 'فعال',
+    // Wave 6D (SPEC §14.3)
+    s3_endpoint: 'نشانی سرویس', region: 'ناحیه', bucket: 'نام باکت', prefix: 'پیشوند', access_key: 'کلید دسترسی',
+    secret_key: 'کلید مخفی', anonymize_ip: 'ناشناس‌سازی آی‌پی', sample_rate: 'نرخ نمونه‌برداری', items: 'وب‌هوک',
+    events: 'رویدادها', description: 'توضیح', minutes: 'بازه', month: 'ماه', limit: 'تعداد'
   };
   /** Controller errors → {summary, items:[{path, label, msg}]}. */
   function parseErrors(data, status) {

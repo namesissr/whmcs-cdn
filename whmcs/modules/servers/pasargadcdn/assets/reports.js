@@ -178,14 +178,19 @@
         h('span', { className: 'pcdn-barlist-track' }, h('span', { className: 'pcdn-barlist-bar', style: 'width:' + Math.max(1, Math.round((Number(r[1]) || 0) * 100 / max)) + '%' + (o.color ? ';background:' + o.color : '') })));
     }));
   }
+  P.charts.barList = barList;   // shared with platform.js (live analytics, SPEC §14.3.1)
 
   // ------------------------------------------------------------------ analytics
 
   var PERIODS = [['24h', '۲۴ ساعت'], ['7d', '۷ روز'], ['30d', '۳۰ روز']];
-  var SEC_SRC = { waf: 'WAF', firewall: 'فایروال', ratelimit: 'محدودیت نرخ', challenge: 'چالش', ddos: 'DDoS', hotlink: 'Hotlink' };
+  // `bots` (bot management, §14.2) is always present in the controller's totals since Wave 6D
+  var SEC_SRC = { waf: 'WAF', firewall: 'فایروال', ratelimit: 'محدودیت نرخ', challenge: 'چالش', ddos: 'DDoS', hotlink: 'Hotlink', bots: 'ربات‌ها' };
 
   function renderAnalytics(Aa) {
     var S = Aa.S;
+    // Wave 6D (SPEC §14.3.1): «زنده» mode from platform.js, offered only when the controller serves it.
+    var L = P.live, live = L ? L.supported(Aa) : false;
+    if (live === true && S.amode === 'live') return L.render(Aa);
     var holder = h('div', { className: 'pcdn-stack' });
     var seg = P.segmented(PERIODS, S.period, function (v) { S.period = v; Aa.renderMain(); }, 'بازه زمانی');
     var refresh = P.btn('', { icon: 'refresh', aria: 'بروزرسانی آمار', title: 'بروزرسانی آمار', cls: 'pcdn-btn-iconic', onclick: function () {
@@ -193,7 +198,14 @@
       Aa.renderMain();
     } });
     refresh.setAttribute('data-ro-ok', '1');
-    var bar = h('div', { className: 'pcdn-toolbar pcdn-toolbar-end' }, seg, refresh);
+    var start = h('div', { className: 'pcdn-toolbar' }, live === true ? L.modeSwitch(Aa) : null, seg);
+    var bar = h('div', { className: 'pcdn-toolbar pcdn-toolbar-end' }, start, refresh);
+    if (L && live === undefined) {
+      // controller without the 6D sections: one background probe decides whether to offer the live mode
+      L.probe(Aa).then(function (ok) {
+        if (ok && S.page === 'analytics' && document.body.contains(start) && !start.querySelector('[data-seg="amode"]')) start.insertBefore(L.modeSwitch(Aa), seg);
+      });
+    }
     var period = S.period;
     if (S.analytics[period]) setTimeout(function () { draw(holder, S.analytics[period]); }, 0);
     else {
@@ -269,7 +281,7 @@
 
   // ------------------------------------------------------------------ security events
 
-  var SOURCES = [['', 'همه'], ['waf', 'WAF'], ['firewall', 'فایروال'], ['ratelimit', 'محدودیت نرخ'], ['ddos', 'DDoS'], ['hotlink', 'Hotlink']];
+  var SOURCES = [['', 'همه'], ['waf', 'WAF'], ['firewall', 'فایروال'], ['ratelimit', 'محدودیت نرخ'], ['ddos', 'DDoS'], ['hotlink', 'Hotlink'], ['bots', 'ربات‌ها']];
   var ACTIONS = { block: ['مسدود', 'danger'], challenge: ['چالش', 'warning'], captcha: ['کپچا', 'warning'], log: ['ثبت', 'muted'] };
   var BLOCK_RULE_ID = 'blocked-ips';
 

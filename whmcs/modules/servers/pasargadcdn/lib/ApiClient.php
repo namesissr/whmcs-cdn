@@ -236,14 +236,18 @@ class ApiClient
 
     /**
      * Secrets never reach the WHMCS module log: edge tokens (shown to the admin
-     * once), private keys of custom certificates.
+     * once), private keys of custom certificates, and (SPEC §14.3) the log-export
+     * S3 keys in `logs` bodies plus webhook signing secrets — `new_secrets` of a
+     * webhooks PUT, the `secret` of a rotation and any `whsec_…` value.
      */
     public static function redact($text)
     {
         if (!is_string($text) || $text === '') {
             return $text;
         }
-        $text = (string) preg_replace('/"(token|key)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        $text = (string) preg_replace('/"new_secrets"\s*:\s*\{[^{}]*\}/', '"new_secrets":"***"', $text);
+        $text = (string) preg_replace('/whsec_[0-9A-Za-z]+/', 'whsec_***', $text);
         // One-time edge tokens can also appear embedded in install/bootstrap one-liner strings
         // (e.g. the batch response's `install`), so mask the token value wherever it occurs.
         $text = (string) preg_replace('/edge_[0-9a-f]{16,}/', 'edge_***', $text);
