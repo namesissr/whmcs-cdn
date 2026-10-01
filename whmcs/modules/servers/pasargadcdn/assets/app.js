@@ -126,8 +126,11 @@
   // ------------------------------------------------------------------ helpers shared with pages.js / reports.js
 
   var DEFAULTS = {
-    cache: { enabled: true, dev_mode: false, level: 'standard', edge_ttl: 86400, browser_ttl: 0, ignore_query: false, bypass_cookies: [], always_online: true },
-    ssl: { force_https: false, hsts: { enabled: false, max_age: 31536000, include_subdomains: false, preload: false }, min_tls: '1.2', origin_protocol: 'http', origin_verify: false },
+    // Wave 6A fields (SPEC §14.1): the pages render their controls only when the section returned by
+    // the controller carries the key, so an older controller (which rejects unknown fields) never gets them.
+    cache: { enabled: true, dev_mode: false, level: 'standard', edge_ttl: 86400, browser_ttl: 0, ignore_query: false, bypass_cookies: [], always_online: true,
+      stale_while_revalidate: true, stale_if_error: 86400, shield: false, key_device: false, key_cookies: [], key_query_allow: [] },
+    ssl: { force_https: false, hsts: { enabled: false, max_age: 31536000, include_subdomains: false, preload: false }, min_tls: '1.2', origin_protocol: 'http', origin_verify: false, http3: true },
     waf: { mode: 'off', paranoia: 1, groups: ['sqli', 'xss', 'lfi', 'rce', 'php', 'scanner', 'protocol'], exclusions: [] },
     ddos: { mode: 'off', threshold_rps: 200, clearance_ttl: 3600 },
     firewall: { default_action: 'allow', rules: [] },
@@ -136,7 +139,7 @@
     pools: { pools: [] },
     headers: { request: [], response: [] },
     hotlink: { enabled: false, extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'mp4'], allowed_referers: [], allow_empty: true },
-    image: { enabled: false, quality: 85, max_width: 2000 },
+    image: { enabled: false, quality: 85, max_width: 2000, auto_webp: false },
     errorpages: { '5xx': null, '4xx': null },
     tunnel: { enabled: false, paths: [], idle_timeout: 3600, per_connection_mbps: 0, max_connections_per_ip: 0, allowed_countries: [], fallback: 'origin' }
   };
@@ -192,12 +195,23 @@
   /**
    * build(draft, form) → nodes. Returns form {el, draft, redraw(), dirty(), save(), reset()}.
    * The page puts form.el into its output; the save bar appears once the draft differs from the stored section.
+   * o.validate(draft) → [{path, label, msg}] runs before the PUT (client-side mirror of controller rules);
+   * any problem is shown next to its field (or in the form summary) and nothing is sent.
    */
   function sectionForm(section, build, o) {
     o = o || {};
     var ser = o.serialize || function (x) { return x; };
     var f = { section: section, el: h('div', { className: 'pcdn-form', 'data-form': section }), summary: h('div', { className: 'pcdn-form-errors' }) };
     function snap(d) { return JSON.stringify(ser(clone(d))); }
+    function failed(items, summary, status) {
+      var rest = P.placeErrors(f.ctx, items);
+      if (rest.length || !items.length) {
+        append(f.summary, P.errorBox({ ok: false, status: status, data: { detail: rest.length ? rest.map(function (x) { return { loc: ['body'].concat(x.path.split('.')), msg: x.msg }; }) : summary } }, 'ذخیره انجام نشد'));
+      }
+      P.toast('ذخیره انجام نشد؛ خطاها را بررسی کنید.', 'error');
+      var first = f.el.querySelector('.has-error, .pcdn-form-errors .pcdn-alert');
+      if (first && first.scrollIntoView) first.scrollIntoView({ block: 'center', behavior: reduced() ? 'auto' : 'smooth' });
+    }
     f.load = function () { f.draft = config(section); f.original = snap(f.draft); };
     f.redraw = function () {
       var y = window.pageYOffset;
@@ -214,16 +228,15 @@
     f.save = function (button) {
       clear(f.summary);
       P.clearErrors(f.el);
+      var bad = o.validate ? (o.validate(f.draft) || []) : [];
+      if (bad.length) {
+        failed(bad, '', 422);
+        return Promise.resolve({ ok: false, status: 422, data: { detail: bad.map(function (x) { return { loc: ['body'].concat(x.path.split('.')), msg: x.msg }; }) } });
+      }
       return P.busy(button, api('PUT', 'config/' + section, ser(clone(f.draft)))).then(function (res) {
         if (!res.ok) {
           var e = P.parseErrors(res.data, res.status);
-          var rest = P.placeErrors(f.ctx, e.items);
-          if (rest.length || !e.items.length) {
-            append(f.summary, P.errorBox({ ok: false, status: res.status, data: { detail: rest.length ? rest.map(function (x) { return { loc: ['body'].concat(x.path.split('.')), msg: x.msg }; }) : e.summary } }, 'ذخیره انجام نشد'));
-          }
-          P.toast('ذخیره انجام نشد؛ خطاها را بررسی کنید.', 'error');
-          var first = f.el.querySelector('.has-error, .pcdn-form-errors .pcdn-alert');
-          if (first && first.scrollIntoView) first.scrollIntoView({ block: 'center', behavior: reduced() ? 'auto' : 'smooth' });
+          failed(e.items, e.summary, res.status);
           return res;
         }
         setConfig(section, res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : ser(clone(f.draft)));

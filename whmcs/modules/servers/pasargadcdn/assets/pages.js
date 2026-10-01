@@ -12,6 +12,16 @@
   function A() { return P.app; }
   function site() { return P.app.S.site; }
   function domain() { return site().domain; }
+  function has(o, k) { return !!o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, k); }
+  /**
+   * True when the controller knows the Wave 6A fields (SPEC §14.1). It always returns whole sections
+   * with defaults, so a section without the new keys means an older controller that would reject them.
+   */
+  function perf6a() {
+    var c = site().config || {};
+    return has(c.cache, 'stale_while_revalidate') || has(c.ssl, 'http3') || has(c.image, 'auto_webp')
+      || !!(c.pagerules && (c.pagerules.rules || []).some(function (r) { return has(r, 'preload'); }));
+  }
 
   var TTL_PICKS = [[3600, '۱ ساعت'], [86400, '۱ روز'], [604800, '۱ هفته'], [2592000, '۱ ماه']];
 
@@ -163,8 +173,105 @@
     return Object.keys(v).every(function (k) { return JSON.stringify(d[k]) === JSON.stringify(v[k]); });
   }
 
+  // Wave 6A (SPEC §14.1): stale content, origin shield and cache-key options. Each control is shown
+  // only when the controller's section carries the field (older controllers reject unknown fields).
+  var STALE_ERROR_PICKS = [[0, 'خاموش'], [3600, '۱ ساعت'], [21600, '۶ ساعت'], [86400, '۱ روز'], [604800, '۷ روز']];
+  var MAX_STALE_ERROR = 604800;
+  var MAX_KEY_COOKIES = 10, MAX_KEY_QUERY = 50;
+  var COOKIE_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;      // same rule as the controller's cookie names
+  var QUERY_NAME_RE = /^[A-Za-z0-9_.[\]-]{1,64}$/;    // plus [] for array parameters (ids[])
+  var KEY_QUERY_CONFLICT = 'فهرست پارامترهای مجاز کلید کش با «نادیده گرفتن Query String» قابل جمع نیست؛ یکی از آن دو را خاموش یا خالی کنید.';
+
+  function staleErrorOptions(v) {
+    var opts = STALE_ERROR_PICKS.slice();
+    if (typeof v === 'number' && !opts.some(function (o) { return o[0] === v; })) opts.push([v, P.dur(v) + ' (مقدار فعلی)']);
+    return opts;
+  }
+  function nameProblems(d, key, max, re, what, chars, out) {
+    if (!has(d, key)) return;
+    var list = Array.isArray(d[key]) ? d[key] : [];
+    if (list.length > max) out.push({ path: key, msg: 'حداکثر ' + num(max) + ' ' + what + ' مجاز است؛ ' + num(list.length) + ' مورد وارد شده.' });
+    var bad = list.filter(function (x) { return !re.test(String(x)); });
+    if (bad.length) out.push({ path: key, msg: 'نام نامعتبر: ' + bad.join('، ') + ' — فقط ' + chars + ' (حداکثر ۶۴ نویسه).' });
+  }
+  /** Client-side mirror of the controller's cache-section rules (the controller still has the last word). */
+  function validateCache(d) {
+    var out = [];
+    if (has(d, 'stale_if_error')) {
+      var v = d.stale_if_error;
+      if (typeof v !== 'number' || Math.floor(v) !== v || v < 0 || v > MAX_STALE_ERROR) {
+        out.push({ path: 'stale_if_error', msg: 'مدت باید بین ۰ تا ' + num(MAX_STALE_ERROR) + ' ثانیه (۷ روز) باشد.' });
+      }
+    }
+    nameProblems(d, 'key_cookies', MAX_KEY_COOKIES, COOKIE_NAME_RE, 'کوکی', 'حروف لاتین، عدد، نقطه، - و _', out);
+    nameProblems(d, 'key_query_allow', MAX_KEY_QUERY, QUERY_NAME_RE, 'پارامتر', 'حروف لاتین، عدد، نقطه، -، _ و []', out);
+    if (d.ignore_query === true && Array.isArray(d.key_query_allow) && d.key_query_allow.length) out.push({ path: 'key_query_allow', msg: KEY_QUERY_CONFLICT });
+    return out;
+  }
+
+  function freshnessCard(d) {
+    if (!has(d, 'stale_while_revalidate') && !has(d, 'stale_if_error')) return null;
+    var c = P.card({ title: 'تازگی و محتوای قدیمی', icon: 'clock', id: 'freshness', subtitle: 'وقتی نسخه کش‌شده منقضی شده یا سرور اصلی خطا می‌دهد چه اتفاقی بیفتد.' });
+    append(c.body, [
+      has(d, 'stale_while_revalidate') ? P.toggle(d, 'stale_while_revalidate', 'به‌روزرسانی در پس‌زمینه', { cls: 'pcdn-swr',
+        help: 'وقتی مدت کش فایلی تمام شده، بازدیدکننده بی‌درنگ همان نسخه قبلی را می‌گیرد و CDN نسخه تازه را در پس‌زمینه از سرور اصلی دریافت می‌کند؛ هیچ بازدیدکننده‌ای منتظر سرور اصلی نمی‌ماند. پیشنهادی: روشن.' }) : null,
+      has(d, 'stale_if_error') ? P.select(d, 'stale_if_error', 'نمایش نسخه قدیمی هنگام خطای سرور اصلی', staleErrorOptions(d.stale_if_error), { cls: 'pcdn-stale-error',
+        help: 'اگر سرور اصلی خطای ۵xx بدهد یا پاسخ ندهد، تا این مدت پس از انقضا نسخه کش‌شده نمایش داده می‌شود تا سایت از دسترس خارج نشود.' }) : null,
+      h('p', { className: 'pcdn-help' }, 'اگر سرور اصلی در هدر ', ltr('Cache-Control'), ' مقدار ', ltr('stale-while-revalidate'), ' یا ', ltr('stale-if-error'), ' بفرستد، همان هم رعایت می‌شود.')
+    ]);
+    return c;
+  }
+
+  function shieldCard(d) {
+    if (!has(d, 'shield')) return null;
+    var c = P.card({ title: 'Origin Shield', icon: 'server', id: 'shield', subtitle: 'یک لایه کش میانی جلوی سرور اصلی شما.' });
+    append(c.body, [
+      P.toggle(d, 'shield', 'Origin Shield (کش لایه‌ای)', {
+        help: 'نودهای CDN فایل‌های کش‌نشده را به‌جای سرور اصلی از نودهای Shield می‌گیرند و فقط Shield به سرور اصلی وصل می‌شود؛ درخواست‌های کمتری به سرور شما می‌رسد و نرخ کش بالاتر می‌رود. برای سایت‌های پربازدید یا سرور اصلی کم‌توان مناسب است.' }),
+      h('p', { className: 'pcdn-help pcdn-shield-note' }, icon('info'), h('span', { text: 'فقط وقتی اثر دارد که سکو نود Shield فعال داشته باشد. اگر نود Shield وجود نداشته باشد یا در دسترس نباشد، نودها مثل قبل مستقیم به سرور اصلی وصل می‌شوند و سایت قطع نمی‌شود.' }))
+    ]);
+    return c;
+  }
+
+  /** Tag list with a live «n از max» counter in its help line. */
+  function keyList(d, key, label, max, o) {
+    var cnt = h('span', { className: 'pcdn-limit' });
+    function count() {
+      var n = (d[key] || []).length;
+      cnt.className = 'pcdn-limit' + (n >= max ? ' is-full' : '');
+      cnt.textContent = num(n) + ' از ' + num(max);
+    }
+    var el = P.tags(d, key, label, { placeholder: o.placeholder,
+      help: h('span', null, o.help + ' با Enter یا کاما اضافه کنید. ', cnt),
+      onchange: function () { count(); if (o.onchange) o.onchange(); } });
+    count();
+    return el;
+  }
+
+  /** «کلید کش» card; returns {card, sync()} — sync() refreshes the ignore_query conflict warning in place. */
+  function cacheKeyCard(d) {
+    if (!has(d, 'key_device') && !has(d, 'key_cookies') && !has(d, 'key_query_allow')) return { card: null, sync: function () {} };
+    var conflict = h('div', { className: 'pcdn-key-conflict', 'aria-live': 'polite' });
+    function sync() {
+      clear(conflict);
+      if (d.ignore_query === true && Array.isArray(d.key_query_allow) && d.key_query_allow.length) conflict.appendChild(P.alertBox('warning', KEY_QUERY_CONFLICT));
+    }
+    var c = P.card({ title: 'کلید کش', icon: 'key', id: 'cachekey', subtitle: 'تعیین کنید چه چیزهایی نسخه‌های جداگانه در کش بسازند.' });
+    append(c.body, [
+      has(d, 'key_device') ? P.toggle(d, 'key_device', 'نسخه جدا برای موبایل و دسکتاپ', { cls: 'pcdn-key-device',
+        help: 'فقط اگر سایت برای موبایل HTML متفاوتی می‌فرستد (نه صرفاً طراحی واکنش‌گرا) روشن کنید؛ وگرنه نرخ کش بی‌دلیل نصف می‌شود.' }) : null,
+      has(d, 'key_cookies') ? keyList(d, 'key_cookies', 'کوکی‌های مؤثر در کلید کش', MAX_KEY_COOKIES, { placeholder: 'lang',
+        help: 'مقدار این کوکی‌ها بخشی از کلید کش می‌شود؛ مثلاً کوکی زبان یا واحد پول، تا هر زبان نسخه کش خودش را داشته باشد. کوکی ورود کاربر را اینجا نگذارید؛ برای آن «کوکی‌های عبور از کش» را به کار ببرید.' }) : null,
+      has(d, 'key_query_allow') ? keyList(d, 'key_query_allow', 'پارامترهای مجاز Query String', MAX_KEY_QUERY, { placeholder: 'page', onchange: sync,
+        help: 'اگر پر باشد فقط همین پارامترها در کلید کش لحاظ می‌شوند و بقیه (مثل utm_source یا fbclid) نادیده گرفته می‌شوند. خالی یعنی همه پارامترها.' }) : null,
+      conflict]);
+    sync();
+    return { card: c, sync: sync };
+  }
+
   function renderCache() {
     var f = A().sectionForm('cache', function (d, f2) {
+      var ck = d.enabled ? cacheKeyCard(d) : null;
       var settings = P.card({ title: 'تنظیمات کش', icon: 'zap', id: 'settings' });
       append(settings.body, [
         P.toggle(d, 'enabled', 'کش CDN', { help: 'اگر خاموش باشد همه درخواست‌ها مستقیم به سرور اصلی می‌روند.', onchange: f2.redraw }),
@@ -177,7 +284,8 @@
           h('div', { className: 'pcdn-grid' },
             P.duration(d, 'edge_ttl', 'مدت نگهداری در CDN', { min: 60, max: 31536000, picks: TTL_PICKS, help: 'فایل‌های ثابت حداکثر این مدت در سرورهای CDN می‌مانند.' }),
             P.duration(d, 'browser_ttl', 'مدت نگهداری در مرورگر', { min: 0, zeroText: 'طبق هدر سرور اصلی', picks: [[0, 'طبق سرور'], [3600, '۱ ساعت'], [86400, '۱ روز']], help: '۰ یعنی هدر سرور اصلی دست نمی‌خورد.' })),
-          P.toggle(d, 'ignore_query', 'نادیده گرفتن Query String', { help: 'آدرس‌های ‎?a=1 و ‎?a=2 یک نسخه کش مشترک می‌گیرند. اگر از ‎?v= برای نسخه‌بندی فایل‌ها استفاده می‌کنید خاموش بگذارید.' }),
+          P.toggle(d, 'ignore_query', 'نادیده گرفتن Query String', { help: 'آدرس‌های ‎?a=1 و ‎?a=2 یک نسخه کش مشترک می‌گیرند. اگر از ‎?v= برای نسخه‌بندی فایل‌ها استفاده می‌کنید خاموش بگذارید.',
+            onchange: function () { if (ck) ck.sync(); } }),
           P.tags(d, 'bypass_cookies', 'کوکی‌های عبور از کش', { placeholder: 'wordpress_logged_in', help: 'اگر بازدیدکننده کوکی‌ای داشته باشد که نامش با یکی از این‌ها شروع شود، پاسخ از کش داده نمی‌شود (مثلاً کاربران واردشده).' }),
           P.toggle(d, 'always_online', 'همیشه آنلاین', { help: 'اگر سرور اصلی خطا بدهد یا در دسترس نباشد، آخرین نسخه کش‌شده نمایش داده می‌شود.' }),
           P.toggle(d, 'dev_mode', 'حالت توسعه', { help: 'کش موقتاً خاموش می‌شود تا تغییرات سایت فوراً دیده شوند. بعد از پایان کار خاموشش کنید.' })
@@ -186,8 +294,8 @@
       return [presets('الگوهای آماده', 'نوع سایت خود را انتخاب کنید تا تنظیمات مناسب پر شود؛ سپس بررسی و ذخیره کنید.', CACHE_PRESETS.map(function (p) {
         return { id: p.id, title: p.title, desc: p.desc, icon: p.icon, active: function (x) { return sameCache(x, p.v); },
           apply: function (x) { Object.keys(p.v).forEach(function (k) { x[k] = clone(p.v[k]); }); } };
-      }), d, f2), settings];
-    });
+      }), d, f2), settings, d.enabled ? [freshnessCard(d), shieldCard(d), ck.card] : null];
+    }, { validate: validateCache });
     return [f.el, purgeCard()];
   }
 
@@ -252,18 +360,74 @@
     if (r.ignore_query === true) parts.push('بدون Query String در کلید کش');
     if (r.ignore_query === false) parts.push('Query String در کلید کش');
     if (r.waf === false) parts.push('WAF خاموش');
+    if (Array.isArray(r.preload) && r.preload.length) parts.push('پیش‌بارگذاری ' + num(r.preload.length) + ' منبع');
     out.push(word(parts.length ? parts.join('، ') : 'بدون تغییر (طبق تنظیمات کلی)', 'pcdn-w pcdn-w-strong'));
     return out;
   }
+
+  // Preload / Early Hints (SPEC §14.1): page-rule field preload: [{url, as}] (≤10).
+  var PRELOAD_AS = [['style', 'استایل (style)'], ['script', 'اسکریپت (script)'], ['font', 'فونت (font)'], ['image', 'تصویر (image)'], ['fetch', 'داده (fetch)']];
+  var MAX_PRELOAD = 10;
+  function preloadEditor(x, redraw) {
+    if (!Array.isArray(x.preload)) x.preload = [];
+    var full = x.preload.length >= MAX_PRELOAD;
+    return h('fieldset', { className: 'pcdn-fieldset pcdn-preload' }, h('legend', { text: 'Preload (پیش‌بارگذاری منابع)' }),
+      h('p', { className: 'pcdn-help' }, 'مرورگر این فایل‌ها را هم‌زمان با HTML و زودتر از معمول دریافت می‌کند (هدر ', ltr('Link: rel=preload'),
+        '). روی نودهایی که Early Hints را پشتیبانی می‌کنند، همین فهرست با پاسخ ', ltr('103'), ' حتی پیش از آماده شدن صفحه فرستاده می‌شود. فقط منابع مهم بالای صفحه (مثل CSS اصلی یا فونت) را اضافه کنید؛ آدرس، مسیری مثل ',
+        ltr('/app.css'), ' یا آدرس کامل ', ltr('https://'), ' است.'),
+      x.preload.length ? h('div', { className: 'pcdn-rows' }, x.preload.map(function (p, i) {
+        if (!PRELOAD_AS.some(function (a) { return a[0] === p.as; })) p.as = 'style';
+        return h('div', { className: 'pcdn-plrow', 'data-preload': String(i) },
+          P.input(p, 'url', null, { placeholder: '/assets/main.css', aria: 'آدرس منبع ' + num(i + 1), maxlength: 2048 }),
+          P.select(p, 'as', null, PRELOAD_AS, { aria: 'نوع منبع ' + num(i + 1) }),
+          P.iconBtn('trash', 'حذف منبع ' + num(i + 1), function () { x.preload.splice(i, 1); redraw(); }, { write: true, cls: 'is-danger' }));
+      })) : null,
+      h('div', { className: 'pcdn-row-actions' },
+        P.btn('افزودن منبع', { icon: 'plus', size: 'sm', write: true, cls: 'pcdn-add-preload', disabled: full,
+          title: full ? 'حداکثر ' + num(MAX_PRELOAD) + ' منبع در هر قانون' : null,
+          onclick: function () { x.preload.push({ url: '', as: 'style' }); redraw(); } }),
+        limitText(x.preload.length, MAX_PRELOAD, 'منبع')));
+  }
+  // Same rules as the controller: the URL ends up inside a `Link: <…>` header rendered into nginx config,
+  // so only URL characters (no quotes, <>, whitespace/CR/LF, backslash, $ or braces), and either a path
+  // starting with a single / or an absolute https:// address.
+  var PRELOAD_URL_CHARS = /^[A-Za-z0-9\-._~:/?#[\]@!&()*+,;=%]+$/;
+  var PRELOAD_ABS = /^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?(\/|$)/i;
+  /** Client-side mirror of the controller's preload rules; returns a Persian problem or null. */
+  function preloadProblem(list) {
+    if (!Array.isArray(list)) return null;
+    if (list.length > MAX_PRELOAD) return 'حداکثر ' + num(MAX_PRELOAD) + ' منبع Preload در هر قانون مجاز است.';
+    for (var i = 0; i < list.length; i++) {
+      var u = String(list[i].url || '').trim(), n = num(i + 1);
+      list[i].url = u;
+      if (!u) return 'آدرس منبع Preload شماره ' + n + ' را وارد کنید.';
+      if (u.length > 2048) return 'آدرس منبع Preload شماره ' + n + ' بیش از حد طولانی است (حداکثر ۲۰۴۸ نویسه).';
+      if (/["'<>\s]/.test(u)) return 'آدرس منبع Preload شماره ' + n + ' نباید کوتیشن (" یا \')، علامت‌های < و >، فاصله یا شکست خط داشته باشد.';
+      if (!PRELOAD_URL_CHARS.test(u)) return 'آدرس منبع Preload شماره ' + n + ' نویسهٔ غیرمجاز دارد (مثل \\، $ یا { }).';
+      if (u.charAt(0) === '/' ? u.charAt(1) === '/' : !PRELOAD_ABS.test(u)) {
+        return 'آدرس منبع Preload شماره ' + n + ' باید مسیری با / (مثل /app.css) یا آدرس کامل https:// باشد.';
+      }
+      if (!PRELOAD_AS.some(function (a) { return a[0] === list[i].as; })) return 'نوع منبع Preload شماره ' + n + ' نامعتبر است.';
+    }
+    return null;
+  }
+
   function prEditor(r, done) {
     var isNew = !r;
     r = r || { id: P.uid('p'), enabled: true, pattern: '/', cache: null, edge_ttl: null, browser_ttl: null, ignore_query: null, waf: null, redirect: null };
+    // Preload is offered only when the controller knows the field (an older one rejects it).
+    var withPreload = has(r, 'preload') || perf6a();
+    if (isNew && withPreload) r.preload = [];
     var mode = { v: r.redirect ? 'redirect' : 'settings' };
     editDrawer(isNew ? 'قانون صفحه جدید' : 'ویرایش قانون صفحه', 'برای مسیرهای خاص، رفتار کش یا ریدایرکت را تعیین کنید.', r, function (x, redraw) {
       return [
         P.input(x, 'pattern', 'الگوی مسیر', { placeholder: '/wp-admin/*', help: h('span', null, 'با ', ltr('/'), ' شروع کنید. ', ltr('*'), ' یعنی هر چیزی (حتی ', ltr('/'), ')؛ مثلاً ', ltr('/static/*'), ' همه فایل‌های پوشه static.') }),
         P.choice(mode, 'v', 'نوع قانون', [['settings', 'تنظیم کش و امنیت', 'رفتار کش یا WAF را برای این مسیر تغییر دهید.', 'zap'], ['redirect', 'ریدایرکت', 'بازدیدکننده را به آدرس دیگری بفرستید.', 'arrowLeft']], {
-          cols: 2, onchange: function (v) { x.redirect = v === 'redirect' ? (x.redirect || { url: 'https://' + domain() + '/', code: 301 }) : null; redraw(); } }),
+          cols: 2, onchange: function (v) {
+            x.redirect = v === 'redirect' ? (x.redirect || { url: 'https://' + domain() + '/', code: 301 }) : null;
+            if (v === 'redirect' && Array.isArray(x.preload)) x.preload = [];  // a redirect has no page to preload for
+            redraw();
+          } }),
         x.redirect ? h('div', { className: 'pcdn-grid' },
           P.input(x.redirect, 'url', 'آدرس مقصد', { placeholder: 'https://' + domain() + '/new' }),
           P.select(x.redirect, 'code', 'نوع ریدایرکت', [[301, '۳۰۱ — دائمی (برای سئو)'], [302, '۳۰۲ — موقت']])) : [
@@ -272,13 +436,14 @@
             P.duration(x, 'edge_ttl', 'مدت کش در CDN', { min: 0, nullable: true, nullText: 'طبق تنظیمات کلی', picks: TTL_PICKS }),
             P.duration(x, 'browser_ttl', 'مدت کش در مرورگر', { min: 0, nullable: true, nullText: 'طبق تنظیمات کلی', picks: [[0, 'طبق سرور'], [3600, '۱ ساعت'], [86400, '۱ روز']] })),
           P.select(x, 'ignore_query', 'Query String', [[null, 'طبق تنظیمات کلی'], [true, 'نادیده گرفتن در کلید کش'], [false, 'در کلید کش لحاظ شود']]),
-          P.select(x, 'waf', 'WAF', [[null, 'طبق تنظیمات کلی'], [false, 'خاموش در این مسیر']], { help: 'فقط برای مسیرهایی که مطمئنید (مثلاً وب‌هوک پرداخت) WAF را خاموش کنید.' })],
+          P.select(x, 'waf', 'WAF', [[null, 'طبق تنظیمات کلی'], [false, 'خاموش در این مسیر']], { help: 'فقط برای مسیرهایی که مطمئنید (مثلاً وب‌هوک پرداخت) WAF را خاموش کنید.' }),
+          withPreload ? preloadEditor(x, redraw) : null],
         P.toggle(x, 'enabled', 'قانون فعال باشد')
       ];
     }, done, function (x) {
       if (!/^\//.test(x.pattern || '')) return 'الگوی مسیر باید با / شروع شود.';
       if (x.redirect && !/^https?:\/\/\S+$/.test(x.redirect.url || '')) return 'آدرس مقصد ریدایرکت باید با http:// یا https:// شروع شود.';
-      return null;
+      return preloadProblem(x.preload);
     }, prSentence);
   }
   function renderPagerules(Aa) {
@@ -320,7 +485,18 @@
           P.copyable(ex, { block: true, label: 'کپی نمونه آدرس' }),
           h('p', { className: 'pcdn-muted' }, 'در HTML می‌توانید برای نمایشگرهای مختلف از ', ltr('srcset'), ' با عرض‌های متفاوت استفاده کنید.'))
       ]);
-      return c;
+      // WebP (SPEC §14.1) — independent of resizing; shown only when the controller knows the field.
+      var webp = null;
+      if (has(d, 'auto_webp')) {
+        webp = P.card({ title: 'فرمت WebP', icon: 'sparkles', id: 'webp' });
+        append(webp.body, [
+          P.toggle(d, 'auto_webp', 'تبدیل خودکار به WebP', { cls: 'pcdn-auto-webp',
+            help: 'اگر مرورگر بازدیدکننده WebP را پشتیبانی کند، تصاویر JPEG و PNG با فرمت WebP (معمولاً ۲۵ تا ۳۵ درصد کم‌حجم‌تر) تحویل داده می‌شوند و بقیه مرورگرها همان فایل اصلی را می‌گیرند. لازم نیست آدرس تصاویر را تغییر دهید.' }),
+          h('p', { className: 'pcdn-help' }, 'روی نودهایی که امکان تبدیل ندارند، کش بر اساس پشتیبانی مرورگر از WebP جدا نگه داشته می‌شود (مانند ', ltr('Vary: Accept'),
+            ')؛ پس اگر سرور اصلی خودش نسخه WebP می‌سازد، به هر مرورگر نسخه درست می‌رسد.')
+        ]);
+      }
+      return [c, webp];
     });
     return f.el;
   }
@@ -710,7 +886,18 @@
         d.origin_protocol === 'http' ? P.alertBox('info', ['اگر سرور اصلی (یا وردپرس) خودش به HTTPS ریدایرکت می‌کند، با این حالت خطای «تعداد ریدایرکت زیاد» می‌گیرید. ', Aa.tutLink('redirectloop', 'رفع حلقه ریدایرکت')]) : null,
         d.origin_protocol === 'https' ? P.toggle(d, 'origin_verify', 'بررسی اعتبار گواهی سرور اصلی', { help: 'اگر گواهی سرور اصلی خودامضا یا منقضی باشد، با روشن بودن این گزینه خطای ۵۰۲ می‌گیرید.' }) : null
       ]);
-      return c;
+      // HTTP/3 (SPEC §14.1) — shown only when the controller knows the field.
+      var h3 = null;
+      if (has(d, 'http3')) {
+        h3 = P.card({ title: 'HTTP/3', icon: 'rocket', id: 'http3', subtitle: 'نسل جدید پروتکل HTTP روی QUIC' });
+        append(h3.body, [
+          P.toggle(d, 'http3', 'HTTP/3 (QUIC)', { cls: 'pcdn-http3',
+            help: 'روی اینترنت موبایل و شبکه‌های ناپایدار، صفحات سریع‌تر و پایدارتر بارگذاری می‌شوند. مرورگرهایی که پشتیبانی می‌کنند خودکار از آن استفاده می‌کنند و بقیه مثل قبل با HTTP/2 وصل می‌شوند.' }),
+          h('p', { className: 'pcdn-help' }, 'فقط روی نودهایی اعمال می‌شود که HTTP/3 را پشتیبانی می‌کنند؛ نیازی به تغییر در سرور اصلی نیست.' +
+            (certOk ? '' : ' تا وقتی گواهی SSL فعال نشود اعمال نمی‌شود.'))
+        ]);
+      }
+      return [c, h3];
     });
 
     var custom;
@@ -828,7 +1015,8 @@
     guide: { what: 'CDN پاسخ‌های قابل کش (تصاویر، CSS، JS و ...) را نگه می‌دارد و بدون مراجعه به سرور شما تحویل می‌دهد.',
       when: 'همیشه روشن باشد. بعد از به‌روزرسانی سایت، آدرس فایل‌های تغییرکرده را پاکسازی کنید.',
       rec: 'سطح استاندارد، مدت کش CDN یک روز، و الگوی مناسب نوع سایت (برای وردپرس/ووکامرس: «فروشگاه اینترنتی»).',
-      mistakes: ['استفاده از سطح «تهاجمی» برای سایت‌هایی که کاربر واردشده دارند.', 'فراموش کردن خاموش کردن حالت توسعه.', 'روشن کردن «نادیده گرفتن Query String» در حالی که فایل‌ها با ‎?v= نسخه‌بندی شده‌اند.'],
+      mistakes: ['استفاده از سطح «تهاجمی» برای سایت‌هایی که کاربر واردشده دارند.', 'فراموش کردن خاموش کردن حالت توسعه.', 'روشن کردن «نادیده گرفتن Query String» در حالی که فایل‌ها با ‎?v= نسخه‌بندی شده‌اند.',
+        'روشن کردن «نسخه جدا برای موبایل و دسکتاپ» برای سایت واکنش‌گرا؛ نرخ کش بی‌دلیل نصف می‌شود.'],
       tut: 'cache' },
     render: renderCache
   });

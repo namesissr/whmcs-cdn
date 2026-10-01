@@ -200,6 +200,8 @@ final class Admin
                 return self::edgeBatch($post, $admin);
             case 'edge_edit':
                 return self::edgeEdit($post, $admin);
+            case 'edge_shield':
+                return self::edgeShield($post, $admin);
             case 'edge_toggle':
             case 'edge_rotate':
             case 'edge_delete':
@@ -489,6 +491,31 @@ final class Admin
         Pages::reset();
         return [[['ok', 'تنظیمات نود ' . View::ltr($name) . ' ذخیره شد (گروه ' . ($group === 'tunnel' ? 'تونل' : 'عمومی') . '، ظرفیت '
             . ($cap ? View::n($cap) . ' Mbps' : 'نامشخص') . ').']], []];
+    }
+
+    /** Origin-shield role of an edge (SPEC §14.1): PATCH /api/v1/edges/{id} with {"shield": bool}. */
+    private static function edgeShield(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $v = Env::input($post['shield'] ?? '');
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        if ($v !== '1' && $v !== '0') {
+            return [[['bad', 'مقدار Shield نامعتبر است.']], []];
+        }
+        $on = $v === '1';
+        try {
+            $r = Env::api(10)->request('PATCH', '/api/v1/edges/' . $id, ['shield' => $on]);
+        } catch (\Throwable $e) {
+            return [[['bad', View::e('تغییر Shield نود ناموفق بود: ' . $e->getMessage())]], []];
+        }
+        $name = is_array($r['edge'] ?? null) ? (string) ($r['edge']['name'] ?? '#' . $id) : '#' . $id;
+        Env::log('edge ' . $name . ' shield ' . ($on ? 'enabled' : 'disabled') . ' by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', $on
+            ? 'نود ' . View::ltr($name) . ' اکنون Shield است؛ سایت‌هایی که Origin Shield را روشن کرده‌اند فایل‌های کش‌نشده را از این نود می‌گیرند.'
+            : 'نقش Shield از نود ' . View::ltr($name) . ' برداشته شد.']], []];
     }
 
     private static function edgeAction(string $action, int $id, string $enabled, int $admin): array

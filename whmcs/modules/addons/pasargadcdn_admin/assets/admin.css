@@ -393,6 +393,27 @@
 .pcdna .pcdna-load-top { flex-wrap: wrap; }
 .pcdna .pcdna-load .pcdna-num { white-space: normal; }
 
+/* ---------- Wave 6A (§14.1): node capability badges + «Shield» switch */
+.pcdna .pcdna-caps { margin-top: 4px; }
+.pcdna .pcdna-caps .pcdna-badge { font-size: 11px; padding: 0 7px; line-height: 1.7; }
+.pcdna .pcdna-shield-cell { margin-top: 5px; }
+.pcdna .pcdna-shield-btn { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px 0 8px; border: 1px solid var(--a-border-strong); border-radius: 999px;
+  background: var(--a-surface); color: var(--a-text-2); font: inherit; font-size: 12px; font-weight: 600; line-height: 1; white-space: nowrap; cursor: pointer; }
+.pcdna .pcdna-shield-btn:hover { border-color: #94a3b8; background: var(--a-surface-2); }
+.pcdna .pcdna-shield-btn:focus-visible { outline: 0; box-shadow: 0 0 0 3px rgba(29, 95, 214, .3); }
+.pcdna .pcdna-shield-btn .pcdna-sw { position: relative; flex: none; width: 26px; height: 16px; border-radius: 99px; background: #cbd5e1; transition: background .15s; }
+.pcdna .pcdna-shield-btn .pcdna-sw::after { content: ''; position: absolute; top: 2px; right: 2px; width: 12px; height: 12px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .2); transition: transform .15s; }
+.pcdna .pcdna-shield-btn.is-on { border-color: #bfe6cc; background: var(--a-ok-50); color: var(--a-ok); }
+.pcdna .pcdna-shield-btn.is-on .pcdna-sw { background: var(--a-ok); }
+.pcdna .pcdna-shield-btn.is-on .pcdna-sw::after { transform: translateX(-10px); }
+.pcdna .pcdna-shield-btn[disabled] { opacity: .6; cursor: progress; }
+.pcdna .pcdna-perf-note { display: flex; gap: 6px; align-items: flex-start; margin: 12px 0 0; line-height: 1.8; }
+.pcdna .pcdna-perf-note .pcdna-icon { flex: none; width: 15px; height: 15px; margin-top: 4px; }
+@media (prefers-reduced-motion: reduce) {
+  .pcdna .pcdna-shield-btn .pcdna-sw, .pcdna .pcdna-shield-btn .pcdna-sw::after { transition: none; }
+}
+
 /* ---------- edge availability / uptime + node-health summary */
 .pcdna .pcdna-edges td.pcdna-uptime-cell { white-space: normal; min-width: 118px; }
 .pcdna .pcdna-uptime { display: flex; flex-direction: column; gap: 3px; }

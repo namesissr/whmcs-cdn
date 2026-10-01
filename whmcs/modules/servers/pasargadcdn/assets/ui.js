@@ -233,7 +233,11 @@
     action: 'اقدام', field: 'فیلد', op: 'عملگر', rule_id: 'شناسه قانون', health: 'بررسی سلامت', interval: 'فاصله',
     timeout: 'مهلت', expect: 'کدهای سالم', host: 'هاست', quality: 'کیفیت', max_width: 'حداکثر عرض', extensions: 'پسوندها',
     allowed_referers: 'دامنه‌های مجاز', bypass_cookies: 'کوکی‌های عبور از کش', threshold_rps: 'آستانه', clearance_ttl: 'اعتبار مجوز',
-    max_age: 'max-age', hsts: 'HSTS', cert: 'گواهی', key: 'کلید خصوصی', zone: 'فایل زون', paranoia: 'سطح حساسیت', groups: 'گروه‌ها'
+    max_age: 'max-age', hsts: 'HSTS', cert: 'گواهی', key: 'کلید خصوصی', zone: 'فایل زون', paranoia: 'سطح حساسیت', groups: 'گروه‌ها',
+    // Wave 6A (SPEC §14.1)
+    stale_while_revalidate: 'به‌روزرسانی در پس‌زمینه', stale_if_error: 'نسخه قدیمی هنگام خطای سرور اصلی', shield: 'Origin Shield',
+    key_device: 'نسخه جدا برای موبایل', key_cookies: 'کوکی‌های کلید کش', key_query_allow: 'پارامترهای مجاز کلید کش',
+    http3: 'HTTP/3', auto_webp: 'تبدیل خودکار به WebP', preload: 'Preload', as: 'نوع منبع'
   };
   /** Controller errors → {summary, items:[{path, label, msg}]}. */
   function parseErrors(data, status) {

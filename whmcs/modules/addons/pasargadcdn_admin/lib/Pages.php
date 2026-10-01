@@ -561,6 +561,87 @@ final class Pages
             . '" role="img" aria-label="نمودار در دسترس‌بودن ۳۰ روز اخیر" preserveAspectRatio="none">' . $bars . '</svg>';
     }
 
+    /** Node capabilities reported in the heartbeat (SPEC §14.1): key => [badge, tooltip]. */
+    const EDGE_CAPS = [
+        'http3' => ['HTTP/3', 'این نود HTTP/3 (QUIC) را پشتیبانی می‌کند'],
+        'early_hints' => ['Early Hints', 'این نود پاسخ 103 Early Hints را برای Preload پشتیبانی می‌کند'],
+        'webp_convert' => ['WebP', 'این نود تصاویر JPEG/PNG را خودش به WebP تبدیل می‌کند'],
+    ];
+
+    /**
+     * Capability badges of a node (HTTP/3, Early Hints, WebP) from `capabilities` (SPEC §14.1). An older
+     * controller/agent that reports no capabilities renders nothing; loaded nginx modules go in the tooltip.
+     */
+    public static function edgeCapBadges(array $e): string
+    {
+        $c = is_array($e['capabilities'] ?? null) ? $e['capabilities'] : null;
+        if ($c === null || !array_intersect_key(self::EDGE_CAPS, $c)) {
+            return '';  // not reported yet (or an older agent/controller): show nothing rather than guess
+        }
+        $b = '';
+        foreach (self::EDGE_CAPS as $k => [$label, $tip]) {
+            if (($c[$k] ?? false) === true) {
+                $b .= View::badge($label, 'brand', ' title="' . View::e($tip) . '" data-cap="' . $k . '"');
+            }
+        }
+        if ($b === '') {
+            $b = '<span class="pcdna-small pcdna-muted" data-cap="none" title="این نود HTTP/3، Early Hints یا تبدیل WebP را گزارش نکرده است">بدون HTTP/3</span>';
+        }
+        $mods = [];
+        foreach ((array) ($c['modules'] ?? []) as $m) {
+            if (is_string($m) && preg_match('/^[A-Za-z0-9_.-]{1,64}$/', $m)) {
+                $mods[] = $m;
+            }
+        }
+        return '<div class="pcdna-badges pcdna-caps"' . ($mods ? ' title="' . View::e('ماژول‌های nginx: ' . implode('، ', array_slice($mods, 0, 30))) . '"' : '') . '>' . $b . '</div>';
+    }
+
+    /**
+     * «Shield» switch of a node (SPEC §14.1): a CSRF-protected POST (edge_shield) → PATCH /api/v1/edges/{id} {shield}.
+     * Rendered only when the controller reports the `shield` field (older controllers don't know it).
+     */
+    private static function edgeShieldToggle(array $e, int $id): string
+    {
+        $on = !empty($e['shield']);
+        $name = (string) ($e['name'] ?? ('#' . $id));
+        $confirm = $on
+            ? 'نقش Shield از نود «' . $name . '» برداشته شود؟ سایت‌هایی که Origin Shield دارند از نودهای Shield دیگر یا در نبود آن‌ها مستقیم از سرور اصلی استفاده می‌کنند.'
+            : 'نود «' . $name . '» به‌عنوان Shield (لایه کش میانی جلوی سرور اصلی) استفاده شود؟ برای سایت‌هایی که Origin Shield را روشن کرده‌اند، نودهای دیگر فایل‌های کش‌نشده را از این نود می‌گیرند.';
+        return '<form method="post" action="' . View::url(['page' => 'edges']) . '" class="pcdna-inline pcdna-shield-form" data-confirm="' . View::e($confirm) . '">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_shield"><input type="hidden" name="id" value="' . $id . '">'
+            . '<input type="hidden" name="shield" value="' . ($on ? '0' : '1') . '">'
+            . '<button type="submit" class="pcdna-shield-btn' . ($on ? ' is-on' : '') . '" role="switch" aria-checked="' . ($on ? 'true' : 'false') . '"'
+            . ' aria-label="' . View::e('Shield نود ' . $name) . '" title="' . ($on ? 'Shield روشن است؛ برای خاموش کردن کلیک کنید' : 'Shield خاموش است؛ برای روشن کردن کلیک کنید') . '">'
+            . '<span class="pcdna-sw" aria-hidden="true"></span><span>Shield</span></button></form>';
+    }
+
+    /** Explanation under the edges table: what «Shield» does + how many shield nodes are live (SPEC §14.1). */
+    private static function edgePerfNote(array $edges): string
+    {
+        $known = false;
+        $shields = 0;
+        $online = 0;
+        foreach ($edges as $e) {
+            if (!is_array($e) || !array_key_exists('shield', $e)) {
+                continue;
+            }
+            $known = true;
+            if (!empty($e['shield']) && !empty($e['enabled'])) {
+                $shields++;
+                $online += self::edgeOnline($e) ? 1 : 0;
+            }
+        }
+        if (!$known) {
+            return '';
+        }
+        $state = $shields > 0
+            ? 'اکنون ' . View::n($shields) . ' نود Shield فعال است (' . View::n($online) . ' آنلاین).'
+            : 'هنوز نود Shield فعالی وجود ندارد، پس گزینهٔ Origin Shield سایت‌ها فعلاً اثری ندارد.';
+        return '<p class="pcdna-small pcdna-muted pcdna-perf-note" data-shield-count="' . $shields . '">' . View::icon('info')
+            . '<span><b>Shield:</b> نودی که Shield باشد، لایهٔ کش میانی جلوی سرور اصلی سایت‌هایی است که «Origin Shield» را روشن کرده‌اند؛ نودهای دیگر فایل‌های کش‌نشده را از آن می‌گیرند و اگر هیچ نود Shield در دسترس نباشد، مستقیم سراغ سرور اصلی می‌روند. '
+            . $state . ' نشان‌های HTTP/3، Early Hints و WebP از آخرین گزارش هر نود خوانده می‌شوند.</span></p>';
+    }
+
     /** Health-warning badges for an edge row (disk/memory/high load) surfaced from the latest heartbeat. */
     private static function edgeWarnBadges(array $e): string
     {
@@ -602,12 +683,17 @@ final class Pages
             $err = trim((string) ($e['last_error'] ?? ''));
             [$gl, $gt] = self::EDGE_GROUPS[$e['group'] ?? 'general'] ?? [(string) ($e['group'] ?? ''), 'muted'];
             $id = (int) ($e['id'] ?? 0);
+            $shieldKnown = array_key_exists('shield', $e);
             $h .= '<tr data-edge="' . $id . '"' . (!empty($e['enabled']) && !$online && !$fresh ? ' class="is-bad"' : '') . ($err !== '' ? ' data-has-error="1"' : '')
-                . (!empty($e['shed']) ? ' data-shed="1"' : '') . '><td><strong>' . View::ltr($e['name'] ?? '') . '</strong>'
-                . '<div class="pcdna-small pcdna-muted">' . View::ltr($e['ipv4'] ?? '') . (!empty($e['ipv6']) ? '<br>' . View::ltr($e['ipv6']) : '') . '</div></td>'
+                . (!empty($e['shed']) ? ' data-shed="1"' : '') . (!empty($e['shield']) ? ' data-shield="1"' : '') . '><td><strong>' . View::ltr($e['name'] ?? '') . '</strong>'
+                . '<div class="pcdna-small pcdna-muted">' . View::ltr($e['ipv4'] ?? '') . (!empty($e['ipv6']) ? '<br>' . View::ltr($e['ipv6']) : '') . '</div>'
+                . ($actions ? self::edgeCapBadges($e) : '') . '</td>'
                 . '<td><span class="pcdna-badges">' . (($e['region'] ?? '') === 'home' ? View::badge('ایران', 'brand') : View::badge('خارج', 'violet'))
                 . View::badge($gl, $gt === 'violet' ? 'violet' : 'muted', ' data-group="' . View::e($e['group'] ?? 'general') . '"') . '</span></td>'
-                . '<td>' . $status . self::edgeWarnBadges($e) . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
+                // «Shield» (SPEC §14.1) sits under the status badge: the status column has room, the group column does not.
+                . '<td>' . $status . (!$actions && !empty($e['shield']) ? ' ' . View::badge('Shield', 'ok', ' title="لایهٔ کش میانی (Origin Shield)"') : '')
+                . ($actions && $shieldKnown ? '<div class="pcdna-shield-cell">' . self::edgeShieldToggle($e, $id) . '</div>' : '')
+                . self::edgeWarnBadges($e) . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
                 . '<td class="pcdna-uptime-cell">' . self::uptimeCell($e, $series[$id] ?? null) . '</td>'
                 . '<td title="' . View::e($e['last_seen_at'] ?? '') . '">' . View::e(View::ago($e['last_seen_at'] ?? null))
                 . (!empty($e['applied_version']) ? '<div class="pcdna-small pcdna-muted" title="نسخه تنظیمات اعمال‌شده">' . View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') . '</div>' : '')
@@ -1061,7 +1147,8 @@ final class Pages
             $h .= View::card('گروه‌های نود', self::groupCards($edges), '', '', 'activity');
         }
         $h .= View::card('نودهای CDN' . ($edges !== null ? ' (' . View::n($online) . ' آنلاین از ' . View::n(count($edges)) . ')' : ''),
-            $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error'])) : self::edgeTable($edges, true, $series, $bundle, $ctlUrl),
+            $edges === null ? View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error']))
+                : self::edgeTable($edges, true, $series, $bundle, $ctlUrl) . self::edgePerfNote($edges),
             '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'edges', 'view' => 'availability']) . '">' . View::icon('activity') . '<span>گزارش در دسترس‌بودن</span></a>',
             'pcdna-flush', 'server');
 

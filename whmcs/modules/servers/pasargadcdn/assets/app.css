@@ -1021,6 +1021,16 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 #pcdn-app.pc-narrow .pcdn-hrow { grid-template-columns: minmax(0, 1fr) auto auto; }
 #pcdn-app.pc-narrow .pcdn-hrow > :nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-xrow .pcdn-ferr, :is(#pcdn-app, #pcdn-layer) .pcdn-hrow .pcdn-ferr, :is(#pcdn-app, #pcdn-layer) .pcdn-origin .pcdn-ferr { grid-column: 1 / -1; }
+/* Wave 6A (§14.1): page-rule preload rows (url · type · delete), shield note, cache-key conflict slot */
+:is(#pcdn-app, #pcdn-layer) .pcdn-plrow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 150px) auto; gap: 8px; align-items: center; }
+@media (max-width: 480px) {
+  :is(#pcdn-app, #pcdn-layer) .pcdn-plrow { grid-template-columns: minmax(0, 1fr) auto; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-plrow > :first-child { grid-column: 1 / -1; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-plrow + .pcdn-plrow { padding-top: 8px; border-top: 1px dashed var(--pc-border); }
+}
+:is(#pcdn-app, #pcdn-layer) .pcdn-shield-note { display: flex; gap: 6px; align-items: flex-start; margin: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-shield-note .pcdn-icon { flex: none; margin-top: 3px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-key-conflict:empty { display: none; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-origins { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
 :is(#pcdn-app, #pcdn-layer).pcdn .pcdn-origins > .pcdn-btn { align-self: flex-start; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-origin { display: grid; grid-template-columns: minmax(0, 2fr) 90px 80px 80px 34px; gap: 8px; align-items: center; }
