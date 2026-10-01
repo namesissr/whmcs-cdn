@@ -32,6 +32,8 @@ def make_cfg(tmp_path, **over):
         "NGINX_RELOAD_CMD": "true",
         "NGINX_USER": "root",
         "RELOAD_VERIFY": "no",  # no real nginx to poll /__pcdn/confver in unit tests
+        # deterministic capabilities: today's distro build (nginx 1.24, all modules, no HTTP/3)
+        "NGINX_CAPS": dict(agent.LEGACY_CAPS, nginx="1.24.0"),
     })
     cfg.update(over)
     return cfg
@@ -644,16 +646,31 @@ def test_suspended_tunnel_cut_paths(tmp_path):
     assert "proxy_pass" not in text
 
 
-def test_sysctl_heredoc(tmp_path):
+def _sysctl_kv(tmp_path, tcp_cc):
+    """Run install.sh's sysctl heredoc (it expands ${TCP_CC}) and parse what it writes."""
     install = (HERE.parent / "install.sh").read_text()
-    block = install.split("# >>> pcdn sysctl", 1)[1].split("# <<< pcdn sysctl", 1)[0]
-    body = block.split("<<'EOF'", 1)[1].split("\nEOF", 1)[0]
+    block = install.split("# >>> pcdn sysctl", 1)[1].split("\n", 1)[1].split("# <<< pcdn sysctl", 1)[0]
+    out = tmp_path / f"999-pcdn-{tcp_cc}.conf"
+    subprocess.run(["bash", "-euc", block.replace("/etc/sysctl.d/999-pcdn.conf", str(out))],
+                   check=True, env={"TCP_CC": tcp_cc, "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
     kv = {}
-    for line in body.splitlines():
+    for line in out.read_text().splitlines():
         if "=" in line and not line.strip().startswith("#"):
             k, v = line.split("=", 1)
             kv[k.strip()] = v.strip()
+    return kv
+
+
+def test_sysctl_heredoc(tmp_path):
+    install = (HERE.parent / "install.sh").read_text()
+    kv = _sysctl_kv(tmp_path, "bbr")
     assert kv["net.ipv4.tcp_congestion_control"] == "bbr" and kv["net.core.default_qdisc"] == "fq"
+    # SPEC §14.1 --cc: the heredoc writes the chosen algorithm; nothing else in it is expanded
+    cubic = _sysctl_kv(tmp_path, "cubic")
+    assert cubic["net.ipv4.tcp_congestion_control"] == "cubic"
+    assert {k: v for k, v in cubic.items() if k != "net.ipv4.tcp_congestion_control"} == \
+        {k: v for k, v in kv.items() if k != "net.ipv4.tcp_congestion_control"}
+    assert 'TCP_CC="${TCP_CC:-bbr}"' in install and "--cc must be bbr or cubic" in install
     assert kv["net.core.somaxconn"] == "65535" and kv["net.ipv4.tcp_keepalive_time"] == "300"
     assert kv["fs.file-max"] == "9223372036854775807" and "fs.nr_open" not in kv          # F31
     assert kv["net.ipv4.ip_local_port_range"] == "10240 65535"                            # F18: not widened
@@ -854,3 +871,539 @@ def test_bundle_version_from_file_and_fallback(tmp_path):
     vf = tmp_path / "bundle.version"
     vf.write_text("deadbeef1234\n")
     assert agent.bundle_version(cfg) == "deadbeef1234"
+
+
+# ----------------------------------------------------------------- Wave 6A: edge performance & cache (SPEC §14.1)
+
+V_UBUNTU = """nginx version: nginx/1.24.0 (Ubuntu)
+built with OpenSSL 3.0.13 30 Jan 2024
+TLS SNI support enabled
+configure arguments: --with-cc-opt='-g -O2' --prefix=/usr/share/nginx --conf-path=/etc/nginx/nginx.conf --modules-path=/usr/lib/nginx/modules --with-http_ssl_module --with-http_v2_module --with-http_geoip_module=dynamic --with-http_image_filter_module=dynamic --with-stream=dynamic
+"""
+V_NGINX_ORG = """nginx version: nginx/1.29.1
+built by gcc 13.2.0 (Ubuntu 13.2.0-23ubuntu4)
+built with OpenSSL 3.0.13 30 Jan 2024
+TLS SNI support enabled
+configure arguments: --prefix=/etc/nginx --sbin-path=/usr/sbin/nginx --modules-path=/usr/lib/nginx/modules --conf-path=/etc/nginx/nginx.conf --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-stream --with-cc-opt='-g -O2'
+"""
+
+
+def caps_cfg(tmp_path, **kw):
+    """make_cfg with capability overrides (lower-case keys) and cfg overrides (UPPER-CASE keys)."""
+    over = {k: v for k, v in kw.items() if k.isupper()}
+    caps = dict(agent.LEGACY_CAPS, nginx="1.24.0")
+    caps.update({k: v for k, v in kw.items() if not k.isupper()})
+    return make_cfg(tmp_path, NGINX_CAPS=caps, **over)
+
+
+H3 = {"nginx": "1.29.1", "http3": True, "early_hints": True, "http2_directive": True}
+
+
+def directives(text):
+    """Config text without comment lines (the template documents the directives it guards)."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+ORG_MODULES = ["image_filter", "njs"]
+
+
+def test_parse_nginx_v_capabilities():
+    present = {"/usr/lib/nginx/modules/" + so for so in agent.MODULE_FILES.values()}
+    c = agent.parse_nginx_v(V_UBUNTU, exists=lambda p: p in present)
+    assert c["nginx"] == "1.24.0" and c["http3"] is False and c["early_hints"] is False
+    assert c["http2_directive"] is False and c["webp_convert"] is False and c["webp_mode"] == "accept_key"
+    assert c["modules"] == ["brotli", "geoip2", "image_filter", "njs"]
+    # nginx.org mainline: HTTP/3 + early hints, only njs / image-filter module files present
+    org = {"/usr/lib/nginx/modules/ngx_http_js_module.so", "/usr/lib/nginx/modules/ngx_http_image_filter_module.so"}
+    c = agent.parse_nginx_v(V_NGINX_ORG, exists=lambda p: p in org)
+    assert c["nginx"] == "1.29.1" and c["http3"] and c["early_hints"] and c["http2_directive"]
+    assert c["modules"] == ORG_MODULES
+    # http3 needs the module AND >= 1.25.1; early_hints >= 1.29.0
+    v3 = lambda ver: V_NGINX_ORG.replace("nginx/1.29.1", f"nginx/{ver}")  # noqa: E731
+    assert not agent.parse_nginx_v(v3("1.25.0"), exists=lambda p: False)["http3"]
+    c = agent.parse_nginx_v(v3("1.27.4"), exists=lambda p: False)
+    assert c["http3"] and not c["early_hints"]
+    assert agent.parse_nginx_v(v3("1.29.0"), exists=lambda p: False)["early_hints"]
+    no_v3 = agent.parse_nginx_v(V_NGINX_ORG.replace(" --with-http_v3_module", ""), exists=lambda p: False)
+    assert not no_v3["http3"] and no_v3["early_hints"]
+    # a lookalike flag is not the module
+    assert not agent.parse_nginx_v(V_NGINX_ORG.replace("--with-http_v3_module", "--with-http_v3_modulex"),
+                                   exists=lambda p: False)["http3"]
+    # statically compiled modules count without a .so; =dynamic needs the file
+    static = V_UBUNTU.replace("--with-http_image_filter_module=dynamic",
+                              "--with-http_image_filter_module --add-module=/build/ngx_brotli")
+    assert agent.parse_nginx_v(static, exists=lambda p: False)["modules"] == ["brotli", "image_filter"]
+    assert agent.parse_nginx_v(V_UBUNTU, exists=lambda p: False)["modules"] == []
+    # an explicit modules dir wins over --modules-path
+    c = agent.parse_nginx_v(V_UBUNTU, "/opt/mods", exists=lambda p: p == "/opt/mods/ngx_http_js_module.so")
+    assert c["modules"] == ["njs"]
+    # unparseable output (nginx missing): today's distro build is assumed
+    assert agent.parse_nginx_v("") == dict(agent.LEGACY_CAPS)
+
+
+def test_nginx_capabilities_probed_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "_CAPS_CACHE", {})
+    calls, fake = tmp_path / "calls", tmp_path / "nginx"
+    out = tmp_path / "v.txt"
+    out.write_text(V_NGINX_ORG)
+    fake.write_text(f"#!/bin/sh\necho x >> {calls}\ncat {out} >&2\n")
+    fake.chmod(0o755)
+    (tmp_path / "mods").mkdir()
+    (tmp_path / "mods/ngx_http_js_module.so").write_bytes(b"")
+    cfg = dict(agent.DEFAULTS, NGINX_BIN=str(fake), NGINX_MODULES_DIR=str(tmp_path / "mods"))
+    for _ in range(3):
+        c = agent.nginx_capabilities(cfg)
+    assert calls.read_text().count("x") == 1                      # once per agent start
+    assert c["http3"] and c["modules"] == ["njs"] and agent.has_module(cfg, "njs")
+    assert not agent.has_module(cfg, "geoip2")
+    # nginx not installed / not runnable -> legacy assumption, never an exception
+    assert agent.nginx_capabilities(dict(cfg, NGINX_BIN=str(tmp_path / "nope")))["modules"] == sorted(agent.MODULE_FILES)
+    # the capabilities are part of render_rev: an nginx swap (install.sh --http3) forces a re-render
+    a, b = caps_cfg(tmp_path), caps_cfg(tmp_path, **H3)
+    assert agent.render_rev(a) != agent.render_rev(b) and agent.render_rev(a) == agent.render_rev(caps_cfg(tmp_path))
+
+
+def test_heartbeat_reports_capabilities(tmp_path):
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg = caps_cfg(tmp_path, modules=ORG_MODULES, **H3)
+    body = a._hb(applied_version="v1")
+    assert body["capabilities"] == {"http3": True, "early_hints": True, "webp_convert": False,
+                                    "webp_mode": "accept_key", "modules": ORG_MODULES, "nginx": "1.29.1"}
+    json.dumps(body)
+
+
+def h3_site(cert, key, **over):
+    return dict(SITE, hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}],
+                ssl={"cert": cert, "key": key}, **over)
+
+
+def test_http3_rendered_only_when_capable_and_enabled(tmp_path):
+    cert, key = self_signed(tmp_path)
+    site = h3_site(cert, key)
+    alt = "add_header Alt-Svc 'h3=\":443\"; ma=86400' always;"
+    # capable node: default server owns `quic reuseport`, sites add plain `quic` + http3 + Alt-Svc
+    cfg = caps_cfg(tmp_path, **H3)
+    http = agent.render_http(cfg)
+    assert "    listen 443 quic default_server reuseport;\n    listen [::]:443 quic default_server reuseport;" in http
+    assert "listen 443 ssl default_server reuseport" in http and "http2 on;" in http and "ssl http2" not in http
+    text, _ = agent.render_site(site, cfg)
+    assert "    listen 443 ssl;\n    listen [::]:443 ssl;\n    http2 on;\n    listen 443 quic;\n" \
+           "    listen [::]:443 quic;\n    http3 on;\n    " + alt in text
+    assert text.count("quic reuseport") == 0
+    loc = text.split("    location / {", 1)[1]
+    assert alt in loc                       # locations with add_header repeat it (no inheritance)
+    # IPv6 off: no [::] quic listener
+    assert "[::]" not in agent.render_http(caps_cfg(tmp_path, LISTEN_IPV6="no", **H3))
+    # site toggle off (in the ssl section the edge receives as ssl_options)
+    off, _ = agent.render_site(dict(site, ssl_options=dict(SITE["ssl_options"], http3=False)), cfg)
+    assert not re.search(r" quic[ ;]|http3 on|Alt-Svc", off) and "http2 on;" in off
+    # a site without a certificate never gets h3
+    nocert, _ = agent.render_site(dict(site, ssl=None), cfg)
+    assert not re.search(r" quic[ ;]|http3 on|Alt-Svc", nocert)
+    # non-capable node (nginx 1.24): nothing h3-related anywhere, listen ... http2 as before
+    legacy = caps_cfg(tmp_path)
+    t2, _ = agent.render_site(site, legacy)
+    http2 = directives(agent.render_http(legacy))
+    for s in (t2, http2):
+        assert not re.search(r" quic[ ;]|http3 on|\$http3|Alt-Svc|http2 on", s)
+    assert "listen 443 ssl http2;" in t2 and "listen 443 ssl http2 default_server" in http2
+    assert "{{" not in http and "{{" not in http2
+
+
+def test_module_guards(tmp_path):
+    db = tmp_path / "geo.mmdb"
+    db.write_bytes(b"x")
+    site = dict(SITE, tunnel=TUNNEL, pools=POOLS, image={"enabled": True},
+                hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}])
+    full = caps_cfg(tmp_path, GEOIP_DB=str(db))
+    http = agent.render_http(full)
+    assert "geoip2 " in http and "brotli on;" in http and "js_import" in http and "image_filter resize" in http
+    assert not re.search(r"^# @(?:if|else|endif) ", http, re.M)     # every guard resolved
+    text, _ = agent.render_site(site, full)
+    assert "brotli off;" in text and "js_content pcdn.deny" in text and "/__pcdn/img/" in text
+    assert "$pcdn_tcc_7" in text
+    # nginx.org build: njs + image_filter only. GeoIP DB present but no module -> no geoip2 directives
+    # and the tunnel country gate fails open; no brotli directives anywhere
+    org = caps_cfg(tmp_path, GEOIP_DB=str(db), modules=ORG_MODULES)
+    assert not agent.geoip_present(org)
+    http = directives(agent.render_http(org))
+    assert "geoip2" not in http and "map $host $pcdn_country" in http and "brotli" not in http
+    assert "js_import" in http and "image_filter resize" in http
+    text, _ = agent.render_site(site, org)
+    assert "brotli" not in text and "$pcdn_tcc_7" not in text and "js_content pcdn.deny" in text
+    # nothing optional at all: njs fallbacks keep the variables defined, no js_* / image_filter
+    bare = caps_cfg(tmp_path, modules=[])
+    http = directives(agent.render_http(bare))
+    assert "js_" not in http and "image_filter" not in http and "brotli" not in http
+    assert "map $uri $pcdn_verdict {\n    default \"ok\";\n}" in http
+    text, _ = agent.render_site(site, bare)
+    assert "js_content" not in text and "location ^~ /__pcdn/deny/ { internal; return 403; }" in text
+    assert "/__pcdn/img/" not in text and "$pcdn_img_w" not in text
+
+
+@pytest.mark.skipif(shutil.which("nginx") is None, reason="nginx not installed")
+@pytest.mark.parametrize("mods", [ORG_MODULES, []])
+def test_nginx_accepts_config_without_optional_modules(tmp_path, mods):
+    """nginx.org-like build (njs + image_filter, no geoip2 / brotli) and a build with no optional
+    module at all both pass a real `nginx -t` with everything enabled."""
+    from conftest import nginx_conf, modules_available
+    if not modules_available():
+        pytest.skip("nginx dynamic modules not installed")
+    cert, key = self_signed(tmp_path)
+    db = tmp_path / "geo.mmdb"
+    db.write_bytes(b"x")  # a DB without the module must not render geoip2
+    cfg = caps_cfg(tmp_path, LISTEN_IPV6="no", HTTP_PORT="18880", HTTPS_PORT="18843", GEOIP_DB=str(db), modules=mods)
+    site = dict(SITE, hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": None}},
+                             {"name": "lb.example.com", "origin": {"pool": "main"}}],
+                ssl={"cert": cert, "key": key}, pools=POOLS, tunnel=TUNNEL, image={"enabled": True, "auto_webp": True},
+                errorpages={"5xx": "<h1>down</h1>"},
+                cache=dict(SITE["cache"], shield=True, key_device=True, key_cookies=["lang"]),
+                pagerules={"rules": [{"id": "p", "pattern": "/", "preload": [{"url": "/a.css", "as": "style"}]}]})
+    shield = {"self": False, "peers": ["10.0.0.1"], "secret": "ab" * 16}
+    assert agent.apply_config({"sites": [site], "shield": shield}, cfg) is None
+    so = {"njs": "ngx_http_js_module.so", "image_filter": "ngx_http_image_filter_module.so"}
+    conf = nginx_conf(tmp_path, cfg, modules=[so[m] for m in mods])
+    p = subprocess.run(["nginx", "-t", "-c", str(conf)], capture_output=True, text=True)
+    assert p.returncode == 0 and "[warn]" not in p.stderr, p.stderr
+
+
+SHIELD_SECRET = "0123456789abcdef" * 2
+
+
+def shield_site(**cache):
+    return dict(SITE, hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}],
+                cache=dict(SITE["cache"], shield=True, **cache), errorpages={"5xx": "<h1>down</h1>", "4xx": "<h1>no</h1>"},
+                pagerules={"rules": [{"id": "p1", "pattern": "/wp-admin/*", "cache": "bypass"}]})
+
+
+def test_norm_shield():
+    ok = {"self": False, "peers": ["10.0.0.2", "10.0.0.1", "10.0.0.1", "2001:DB8::1", "x; evil", "0.0.0.0", 5],
+          "secret": SHIELD_SECRET.upper()}
+    assert agent.norm_shield({"shield": ok}) == {"self": False, "peers": ["10.0.0.1", "10.0.0.2", "[2001:db8::1]"],
+                                                 "secret": SHIELD_SECRET}
+    assert agent.norm_shield({}) is None and agent.norm_shield({"shield": "x"}) is None
+    assert agent.norm_shield({"shield": dict(ok, secret="short")}) is None
+    assert agent.norm_shield({"shield": dict(ok, secret='a"; }')}) is None
+    assert agent.norm_shield({"shield": dict(ok, peers=[])}) is None       # nothing to send misses to
+    # a shield never re-shields: its peers are ignored
+    assert agent.norm_shield({"shield": dict(ok, self=True)}) == {"self": True, "peers": [], "secret": SHIELD_SECRET}
+
+
+def test_shield_render_edge_node(tmp_path):
+    cfg = make_cfg(tmp_path, SHIELD_HTTPS_PORT="8443")
+    cert, key = self_signed(tmp_path)
+    tls = dict(shield_site(), id=9, domain="tls.example.com", ssl={"cert": cert, "key": key},
+               hosts=[{"name": "tls.example.com", "origin": {"address": "127.0.0.1", "port": 18080}}])
+    config = {"sites": [shield_site(), dict(SITE, id=8, domain="b.com", hosts=[{"name": "b.com", "origin": "1.1.1.1"}]),
+                        tls],
+              "shield": {"self": False, "peers": ["10.0.0.2", "10.0.0.1"], "secret": SHIELD_SECRET}}
+    files = agent.render_all(config, cfg)
+    sh = files["shield.conf"]
+    # the hop is TLS only: one upstream, on the peers' HTTPS port
+    assert "upstream pcdn_shield_https {\n    hash $pcdn_ck consistent;\n    server 10.0.0.1:8443 max_fails=1 " in sh
+    assert "pcdn_shield_http " not in sh and ":80 " not in sh
+    assert f'geo $pcdn_shield_secret {{\n    default "{SHIELD_SECRET}";\n}}' in sh
+    assert "$pcdn_shield_ok" in sh and "pcdn_gate" not in sh
+    assert f"include {cfg['NGINX_DIR']}/shield.conf;" in files["http.conf"]
+    # an HTTP-only site (no certificate) never shields: straight to the origin, no secret sent
+    plain = files["sites/7.conf"]
+    assert "pcdn_shield" not in plain and "$pcdn_sh_skip" not in plain and "@pcdn_origin_" not in plain
+    assert plain.count('proxy_set_header X-Pcdn-Shield "";') == plain.count("proxy_pass $pcdn_proto://$pcdn_target;")
+    # a site with a certificate hops over TLS, verified against $host
+    text = files["sites/9.conf"]
+    for f in files.values():
+        assert SHIELD_SECRET not in f or f is sh                             # only in the 0600 file
+    static = text.split("    location ~* \\.(?:css", 1)[1].split("\n    }\n", 1)[0]
+    assert "if ($pcdn_sh_skip) { return 418; }" in static
+    assert 'set $pcdn_ck "$scheme://$host$request_uri";' in static
+    assert "proxy_set_header X-Pcdn-Shield $pcdn_shield_secret;" in static
+    assert "proxy_set_header Host $host;" in static                          # Host preserved
+    assert "error_page 418 502 504 = @pcdn_origin_" in static and "proxy_intercept_errors off;" in static
+    assert "error_page 500 503 /__pcdn/err/5xx.html;" in static              # custom pages kept
+    assert "error_page 400 403 404 405 410 /__pcdn/err/4xx.html;" in static
+    assert "proxy_hide_header X-Cache;" in static and "proxy_hide_header X-Served-By;" in static
+    assert "proxy_hide_header Strict-Transport-Security;" in static
+    assert "proxy_pass https://pcdn_shield_https;" in static and "proxy_ssl_verify on;" in static
+    assert f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};" in static and "proxy_ssl_name $host;" in static
+    assert "proxy_cache pcdn_9;" in static and "proxy_cache_key $scheme://$host$request_uri;" in static
+    name = re.search(r"error_page 418 502 504 = (@pcdn_origin_\d+);", static).group(1)
+    fb = text.split(f"    location {name} {{", 1)[1].split("\n    }\n", 1)[0]
+    assert 'proxy_set_header X-Pcdn-Shield "";' in fb and "proxy_pass $pcdn_proto://$pcdn_target;" in fb
+    assert "proxy_cache pcdn_9;" in fb and "pcdn_shield" not in fb
+    # a bypass page rule is never shielded; the dynamic catch-all is
+    wp = text.split('location ~ "^/wp\\-admin/.*$" {', 1)[1].split("\n    }\n", 1)[0]
+    assert "pcdn_shield" not in wp and 'proxy_set_header X-Pcdn-Shield "";' in wp
+    assert text.count("proxy_pass https://pcdn_shield_https;") == 2
+    # a site without cache.shield only strips the header
+    other = files["sites/8.conf"]
+    assert "pcdn_shield" not in other and 'proxy_set_header X-Pcdn-Shield "";' in other
+    # the file holding the secret is root-only
+    agent.write_tree(str(tmp_path / "tree"), files)
+    assert oct((tmp_path / "tree/shield.conf").stat().st_mode & 0o777) == "0o600"
+    # a customer request header can never set or clear the shield header
+    s2, _ = agent.render_site(dict(tls, headers={"request": [{"name": "X-Pcdn-Shield", "value": "x"}]}),
+                              cfg, agent.norm_shield(config))
+    assert 'X-Pcdn-Shield "x"' not in s2 and "pcdn_shield_https" in s2
+    # cache off -> never shielded
+    s3, _ = agent.render_site(dict(tls, cache=dict(SITE["cache"], enabled=False, shield=True)),
+                              cfg, agent.norm_shield(config))
+    assert "pcdn_shield" not in s3
+
+
+def test_shield_render_shield_node(tmp_path):
+    cfg = make_cfg(tmp_path)
+    config = {"sites": [shield_site()], "shield": {"self": True, "peers": ["10.0.0.1"], "secret": SHIELD_SECRET}}
+    files = agent.render_all(config, cfg)
+    sh = files["shield.conf"]
+    # accepted only over TLS: a valid header on a plain-HTTP connection is an ordinary visitor
+    assert f'map "$https:$http_x_pcdn_shield" $pcdn_shield_ok {{\n    default 0;\n    "on:{SHIELD_SECRET}" 1;\n}}' in sh
+    assert "upstream" not in sh and "$pcdn_gate" in sh and "$pcdn_log_ok" in sh
+    text = files["sites/7.conf"]
+    assert "pcdn_shield_https" not in text and "$pcdn_sh_skip" not in text   # never re-shields
+    # valid hops skip the verdict and the access log; visitor address/scheme come from the edge
+    assert 'if ($pcdn_gate !~ "^(?:ok|log:)") { rewrite ^ /__pcdn/deny/$pcdn_gate? last; }' in text
+    assert "pcdn buffer=64k flush=1s if=$pcdn_log_ok;" in text
+    assert "proxy_set_header X-Real-IP $pcdn_client_ip;" in text and "proxy_set_header X-Forwarded-For $pcdn_xff;" in text
+    assert "proxy_set_header X-Forwarded-Proto $pcdn_scheme;" in text
+    assert 'proxy_set_header X-Pcdn-Shield "";' in text               # stripped before the origin
+    assert "proxy_cache_key $pcdn_scheme://$host$request_uri;" in text
+    assert SHIELD_SECRET not in text
+    # no shield section -> no shield.conf, today's rendering (digest-stable)
+    plain = agent.render_all({"sites": [shield_site()]}, cfg)
+    assert "shield.conf" not in plain and "pcdn_shield_secret" not in plain["sites/7.conf"]
+    assert 'proxy_set_header X-Pcdn-Shield "";' in plain["sites/7.conf"]   # stripped on every node
+    assert "map $uri $pcdn_shield_ok {\n    default 0;\n}" in plain["http.conf"]
+    # shield.conf is node-global: a peer/secret change is never deferred as a foreign-group edit (F21)
+    other = agent.render_all(dict(config, shield=dict(config["shield"], secret="f" * 32)), cfg)
+    assert agent.global_digest(other) != agent.global_digest(files)
+    assert agent.site_digests(other) == agent.site_digests(files)
+
+
+def test_stale_mapping(tmp_path):
+    cfg = make_cfg(tmp_path)
+
+    def loc(**cache):
+        text, _ = agent.render_site(dict(SITE, cache=dict(SITE["cache"], **cache)), cfg)
+        return text.split("    location / {", 1)[1].split("\n    }", 1)[0]
+    default = loc()
+    assert "proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;" in default
+    assert "proxy_cache_background_update on;" in default
+    assert loc(stale_while_revalidate=True, stale_if_error=86400) == default   # explicit defaults: same
+    no_swr = loc(stale_while_revalidate=False)
+    assert "proxy_cache_use_stale error timeout http_500 http_502 http_503 http_504;" in no_swr
+    assert "background_update" not in no_swr
+    assert "proxy_cache_use_stale updating;" in loc(stale_if_error=0)
+    assert "proxy_cache_use_stale off;" in loc(stale_if_error=0, stale_while_revalidate=False)
+    assert "proxy_cache_use_stale updating;" in loc(always_online=False, stale_if_error=600)
+    assert "proxy_cache_use_stale error timeout updating" in loc(stale_if_error="junk")   # defensive
+    # origin Cache-Control (incl. stale-* extensions) stays honoured where it was
+    assert "proxy_ignore_headers" not in default
+
+
+def test_cache_key_options(tmp_path):
+    cfg = make_cfg(tmp_path)
+    plain, _ = agent.render_site(SITE, cfg)
+    assert "proxy_cache_key $scheme://$host$request_uri;" in plain and ";d=" not in plain
+    site = dict(SITE, cache=dict(SITE["cache"], key_device=True,
+                                 key_cookies=["lang", "wp-lang", "bad cookie", 'x";', "lang"] + [f"c{i}" for i in range(20)],
+                                 key_query_allow=["v", "utm.x", "a&b", "$x", "f[c]"]),
+                pagerules={"rules": [{"id": "p", "pattern": "/iq/*", "ignore_query": True, "cache": "standard"}]})
+    text, _ = agent.render_site(site, cfg)
+    k = agent.key_options(site)
+    assert k["cookies"][:2] == ["lang", "wp-lang"] and len(k["cookies"]) == 10 and k["qa"] == ["v", "utm.x", "f[c]"]
+    assert "bad cookie" not in text and 'x";' not in text and "a&b" not in text
+    # names that are not nginx variable suffixes are read through a regex map
+    assert 'map $http_cookie $pcdn_kc_7_1 {\n    default "";\n    "~*(?:^|;)\\s*wp\\-lang=([^;]*)" $1;\n}' in text
+    assert 'map $args $pcdn_ka_7_1 {\n    default "";\n    "~*(?:^|&)utm\\.x=([^&]*)" $1;\n}' in text
+    assert 'map $args $pcdn_ka_7_2 {\n    default "";\n    "~*(?:^|&)f\\[c\\]=([^&]*)" $1;\n}' in text
+    key = ('"$scheme://$host$pcdn_path?v=${arg_v}&utm.x=${pcdn_ka_7_1}&f[c]=${pcdn_ka_7_2};d=${pcdn_dev};'
+           'c.lang=${cookie_lang};c.wp-lang=${pcdn_kc_7_1};c.c0=${cookie_c0}')
+    root = text.split("    location / {", 1)[1].split("\n    }", 1)[0]
+    assert f"proxy_cache_key {key}" in root
+    # a page rule with ignore_query drops the query entirely, variants stay
+    iq = text.split('location ~ "^/iq/.*$" {', 1)[1].split("\n    }", 1)[0]
+    assert 'proxy_cache_key "$scheme://$host$pcdn_path;d=${pcdn_dev};c.lang=' in iq
+    # site ignore_query wins over key_query_allow (the controller rejects the combination)
+    t2, _ = agent.render_site(dict(SITE, cache=dict(SITE["cache"], ignore_query=True, key_query_allow=["v"])), cfg)
+    assert "proxy_cache_key $scheme://$host$pcdn_path;" in t2 and "arg_v" not in t2
+    # the agent records the key shape for exact-URL purges (only sites that need it)
+    infos = agent.key_infos({"sites": [site, SITE]})
+    assert list(infos) == ["7"] and infos["7"]["dev"] and infos["7"]["qa"] == ["v", "utm.x", "f[c]"]
+
+
+def test_purge_variant_keys(tmp_path):
+    cfg = make_cfg(tmp_path)
+    base = os.path.join(cfg["CACHE_DIR"], "7")
+    kinfo = {"dev": True, "cookies": [], "qa": ["v"], "webp": True}
+    keys = [f"https://example.com/a.png?v=1;d={d};w={w}" for d in ("mobile", "desktop") for w in ("0", "1")]
+    paths = []
+    for k in keys + ["https://example.com/other.png?v=1;d=mobile;w=0"]:
+        p = pathlib.Path(agent.cache_file(cfg["CACHE_DIR"], 7, k))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+        paths.append(p)
+    # the purged URL carries extra / reordered params: the key_query_allow form is derived from it
+    assert agent.do_purge({"site_id": 7, "urls": ["https://example.com/a.png?utm=1&V=1&v=2"]}, cfg, kinfo) == 4
+    assert not any(p.exists() for p in paths[:4]) and paths[4].exists()
+    # cookie-keyed variants cannot be enumerated: the cache is scanned for "<url>;<fields>"
+    ck = {"dev": False, "cookies": ["lang"], "qa": [], "webp": False}
+    a = _fake_cache_file(base, "http://example.com/p;x?q=1;c.lang=fa")
+    b = _fake_cache_file(base, "http://example.com/p;x?q=1;c.lang=en")
+    c = _fake_cache_file(base, "http://example.com/p;x?q=2;c.lang=en")
+    assert agent.do_purge({"site_id": 7, "urls": ["http://example.com/p;x?q=1"]}, cfg, ck) == 2
+    assert not a.exists() and not b.exists() and c.exists()
+    # without key info the hashed fast path is unchanged
+    assert agent.key_suffixes(None) == [""] and agent.url_key_bases("/a?b=1", None) == ["/a?b=1", "/a"]
+
+
+def test_agent_records_keyinfo_and_passes_it_to_purges(tmp_path):
+    cfg = make_cfg(tmp_path)
+    site = dict(MINSITE, cache={"enabled": True, "key_device": True})
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg, a.state, a.ctl = cfg, {}, SeqCtl()
+    a.ctl.serve("v1", "e1", [site])
+    a.sync_config()
+    assert a.state["keyinfo"] == {"1": {"dev": True, "cookies": [], "qa": [], "webp": False}}
+    for d in ("mobile", "desktop"):
+        p = pathlib.Path(agent.cache_file(cfg["CACHE_DIR"], 1, f"http://a.com/x;d={d}"))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    a.state["purge_id"] = 0
+    a.ctl = FakeCtl([{"id": 1, "site_id": 1, "domain": "a.com", "urls": ["http://a.com/x"]}])
+    a.sync_purges()
+    assert not pathlib.Path(agent.cache_file(cfg["CACHE_DIR"], 1, "http://a.com/x;d=mobile")).exists()
+    assert not pathlib.Path(agent.cache_file(cfg["CACHE_DIR"], 1, "http://a.com/x;d=desktop")).exists()
+
+
+def test_webp_accept_key_mode(tmp_path):
+    cfg = make_cfg(tmp_path)
+    assert agent.nginx_capabilities(cfg)["webp_convert"] is False   # image_filter keeps the input format
+    site = dict(SITE, image={"enabled": True, "auto_webp": True})
+    text, _ = agent.render_site(site, cfg)
+    static = text.split("    location ~* \\.(?:css", 1)[1].split("\n    }", 1)[0]
+    assert 'proxy_cache_key "$scheme://$host$request_uri;w=${pcdn_webp}";' in static
+    assert "add_header Vary $pcdn_webp_vary;" in static
+    img = text.split("    location ^~ /__pcdn/img/ {", 1)[1].split("\n    }", 1)[0]
+    assert ";w=${pcdn_webp}" in img and "add_header Vary $pcdn_webp_vary;" in img
+    assert "proxy_set_header Accept" not in text            # the client's Accept goes to the origin
+    http = agent.render_http(cfg)
+    assert '"~*\\.(?:jpe?g|png)$" $pcdn_accept_webp;' in http and '"~*image/webp" 1;' in http
+    # independent of the resize toggle (the controller folds the plan gate into auto_webp)
+    t1, _ = agent.render_site(dict(SITE, image={"enabled": False, "auto_webp": True}), cfg)
+    assert ";w=${pcdn_webp}" in t1 and "/__pcdn/img/" not in t1
+    # off (or a decoy tunnel site that never fetches origin content) -> unchanged rendering
+    for s in (dict(SITE, image={"enabled": True}), dict(SITE, image={"enabled": True, "auto_webp": False}),
+              dict(SITE, image={"auto_webp": True}, tunnel=dict(TUNNEL, fallback="decoy"))):
+        t2, _ = agent.render_site(s, cfg)
+        assert "pcdn_webp" not in t2
+
+
+def test_preload_links(tmp_path):
+    cfg = make_cfg(tmp_path)
+    bad = ['/x"y', "/x\ny", "/x\r\n", "/a b", "/<x>", "/x'", "javascript:alert(1)", "//evil.com/x", "/x\\y", "", None]
+    rule = {"id": "p", "pattern": "/", "preload": (
+        [{"url": u, "as": "style"} for u in bad[:9]]
+        + [{"url": "/a.css", "as": "style"}, {"url": "/f.woff2", "as": "font"}, {"url": "/a.css", "as": "evil"},
+           {"url": "https://cdn.example.com/x.js?v=$1", "as": "script"}, "junk"])}
+    assert agent.preload_links(rule) == ["</a.css>; rel=preload; as=style"]   # only the first 10 entries count
+    assert not agent.preload_links({"preload": [{"url": u, "as": "style"} for u in bad]})
+    rule["preload"] = rule["preload"][9:]
+    links = agent.preload_links(rule)
+    assert links == ["</a.css>; rel=preload; as=style", "</f.woff2>; rel=preload; as=font; crossorigin",
+                     "<https://cdn.example.com/x.js?v=$1>; rel=preload; as=script"]
+    site = dict(SITE, pagerules={"rules": [rule, {"id": "b", "pattern": "/blog/*", "preload": [{"url": "/b.js", "as": "script"}]},
+                                           {"id": "c", "pattern": "/nopre/*", "cache": "bypass"}]})
+    text, _ = agent.render_site(site, cfg)
+    assert ('map $uri $pcdn_link_7 {\n    default "";\n    "~^/$" "</a.css>; rel=preload; as=style, '
+            '</f.woff2>; rel=preload; as=font; crossorigin, <https://cdn.example.com/x.js?v=${pcdn_dollar}1>; '
+            'rel=preload; as=script";\n    "~^/blog/.*$" "</b.js>; rel=preload; as=script";\n}') in text
+    # preload-only rules add no location (static files keep their own location); headers everywhere
+    assert 'location ~ "^/$"' not in text and 'location ~ "^/blog/.*$"' not in text
+    assert text.count("add_header Link $pcdn_link_7;") == text.count("proxy_pass $pcdn_proto://$pcdn_target;")
+    assert "early_hints" not in text
+    # 103 Early Hints only on capable nodes (nginx relays an origin's 103 to HTTP/2+ navigations)
+    eh, _ = agent.render_site(site, caps_cfg(tmp_path, **H3))
+    assert "early_hints $pcdn_early_hints;" in eh
+    http = agent.render_http(caps_cfg(tmp_path, **H3))
+    assert "map $http_sec_fetch_mode $pcdn_early_hints {\n    default \"\";\n    navigate $http2$http3;\n}" in http
+    assert "$http3" not in agent.render_http(caps_cfg(tmp_path, nginx="1.29.0", early_hints=True))
+    assert "pcdn_early_hints" not in agent.render_http(cfg)
+    # no preload -> no map / header
+    assert "pcdn_link" not in agent.render_site(SITE, cfg)[0]
+
+
+def test_new_fields_absent_or_default_keep_rendering(tmp_path):
+    """SPEC §14.1 fields missing or at their defaults leave a site's config byte-identical, so a
+    controller upgrade alone never triggers a reload."""
+    cfg = make_cfg(tmp_path)
+    cert, key = self_signed(tmp_path)
+    base = dict(SITE, ssl={"cert": cert, "key": key}, image={"enabled": True},
+                pagerules={"rules": [{"id": "p", "pattern": "/a/*", "cache": "everything"}]})
+    explicit = dict(base, cache=dict(SITE["cache"], stale_while_revalidate=True, stale_if_error=86400, shield=False,
+                                     key_device=False, key_cookies=[], key_query_allow=[]),
+                    ssl_options=dict(SITE["ssl_options"], http3=True), image={"enabled": True, "auto_webp": False},
+                    pagerules={"rules": [{"id": "p", "pattern": "/a/*", "cache": "everything", "preload": []}]})
+    assert agent.render_site(base, cfg) == agent.render_site(explicit, cfg)
+    f1 = agent.render_all({"sites": [base]}, cfg)
+    f2 = agent.render_all({"sites": [explicit], "shield": None}, cfg)
+    assert agent.tree_digest(f1) == agent.tree_digest(f2)
+
+
+def _install_block(start, end):
+    install = (HERE.parent / "install.sh").read_text()
+    return install.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_install_upgrade_roundtrip_new_keys(tmp_path):
+    """install.sh writes TCP_CC / HTTP3 to agent.conf and --upgrade reads them back (flags win)."""
+    conf = tmp_path / "agent.conf"
+    write = "cat > /etc/pcdn/agent.conf <<EOF" + _install_block("cat > /etc/pcdn/agent.conf <<EOF", "\nEOF") + "\nEOF\n"
+    upgrade = ('if [ "$UPGRADE" = yes ]; then' + _install_block('if [ "$UPGRADE" = yes ]; then', 'HTTP3="${HTTP3:-no}"')
+               + 'HTTP3="${HTTP3:-no}"\n')
+
+    def run(script, **env):
+        base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CONTROLLER": "", "TOKEN": "", "REGION": "",
+                "ROLE": "", "UPGRADE": "yes", "TCP_CC": "", "HTTP3": ""}
+        base.update(env)
+        script = script.replace("/etc/pcdn/agent.conf", str(conf))
+        return subprocess.run(["bash", "-euc", script + '\necho "CC=$TCP_CC H3=$HTTP3"'], env=base,
+                              capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
+    run(write, CONTROLLER="https://c", TOKEN="t", NGINX_USER="www-data", IPV6="yes", CACHE_SIZE="10g",
+        HTTP_PORT="80", HTTPS_PORT="443", TCP_CC="cubic", HTTP3="yes")
+    text = conf.read_text()
+    assert "TCP_CC=cubic\n" in text and "HTTP3=yes\n" in text
+    assert run(upgrade) == "CC=cubic H3=yes"                         # read back
+    assert run(upgrade, TCP_CC="bbr", HTTP3="no") == "CC=bbr H3=no"  # explicit flags win
+    conf.write_text("CONTROLLER_URL=https://c\nEDGE_TOKEN=t\n")       # an older install: defaults
+    assert run(upgrade) == "CC=bbr H3=no"
+    conf.write_text("CONTROLLER_URL=https://c\nEDGE_TOKEN=t\nTCP_CC=reno\nHTTP3=maybe\n")   # junk ignored
+    assert run(upgrade) == "CC=bbr H3=no"
+
+
+def test_install_http3_load_module_block(tmp_path):
+    """--http3 writes one load_module line per optional module file present (idempotent) and warns
+    about geoip2 / brotli being unavailable."""
+    block = _install_block("# >>> pcdn load_module", "# <<< pcdn load_module").split("\n", 1)[1]
+    mods = tmp_path / "modules"
+    mods.mkdir()
+    for so in ("ngx_http_js_module.so", "ngx_http_image_filter_module.so"):
+        (mods / so).write_bytes(b"")
+    ngx = tmp_path / "nginx.conf"
+    ngx.write_text("user nginx;\nworker_processes auto;\nevents { worker_connections 1024; }\nhttp { }\n")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HTTP3": "yes", "MODULES_DIR": str(mods)}
+    script = block.replace("/etc/nginx/nginx.conf", str(ngx))
+    outs = [subprocess.run(["bash", "-euc", script], env=env, capture_output=True, text=True, check=True).stdout
+            for _ in range(2)]
+    text = ngx.read_text()
+    assert text.count(f"load_module {mods}/ngx_http_js_module.so;") == 1
+    assert text.count(f"load_module {mods}/ngx_http_image_filter_module.so;") == 1
+    assert "geoip2_module" not in text and "brotli" not in text and text.index("load_module") < text.index("user nginx;")
+    assert "warning: no geoip2 module" in outs[0] and "warning: no brotli module" in outs[0]
+    # the distro path never touches nginx.conf here
+    subprocess.run(["bash", "-euc", script], env=dict(env, HTTP3="no"), check=True)
+    assert ngx.read_text() == text
+    install = (HERE.parent / "install.sh").read_text()
+    assert "https://nginx.org/packages/mainline/$NGINX_DISTRO $CODENAME nginx" in install
+    assert "NGINX_KEY_FPR=573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62" in install
+    assert "nginx nginx-module-njs nginx-module-image-filter" in install
+    assert 'allow UDP/$HTTPS_PORT' in install
+    boot = (HERE.parent / "bootstrap.sh").read_text()
+    assert "--http3|--no-http3" in boot and "|--cc)" in boot

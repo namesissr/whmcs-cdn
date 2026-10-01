@@ -17,6 +17,9 @@
 #   --https-port N       public HTTPS port (default 443)
 #   --no-ipv6            do not listen on IPv6
 #   --no-geoip           do not download the country database
+#   --http3              nginx.org mainline nginx with HTTP/3 (QUIC); open UDP/<https-port>
+#   --no-http3           back to the distro nginx (default)
+#   --cc bbr|cubic       TCP congestion control (default bbr)
 #   --upgrade            update an installed edge in place
 set -euo pipefail
 
@@ -28,9 +31,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --controller) CONTROLLER="${2:-}"; shift 2 ;;
     --token) TOKEN="${2:-}"; shift 2 ;;
-    --region|--role|--cache-size|--http-port|--https-port)
+    --region|--role|--cache-size|--http-port|--https-port|--cc)
       PASS+=("$1" "${2:-}"); shift 2 ;;
-    --no-ipv6|--no-geoip|--upgrade)
+    --no-ipv6|--no-geoip|--upgrade|--http3|--no-http3)
       PASS+=("$1"); shift ;;
     *) echo "bootstrap: unknown option: $1" >&2; exit 1 ;;
   esac

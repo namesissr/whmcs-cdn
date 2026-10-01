@@ -14,6 +14,7 @@ events. Standard library only, so it runs on any stock Debian/Ubuntu python3.
 
 import collections
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -133,6 +134,15 @@ DEFAULTS = {
     # group (and no global file changed and no site was added/removed/suspended or had its cert
     # rotated), so a tunnel-role node does not reload for general-website edits.
     "FOREIGN_DEFER": "900",
+    # SPEC §14.1: nginx binary probed once per agent start with `-V` (version, --with-http_v3_module,
+    # modules path) and the directory whose module .so files decide which optional directives
+    # (geoip2, brotli, njs, image_filter) are rendered. Empty = the --modules-path nginx reports.
+    "NGINX_BIN": "nginx",
+    "NGINX_MODULES_DIR": "",
+    # origin shield hop port on the shield peers (empty = this node's HTTPS_PORT); hops are TLS only
+    "SHIELD_HTTPS_PORT": "",
+    # TCP congestion control written by install.sh --cc (informational for the agent)
+    "TCP_CC": "bbr",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -152,7 +162,8 @@ SAFE_TUNNEL_PATH = re.compile(r"^/[A-Za-z0-9._~/-]{1,200}$")
 IP_LITERAL = re.compile(r"^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])$")
 TUNNEL_PROTOCOLS = ("ws", "httpupgrade", "grpc", "xhttp", "h2")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
-               "transfer-encoding", "upgrade", "host", "content-length"}
+               "transfer-encoding", "upgrade", "host", "content-length",
+               "x-pcdn-shield"}  # SPEC §14.1: the shield hop header is reserved for the edge itself
 FW_ACTIONS = {"allow", "block", "challenge", "captcha", "log"}
 FW_FIELDS = {"ip", "country", "path", "host", "query", "user_agent", "referer", "method", "header"}
 FW_OPS = {"eq", "ne", "contains", "not_contains", "starts_with", "ends_with", "regex", "in", "not_in"}
@@ -222,24 +233,226 @@ def _v6(cfg: dict) -> bool:
 
 
 def geoip_present(cfg: dict) -> bool:
-    """True when the GeoIP country database is installed (F9): tunnel allowed_countries only
-    enforces when it is, and fails open (allow) when it is missing."""
+    """True when the GeoIP country database is installed AND the geoip2 module is available (F9,
+    SPEC §14.1): tunnel allowed_countries only enforces when it is, and fails open (allow) when
+    either is missing (e.g. an nginx.org build without geoip2)."""
     geo = cfg.get("GEOIP_DB") or ""
-    return bool(SAFE_FSPATH.match(geo) and os.path.isfile(geo))
+    return bool(SAFE_FSPATH.match(geo) and os.path.isfile(geo)) and has_module(cfg, "geoip2")
+
+
+# ----------------------------------------------------------------- nginx capabilities (SPEC §14.1)
+
+# optional dynamic modules the rendered config can use -> their .so file in the modules directory
+MODULE_FILES = {"njs": "ngx_http_js_module.so", "geoip2": "ngx_http_geoip2_module.so",
+                "image_filter": "ngx_http_image_filter_module.so", "brotli": "ngx_http_brotli_filter_module.so"}
+# statically compiled variants, recognised in `nginx -V` configure arguments
+_STATIC_MODULE = {"njs": re.compile(r"--add-module=\S*njs"), "geoip2": re.compile(r"--add-module=\S*geoip2"),
+                  "brotli": re.compile(r"--add-module=\S*brotli"),
+                  "image_filter": re.compile(r"--with-http_image_filter_module(?!=dynamic)(?:\s|$)")}
+# WebP for image.auto_webp: ngx_http_image_filter_module always writes the INPUT format (JPEG in ->
+# JPEG out, PNG in -> PNG out; WebP is only produced from WebP input), so no stock nginx can convert
+# JPEG/PNG to WebP and webp_convert is always False. The edge therefore uses the "accept_key" mode:
+# the cache key carries the client's WebP capability for JPEG/PNG URIs, Accept is passed through to
+# origins that negotiate formats, and those responses get "Vary: Accept" (see pcdn-base.conf).
+WEBP_MODE = "accept_key"
+# what an undetectable nginx is assumed to be: today's distro build (Ubuntu 1.24 + all modules)
+LEGACY_CAPS = {"nginx": None, "http3": False, "early_hints": False, "http2_directive": False,
+               "webp_convert": False, "webp_mode": WEBP_MODE, "modules": sorted(MODULE_FILES)}
+_CAPS_CACHE: dict = {}
+
+
+def _version(text: str) -> tuple:
+    m = re.search(r"nginx version: [^/\s]*/(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(x) for x in m.groups()) if m else ()
+
+
+def parse_nginx_v(text: str, modules_dir: str | None = None, exists=os.path.isfile) -> dict:
+    """Capabilities from `nginx -V` output (stderr). http3 needs --with-http_v3_module and nginx
+    >= 1.25.1 (`listen ... quic` 1.25.0, `http3` directive 1.25.1); early_hints needs >= 1.29.0
+    (`early_hints` directive, ngx_http_core_module). modules: optional modules compiled in or whose
+    .so is present in the modules directory (install.sh writes a load_module line for each)."""
+    ver = _version(text)
+    if not ver:
+        return dict(LEGACY_CAPS, modules=list(LEGACY_CAPS["modules"]))
+    args = ""
+    for line in text.splitlines():
+        if line.startswith("configure arguments:"):
+            args = line.split(":", 1)[1]
+    mdir = modules_dir
+    if not mdir:
+        m = re.search(r"--modules-path=(\S+)", args)
+        if m:
+            mdir = m.group(1).strip("'\"")
+        else:
+            m = re.search(r"--prefix=(\S+)", args)
+            mdir = os.path.join(m.group(1).strip("'\"") if m else "/usr/local/nginx", "modules")
+    mods = sorted(name for name, so in MODULE_FILES.items()
+                  if _STATIC_MODULE[name].search(args) or exists(os.path.join(mdir, so)))
+    v3 = bool(re.search(r"(?:^|\s)--with-http_v3_module(?:\s|$)", args))
+    return {"nginx": ".".join(str(x) for x in ver), "http3": v3 and ver >= (1, 25, 1),
+            "early_hints": ver >= (1, 29, 0), "http2_directive": ver >= (1, 25, 1),
+            "webp_convert": False, "webp_mode": WEBP_MODE, "modules": mods}
+
+
+def nginx_capabilities(cfg: dict) -> dict:
+    """Probe `nginx -V` once per agent start (cached per binary/modules dir). A test or an operator
+    tool may pass a ready dict as cfg["NGINX_CAPS"]. When nginx cannot be probed, the legacy distro
+    build is assumed so rendering stays exactly as before."""
+    caps = cfg.get("NGINX_CAPS")
+    if isinstance(caps, dict):
+        return dict(LEGACY_CAPS, **caps)
+    binary = cfg.get("NGINX_BIN") or "nginx"
+    key = (binary, cfg.get("NGINX_MODULES_DIR") or "")
+    if key not in _CAPS_CACHE:
+        try:
+            p = subprocess.run([binary, "-V"], capture_output=True, text=True, timeout=15)
+            text = (p.stdout or "") + (p.stderr or "")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            text = ""
+        _CAPS_CACHE[key] = parse_nginx_v(text, cfg.get("NGINX_MODULES_DIR") or None)
+    return dict(_CAPS_CACHE[key])
+
+
+def has_module(cfg: dict, name: str) -> bool:
+    return name in nginx_capabilities(cfg)["modules"]
+
+
+def heartbeat_capabilities(cfg: dict) -> dict:
+    """The `capabilities` object of the heartbeat (SPEC §14.1)."""
+    c = nginx_capabilities(cfg)
+    return {"http3": bool(c["http3"]), "early_hints": bool(c["early_hints"]),
+            "webp_convert": bool(c["webp_convert"]), "webp_mode": c["webp_mode"],
+            "modules": list(c["modules"]), "nginx": c["nginx"]}
+
+
+_GUARD = re.compile(r"^# @if (\w+)\n(.*?)(?:^# @else \1\n(.*?))?^# @endif \1\n", re.S | re.M)
+
+
+def module_blocks(text: str, modules) -> str:
+    """Resolve the template's "# @if <module>" / "# @else" / "# @endif" blocks (SPEC §14.1)."""
+    def sub(m):
+        return m.group(2) if m.group(1) in modules else (m.group(3) or "")
+    prev = None
+    while prev != text:   # nested guards resolve from the inside out
+        prev, text = text, _GUARD.sub(sub, text)
+    return text
+
+
+# ----------------------------------------------------------------- origin shield (SPEC §14.1)
+
+SAFE_SHIELD_SECRET = re.compile(r"^[0-9a-fA-F]{16,256}$")
+SHIELD_MAX_PEERS = 64
+
+
+def _ip_literal(v) -> str | None:
+    """A shield peer address as an nginx server address ("1.2.3.4" / "[2001:db8::1]"), or None."""
+    s = str(v or "").strip().strip("[]")
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        return None
+    if ip.is_unspecified or ip.is_multicast:
+        return None
+    return f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
+
+
+def norm_shield(config: dict) -> dict | None:
+    """Node-wide `shield` section {self, peers, secret}; None when unusable (no valid secret, or
+    neither a shield itself nor any peer to send misses to). Missing -> today's behaviour."""
+    sh = config.get("shield") if isinstance(config, dict) else None
+    if not isinstance(sh, dict):
+        return None
+    secret = str(sh.get("secret") or "")
+    if not SAFE_SHIELD_SECRET.match(secret):
+        return None
+    is_self = sh.get("self") is True
+    peers = sorted({p for p in (_ip_literal(x) for x in (sh.get("peers") or []) if isinstance(x, str)) if p})
+    peers = peers[:SHIELD_MAX_PEERS]
+    if not is_self and not peers:
+        return None
+    # a shield never re-shields: its own misses always go to the origin
+    return {"self": is_self, "peers": [] if is_self else peers, "secret": secret.lower()}
+
+
+def render_shield(shield: dict | None, cfg: dict) -> str | None:
+    """shield.conf (0600: it holds the shared secret). Shield nodes get the maps that accept a valid
+    X-Pcdn-Shield hop; other nodes get the peer upstream (consistent hash on the request's cache key,
+    $pcdn_ck) plus the header value they send. None when the node takes no part in shielding.
+    The secret is fleet-wide and a valid hop skips the verdict / rate limits, so it only ever travels
+    over TLS: edges shield only sites with a certificate (verified TLS hop) and a shield accepts the
+    header only on a TLS connection ($https = on); over plain HTTP it is an ordinary visitor."""
+    if not shield:
+        return None
+    sec = shield["secret"]
+    out = ["# origin shield (SPEC §14.1) — generated by pcdn-agent, do not edit"]
+    if shield["self"]:
+        out += [
+            "# a valid X-Pcdn-Shield received over TLS marks a cache miss forwarded by another edge;",
+            "# anything else (no / wrong header, or any header over plain HTTP) is an ordinary visitor",
+            f"map \"$https:$http_x_pcdn_shield\" $pcdn_shield_ok {{\n    default 0;\n    \"on:{sec}\" 1;\n}}",
+            "# shield hops skip the security verdict (the visitor-facing edge already ran it) ...",
+            "map $pcdn_shield_ok $pcdn_gate {\n    1       ok;\n    default $pcdn_verdict;\n}",
+            "# ... keep the visitor's address / country / scheme the edge forwarded ...",
+            "map $pcdn_shield_ok $pcdn_client_ip {\n    1       $http_x_real_ip;\n    default $remote_addr;\n}",
+            "map $pcdn_shield_ok $pcdn_xff {\n    1       $http_x_forwarded_for;\n"
+            "    default $proxy_add_x_forwarded_for;\n}",
+            "map $pcdn_shield_ok $pcdn_cc {\n    1       $http_x_country_code;\n    default $pcdn_country;\n}",
+            "map \"$pcdn_shield_ok:$http_x_forwarded_proto\" $pcdn_scheme {\n    \"1:https\" https;\n"
+            "    \"1:http\"  http;\n    default   $scheme;\n}",
+            "# ... and are not logged (usage is billed once, at the visitor-facing edge)",
+            "map $pcdn_shield_ok $pcdn_log_ok {\n    1       0;\n    default 1;\n}",
+        ]
+        return "\n".join(out) + "\n"
+    sp = _int(cfg.get("SHIELD_HTTPS_PORT") or cfg.get("HTTPS_PORT"), 443, 1, 65535)
+    out += [
+        "map $uri $pcdn_shield_ok {\n    default 0;\n}",
+        "# cache key of the current request (set by each shielded location): every edge sends a given",
+        "# object to the same shield, so it is fetched from the origin once",
+        "map $uri $pcdn_ck {\n    default \"\";\n}",
+        "# only GET/HEAD are shielded; other methods go straight to the origin (never replayed)",
+        "map $request_method $pcdn_sh_skip {\n    GET     \"\";\n    HEAD    \"\";\n    default 1;\n}",
+        f"geo $pcdn_shield_secret {{\n    default \"{sec}\";\n}}",
+    ]
+    servers = "".join(f"    server {p}:{sp} max_fails=1 fail_timeout=10s;\n" for p in shield["peers"])
+    out.append(f"upstream pcdn_shield_https {{\n    hash $pcdn_ck consistent;\n{servers}"
+               f"    keepalive 32;\n    keepalive_timeout 60s;\n}}")
+    return "\n".join(out) + "\n"
 
 
 # ----------------------------------------------------------------- rendering
 
-def render_http(cfg: dict, hc_interval: int = 2) -> str:
+def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None) -> str:
     """The base http-context config (from the template), see nginx/pcdn-base.conf.
-    hc_interval: js_periodic tick for pool health checks (> the largest check timeout)."""
+    hc_interval: js_periodic tick for pool health checks (> the largest check timeout).
+    shield: the node's normalised shield section (norm_shield) or None."""
     with open(asset(cfg, "BASE_TEMPLATE", "nginx/pcdn-base.conf")) as f:
         text = f.read()
+    caps = nginx_capabilities(cfg)
+    text = module_blocks(text, caps["modules"])
     if geoip_present(cfg):
         geo = cfg["GEOIP_DB"]
         geo_conf = f"geoip2 {geo} {{\n    auto_reload 60m;\n    $pcdn_country country iso_code;\n}}"
-    else:  # nginx must start without the database; country rules then never match
+    else:  # nginx must start without the database (or module); country rules then never match
         geo_conf = "map $host $pcdn_country {\n    default \"\";\n}"
+    sport = str(_int(cfg["HTTPS_PORT"], 443, 1, 65535))
+    extra = []
+    if caps["http2_directive"]:
+        extra.append("    http2 on;")
+    if caps["http3"]:
+        # one `quic reuseport` per address (on the default server); site servers add plain `quic`
+        extra += [f"    listen {sport} quic default_server reuseport;",
+                  f"    listen [::]:{sport} quic default_server reuseport;"]
+    if caps["early_hints"]:
+        # SPEC §14.1: pass 103 Early Hints to HTTP/2+ navigations only (HTTP/1.1 clients and
+        # intermediaries are known to mishandle 1xx); used by sites with preload page rules
+        eh = "$http2$http3" if caps["http3"] else "$http2"
+        eh_conf = f"map $http_sec_fetch_mode $pcdn_early_hints {{\n    default \"\";\n    navigate {eh};\n}}"
+    else:
+        eh_conf = ""
+    if shield:
+        shield_conf = f"include {cfg['NGINX_DIR'].rstrip('/')}/shield.conf;"
+    else:
+        shield_conf = "map $uri $pcdn_shield_ok {\n    default 0;\n}"
     subst = {
         "NGINX_DIR": cfg["NGINX_DIR"].rstrip("/"),
         "HTTP_PORT": str(_int(cfg["HTTP_PORT"], 80, 1, 65535)),
@@ -251,6 +464,10 @@ def render_http(cfg: dict, hc_interval: int = 2) -> str:
         "HC_INTERVAL": str(_int(hc_interval, 2, 2, 11)),
         "CONNECT_TIMEOUT": str(_int(cfg.get("TUNNEL_CONNECT_TIMEOUT"), 10, 3, 30)),
         "SSL_BUFFER_SIZE": cfg["SSL_BUFFER_SIZE"] if SAFE_SIZE.match(cfg.get("SSL_BUFFER_SIZE") or "") else "4k",
+        "SHIELD": shield_conf,
+        "EARLY_HINTS": eh_conf,
+        "LISTEN_H2": "" if caps["http2_directive"] else " http2",
+        "HTTPS_DEFAULT_EXTRA": "\n".join(extra),
     }
     if not SAFE_FSPATH.match(subst["NGINX_DIR"]):
         raise ValueError("unsafe NGINX_DIR")
@@ -389,6 +606,69 @@ def page_rules(site: dict) -> list:
     return rules
 
 
+PRELOAD_AS = ("script", "style", "image", "font", "fetch")
+PRELOAD_MAX = 10
+# same-site path or absolute http(s) URL (no protocol-relative "//host"); printable ASCII without
+# space (so no CR/LF either)
+SAFE_PRELOAD_URL = re.compile(r"^(?:https?://[A-Za-z0-9.-]+(?::\d{1,5})?)?/(?!/)[\x21-\x7e]{0,1000}$")
+PRELOAD_BAD = set("\"'<>\\`")
+
+
+def preload_links(rule: dict) -> list[str]:
+    """Validated `Link` values of a page rule's `preload` list (SPEC §14.1), re-checked on the edge:
+    quotes, CR/LF, whitespace and <> are rejected (they could break out of the header or the
+    nginx string); `$` is kept literal by _qv at render time."""
+    out = []
+    pre = rule.get("preload")
+    for p in (pre if isinstance(pre, list) else [])[:PRELOAD_MAX]:
+        if not isinstance(p, dict):
+            continue
+        url, kind = str(p.get("url") or ""), p.get("as")
+        if kind not in PRELOAD_AS or not SAFE_PRELOAD_URL.match(url) or PRELOAD_BAD & set(url):
+            continue
+        # fonts are always fetched in CORS mode; without `crossorigin` the preload is wasted
+        out.append(f"<{url}>; rel=preload; as={kind}" + ("; crossorigin" if kind == "font" else ""))
+    return list(dict.fromkeys(out))
+
+
+SAFE_KEY_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")             # cookie names
+SAFE_QUERY_NAME = re.compile(r"^[A-Za-z0-9_.\[\]-]{1,64}$")     # query parameter names ("f[x]")
+NGX_VAR_NAME = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+KEY_COOKIES_MAX, KEY_QUERY_MAX = 10, 50
+
+
+def key_options(site: dict) -> dict:
+    """Cache-key options of a site (SPEC §14.1), validated again on the edge. Names must be cookie /
+    query-parameter tokens; ones that are not valid nginx variable suffixes ("wp-lang") are read
+    through a per-site regex map instead of $cookie_<name> / $arg_<name>. image.auto_webp is
+    independent of the resize toggle; the plan's image_optimization gate is folded in by the
+    controller (it sends auto_webp=false when the feature is off)."""
+    cache, _ = _legacy_sections(site)
+
+    def names(v, cap, rx):
+        return list(dict.fromkeys(x for x in (v if isinstance(v, list) else [])
+                                  if isinstance(x, str) and rx.match(x)))[:cap]
+    return {"dev": cache.get("key_device") is True,
+            "cookies": names(cache.get("key_cookies"), KEY_COOKIES_MAX, SAFE_KEY_NAME),
+            "qa": names(cache.get("key_query_allow"), KEY_QUERY_MAX, SAFE_QUERY_NAME),
+            "webp": _sec(site, "image").get("auto_webp") is True}
+
+
+def key_infos(config: dict) -> dict:
+    """Per-site cache-key shape for exact-URL purges ({site_id: options}); only sites whose key is
+    not the plain "<scheme>://<host><uri>" are listed."""
+    out = {}
+    for s in config.get("sites", []) if isinstance(config, dict) else []:
+        try:
+            k = key_options(s)
+            sid = str(int(s["id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if k["dev"] or k["cookies"] or k["qa"] or k["webp"]:
+            out[sid] = k
+    return out
+
+
 def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None) -> dict:
     """Per-site data for njs (sites.js). Only validated / typed values end up here."""
     fw = _sec(site, "firewall")
@@ -461,13 +741,13 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
     }
 
 
-def render_site(site: dict, cfg: dict) -> tuple[str, dict]:
+def render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str, dict]:
     """Return (nginx config text, {relative_path: content}) for one site."""
-    text, files, _ = _render_site(site, cfg)
+    text, files, _ = _render_site(site, cfg, shield)
     return text, files
 
 
-def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
+def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str, dict, dict | None]:
     sid = int(site["id"])
     domain = site["domain"]
     files = {}
@@ -512,6 +792,28 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     always_online = cache.get("always_online", True) is not False
     port, sport = _int(cfg["HTTP_PORT"], 80, 1, 65535), _int(cfg["HTTPS_PORT"], 443, 1, 65535)
     v6 = _v6(cfg)
+    caps = nginx_capabilities(cfg)
+    njs_ok, brotli_ok = "njs" in caps["modules"], "brotli" in caps["modules"]
+    # SPEC §14.1 stale content: stale_while_revalidate -> "updating" + background update;
+    # stale_if_error > 0 (and always_online) -> serve stale on error/timeout/5xx. nginx cannot bound
+    # the stale age per request; entries live until `inactive` (CACHE_INACTIVE, 7d >= the 604800 s
+    # maximum). Origin Cache-Control stale-* extensions keep working natively where Cache-Control is
+    # honoured. Missing fields keep today's behaviour.
+    swr = cache.get("stale_while_revalidate", True) is not False
+    sie = cache.get("stale_if_error")
+    stale_err = always_online and (sie is None or _int(sie, 86400, 0, 604800) > 0)
+    # SPEC §14.1 HTTP/3: only on capable nodes, for HTTPS sites whose ssl.http3 is not off
+    h3_flag = sslo.get("http3")
+    if h3_flag is None and isinstance(site.get("ssl"), dict):
+        h3_flag = site["ssl"].get("http3")
+    h3 = bool(caps["http3"] and ssl and h3_flag is not False)
+    alt_svc = f"add_header Alt-Svc 'h3=\":{sport}\"; ma=86400' always;"
+    # SPEC §14.1 origin shield
+    shield_self = bool(shield and shield.get("self"))
+    shield_peers = [] if not shield or shield_self else list(shield.get("peers") or [])
+    # only sites with a certificate: the hop (and the secret it carries) must be TLS. HTTP-only sites
+    # always fetch from the origin directly and never send X-Pcdn-Shield.
+    shielded = bool(shield_peers) and cache_on and cache.get("shield") is True and bool(ssl)
 
     # --- per-site maps (http context)
     cookies = [str(c) for c in (cache.get("bypass_cookies") or []) if SAFE_COOKIE.match(str(c))]
@@ -528,6 +830,52 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         v += "; preload" if hsts.get("preload") else ""
         hsts_var = f"$pcdn_hsts_{sid}"
         out.append(f"map $scheme {hsts_var} {{\n    https \"{v}\";\n    default \"\";\n}}")
+
+    # --- cache key (SPEC §14.1). Variant fields are appended after the URI as ";<field>=<value>":
+    # no field value can contain ";" (device class, WebP flag, cookie values), so a key always
+    # splits back into one URI + fixed fields and two different requests never share a key.
+    # Without options the key text stays exactly "<scheme>://$host<uri>" as before.
+    kopt = key_options(site)
+    scheme_var = "$pcdn_scheme" if shield_self else "$scheme"
+
+    def _kvar(kind, i, name):
+        if NGX_VAR_NAME.match(name):
+            return f"${{{kind}_{name}}}"
+        var = f"pcdn_k{kind[0]}_{sid}_{i}"
+        src, sep = ("$http_cookie", ";") if kind == "cookie" else ("$args", "&")
+        lead = "(?:^|;)\\s*" if kind == "cookie" else "(?:^|&)"
+        out.append(f"map {src} ${var} {{\n    default \"\";\n    \"~*{lead}{re.escape(name)}=([^{sep}]*)\" $1;\n}}")
+        return f"${{{var}}}"
+    key_cookies = [(n, _kvar("cookie", i, n)) for i, n in enumerate(kopt["cookies"])]
+    key_args = [(n, _kvar("arg", i, n)) for i, n in enumerate(kopt["qa"])]
+    webp_on = kopt["webp"]
+    key_suffix = (("" if not kopt["dev"] else ";d=${pcdn_dev}")
+                  + "".join(f";c.{n}={v}" for n, v in key_cookies)
+                  + (";w=${pcdn_webp}" if webp_on else ""))
+
+    def cache_key(iq, image=False):
+        """-> (key text, needs quoting)."""
+        if image:
+            uri = "$pcdn_path?w=$pcdn_img_w&h=$pcdn_img_h" if (iq or key_args) else "$request_uri"
+        elif iq:
+            uri = "$pcdn_path"
+        elif key_args:   # cache.key_query_allow: only these parameters, in a fixed order
+            uri = "$pcdn_path?" + "&".join(f"{n}={v}" for n, v in key_args)
+        else:
+            uri = "$request_uri"
+        key = f"{scheme_var}://$host{uri}{key_suffix}"
+        return key, bool(key_suffix or (key_args and not iq and not image))
+
+    # --- preload page rules (SPEC §14.1): the first rule with `preload` matching the URI adds its
+    # Link headers on every proxied location (the same first-match-per-feature model as WAF rules)
+    link_rules = [(r["_re"], ", ".join(lk)) for r in page_rules(site) if (lk := preload_links(r))]
+    link_var = f"$pcdn_link_{sid}" if link_rules else None
+    if link_var:
+        out.append(f"map $uri {link_var} {{\n    default \"\";\n"
+                   + "".join(f"    \"~{rx}\" {_qv(v)};\n" for rx, v in link_rules) + "}")
+    # nginx relays 103 responses it receives from the origin but cannot originate one; on
+    # early_hints-capable nodes those are passed to HTTP/2+ navigations of preload-rule sites
+    eh_on = bool(link_var and caps["early_hints"])
 
     # --- header rules
     hdr = _sec(site, "headers")
@@ -546,8 +894,16 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         elif SAFE_VALUE.match(str(v)):
             resp_hide.append(n)  # replace the origin's value instead of sending both
             resp_add.append(f"add_header {n} {_qv(str(v))} always;")
-    base_req = [("Host", "$host"), ("X-Real-IP", "$remote_addr"), ("X-Forwarded-For", "$proxy_add_x_forwarded_for"),
-                ("X-Forwarded-Proto", "$scheme"), ("X-Country-Code", "$pcdn_country")]
+    if shield_self:
+        # a shield keeps the visitor's address / scheme / country forwarded by a valid shield hop
+        base_req = [("Host", "$host"), ("X-Real-IP", "$pcdn_client_ip"), ("X-Forwarded-For", "$pcdn_xff"),
+                    ("X-Forwarded-Proto", "$pcdn_scheme"), ("X-Country-Code", "$pcdn_cc")]
+    else:
+        base_req = [("Host", "$host"), ("X-Real-IP", "$remote_addr"), ("X-Forwarded-For", "$proxy_add_x_forwarded_for"),
+                    ("X-Forwarded-Proto", "$scheme"), ("X-Country-Code", "$pcdn_country")]
+    # never forwarded to an origin, also on a node that is no longer a shield while edges still
+    # send it hops (config propagation lag)
+    base_req.append(("X-Pcdn-Shield", '""'))
 
     def req_hdrs(directive, conn=(("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))):
         pairs = [(n, v) for n, v in base_req if n.lower() not in req_headers] + list(req_headers.values()) + list(conn)
@@ -557,24 +913,39 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     # a location sets one of them, so every proxying location gets the complete set.
     proxy_hdrs = req_hdrs("proxy_set_header")
 
-    def loc_common(hides=(), extra_add=()):
-        lines = list(proxy_hdrs)
+    def loc_common(hides=(), extra_add=(), hdrs=None):
+        lines = list(proxy_hdrs if hdrs is None else hdrs)
         for n in dict.fromkeys(list(hides) + resp_hide):
             lines.append(f"proxy_hide_header {n};")
         lines += list(extra_add)
         lines.append("add_header X-Served-By $hostname always;")
         if hsts_var:
             lines.append(f"add_header Strict-Transport-Security {hsts_var} always;")
+        if h3:
+            lines.append(alt_svc)
+        if link_var:
+            lines.append(f"add_header Link {link_var};")
+        if webp_on:
+            lines.append("add_header Vary $pcdn_webp_vary;")
+        if eh_on:
+            lines.append("early_hints $pcdn_early_hints;")
         return lines + resp_add
+
+    def ind(lines):
+        return ["        " + x for x in lines]
+
+    named = [0]
 
     def proxy_loc(match, mode, ttl, bttl, iq):
         """mode: bypass | dynamic (honour origin; ttl>0 = default TTL) | aggressive | everything | static."""
         L, hides, adds = [], [], []
-        if mode == "bypass" or not cache_on:
+        cacheable = mode != "bypass" and cache_on
+        key = None
+        if not cacheable:
             adds.append("add_header X-Cache BYPASS always;")
         else:
-            key = "$scheme://$host$pcdn_path" if iq else "$scheme://$host$request_uri"
-            L += [f"proxy_cache {zone};", f"proxy_cache_key {key};"]
+            key, quote = cache_key(iq)
+            L += [f"proxy_cache {zone};", "proxy_cache_key " + (f'"{key}"' if quote else key) + ";"]
             no_cache = []
             if mode == "static":
                 L += [f"proxy_cache_valid 200 206 301 {max(ttl, 60)}s;", "proxy_cache_valid 404 1m;",
@@ -593,14 +964,45 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
                 no_cache.insert(0, nocache_var)
             if no_cache:
                 L.append("proxy_no_cache " + " ".join(no_cache) + ";")
-            stale = "error timeout updating http_500 http_502 http_503 http_504" if always_online else "updating"
-            L += [f"proxy_cache_use_stale {stale};", "proxy_cache_lock on;", "proxy_cache_background_update on;"]
+            stale = ((["error", "timeout"] if stale_err else []) + (["updating"] if swr else [])
+                     + (["http_500", "http_502", "http_503", "http_504"] if stale_err else []))
+            L += [f"proxy_cache_use_stale {' '.join(stale) or 'off'};", "proxy_cache_lock on;"]
+            if swr:
+                L.append("proxy_cache_background_update on;")
             adds.append("add_header X-Cache $upstream_cache_status always;")
         if bttl > 0:
             hides += ["Cache-Control", "Expires"]
             adds.append(f"add_header Cache-Control \"public, max-age={bttl}\" always;")
-        L = loc_common(hides, adds) + L + ["proxy_pass $pcdn_proto://$pcdn_target;"]
-        return [f"    location {match} {{"] + ["        " + x for x in L] + ["    }"]
+        origin = loc_common(hides, adds) + L + ["proxy_pass $pcdn_proto://$pcdn_target;"]
+        if not (shielded and cacheable):
+            return [f"    location {match} {{"] + ind(origin) + ["    }"]
+        # SPEC §14.1 origin shield: GET/HEAD cache misses go to the shield peers (consistent hash on
+        # the cache key); any other method, and every request once all shields are unreachable
+        # (nginx-generated 502/504), is re-run in a named location that fetches from the origin.
+        # proxy_intercept_errors stays off so a shield's own answer (also an error page) is passed
+        # as is and never replayed against the origin.
+        named[0] += 1
+        fb = f"@pcdn_origin_{named[0]}"
+        sh_hdrs = [x if not x.startswith("proxy_set_header X-Pcdn-Shield ")
+                   else "proxy_set_header X-Pcdn-Shield $pcdn_shield_secret;" for x in proxy_hdrs]
+        # headers the shield adds itself; this edge adds its own copies
+        sh_hides = hides + ["X-Cache", "X-Served-By"] + (["Strict-Transport-Security"] if hsts_var else []) \
+            + (["Alt-Svc"] if h3 else [])
+        S = ["if ($pcdn_sh_skip) { return 418; }", f"set $pcdn_ck \"{key}\";"]
+        S += loc_common(sh_hides, adds, sh_hdrs) + L
+        for cls, codes in err_pages.items():
+            rest = " ".join(c for c in codes.split() if c not in ("502", "504"))
+            if rest:
+                S.append(f"error_page {rest} /__pcdn/err/{cls}.html;")
+        S += [f"error_page 418 502 504 = {fb};", "proxy_intercept_errors off;",
+              f"proxy_connect_timeout {min(5, _int(cfg.get('TUNNEL_CONNECT_TIMEOUT'), 10, 3, 30))}s;",
+              f"proxy_next_upstream_tries {len(shield_peers)};"]
+        # always TLS, verified against $host (the shield serves the site's certificate)
+        S += ["proxy_ssl_server_name on;", "proxy_ssl_name $host;", "proxy_ssl_verify on;",
+              f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};", "proxy_ssl_verify_depth 4;",
+              "proxy_pass https://pcdn_shield_https;"]
+        return ([f"    location {match} {{"] + ind(S) + ["    }"]
+                + [f"    location {fb} {{"] + ind(origin) + ["    }"])
 
     # --- custom error pages (files next to the config, served from an internal location)
     ep = _sec(site, "errorpages")
@@ -611,7 +1013,8 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
             files[f"errors/{sid}-{cls}.html"] = body
             err_pages[cls] = codes
 
-    image_on = bool(_sec(site, "image").get("enabled"))
+    # the resizer needs the image_filter module and the njs imgW/imgH/imgQ parameters
+    image_on = bool(_sec(site, "image").get("enabled")) and "image_filter" in caps["modules"] and njs_ok
     resize_port = _int(cfg["RESIZE_PORT"], 8089, 1, 65535)
     prules = page_rules(site)
     valid_hosts = []
@@ -620,6 +1023,7 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
     tunnel = norm_tunnel(site, pools)
     fallback = tunnel["fallback"] if tunnel else "origin"
     image_on = image_on and fallback == "origin"  # decoy / 404 sites never fetch origin content
+    webp_on = webp_on and fallback == "origin"
     decoy = decoy_page(cfg, domain) if fallback == "decoy" else None
     geo_ok = geoip_present(cfg)
     ka = _int(cfg.get("TUNNEL_KEEPALIVE"), 64, 1, 4096)
@@ -635,7 +1039,8 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
             out.append(f"map $pcdn_country $pcdn_tcc_{sid} {{\n    \"\" 1;\n"
                        + "".join(f"    {cc} 1;\n" for cc in tunnel["allowed_countries"]) + "    default 0;\n}")
         else:
-            log.warning("no GeoIP DB on this edge; tunnel allowed_countries fails open for site %s", sid)
+            log.warning("no GeoIP DB / geoip2 module on this edge; tunnel allowed_countries fails open for site %s",
+                        sid)
     # F34: a force_https site with tunnel paths must not 301 its ws/httpupgrade/xhttp clients on
     # port 80 (they cannot follow a redirect). Map the tunnel prefixes to 1 and skip the redirect
     # for them; non-tunnel sites keep the plain one-line redirect.
@@ -752,7 +1157,7 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         if h2buf:  # F3: raise per-stream in-flight upload capacity above the 64k default window
             L.append(f"client_body_buffer_size {h2_buf};")
         L += [f"client_body_timeout {idle}s;", f"send_timeout {idle}s;",
-              "tcp_nodelay on;", "gzip off;", "brotli off;",
+              "tcp_nodelay on;", "gzip off;"] + (["brotli off;"] if brotli_ok else []) + [
               f"http2_chunk_size {relay_buf};"]  # F14: larger client-facing HTTP/2 DATA frames
         if grpc:
             L += req_hdrs("grpc_set_header", conn=())
@@ -797,16 +1202,29 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         if v6:
             s.append(f"    listen [::]:{port};")
         if ssl:
-            # "listen ... http2" works on every nginx >= 1.9.5 (newer ones only warn)
-            s.append(f"    listen {sport} ssl http2;")
-            if v6:
-                s.append(f"    listen [::]:{sport} ssl http2;")
+            if caps["http2_directive"]:   # nginx >= 1.25.1 deprecates "listen ... http2" (warns)
+                s.append(f"    listen {sport} ssl;")
+                if v6:
+                    s.append(f"    listen [::]:{sport} ssl;")
+                s.append("    http2 on;")
+            else:  # "listen ... http2" works on every nginx >= 1.9.5
+                s.append(f"    listen {sport} ssl http2;")
+                if v6:
+                    s.append(f"    listen [::]:{sport} ssl http2;")
+            if h3:  # SPEC §14.1; `reuseport` lives on the default server's quic listen
+                s.append(f"    listen {sport} quic;")
+                if v6:
+                    s.append(f"    listen [::]:{sport} quic;")
+                s.append("    http3 on;")
+                s.append(f"    {alt_svc}")
             s.append(f"    ssl_certificate {cfg['NGINX_DIR']}/certs/{sid}.crt;")
             s.append(f"    ssl_certificate_key {cfg['NGINX_DIR']}/certs/{sid}.key;")
         s.append(f"    server_name {name};")
         # F23: buffer the access log so a tunnel stream/packet request does not write an unbuffered
         # line from the worker event loop; flush often enough that usage accounting barely lags.
-        s.append(f"    access_log {cfg['ACCESS_LOG']} pcdn buffer=64k flush=1s;")
+        # SPEC §14.1: a shield does not log (bill) the cache misses other edges forward to it
+        s.append(f"    access_log {cfg['ACCESS_LOG']} pcdn buffer=64k flush=1s"
+                 + (" if=$pcdn_log_ok;" if shield_self else ";"))
         s.append(f"    set $pcdn_site {sid};")
         s.append("    location = /__pcdn/health { access_log off; return 200 \"ok\\n\"; }")
         if tunnel and status not in ("suspended", "over_quota"):
@@ -844,7 +1262,8 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
         else:
             s.append(f"    set $pcdn_target {_q(target)};")
         # security verdict (njs): firewall, hotlink, rate limits, DDoS challenge, WAF
-        s.append("    if ($pcdn_verdict !~ \"^(?:ok|log:)\") { rewrite ^ /__pcdn/deny/$pcdn_verdict? last; }")
+        gate = "$pcdn_gate" if shield_self else "$pcdn_verdict"   # a valid shield hop skips the verdict
+        s.append(f"    if ({gate} !~ \"^(?:ok|log:)\") {{ rewrite ^ /__pcdn/deny/{gate}? last; }}")
         if sslo.get("force_https") and ssl:
             if force_https_tn:  # F34: redirect http, but never tunnel-path requests
                 s.append(f"    if ($pcdn_httpredir_{sid}) {{ return 301 https://$host$request_uri; }}")
@@ -867,9 +1286,13 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
             s.append("    proxy_intercept_errors on;")
 
         s.append("    location ^~ /__pcdn/ { return 404; }")
-        s.append("    location ^~ /__pcdn/deny/ { internal; js_content pcdn.deny; }")
-        s.append("    location = /__pcdn/verify { js_content pcdn.verify; }")
-        s.append("    location = /__pcdn/captcha { client_max_body_size 16k; client_body_buffer_size 16k; js_content pcdn.captcha; }")
+        if njs_ok:
+            s.append("    location ^~ /__pcdn/deny/ { internal; js_content pcdn.deny; }")
+            s.append("    location = /__pcdn/verify { js_content pcdn.verify; }")
+            s.append("    location = /__pcdn/captcha { client_max_body_size 16k; client_body_buffer_size 16k; "
+                     "js_content pcdn.captcha; }")
+        else:  # no njs module (never a verdict other than "ok"): keep nginx -t passing
+            s.append("    location ^~ /__pcdn/deny/ { internal; return 403; }")
         for cls in err_pages:
             s.append(f"    location = /__pcdn/err/{cls}.html {{ internal; default_type text/html; "
                      f"alias {cfg['NGINX_DIR']}/errors/{sid}-{cls}.html; add_header Cache-Control no-store always; }}")
@@ -878,8 +1301,7 @@ def _render_site(site: dict, cfg: dict) -> tuple[str, dict, dict | None]:
             L = ["internal;", "rewrite ^/__pcdn/img(/.*)$ $1 break;"]
             adds = []
             if cache_on:
-                key = ("$scheme://$host$pcdn_path?w=$pcdn_img_w&h=$pcdn_img_h" if ignore_q
-                       else "$scheme://$host$request_uri")
+                key, _ = cache_key(ignore_q, image=True)
                 L += [f"proxy_cache {zone};", f"proxy_cache_key \"{key}\";",
                       f"proxy_cache_valid 200 {max(edge_ttl, 60)}s;",
                       "proxy_ignore_headers Cache-Control Expires Set-Cookie Vary;", "proxy_cache_lock on;"]
@@ -952,8 +1374,12 @@ def render_all(config: dict, cfg: dict) -> dict:
         files = {"js/pcdn.js": f.read()}
     js_sites = {}
     max_timeout = 1
+    shield = norm_shield(config)   # node-wide (SPEC §14.1); None -> today's behaviour
+    sh_conf = render_shield(shield, cfg)
+    if sh_conf:
+        files["shield.conf"] = sh_conf
     for site in config.get("sites", []):
-        text, extra, js = _render_site(site, cfg)
+        text, extra, js = _render_site(site, cfg, shield)
         files[f"sites/{int(site['id'])}.conf"] = text
         files.update(extra)
         if js:
@@ -961,7 +1387,7 @@ def render_all(config: dict, cfg: dict) -> dict:
             for p in js["pools"].values():
                 if p["health"]["enabled"]:
                     max_timeout = max(max_timeout, p["health"]["timeout"])
-    files["http.conf"] = render_http(cfg, max_timeout + 1)
+    files["http.conf"] = render_http(cfg, max_timeout + 1, shield)
     # JSON is valid JS; ensure_ascii keeps U+2028 & co. out of the source
     files["js/sites.js"] = ("// generated by pcdn-agent, do not edit\nexport default "
                             + json.dumps(js_sites, ensure_ascii=True, sort_keys=True) + ";\n")
@@ -1013,9 +1439,9 @@ def cert_digests(files: dict) -> dict:
 
 
 def global_digest(files: dict) -> str:
-    """Digest of the node-global rendered files (base http.conf + njs module): any change here
-    affects every site and must not be deferred (F21)."""
-    return tree_digest({k: files[k] for k in ("http.conf", "js/pcdn.js") if k in files})
+    """Digest of the node-global rendered files (base http.conf + njs module + shield.conf): any
+    change here affects every site and must not be deferred (F21)."""
+    return tree_digest({k: files[k] for k in ("http.conf", "js/pcdn.js", "shield.conf") if k in files})
 
 
 def verify_reload(cfg: dict, digest: str) -> bool:
@@ -1050,8 +1476,8 @@ def write_tree(root: str, files: dict):
     for rel, content in files.items():
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # keys and the HMAC secrets are only read by the nginx master (root) at load time
-        mode = 0o600 if rel.endswith(".key") or rel == "js/sites.js" else 0o644
+        # keys and the HMAC / shield secrets are only read by the nginx master (root) at load time
+        mode = 0o600 if rel.endswith(".key") or rel in ("js/sites.js", "shield.conf") else 0o644
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as f:
             f.write(content)
@@ -1129,6 +1555,8 @@ def render_rev(cfg: dict) -> str:
             pass
     h.update(str(os.path.isfile(cfg.get("GEOIP_DB") or "")).encode())
     h.update(json.dumps({k: cfg.get(k) for k in sorted(DEFAULTS) if k not in ("CONTROLLER_URL", "EDGE_TOKEN")}).encode())
+    # an nginx swap (install.sh --http3) changes what can be rendered (SPEC §14.1)
+    h.update(json.dumps(nginx_capabilities(cfg), sort_keys=True).encode())
     return h.hexdigest()
 
 
@@ -1219,7 +1647,63 @@ def purge_prefixes(base: str, prefixes: list[str], scan_max: int) -> tuple[int, 
     return removed, False
 
 
-def do_purge(item: dict, cfg: dict) -> int:
+def _arg(query: str, name: str) -> str:
+    """nginx $arg_<name> semantics: raw value of the first `name=` parameter (name case-insensitive)."""
+    for part in query.split("&"):
+        k, eq, v = part.partition("=")
+        if eq and k.lower() == name.lower():
+            return v
+    return ""
+
+
+def url_key_bases(path: str, kinfo: dict | None) -> list[str]:
+    """The "<uri>" parts (after scheme://host) an exact URL can be cached under: the full request
+    URI, the query-less path (ignore_query) and, for cache.key_query_allow sites, the path with
+    only the allowed parameters in their configured order (SPEC §14.1)."""
+    noq, _, query = path.partition("?")
+    bases = [path, noq]
+    if kinfo and kinfo.get("qa"):
+        bases.append(noq + "?" + "&".join(f"{n}={_arg(query, n)}" for n in kinfo["qa"]))
+    return list(dict.fromkeys(bases))
+
+
+def key_suffixes(kinfo: dict | None) -> list[str] | None:
+    """Every variant suffix of a key when they can be enumerated (device class, WebP flag), or None
+    when cookie values are part of the key (the cache then has to be scanned)."""
+    if not kinfo:
+        return [""]
+    if kinfo.get("cookies"):
+        return None
+    devs = [";d=mobile", ";d=desktop"] if kinfo.get("dev") else [""]
+    webps = [";w=", ";w=0", ";w=1"] if kinfo.get("webp") else [""]
+    return [d + w for d in devs for w in webps]
+
+
+def purge_exact_scan(base: str, targets: set, fields: int, scan_max: int) -> tuple[int, bool]:
+    """Delete cache files whose KEY minus its `fields` trailing ";<field>" parts is in `targets`."""
+    if not targets or not os.path.isdir(base):
+        return 0, False
+    removed = scanned = 0
+    for root, _dirs, names in os.walk(base):
+        for name in names:
+            scanned += 1
+            if scanned > scan_max:
+                return removed, True
+            fpath = os.path.join(root, name)
+            key = _read_cache_key(fpath)
+            if key is None:
+                continue
+            if (key.rsplit(";", fields)[0] if fields else key) in targets:
+                try:
+                    os.remove(fpath)
+                    removed += 1
+                except OSError:
+                    pass
+    return removed, False
+
+
+def do_purge(item: dict, cfg: dict, kinfo: dict | None = None) -> int:
+    """kinfo: the site's cache-key options (key_infos) when its keys carry variants."""
     sid = int(item["site_id"])
     base = os.path.join(cfg["CACHE_DIR"], str(sid))
     urls = item.get("urls") or []
@@ -1229,6 +1713,9 @@ def do_purge(item: dict, cfg: dict) -> int:
     if everything or (not urls and not prefixes):
         return wipe_cache(base)
     removed = 0
+    scan_max = _int(cfg.get("PURGE_SCAN_MAX"), 500000, 1, 10 ** 9)
+    suffixes = key_suffixes(kinfo)
+    scan_targets = set()
     for url in urls:  # exact URLs keep the fast hashed-key delete
         m = re.match(r"^https?://([^/?#]+)([^#]*)", url)
         if not m:
@@ -1237,16 +1724,27 @@ def do_purge(item: dict, cfg: dict) -> int:
         if not path.startswith("/"):
             path = "/" + path
         # cache keys are "$scheme://$host$request_uri", or "$scheme://$host$pcdn_path"
-        # (query dropped) on sites with ignore_query: remove both variants
+        # (query dropped) on sites with ignore_query: remove both variants (plus the
+        # key_query_allow form and every device/WebP variant, SPEC §14.1)
         for scheme in ("http", "https"):
-            for p in dict.fromkeys((path, path.split("?", 1)[0])):
-                try:
-                    os.remove(cache_file(cfg["CACHE_DIR"], sid, f"{scheme}://{host}{p}"))
-                    removed += 1
-                except FileNotFoundError:
-                    pass
+            for p in url_key_bases(path, kinfo):
+                if suffixes is None:   # cookie-keyed variants: found by scanning below
+                    scan_targets.add(f"{scheme}://{host}{p}")
+                    continue
+                for suf in suffixes:
+                    try:
+                        os.remove(cache_file(cfg["CACHE_DIR"], sid, f"{scheme}://{host}{p}{suf}"))
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+    if scan_targets:
+        fields = int(bool(kinfo.get("dev"))) + len(kinfo.get("cookies") or []) + int(bool(kinfo.get("webp")))
+        n, overflow = purge_exact_scan(base, scan_targets, fields, scan_max)
+        if overflow:
+            log.warning("purge scan cap %d exceeded for site %s; falling back to full purge", scan_max, sid)
+            return wipe_cache(base)
+        removed += n
     if prefixes:
-        scan_max = _int(cfg.get("PURGE_SCAN_MAX"), 500000, 1, 10 ** 9)
         n, overflow = purge_prefixes(base, prefixes, scan_max)
         if overflow:  # too many files to scan safely -> fall back to a full-site purge
             log.warning("purge scan cap %d exceeded for site %s; falling back to full purge", scan_max, sid)
@@ -1852,6 +2350,7 @@ class Agent:
         st["tree_digest"] = digest
         st["site_digests"], st["cert_digests"] = site_digests(files), cert_digests(files)
         st["global_digest"] = global_digest(files)
+        st["keyinfo"] = key_infos(body)   # cache-key shapes for exact-URL purges (SPEC §14.1)
         for k in ("pending_version", "pending_since"):
             st.pop(k, None)
         st["last_reload"] = time.monotonic()
@@ -1881,6 +2380,7 @@ class Agent:
                 and not st.get("last_error")):
             ensure_cache_dirs(body, cfg)
             st["etag"], st["version"], st["render_rev"] = etag, version, rev
+            st["keyinfo"] = key_infos(body)
             for k in ("pending_version", "pending_since"):
                 st.pop(k, None)
             self._report(version, None)
@@ -1929,8 +2429,9 @@ class Agent:
             # first run: a fresh node has an empty cache, so skip history and remember where we are
             self.state["purge_id"] = items[-1]["id"] if items else 0
             return
+        kinfo = self.state.get("keyinfo") or {}
         for it in items or []:
-            n = do_purge(it, self.cfg)
+            n = do_purge(it, self.cfg, kinfo.get(str(it.get("site_id"))))
             what = "ALL" if it.get("everything") else (it["urls"] or it.get("prefixes") or "ALL")
             log.info("purge %s %s -> %d entries", it["domain"], what, n)
             self.state["purge_id"] = it["id"]
@@ -1999,7 +2500,8 @@ class Agent:
     def _hb(self, **over) -> dict:
         """Base heartbeat body: bundle version + (when configured) region/role, so a fresh node
         self-registers into the right pool (SPEC §11.1). Overrides fill applied_version/error/metrics."""
-        body: dict = {"bundle_version": bundle_version(self.cfg), "geoip": geoip_present(self.cfg)}
+        body: dict = {"bundle_version": bundle_version(self.cfg), "geoip": geoip_present(self.cfg),
+                      "capabilities": heartbeat_capabilities(self.cfg)}   # SPEC §14.1
         if self.cfg.get("REGION"):
             body["region"] = self.cfg["REGION"]
         if self.cfg.get("GROUP"):

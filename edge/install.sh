@@ -5,6 +5,9 @@
 #
 # Uses the distribution nginx (1.24) with the distro dynamic modules:
 #   libnginx-mod-http-js (njs >= 0.8.1), -geoip2, -image-filter, -brotli-filter
+# or, with --http3, nginx.org mainline (HTTP/3 + QUIC) with the nginx.org modules (njs,
+# image-filter). nginx.org has no geoip2 / brotli build: the agent detects which module files are
+# present and renders their directives only then (country rules fail open, gzip only).
 #
 # Options:
 #   --region home|global   edge region / DNS pool (default global)
@@ -14,9 +17,13 @@
 #   --http-port N      public HTTP port (default 80)
 #   --https-port N     public HTTPS port (default 443)
 #   --no-geoip         do not download the DB-IP country database (country rules never match)
+#   --http3            opt-in: nginx.org mainline nginx (HTTP/3 over QUIC). Open UDP/<https-port>.
+#   --no-http3         go back to the distro nginx (overrides HTTP3=yes read by --upgrade)
+#   --cc bbr|cubic     TCP congestion control (default bbr)
 #   --upgrade          update an installed edge in place: controller, token, ports, IPv6, cache
-#                      size, region and role are read from /etc/pcdn/agent.conf (flags still override)
-#   --distro-nginx     accepted for compatibility (the distro nginx is always used now)
+#                      size, region, role, --http3 and --cc are read from /etc/pcdn/agent.conf
+#                      (flags still override)
+#   --distro-nginx     same as --no-http3 (the default)
 set -euo pipefail
 
 CONTROLLER=""
@@ -29,6 +36,8 @@ HTTP_PORT=80
 HTTPS_PORT=443
 GEOIP=yes
 UPGRADE=no
+HTTP3=""     # yes | no ("" = not given: no, or the installed value on --upgrade)
+TCP_CC=""    # bbr | cubic ("" = not given: bbr, or the installed value on --upgrade)
 # F6: worker_shutdown_timeout — bounds how many draining worker generations pile up after reloads.
 # 1h matches the default tunnel idle_timeout; use 20-30m on <=4GB nodes. Never seconds (a hard cut).
 SHUTDOWN_TIMEOUT=1h
@@ -41,7 +50,9 @@ while [ $# -gt 0 ]; do
     --region) REGION="$2"; shift 2 ;;
     --role) ROLE="$2"; shift 2 ;;
     --no-ipv6) IPV6=no; shift ;;
-    --distro-nginx) shift ;;
+    --distro-nginx|--no-http3) HTTP3=no; shift ;;
+    --http3) HTTP3=yes; shift ;;
+    --cc) TCP_CC="${2:-}"; shift 2 ;;
     --cache-size) CACHE_SIZE="$2"; shift 2 ;;
     --http-port) HTTP_PORT="$2"; shift 2 ;;
     --https-port) HTTPS_PORT="$2"; shift 2 ;;
@@ -55,6 +66,7 @@ export SHUTDOWN_TIMEOUT
 
 case "${REGION:-}" in ""|home|global) ;; *) echo "--region must be home or global"; exit 1 ;; esac
 case "${ROLE:-}" in ""|general|tunnel) ;; *) echo "--role must be general or tunnel"; exit 1 ;; esac
+case "${TCP_CC:-}" in ""|bbr|cubic) ;; *) echo "--cc must be bbr or cubic"; exit 1 ;; esac
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 if [ "$UPGRADE" = yes ]; then
@@ -68,7 +80,11 @@ if [ "$UPGRADE" = yes ]; then
   v="$(conf CACHE_MAX_SIZE)"; [ -n "$v" ] && CACHE_SIZE="$v"
   v="$(conf HTTP_PORT)"; [ -n "$v" ] && HTTP_PORT="$v"
   v="$(conf HTTPS_PORT)"; [ -n "$v" ] && HTTPS_PORT="$v"
+  if [ -z "$TCP_CC" ]; then v="$(conf TCP_CC)"; case "$v" in bbr|cubic) TCP_CC="$v" ;; esac; fi
+  if [ -z "$HTTP3" ]; then v="$(conf HTTP3)"; case "$v" in yes|no) HTTP3="$v" ;; esac; fi
 fi
+TCP_CC="${TCP_CC:-bbr}"
+HTTP3="${HTTP3:-no}"
 [ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || { echo "usage: $0 --controller URL --token TOKEN"; exit 1; }
 [ -f /etc/debian_version ] || { echo "only Ubuntu 24.04 (or a Debian derivative with njs >= 0.8.1) is supported"; exit 1; }
 case "$HTTP_PORT$HTTPS_PORT" in *[!0-9]*) echo "ports must be numeric"; exit 1 ;; esac
@@ -79,17 +95,88 @@ fi
 
 echo "==> packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
-apt-get install -y -q curl ca-certificates python3 logrotate gzip \
-  nginx libnginx-mod-http-js libnginx-mod-http-geoip2 libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter
+# the published nginx.org signing key (https://nginx.org/en/linux_packages.html)
+NGINX_KEY_FPR=573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+NGINX_KEYRING=/usr/share/keyrings/nginx-archive-keyring.gpg
+MODULES_DIR=/usr/lib/nginx/modules
 
-# js_periodic / js_shared_dict_zone need njs >= 0.8.1
-NJS_VER="$(dpkg-query -W -f='${Version}' libnginx-mod-http-js 2>/dev/null | sed 's/^[0-9]*://; s/-.*//')"
+# (pipelines below end in `grep ... >/dev/null`, not `grep -q`: with pipefail an early grep exit
+# could SIGPIPE the writer and turn a match into a failure)
+installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep "ok installed" >/dev/null; }
+# dpkg conffile policy for the nginx packages only: keep our edited nginx.conf on a plain upgrade;
+# after a flavour swap take the new package's stock file (it was moved aside).
+NGINX_APT_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+# the distro and nginx.org nginx packages conflict: remove the other flavour first. Its
+# /etc/nginx/nginx.conf is moved aside (*.pcdn-bak) so the new package installs its own stock file
+# (our edits below are re-applied to it), and pcdn's include is parked so the new package's
+# postinst can start nginx before the module load_module lines exist.
+swap_out() {
+  local pkgs="$*"
+  [ -n "$pkgs" ] || return 0
+  echo "    replacing: $pkgs"
+  if [ -f /etc/nginx/nginx.conf ]; then mv -f /etc/nginx/nginx.conf /etc/nginx/nginx.conf.pcdn-bak; fi
+  if [ -f /etc/nginx/conf.d/00-pcdn.conf ]; then
+    mv -f /etc/nginx/conf.d/00-pcdn.conf /etc/nginx/00-pcdn.conf.parked
+  fi
+  # shellcheck disable=SC2086
+  apt-get remove -y -q $pkgs
+  NGINX_APT_OPTS="-o Dpkg::Options::=--force-confnew -o Dpkg::Options::=--force-confmiss"
+}
+
+if [ "$HTTP3" = yes ]; then
+  # SPEC §14.1: nginx.org mainline (built --with-http_v3_module) + the nginx.org dynamic modules
+  apt-get update -q
+  apt-get install -y -q curl ca-certificates gnupg python3 logrotate gzip
+  CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+  case "${ID:-}" in ubuntu|debian) NGINX_DISTRO="$ID" ;; *) NGINX_DISTRO=ubuntu ;; esac
+  [ -n "$CODENAME" ] || { echo "--http3: cannot determine the distribution codename"; exit 1; }
+  curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor > "$NGINX_KEYRING.tmp"
+  if ! gpg --dry-run --quiet --no-keyring --import --import-options import-show "$NGINX_KEYRING.tmp" 2>/dev/null \
+      | tr -d ' ' | grep -i "$NGINX_KEY_FPR" >/dev/null; then
+    rm -f "$NGINX_KEYRING.tmp"
+    echo "--http3: the downloaded nginx.org key is not $NGINX_KEY_FPR; refusing to add the repository"; exit 1
+  fi
+  mv -f "$NGINX_KEYRING.tmp" "$NGINX_KEYRING"
+  chmod 644 "$NGINX_KEYRING"
+  echo "deb [signed-by=$NGINX_KEYRING] https://nginx.org/packages/mainline/$NGINX_DISTRO $CODENAME nginx" \
+    > /etc/apt/sources.list.d/nginx.list
+  printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx
+  apt-get update -q
+  if installed nginx-common; then
+    swap_out $(dpkg-query -W -f='${Package} ${Status}\n' 'libnginx-mod-*' nginx nginx-core nginx-full nginx-light \
+                 nginx-extras nginx-common 2>/dev/null | awk '/ok installed/{print $1}')
+  fi
+  # shellcheck disable=SC2086
+  apt-get install -y -q $NGINX_APT_OPTS nginx nginx-module-njs nginx-module-image-filter
+  # modules nginx.org may or may not publish for this build: used when present, skipped otherwise
+  for pkg in nginx-module-geoip2 nginx-module-brotli; do
+    # shellcheck disable=SC2086
+    if apt-cache show "$pkg" >/dev/null 2>&1; then apt-get install -y -q $NGINX_APT_OPTS "$pkg" || true; fi
+  done
+  NJS_PKG=nginx-module-njs
+  nginx -V 2>&1 | grep -- '--with-http_v3_module' >/dev/null || echo "warning: this nginx build has no HTTP/3 support"
+else
+  if installed nginx && dpkg-query -W -f='${Maintainer}' nginx 2>/dev/null | grep -i 'nginx packaging' >/dev/null; then
+    # back from --http3: the distro build carries every module we need
+    swap_out $(dpkg-query -W -f='${Package} ${Status}\n' nginx 'nginx-module-*' 2>/dev/null \
+                 | awk '/ok installed/{print $1}')
+  fi
+  # an old install may have pinned nginx.org packages; the distro build carries the modules we need
+  rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/preferences.d/99nginx
+  apt-get update -q
+  apt-get install -y -q curl ca-certificates python3 logrotate gzip
+  # shellcheck disable=SC2086
+  apt-get install -y -q $NGINX_APT_OPTS \
+    nginx libnginx-mod-http-js libnginx-mod-http-geoip2 libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter
+  NJS_PKG=libnginx-mod-http-js
+fi
+if [ -f /etc/nginx/00-pcdn.conf.parked ]; then mv -f /etc/nginx/00-pcdn.conf.parked /etc/nginx/conf.d/00-pcdn.conf; fi
+
+# js_periodic / js_shared_dict_zone need njs >= 0.8.1 (nginx.org versions read "<nginx>+<njs>-<rel>")
+NJS_VER="$(dpkg-query -W -f='${Version}' "$NJS_PKG" 2>/dev/null | sed 's/^[0-9]*://; s/-.*//; s/^.*+//')"
 if ! printf '0.8.1\n%s\n' "$NJS_VER" | sort -V -C; then
   echo "njs $NJS_VER is too old (need >= 0.8.1)"; exit 1
 fi
-# an old install may have pinned nginx.org packages; the distro build carries the modules we need
-rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/preferences.d/99nginx
 
 NGINX_USER="$(awk '/^[[:space:]]*user[[:space:]]/{gsub(";","",$2); print $2; exit}' /etc/nginx/nginx.conf)"
 NGINX_USER="${NGINX_USER:-www-data}"
@@ -97,6 +184,8 @@ NGINX_USER="${NGINX_USER:-www-data}"
 echo "==> files"
 install -d -m 755 /etc/pcdn /var/lib/pcdn /usr/share/pcdn/pages /usr/share/pcdn/njs /usr/share/pcdn/nginx /usr/share/pcdn/geo
 install -d -m 755 -o "$NGINX_USER" /var/cache/pcdn
+# the nginx.org build runs its workers as "nginx", the distro one as "www-data": the cache follows
+chown -R "$NGINX_USER" /var/cache/pcdn 2>/dev/null || true
 install -m 755 "$HERE/pcdn-agent.py" /usr/local/bin/pcdn-agent
 install -m 644 "$HERE"/pages/*.html /usr/share/pcdn/pages/
 install -m 644 "$HERE/njs/pcdn.js" /usr/share/pcdn/njs/pcdn.js
@@ -138,6 +227,22 @@ else
   sed -i "1a worker_shutdown_timeout ${_SHUTDOWN_TIMEOUT};" /etc/nginx/nginx.conf
 fi
 # <<< nginx.conf edits
+# >>> pcdn load_module (nginx.org packages have no modules-enabled/; edge/tests/test_agent.py runs this)
+# one load_module line per optional module file present (the agent renders a module's directives
+# only when its file exists, so every present module must be loaded)
+if [ "$HTTP3" = yes ]; then
+  for so in ngx_http_js_module.so ngx_http_image_filter_module.so ngx_http_geoip2_module.so \
+            ngx_http_brotli_filter_module.so; do
+    if [ -f "$MODULES_DIR/$so" ] && ! grep -q "^[[:space:]]*load_module[[:space:]].*/$so;" /etc/nginx/nginx.conf; then
+      sed -i "1i load_module $MODULES_DIR/$so;" /etc/nginx/nginx.conf
+    fi
+  done
+  [ -f "$MODULES_DIR/ngx_http_geoip2_module.so" ] || echo "warning: no geoip2 module for this nginx build:" \
+    "country firewall rules never match and tunnel allowed_countries fails open"
+  [ -f "$MODULES_DIR/ngx_http_brotli_filter_module.so" ] || echo "warning: no brotli module for this nginx" \
+    "build: responses are compressed with gzip only"
+fi
+# <<< pcdn load_module
 install -d -m 755 /etc/systemd/system/nginx.service.d
 # F24: bias the OOM killer away from nginx (the agent is biased toward it) so a memory spike drops
 # the accounting agent, not the workers carrying live tunnels.
@@ -160,6 +265,8 @@ GEOIP_DB=/usr/share/pcdn/geo/country.mmdb
 NGINX_TEST_CMD=nginx -t -q
 NGINX_RELOAD_CMD=systemctl reload nginx
 ERROR_LOG=/var/log/nginx/error.log
+TCP_CC=$TCP_CC
+HTTP3=$HTTP3
 EOF
 # region / role (maps to the edge group): the agent reports these so a fresh node self-registers
 # into the right pool (SPEC §11.1). Written only when given; the controller already holds them
@@ -205,14 +312,19 @@ EOF
 fi
 
 # kernel tuning for many long-lived connections (VPN tunnels) and high-latency clients
-modprobe tcp_bbr 2>/dev/null || true
-echo tcp_bbr > /etc/modules-load.d/pcdn-bbr.conf
+# --cc (SPEC §14.1): bbr (default) or cubic
+if [ "$TCP_CC" = bbr ]; then
+  modprobe tcp_bbr 2>/dev/null || true
+  echo tcp_bbr > /etc/modules-load.d/pcdn-bbr.conf
+else
+  rm -f /etc/modules-load.d/pcdn-bbr.conf
+fi
 # F30: 999- so it sorts after /etc/sysctl.d/99-sysctl.conf at boot; drop the old 99- name on upgrade.
 rm -f /etc/sysctl.d/99-pcdn.conf
-# >>> pcdn sysctl (edge/tests/test_agent.py parses this heredoc)
-cat > /etc/sysctl.d/999-pcdn.conf <<'EOF'
+# >>> pcdn sysctl (edge/tests/test_agent.py runs this heredoc; it expands only ${TCP_CC})
+cat > /etc/sysctl.d/999-pcdn.conf <<EOF
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = ${TCP_CC}
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65536
 net.ipv4.tcp_max_syn_backlog = 65535
@@ -257,7 +369,7 @@ sysctl --system >/dev/null 2>&1 || true
 
 # F30: verify the values actually took effect (a stray /etc/sysctl.conf entry, or the module not
 # being loaded yet, can silently override them) and warn per key rather than failing silently.
-for kv in "net.ipv4.tcp_congestion_control=bbr" "net.core.somaxconn=65535" \
+for kv in "net.ipv4.tcp_congestion_control=$TCP_CC" "net.core.somaxconn=65535" \
           "net.ipv4.ip_local_port_range=10240	65535" "net.ipv4.tcp_keepalive_time=300" \
           "net.core.default_qdisc=fq"; do
   key="${kv%%=*}"; want="${kv#*=}"
@@ -298,3 +410,8 @@ systemctl restart pcdn-agent
 echo
 echo "Edge installed. Check: systemctl status pcdn-agent ; journalctl -u pcdn-agent -f"
 echo "Health: curl -H 'Host: health.pcdn' http://127.0.0.1:$HTTP_PORT/__pcdn/health"
+if [ "$HTTP3" = yes ]; then
+  echo
+  echo "HTTP/3: allow UDP/$HTTPS_PORT (QUIC) in the host firewall and any provider security group,"
+  echo "        e.g. 'ufw allow $HTTPS_PORT/udp' — TCP/$HTTPS_PORT alone keeps clients on HTTP/2."
+fi
