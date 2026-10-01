@@ -15,12 +15,14 @@ if (!defined('WHMCS')) {
     die('This file cannot be accessed directly');
 }
 
+require_once __DIR__ . '/lib/I18n.php';
 require_once __DIR__ . '/lib/ApiClient.php';
 require_once __DIR__ . '/lib/Reseller.php';
 require_once __DIR__ . '/lib/TeamAccess.php';
 
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
+use PasargadCdn\I18n;
 use PasargadCdn\Reseller;
 use PasargadCdn\TeamAccess;
 use WHMCS\Database\Capsule;
@@ -919,8 +921,14 @@ function pasargadcdn_module_url(): string
 function pasargadcdn_ClientArea(array $params)
 {
     $active = ($params['status'] ?? '') === 'Active';
+    // SPEC §16.10: Persian or English app — the viewer's in-app choice, else the WHMCS client
+    // language. Controller-connection errors in the boot blob follow the same language.
+    $lang = pasargadcdn_lang($params);
+    $prevLang = I18n::$current;
+    I18n::$current = $lang;
     $boot = [
         'serviceId' => (int) $params['serviceid'],
+        'lang' => $lang,
         'domain' => pasargadcdn_domain($params),
         'active' => $active,
         'site' => null,
@@ -950,10 +958,17 @@ function pasargadcdn_ClientArea(array $params)
         ];
     }
     $base = pasargadcdn_module_url();
-    $assets = pasargadcdn_assets($base);
+    $assets = pasargadcdn_assets($base, $lang);
+    $noJs = I18n::tr('برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.');
+    $loading = I18n::tr('در حال بارگذاری پنل CDN…');
+    I18n::$current = $prevLang;
     return [
         'tabOverviewModuleOutputTemplate' => 'templates/clientarea.tpl',
         'templateVariables' => [
+            'pcdnLang' => $lang,
+            'pcdnDir' => $lang === 'en' ? 'ltr' : 'rtl',
+            'pcdnNoJs' => $noJs,
+            'pcdnLoading' => $loading,
             'pcdnCsrf' => pasargadcdn_csrf_token(),
             'pcdnApiUrl' => $base . '/api.php',
             'pcdnCssUrl' => $assets['css'],
@@ -965,8 +980,21 @@ function pasargadcdn_ClientArea(array $params)
     ];
 }
 
-/** Versioned URLs of the client app under $base (the module's web path). */
-function pasargadcdn_assets(string $base): array
+/**
+ * Language of the client app (SPEC §16.10): 'fa' | 'en' — the viewer's in-app choice (cookie),
+ * else the WHMCS session / client / default language ('english' → en, anything else → fa).
+ */
+function pasargadcdn_lang(array $params = []): string
+{
+    return I18n::lang((array) ($params['clientsdetails'] ?? []));
+}
+
+/**
+ * Versioned URLs of the client app under $base (the module's web path). i18n.js loads first;
+ * the English dictionary (i18n-en.js, before it) only for an English page — the admin addon's
+ * embed calls this without $lang and stays Persian.
+ */
+function pasargadcdn_assets(string $base, string $lang = 'fa'): array
 {
     $ver = function (string $f) {
         return (string) @filemtime(__DIR__ . '/' . $f);
@@ -975,7 +1003,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js'])),
     ];
 }
 

@@ -14,6 +14,7 @@
 (function () {
   'use strict';
   var P = window.PCDN = window.PCDN || {};
+  var t = P.t;  // i18n.js (SPEC §16.10)
   var pages = P.pages = P.pages || {};
   if (!P.h) return;
   var h = P.h, s = P.s, append = P.append, clear = P.clear, icon = P.icon, ltr = P.ltr, num = P.num;
@@ -25,17 +26,17 @@
   function onLeave(fn) { if (A().onLeave) A().onLeave(fn); }
   function tunnelOn() { return !!feats().tunnel; }
 
-  var NO_DATA = 'داده‌ای نیست';
+  var NO_DATA = t('داده‌ای نیست');
   var nf1 = null, nf2 = null;
   try {
-    nf1 = new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 1 });
-    nf2 = new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 2 });
+    nf1 = new Intl.NumberFormat(P.locale, { maximumFractionDigits: 1 });
+    nf2 = new Intl.NumberFormat(P.locale, { maximumFractionDigits: 2 });
   } catch (e) { /* old browser: plain digits */ }
   function isNum(v) { return typeof v === 'number' && isFinite(v); }
   function f1(v) { return nf1 ? nf1.format(Math.round(v * 10) / 10) : P.fa(Math.round(v * 10) / 10); }
   function f2(v) { return nf2 ? nf2.format(Math.round(v * 100) / 100) : P.fa(Math.round(v * 100) / 100); }
-  function pct(v) { return isNum(v) ? f1(v) + '٪' : NO_DATA; }
-  function ms(v) { return isNum(v) ? num(Math.round(v)) + ' میلی‌ثانیه' : NO_DATA; }
+  function pct(v) { return isNum(v) ? f1(v) + t('٪') : NO_DATA; }
+  function ms(v) { return isNum(v) ? num(Math.round(v)) + t(' میلی‌ثانیه') : NO_DATA; }
 
   var PROTO = { grpc: 'gRPC', xhttp: 'XHTTP', ws: 'WebSocket', httpupgrade: 'HTTPUpgrade', h2: 'HTTP/2 (h2)' };
   function protoBadge(p) { return h('span', { className: 'pcdn-tn-proto pcdn-tn-' + String(p || ''), text: PROTO[p] || String(p || '—') }); }
@@ -90,7 +91,7 @@
 
   /** Stacked daily bars (inline SVG, same look as reports.js charts). series: [{name, color, values}] */
   function stackedBars(host, labels, series, aria) {
-    var totals = labels.map(function (_, i) { return series.reduce(function (t, sr) { return t + (sr.values[i] || 0); }, 0); });
+    var totals = labels.map(function (_, i) { return series.reduce(function (tx, sr) { return tx + (sr.values[i] || 0); }, 0); });
     var maxV = Math.max.apply(null, [1].concat(totals));
     var p10 = Math.pow(10, Math.floor(Math.log(maxV) / Math.LN10)), nn = maxV / p10;
     var max = (nn <= 1 ? 1 : nn <= 2 ? 2 : nn <= 2.5 ? 2.5 : nn <= 5 ? 5 : 10) * p10;
@@ -103,7 +104,7 @@
     for (var i = 0; i <= 4; i++) {
       var yy = y(max * i / 4);
       svg.appendChild(s('line', { x1: L, x2: W - R, y1: yy, y2: yy, class: i ? 'pcdn-gridline' : 'pcdn-baseline' }));
-      svg.appendChild(s('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'pcdn-axis' }, i ? P.bytes(max * i / 4).replace(/\s*[٫.]0+ /, ' ') : '۰'));
+      svg.appendChild(s('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'pcdn-axis' }, i ? P.bytes(max * i / 4).replace(/\s*[٫.]0+ /, ' ') : t('۰')));
     }
     var n = labels.length, slot = pw / Math.max(1, n), bw = Math.max(2, Math.min(26, slot * 0.66));
     var step = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / (narrow ? 64 : 80)))));
@@ -120,27 +121,27 @@
         base += v;
       });
       g.appendChild(s('title', {}, lb + ' — ' + series.filter(function (sr) { return sr.values[i2] > 0; })
-        .map(function (sr) { return sr.name + ': ' + P.bytes(sr.values[i2]); }).join('، ') + (totals[i2] ? '' : ' بدون ترافیک')));
+        .map(function (sr) { return sr.name + ': ' + P.bytes(sr.values[i2]); }).join(t('، ')) + (totals[i2] ? '' : t(' بدون ترافیک'))));
       svg.appendChild(g);
     });
     wrap.appendChild(svg);
     host.appendChild(h('div', { className: 'pcdn-legend' }, series.map(function (sr) {
-      var tot = sr.values.reduce(function (t, v) { return t + (v || 0); }, 0);
+      var tot = sr.values.reduce(function (tx, v) { return tx + (v || 0); }, 0);
       return h('span', { className: 'pcdn-legend-item' }, h('span', { className: 'pcdn-key', style: 'background:' + sr.color }), h('span', { text: sr.name }), h('strong', { text: P.bytes(tot) }));
     })));
   }
 
   // ================================================================== «کیفیت تونل» (§15.3 quality + §15.4 health)
 
-  var PERIODS = [['24', '۲۴ ساعت'], ['168', '۷ روز'], ['720', '۳۰ روز']];
+  var PERIODS = [['24', t('۲۴ ساعت')], ['168', t('۷ روز')], ['720', t('۳۰ روز')]];
   var ISSUE = {
-    origin_refused: ['اتصال به سرور شما رد شد', 'سرور شما روی پورت مسیر اتصال را رد می‌کند؛ سرویس Xray/sing-box و پورت را بررسی کنید.'],
-    origin_timeout: ['مهلت اتصال به سرور شما تمام شد', 'سرور شما دیر جواب می‌دهد یا فایروال آن اتصال نودهای CDN را بی‌پاسخ می‌گذارد؛ فایروال، بار سرور و مسیر شبکه‌ی آن را بررسی کنید.'],
-    origin_error: ['پاسخ نامعتبر از سرور شما', 'سرور شما اتصال را پذیرفت ولی پاسخ تونل نداد (مثلاً ۴۰۴ یا ۴۰۰)؛ مسیر، پروتکل و TLS ورودی سرور را با «بررسی کانفیگ سرور» مقایسه کنید.'],
-    limit: ['سقف تعداد اتصال پر شد', 'به سقف اتصال همزمان رسیده‌اید؛ «حداکثر اتصال هر IP» را بیشتر کنید یا پلن با اتصال بیشتر بگیرید.'],
-    country: ['کاربر خارج از کشورهای مجاز', 'کاربرانی از کشوری خارج از «کشورهای مجاز» وصل شده‌اند؛ اگر لازم است فهرست کشورها را تغییر دهید.'],
-    protocol: ['کلاینت با پروتکل اشتباه وصل شد', 'کلاینت با پروتکلی غیر از پروتکل مسیر وصل می‌شود؛ لینک اشتراک را دوباره از «پیکربندی آماده» بگیرید.'],
-    edge: ['خطای موقت نود CDN', 'خطای موقت در نودهای CDN؛ اگر ادامه داشت با پشتیبانی تماس بگیرید.']
+    origin_refused: [t('اتصال به سرور شما رد شد'), t('سرور شما روی پورت مسیر اتصال را رد می‌کند؛ سرویس Xray/sing-box و پورت را بررسی کنید.')],
+    origin_timeout: [t('مهلت اتصال به سرور شما تمام شد'), t('سرور شما دیر جواب می‌دهد یا فایروال آن اتصال نودهای CDN را بی‌پاسخ می‌گذارد؛ فایروال، بار سرور و مسیر شبکه‌ی آن را بررسی کنید.')],
+    origin_error: [t('پاسخ نامعتبر از سرور شما'), t('سرور شما اتصال را پذیرفت ولی پاسخ تونل نداد (مثلاً ۴۰۴ یا ۴۰۰)؛ مسیر، پروتکل و TLS ورودی سرور را با «بررسی کانفیگ سرور» مقایسه کنید.')],
+    limit: [t('سقف تعداد اتصال پر شد'), t('به سقف اتصال همزمان رسیده‌اید؛ «حداکثر اتصال هر IP» را بیشتر کنید یا پلن با اتصال بیشتر بگیرید.')],
+    country: [t('کاربر خارج از کشورهای مجاز'), t('کاربرانی از کشوری خارج از «کشورهای مجاز» وصل شده‌اند؛ اگر لازم است فهرست کشورها را تغییر دهید.')],
+    protocol: [t('کلاینت با پروتکل اشتباه وصل شد'), t('کلاینت با پروتکلی غیر از پروتکل مسیر وصل می‌شود؛ لینک اشتراک را دوباره از «پیکربندی آماده» بگیرید.')],
+    edge: [t('خطای موقت نود CDN'), t('خطای موقت در نودهای CDN؛ اگر ادامه داشت با پشتیبانی تماس بگیرید.')]
   };
   var ERR_KEYS = ['origin_refused', 'origin_timeout', 'origin_error', 'limit', 'country', 'protocol', 'edge'];
 
@@ -148,17 +149,17 @@
 
   function healthBadge(W) {
     var hd = W.health || {}, st = hd.state;
-    var M = { up: ['success', 'checkCircle', 'سرور پشت تونل در دسترس است', 'نودهای CDN در چند دقیقه‌ی گذشته به سرور شما وصل شده‌اند.'],
-      down: ['danger', 'xCircle', 'سرور پشت تونل پاسخ نمی‌دهد', 'بیشتر تلاش‌های نودهای CDN برای اتصال به سرور شما ناموفق بوده است. سرویس Xray/sing-box، پورت و فایروال سرور را بررسی کنید.'],
-      unknown: ['muted', 'clock', 'وضعیت سرور هنوز مشخص نیست', 'در چند دقیقه‌ی گذشته اتصال تونلی کافی برای قضاوت ثبت نشده است.'] };
+    var M = { up: ['success', 'checkCircle', t('سرور پشت تونل در دسترس است'), t('نودهای CDN در چند دقیقه‌ی گذشته به سرور شما وصل شده‌اند.')],
+      down: ['danger', 'xCircle', t('سرور پشت تونل پاسخ نمی‌دهد'), t('بیشتر تلاش‌های نودهای CDN برای اتصال به سرور شما ناموفق بوده است. سرویس Xray/sing-box، پورت و فایروال سرور را بررسی کنید.')],
+      unknown: ['muted', 'clock', t('وضعیت سرور هنوز مشخص نیست'), t('در چند دقیقه‌ی گذشته اتصال تونلی کافی برای قضاوت ثبت نشده است.')] };
     var m = M[st] || M.unknown;
-    var since = hd.since ? h('span', { className: 'pcdn-muted pcdn-small' }, (st === 'down' ? 'قطع از ' : st === 'up' ? 'وصل از ' : 'از ') , h('time', { dateTime: String(hd.since), title: P.date(hd.since), text: P.rel(hd.since) })) : null;
-    var check = hd.last_check ? h('span', { className: 'pcdn-muted pcdn-small' }, 'آخرین بررسی: ', h('time', { dateTime: String(hd.last_check), text: P.rel(hd.last_check) })) : null;
+    var since = hd.since ? h('span', { className: 'pcdn-muted pcdn-small' }, (st === 'down' ? t('قطع از ') : st === 'up' ? t('وصل از ') : t('از ')) , h('time', { dateTime: String(hd.since), title: P.date(hd.since), text: P.rel(hd.since) })) : null;
+    var check = hd.last_check ? h('span', { className: 'pcdn-muted pcdn-small' }, t('آخرین بررسی: '), h('time', { dateTime: String(hd.last_check), text: P.rel(hd.last_check) })) : null;
     return h('div', { className: 'pcdn-tq-health pcdn-tone-' + m[0], role: 'status', 'data-origin-health': st || 'unknown' },
       h('span', { className: 'pcdn-tq-health-icon' }, icon(m[1])),
       h('div', { className: 'pcdn-tq-health-text' }, h('strong', { text: m[2] }), h('span', { text: m[3] }),
         h('span', { className: 'pcdn-tq-health-meta' }, since, check),
-        st === 'down' ? h('span', { className: 'pcdn-tq-health-links' }, A().goLink('tunnel', 'تست اتصال در صفحه تونل'), A().goLink('tconfig', 'بررسی کانفیگ سرور')) : null));
+        st === 'down' ? h('span', { className: 'pcdn-tq-health-links' }, A().goLink('tunnel', t('تست اتصال در صفحه تونل')), A().goLink('tconfig', t('بررسی کانفیگ سرور'))) : null));
   }
 
   function renderQuality(Aa) {
@@ -166,9 +167,9 @@
     var hours = Q.hours;
     var holder = h('div', { className: 'pcdn-stack', 'data-tq-holder': hours });
     var healthSlot = h('div', { className: 'pcdn-tq-health-slot' }, W.health ? healthBadge(W) : P.skeleton(1));
-    var seg = P.segmented(PERIODS, hours, function (v) { Q.hours = v; Aa.renderMain(); }, 'بازه کیفیت تونل');
+    var seg = P.segmented(PERIODS, hours, function (v) { Q.hours = v; Aa.renderMain(); }, t('بازه کیفیت تونل'));
     seg.setAttribute('data-seg', 'tq-hours');
-    var refresh = refreshBtn('بروزرسانی کیفیت تونل', function (b) { load(b, true); });
+    var refresh = refreshBtn(t('بروزرسانی کیفیت تونل'), function (b) { load(b, true); });
     var bar = h('div', { className: 'pcdn-toolbar pcdn-toolbar-end' }, seg, refresh);
     function alive() { return S().page === 'tquality' && Q.hours === hours && document.body.contains(holder); }
     function load(b, force) {
@@ -181,8 +182,8 @@
         if (!alive()) return;
         if (!res.ok) {
           clear(holder);
-          if (res.status === 404) { W.ok = false; holder.appendChild(P.alertBox('info', 'گزارش کیفیت تونل روی این سرور CDN در دسترس نیست.')); return; }
-          holder.appendChild(P.errorBox(res, 'دریافت گزارش کیفیت تونل ممکن نشد'));
+          if (res.status === 404) { W.ok = false; holder.appendChild(P.alertBox('info', t('گزارش کیفیت تونل روی این سرور CDN در دسترس نیست.'))); return; }
+          holder.appendChild(P.errorBox(res, t('دریافت گزارش کیفیت تونل ممکن نشد')));
           return;
         }
         Q.data[hours] = res.data || {};
@@ -214,18 +215,18 @@
     });
     var succ = sessions + errors > 0 ? 100 * sessions / (sessions + errors) : null;
     holder.appendChild(h('div', { className: 'pcdn-kpis', 'data-tq-kpis': '1' },
-      kpi('link', 'brand', 'نشست‌های موفق', num(sessions), 'اتصال‌هایی که به سرور شما رسیدند', 'tq-sessions'),
-      kpi('checkCircle', successTone(succ), 'نرخ موفقیت', pct(succ), num(errors) + ' اتصال ناموفق', 'tq-success'),
-      kpi('warn', 'warning', 'قطع غیرعادی', sessions ? pct(abnormal * 100 / sessions) : NO_DATA, 'نشست‌هایی که ناگهان قطع شدند', 'tq-abnormal'),
-      kpi('clock', 'violet', 'زمان اتصال به سرور', cN ? ms(cSum / cN) : NO_DATA, 'میانگین زمان وصل شدن نود به سرور شما', 'tq-connect')));
+      kpi('link', 'brand', t('نشست‌های موفق'), num(sessions), t('اتصال‌هایی که به سرور شما رسیدند'), 'tq-sessions'),
+      kpi('checkCircle', successTone(succ), t('نرخ موفقیت'), pct(succ), num(errors) + t(' اتصال ناموفق'), 'tq-success'),
+      kpi('warn', 'warning', t('قطع غیرعادی'), sessions ? pct(abnormal * 100 / sessions) : NO_DATA, t('نشست‌هایی که ناگهان قطع شدند'), 'tq-abnormal'),
+      kpi('clock', 'violet', t('زمان اتصال به سرور'), cN ? ms(cSum / cN) : NO_DATA, t('میانگین زمان وصل شدن نود به سرور شما'), 'tq-connect')));
     if (!paths.length) {
-      holder.appendChild(P.card({ title: 'مسیرها', icon: 'link', id: 'tq-paths' }));
-      holder.lastChild.body.appendChild(P.empty('activity', 'در این بازه داده‌ای ثبت نشده است',
-        'وقتی کاربران از مسیرهای تونل استفاده کنند، کیفیت هر مسیر با چند دقیقه تأخیر اینجا نمایش داده می‌شود.'));
+      holder.appendChild(P.card({ title: t('مسیرها'), icon: 'link', id: 'tq-paths' }));
+      holder.lastChild.body.appendChild(P.empty('activity', t('در این بازه داده‌ای ثبت نشده است'),
+        t('وقتی کاربران از مسیرهای تونل استفاده کنند، کیفیت هر مسیر با چند دقیقه تأخیر اینجا نمایش داده می‌شود.')));
       return;
     }
     // per-path cards
-    var pc = P.card({ title: 'کیفیت هر مسیر', icon: 'link', id: 'tq-paths', subtitle: 'نرخ موفقیت = نشست‌های موفق ÷ (نشست‌های موفق + اتصال‌های ناموفق).' });
+    var pc = P.card({ title: t('کیفیت هر مسیر'), icon: 'link', id: 'tq-paths', subtitle: t('نرخ موفقیت = نشست‌های موفق ÷ (نشست‌های موفق + اتصال‌های ناموفق).') });
     var grid = h('div', { className: 'pcdn-tq-grid' });
     paths.slice().sort(function (a, b) { return (a.removed ? 1 : 0) - (b.removed ? 1 : 0) || (Number(b.sessions) || 0) - (Number(a.sessions) || 0); })
       .forEach(function (p) { grid.appendChild(pathCard(p)); });
@@ -233,8 +234,8 @@
     holder.appendChild(pc);
     // hourly chart
     var C = P.charts || {};
-    var cc = P.card({ title: 'روند نشست‌ها و خطاها', icon: 'chart', tone: 'violet', id: 'tq-chart',
-      subtitle: hours <= 48 ? 'ساعتی' : hours <= 168 ? 'هر ۴ ساعت' : 'روزانه' });
+    var cc = P.card({ title: t('روند نشست‌ها و خطاها'), icon: 'chart', tone: 'violet', id: 'tq-chart',
+      subtitle: hours <= 48 ? t('ساعتی') : hours <= 168 ? t('هر ۴ ساعت') : t('روزانه') });
     holder.appendChild(cc);
     var size = hours <= 48 ? 1 : hours <= 168 ? 4 : 24;
     var pts = [];
@@ -246,32 +247,32 @@
       pts.push(b);
     }
     var any = pts.some(function (x) { return x.sessions || x.errors || x.abnormal; });
-    if (!pts.length || !any || !C.area) cc.body.appendChild(P.empty('chart', 'در این بازه نشستی ثبت نشده است', null));
+    if (!pts.length || !any || !C.area) cc.body.appendChild(P.empty('chart', t('در این بازه نشستی ثبت نشده است'), null));
     else {
       var labels = pts.map(function (x) { return size >= 24 ? P.date(x.t, { month: 'short', day: 'numeric' }) : P.date(x.t, hours <= 48 ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', hour: '2-digit' }); });
       C.area(cc.body, labels, [
-        { name: 'نشست‌های موفق', color: C.COLORS.requests, values: pts.map(function (x) { return x.sessions; }), total: num(sessions) },
-        { name: 'اتصال‌های ناموفق', color: C.COLORS.s5, values: pts.map(function (x) { return x.errors; }), total: num(errors) },
-        { name: 'قطع غیرعادی', color: C.COLORS.s4, values: pts.map(function (x) { return x.abnormal; }) }
-      ], num, 'نمودار نشست‌ها، خطاها و قطع‌های غیرعادی تونل');
+        { name: t('نشست‌های موفق'), color: C.COLORS.requests, values: pts.map(function (x) { return x.sessions; }), total: num(sessions) },
+        { name: t('اتصال‌های ناموفق'), color: C.COLORS.s5, values: pts.map(function (x) { return x.errors; }), total: num(errors) },
+        { name: t('قطع غیرعادی'), color: C.COLORS.s4, values: pts.map(function (x) { return x.abnormal; }) }
+      ], num, t('نمودار نشست‌ها، خطاها و قطع‌های غیرعادی تونل'));
     }
     // per-edge table (node names only — never addresses)
     if (edges.length) {
-      var ec = P.card({ title: 'کیفیت به تفکیک نود', icon: 'server', tone: 'muted', id: 'tq-edges',
-        subtitle: 'اگر فقط یک نود مشکل دارد، معمولاً مسیر شبکه‌ی آن نود تا سرور شما کند است و سیستم خودش ترافیک را به نودهای سالم می‌برد.' });
+      var ec = P.card({ title: t('کیفیت به تفکیک نود'), icon: 'server', tone: 'muted', id: 'tq-edges',
+        subtitle: t('اگر فقط یک نود مشکل دارد، معمولاً مسیر شبکه‌ی آن نود تا سرور شما کند است و سیستم خودش ترافیک را به نودهای سالم می‌برد.') });
       var tbody = h('tbody');
       edges.forEach(function (e) {
         var tone = isNum(e.abnormal_pct) && e.abnormal_pct >= 10 ? 'is-bad' : '';
         tbody.appendChild(h('tr', { className: tone, 'data-edge': String(e.name || '') },
-          h('td', { 'data-label': 'نود' }, h('bdi', { dir: 'ltr', text: String(e.name || '—') })),
-          h('td', { 'data-label': 'نشست‌ها', className: 'pcdn-num', text: num(e.sessions || 0) }),
-          h('td', { 'data-label': 'قطع غیرعادی', className: 'pcdn-num', text: pct(e.abnormal_pct) }),
-          h('td', { 'data-label': 'زمان اتصال', className: 'pcdn-num', text: ms(e.connect_ms_avg) }),
-          h('td', { 'data-label': 'اتصال ناموفق', className: 'pcdn-num', text: num(e.error_total || 0) })));
+          h('td', { 'data-label': t('نود') }, h('bdi', { dir: 'ltr', text: String(e.name || '—') })),
+          h('td', { 'data-label': t('نشست‌ها'), className: 'pcdn-num', text: num(e.sessions || 0) }),
+          h('td', { 'data-label': t('قطع غیرعادی'), className: 'pcdn-num', text: pct(e.abnormal_pct) }),
+          h('td', { 'data-label': t('زمان اتصال'), className: 'pcdn-num', text: ms(e.connect_ms_avg) }),
+          h('td', { 'data-label': t('اتصال ناموفق'), className: 'pcdn-num', text: num(e.error_total || 0) })));
       });
       ec.body.appendChild(h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table pcdn-rtable pcdn-tq-edges' },
-        h('caption', { className: 'pcdn-sr', text: 'کیفیت تونل به تفکیک نود' }),
-        h('thead', null, h('tr', null, ['نود', 'نشست‌ها', 'قطع غیرعادی', 'زمان اتصال', 'اتصال ناموفق'].map(function (t) { return h('th', { scope: 'col', text: t }); }))),
+        h('caption', { className: 'pcdn-sr', text: t('کیفیت تونل به تفکیک نود') }),
+        h('thead', null, h('tr', null, [t('نود'), t('نشست‌ها'), t('قطع غیرعادی'), t('زمان اتصال'), t('اتصال ناموفق')].map(function (tx) { return h('th', { scope: 'col', text: tx }); }))),
         tbody)));
       holder.appendChild(ec);
     }
@@ -284,23 +285,25 @@
       return h('span', { className: 'pcdn-tq-chip', 'data-err': k }, h('span', { text: ISSUE[k][0] }), h('strong', { text: num(errs[k]) }));
     });
     var top = p.top_issue && ISSUE[p.top_issue] ? p.top_issue : null;
-    var advice = typeof p.advice === 'string' && p.advice ? p.advice : top ? ISSUE[top][1] : null;
+    // The controller's advice is Persian: on an English page the known issues use our own text (SPEC §16.10).
+    var advice = P.isEn && top && ISSUE[top] ? ISSUE[top][1]
+      : typeof p.advice === 'string' && p.advice ? P.ctlText(p.advice) : top ? ISSUE[top][1] : null;
     var avg = Number(p.avg_session_s);
     return h('article', { className: 'pcdn-tq-path' + (p.removed ? ' is-removed' : ''), 'data-tq-path': String(p.id || '') },
       h('header', { className: 'pcdn-tq-path-head' }, protoBadge(p.protocol),
         h('bdi', { className: 'pcdn-vchip pcdn-tn-pathval', dir: 'ltr', text: String(p.path || p.id || '—') }),
-        p.removed ? P.badge('حذف‌شده از تنظیمات', 'muted') : null),
+        p.removed ? P.badge(t('حذف‌شده از تنظیمات'), 'muted') : null),
       h('div', { className: 'pcdn-tq-big pcdn-tone-' + tone },
-        h('span', { className: 'pcdn-tq-big-val', text: pct(p.success_pct) }), h('span', { className: 'pcdn-tq-big-lbl', text: 'نرخ موفقیت' })),
+        h('span', { className: 'pcdn-tq-big-val', text: pct(p.success_pct) }), h('span', { className: 'pcdn-tq-big-lbl', text: t('نرخ موفقیت') })),
       isNum(p.success_pct) ? P.meter(p.success_pct / 100, tone === 'muted' ? null : tone) : null,
       h('dl', { className: 'pcdn-dl pcdn-tq-dl' },
-        h('div', null, h('dt', { text: 'نشست‌ها' }), h('dd', { text: num(p.sessions || 0) })),
-        h('div', null, h('dt', { text: 'قطع غیرعادی' }), h('dd', { text: pct(p.abnormal_pct) })),
-        h('div', null, h('dt', { text: 'زمان اتصال به سرور' }), h('dd', { text: ms(p.connect_ms_avg) })),
-        h('div', null, h('dt', { text: 'میانگین طول نشست' }), h('dd', { text: avg > 0 ? P.dur(Math.round(avg)) : NO_DATA }))),
+        h('div', null, h('dt', { text: t('نشست‌ها') }), h('dd', { text: num(p.sessions || 0) })),
+        h('div', null, h('dt', { text: t('قطع غیرعادی') }), h('dd', { text: pct(p.abnormal_pct) })),
+        h('div', null, h('dt', { text: t('زمان اتصال به سرور') }), h('dd', { text: ms(p.connect_ms_avg) })),
+        h('div', null, h('dt', { text: t('میانگین طول نشست') }), h('dd', { text: avg > 0 ? P.dur(Math.round(avg)) : NO_DATA }))),
       chips.length ? h('div', { className: 'pcdn-tq-chips' }, chips) : null,
-      top ? P.alertBox(tone === 'success' ? 'info' : 'warning', [h('strong', { text: 'مشکل اصلی: ' + ISSUE[top][0] + '. ' }), advice || ''], { icon: 'bulb' })
-        : (isNum(p.success_pct) ? h('p', { className: 'pcdn-muted pcdn-small', text: 'مشکل قابل توجهی دیده نشد.' }) : null));
+      top ? P.alertBox(tone === 'success' ? 'info' : 'warning', [h('strong', { text: t('مشکل اصلی: ') + ISSUE[top][0] + '. ' }), advice || ''], { icon: 'bulb' })
+        : (isNum(p.success_pct) ? h('p', { className: 'pcdn-muted pcdn-small', text: t('مشکل قابل توجهی دیده نشد.') }) : null));
   }
 
   // ================================================================== «مصرف تونل» (§15.3 usage)
@@ -311,7 +314,7 @@
   function renderUsage(Aa) {
     var U = uState();
     var holder = h('div', { className: 'pcdn-stack', 'data-tu-holder': '1' });
-    var refresh = refreshBtn('بروزرسانی مصرف تونل', function (b) { load(b, true); });
+    var refresh = refreshBtn(t('بروزرسانی مصرف تونل'), function (b) { load(b, true); });
     function alive() { return S().page === 'tusage' && document.body.contains(holder); }
     function load(b, force) {
       if (!force && U.data && Date.now() - U.at < 60000) { setTimeout(function () { if (alive()) drawUsage(holder, U.data, Aa); }, 0); return; }
@@ -320,8 +323,8 @@
         if (!alive()) return;
         if (!res.ok) {
           clear(holder);
-          if (res.status === 404) { w7State().ok = false; holder.appendChild(P.alertBox('info', 'گزارش مصرف تونل روی این سرور CDN در دسترس نیست.')); return; }
-          holder.appendChild(P.errorBox(res, 'دریافت مصرف تونل ممکن نشد'));
+          if (res.status === 404) { w7State().ok = false; holder.appendChild(P.alertBox('info', t('گزارش مصرف تونل روی این سرور CDN در دسترس نیست.'))); return; }
+          holder.appendChild(P.errorBox(res, t('دریافت مصرف تونل ممکن نشد')));
           return;
         }
         U.data = res.data || {};
@@ -342,35 +345,35 @@
     var used = Number(m.used_bytes) || 0, limit = isNum(m.limit_bytes) && m.limit_bytes > 0 ? m.limit_bytes : null;
     var fc = isNum(m.forecast_bytes) ? m.forecast_bytes : null;
     // month card
-    var mc = P.card({ title: 'این ماه', icon: 'activity', id: 'tu-month', tone: 'brand',
-      subtitle: 'ترافیک تونل جزو ترافیک ماهانه سرویس حساب می‌شود.' });
+    var mc = P.card({ title: t('این ماه'), icon: 'activity', id: 'tu-month', tone: 'brand',
+      subtitle: t('ترافیک تونل جزو ترافیک ماهانه سرویس حساب می‌شود.') });
     var ratio = limit ? used / limit : 0;
     append(mc.body, [
       h('dl', { className: 'pcdn-dl' },
-        h('div', { 'data-tu': 'used' }, h('dt', { text: 'مصرف تونل این ماه' }), h('dd', { text: P.bytes(used) })),
-        h('div', { 'data-tu': 'limit' }, h('dt', { text: 'سقف ترافیک سرویس' }), h('dd', { text: limit ? P.bytes(limit) : 'بدون سقف' })),
-        h('div', { 'data-tu': 'forecast' }, h('dt', { text: 'پیش‌بینی مصرف تا پایان ماه' }), h('dd', { text: fc !== null ? P.bytes(fc) : NO_DATA })),
-        limit ? h('div', { 'data-tu': 'exhaust' }, h('dt', { text: 'تاریخ احتمالی اتمام ترافیک' }),
-          h('dd', { text: m.forecast_exhaust_date ? P.date(m.forecast_exhaust_date, { dateStyle: 'medium' }) : 'پیش از پایان ماه تمام نمی‌شود' })) : null),
+        h('div', { 'data-tu': 'used' }, h('dt', { text: t('مصرف تونل این ماه') }), h('dd', { text: P.bytes(used) })),
+        h('div', { 'data-tu': 'limit' }, h('dt', { text: t('سقف ترافیک سرویس') }), h('dd', { text: limit ? P.bytes(limit) : t('بدون سقف') })),
+        h('div', { 'data-tu': 'forecast' }, h('dt', { text: t('پیش‌بینی مصرف تا پایان ماه') }), h('dd', { text: fc !== null ? P.bytes(fc) : NO_DATA })),
+        limit ? h('div', { 'data-tu': 'exhaust' }, h('dt', { text: t('تاریخ احتمالی اتمام ترافیک') }),
+          h('dd', { text: m.forecast_exhaust_date ? P.date(m.forecast_exhaust_date, { dateStyle: 'medium' }) : t('پیش از پایان ماه تمام نمی‌شود') })) : null),
       limit ? h('div', { className: 'pcdn-usage-bar' }, P.meter(Math.min(1, ratio), ratio >= 1 ? 'danger' : ratio >= 0.85 ? 'warning' : 'brand'),
-        h('div', { className: 'pcdn-usage-bar-legend' }, h('span', { text: P.pct(used, limit) + ' مصرف‌شده' }), h('span', { text: P.bytes(used) + ' از ' + P.bytes(limit) }))) : null,
-      m.forecast_exhaust_date && limit ? P.alertBox('warning', [h('strong', { text: 'با این روند، ترافیک حدود ' + P.date(m.forecast_exhaust_date, { dateStyle: 'medium' }) + ' تمام می‌شود. ' }),
-        'برای جلوگیری از قطعی، ', Aa.wallet ? 'اعتبار کیف پول را شارژ کنید یا ' : '', 'بسته‌ی ترافیک افزوده بخرید یا پلن را ارتقا دهید.'], { icon: 'activity' })
-        : fc !== null && limit ? h('p', { className: 'pcdn-usage-forecast' }, icon('activity'), h('span', { text: ' با این روند، ترافیک این ماه کافی است.' })) : null
+        h('div', { className: 'pcdn-usage-bar-legend' }, h('span', { text: P.pct(used, limit) + t(' مصرف‌شده') }), h('span', { text: P.bytes(used) + t(' از ') + P.bytes(limit) }))) : null,
+      m.forecast_exhaust_date && limit ? P.alertBox('warning', [h('strong', { text: t('با این روند، ترافیک حدود ') + P.date(m.forecast_exhaust_date, { dateStyle: 'medium' }) + t(' تمام می‌شود. ') }),
+        t('برای جلوگیری از قطعی، '), Aa.wallet ? t('اعتبار کیف پول را شارژ کنید یا ') : '', t('بسته‌ی ترافیک افزوده بخرید یا پلن را ارتقا دهید.')], { icon: 'activity' })
+        : fc !== null && limit ? h('p', { className: 'pcdn-usage-forecast' }, icon('activity'), h('span', { text: t(' با این روند، ترافیک این ماه کافی است.') })) : null
     ]);
     holder.appendChild(mc);
     // totals
     var up = 0, down = 0, sess = 0;
     days.forEach(function (x) { up += Number(x.bytes_up) || 0; down += Number(x.bytes_down) || 0; sess += Number(x.sessions) || 0; });
     holder.appendChild(h('div', { className: 'pcdn-kpis', 'data-tu-kpis': '1' },
-      kpi('upload', 'warning', 'آپلود (۳۰ روز)', P.bytes(up), 'از کاربران به سرور شما', 'tu-up'),
-      kpi('download', 'success', 'دانلود (۳۰ روز)', P.bytes(down), 'از سرور شما به کاربران', 'tu-down'),
-      kpi('link', 'brand', 'نشست‌ها (۳۰ روز)', num(sess), null, 'tu-sessions'),
-      kpi('chart', 'violet', 'میانگین روزانه', P.bytes(days.length ? (up + down) / days.length : 0), null, 'tu-avg')));
+      kpi('upload', 'warning', t('آپلود (۳۰ روز)'), P.bytes(up), t('از کاربران به سرور شما'), 'tu-up'),
+      kpi('download', 'success', t('دانلود (۳۰ روز)'), P.bytes(down), t('از سرور شما به کاربران'), 'tu-down'),
+      kpi('link', 'brand', t('نشست‌ها (۳۰ روز)'), num(sess), null, 'tu-sessions'),
+      kpi('chart', 'violet', t('میانگین روزانه'), P.bytes(days.length ? (up + down) / days.length : 0), null, 'tu-avg')));
     // daily chart by protocol / path
-    var seg = P.segmented([['protocol', 'بر اساس پروتکل'], ['path', 'بر اساس مسیر']], U.by, function (v) { U.by = v; drawUsage(holder, d, Aa); }, 'تفکیک نمودار');
+    var seg = P.segmented([['protocol', t('بر اساس پروتکل')], ['path', t('بر اساس مسیر')]], U.by, function (v) { U.by = v; drawUsage(holder, d, Aa); }, t('تفکیک نمودار'));
     seg.setAttribute('data-seg', 'tu-by');
-    var cc = P.card({ title: 'مصرف روزانه', icon: 'chart', tone: 'violet', id: 'tu-daily', actions: seg });
+    var cc = P.card({ title: t('مصرف روزانه'), icon: 'chart', tone: 'violet', id: 'tu-daily', actions: seg });
     holder.appendChild(cc);
     var key = U.by === 'path' ? 'by_path' : 'by_protocol';
     var totals = {};
@@ -382,17 +385,17 @@
       return { name: U.by === 'path' ? (names[k] || k) : (PROTO[k] || k), color: COLORS[i % COLORS.length],
         values: days.map(function (x) { var o = x[key] || {}; return bytesOf(o[k]); }) };
     });
-    if (rest.length) series.push({ name: 'سایر', color: 'var(--pc-faint)', values: days.map(function (x) { var o = x[key] || {}; return rest.reduce(function (t, k) { return t + bytesOf(o[k]); }, 0); }) });
+    if (rest.length) series.push({ name: t('سایر'), color: 'var(--pc-faint)', values: days.map(function (x) { var o = x[key] || {}; return rest.reduce(function (tx, k) { return tx + bytesOf(o[k]); }, 0); }) });
     if (!series.length) {
       var tot = days.map(function (x) { return (Number(x.bytes_up) || 0) + (Number(x.bytes_down) || 0); });
-      if (tot.some(function (v) { return v > 0; })) series = [{ name: 'ترافیک تونل', color: COLORS[1], values: tot }];
+      if (tot.some(function (v) { return v > 0; })) series = [{ name: t('ترافیک تونل'), color: COLORS[1], values: tot }];
     }
     if (!days.length || !series.length) {
-      cc.body.appendChild(P.empty('chart', 'هنوز ترافیک تونلی ثبت نشده است', 'پس از اتصال اولین کاربر، مصرف روزانه با چند دقیقه تأخیر اینجا نمایش داده می‌شود.'));
+      cc.body.appendChild(P.empty('chart', t('هنوز ترافیک تونلی ثبت نشده است'), t('پس از اتصال اولین کاربر، مصرف روزانه با چند دقیقه تأخیر اینجا نمایش داده می‌شود.')));
       return;
     }
     stackedBars(cc.body, days.map(function (x) { return P.date(String(x.date) + 'T12:00:00Z', { month: 'short', day: 'numeric' }); }), series,
-      'نمودار مصرف روزانه تونل ' + (U.by === 'path' ? 'به تفکیک مسیر' : 'به تفکیک پروتکل'));
+      t('نمودار مصرف روزانه تونل ') + (U.by === 'path' ? t('به تفکیک مسیر') : t('به تفکیک پروتکل')));
   }
   /** path id → path text from the saved tunnel section (for the «بر اساس مسیر» legend). */
   function pathNames() {
@@ -425,44 +428,44 @@
     var C = P.tunnelCheck;
     var ctx = checkCtx();
     var out = [];
-    out.push(P.alertBox('info', [h('strong', { text: 'حریم خصوصی: ' }), 'کانفیگ فقط در همین مرورگر بررسی می‌شود؛ به WHMCS یا سرور CDN فرستاده نمی‌شود و جایی ذخیره نمی‌شود. با بستن یا ترک این صفحه پاک می‌شود. شناسه‌ها و کلیدهای خصوصی هیچ‌جا کامل نمایش داده نمی‌شوند.'], { icon: 'lock' }));
-    var c = P.card({ title: 'کانفیگ سرور', icon: 'fileText', id: 'tc-input', subtitle: 'محتوای config.json سرور Xray یا sing-box را بچسبانید (کامل یا فقط بخش inbounds).' });
+    out.push(P.alertBox('info', [h('strong', { text: t('حریم خصوصی: ') }), t('کانفیگ فقط در همین مرورگر بررسی می‌شود؛ به WHMCS یا سرور CDN فرستاده نمی‌شود و جایی ذخیره نمی‌شود. با بستن یا ترک این صفحه پاک می‌شود. شناسه‌ها و کلیدهای خصوصی هیچ‌جا کامل نمایش داده نمی‌شوند.')], { icon: 'lock' }));
+    var c = P.card({ title: t('کانفیگ سرور'), icon: 'fileText', id: 'tc-input', subtitle: t('محتوای config.json سرور Xray یا sing-box را بچسبانید (کامل یا فقط بخش inbounds).') });
     var ta = h('textarea', { className: 'pcdn-input pcdn-mono pcdn-tc-input', dir: 'ltr', rows: 12, spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off',
-      'data-ro-ok': '1', 'aria-label': 'کانفیگ JSON سرور', placeholder: '{\n  "inbounds": [ … ]\n}', maxlength: MAX_CFG, 'data-lpignore': 'true', 'data-1p-ignore': 'true' });
+      'data-ro-ok': '1', 'aria-label': t('کانفیگ JSON سرور'), placeholder: '{\n  "inbounds": [ … ]\n}', maxlength: MAX_CFG, 'data-lpignore': 'true', 'data-1p-ignore': 'true' });
     var result = h('div', { className: 'pcdn-tc-result', 'aria-live': 'polite' });
-    var go = P.btn('بررسی کانفیگ', { kind: 'primary', icon: 'shieldCheck', cls: 'pcdn-tc-run', onclick: function () { runCheck(); } });
+    var go = P.btn(t('بررسی کانفیگ'), { kind: 'primary', icon: 'shieldCheck', cls: 'pcdn-tc-run', onclick: function () { runCheck(); } });
     go.setAttribute('data-ro-ok', '1');
-    var wipe = P.btn('پاک کردن', { icon: 'trash', cls: 'pcdn-tc-clear', onclick: function () { ta.value = ''; clear(result); ta.focus(); } });
+    var wipe = P.btn(t('پاک کردن'), { icon: 'trash', cls: 'pcdn-tc-clear', onclick: function () { ta.value = ''; clear(result); ta.focus(); } });
     wipe.setAttribute('data-ro-ok', '1');
     function runCheck() {
       clear(result);
-      if (!C) { result.appendChild(P.alertBox('danger', 'بررسی‌کننده بارگذاری نشد؛ صفحه را دوباره باز کنید.')); return; }
+      if (!C) { result.appendChild(P.alertBox('danger', t('بررسی‌کننده بارگذاری نشد؛ صفحه را دوباره باز کنید.'))); return; }
       var text = ta.value;
-      if (text.length > MAX_CFG) { result.appendChild(P.alertBox('danger', 'کانفیگ بیش از حد بزرگ است.')); return; }
+      if (text.length > MAX_CFG) { result.appendChild(P.alertBox('danger', t('کانفیگ بیش از حد بزرگ است.'))); return; }
       var r = C.run(text, ctx);
       result.appendChild(resultView(r, ctx));
       var first = result.querySelector('.pcdn-tc-summary');
       if (first && first.scrollIntoView) first.scrollIntoView({ block: 'nearest', behavior: Aa.reduced && Aa.reduced() ? 'auto' : 'smooth' });
     }
     ta.addEventListener('keydown', function (e) { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); runCheck(); } });
-    append(c.body, [ta, h('div', { className: 'pcdn-row-actions' }, go, wipe, h('span', { className: 'pcdn-muted pcdn-small', text: 'Ctrl+Enter هم بررسی می‌کند.' }))]);
+    append(c.body, [ta, h('div', { className: 'pcdn-row-actions' }, go, wipe, h('span', { className: 'pcdn-muted pcdn-small', text: t('Ctrl+Enter هم بررسی می‌کند.') }))]);
     out.push(c);
     out.push(result);
     // reference: what the site expects
-    var ref = P.collapsible({ title: 'مسیرهای تونل این سایت (مبنای مقایسه)', icon: 'link', tone: 'muted', id: 'tc-paths', open: !ctx.paths.length });
-    if (!ctx.paths.length) ref.body.appendChild(P.alertBox('warning', ['هنوز مسیر تونلی ذخیره نشده است. ', Aa.goLink('tunnel', 'ساخت مسیر در صفحه تونل')]));
+    var ref = P.collapsible({ title: t('مسیرهای تونل این سایت (مبنای مقایسه)'), icon: 'link', tone: 'muted', id: 'tc-paths', open: !ctx.paths.length });
+    if (!ctx.paths.length) ref.body.appendChild(P.alertBox('warning', [t('هنوز مسیر تونلی ذخیره نشده است. '), Aa.goLink('tunnel', t('ساخت مسیر در صفحه تونل'))]));
     else {
       var tbody = h('tbody');
       ctx.paths.forEach(function (p) {
         tbody.appendChild(h('tr', { 'data-tc-path': p.id },
-          h('td', { 'data-label': 'مسیر' }, h('bdi', { dir: 'ltr', className: 'pcdn-tn-pathval', text: p.path })),
-          h('td', { 'data-label': 'پروتکل' }, protoBadge(p.protocol)),
-          h('td', { 'data-label': 'پورت مورد انتظار' }, h('bdi', { dir: 'ltr', text: p.ports.join(' / ') })),
-          h('td', { 'data-label': 'TLS روی سرور' }, h('span', { text: p.tls ? 'بله (security: tls)' : 'خیر (security: none)' }))));
+          h('td', { 'data-label': t('مسیر') }, h('bdi', { dir: 'ltr', className: 'pcdn-tn-pathval', text: p.path })),
+          h('td', { 'data-label': t('پروتکل') }, protoBadge(p.protocol)),
+          h('td', { 'data-label': t('پورت مورد انتظار') }, h('bdi', { dir: 'ltr', text: p.ports.join(' / ') })),
+          h('td', { 'data-label': t('TLS روی سرور') }, h('span', { text: p.tls ? t('بله (security: tls)') : t('خیر (security: none)') }))));
       });
       ref.body.appendChild(h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table pcdn-rtable' },
-        h('caption', { className: 'pcdn-sr', text: 'مسیرهای تونل سایت' }),
-        h('thead', null, h('tr', null, ['مسیر', 'پروتکل', 'پورت مورد انتظار', 'TLS روی سرور'].map(function (t) { return h('th', { scope: 'col', text: t }); }))),
+        h('caption', { className: 'pcdn-sr', text: t('مسیرهای تونل سایت') }),
+        h('thead', null, h('tr', null, [t('مسیر'), t('پروتکل'), t('پورت مورد انتظار'), t('TLS روی سرور')].map(function (tx) { return h('th', { scope: 'col', text: tx }); }))),
         tbody)));
     }
     out.push(ref);
@@ -471,27 +474,27 @@
     return out;
   }
 
-  var LEVEL = { error: ['danger', 'xCircle', 'خطا'], warning: ['warning', 'warn', 'هشدار'], ok: ['success', 'checkCircle', 'درست'], info: ['info', 'info', 'نکته'] };
+  var LEVEL = { error: ['danger', 'xCircle', t('خطا')], warning: ['warning', 'warn', t('هشدار')], ok: ['success', 'checkCircle', t('درست')], info: ['info', 'info', t('نکته')] };
   function resultView(r, ctx) {
     var sum = r.summary || {};
     var head = h('div', { className: 'pcdn-tc-summary pcdn-alert pcdn-alert-' + (r.ok ? (sum.warning ? 'warning' : 'success') : 'danger'), role: 'status', 'data-tc-ok': r.ok ? '1' : '0' },
       icon(r.ok ? 'checkCircle' : 'xCircle'),
       h('div', { className: 'pcdn-alert-body' },
-        h('strong', { text: r.ok ? (sum.warning ? 'کانفیگ قابل استفاده است ولی چند نکته دارد.' : 'کانفیگ با تنظیمات تونل سایت هماهنگ است.') : 'کانفیگ مشکل دارد و احتمالاً وصل نمی‌شود.' }),
+        h('strong', { text: r.ok ? (sum.warning ? t('کانفیگ قابل استفاده است ولی چند نکته دارد.') : t('کانفیگ با تنظیمات تونل سایت هماهنگ است.')) : t('کانفیگ مشکل دارد و احتمالاً وصل نمی‌شود.') }),
         h('div', { className: 'pcdn-tc-counts' },
           r.kind ? P.badge(r.kind === 'singbox' ? 'sing-box' : 'Xray', 'muted') : null,
-          P.badge(num(sum.error || 0) + ' خطا', sum.error ? 'danger' : 'muted'),
-          P.badge(num(sum.warning || 0) + ' هشدار', sum.warning ? 'warning' : 'muted'),
-          P.badge(num(sum.ok || 0) + ' مورد درست', sum.ok ? 'success' : 'muted'))));
+          P.badge(num(sum.error || 0) + t(' خطا'), sum.error ? 'danger' : 'muted'),
+          P.badge(num(sum.warning || 0) + t(' هشدار'), sum.warning ? 'warning' : 'muted'),
+          P.badge(num(sum.ok || 0) + t(' مورد درست'), sum.ok ? 'success' : 'muted'))));
     var list = h('ul', { className: 'pcdn-tc-findings' }, (r.findings || []).map(function (f) {
       var L = LEVEL[f.level] || LEVEL.info;
       return h('li', { className: 'pcdn-tc-finding is-' + f.level, 'data-level': f.level, 'data-code': f.code },
         h('span', { className: 'pcdn-tc-ficon pcdn-tone-' + L[0], title: L[2] }, icon(L[1]), h('span', { className: 'pcdn-sr', text: L[2] + ': ' })),
         h('div', { className: 'pcdn-tc-ftext' }, h('span', { className: 'pcdn-tc-ftitle', text: f.title }),
-          f.fix ? h('span', { className: 'pcdn-tc-ffix' }, h('b', { text: 'راه‌حل: ' }), f.fix) : null));
+          f.fix ? h('span', { className: 'pcdn-tc-ffix' }, h('b', { text: t('راه‌حل: ') }), f.fix) : null));
     }));
     return h('div', { className: 'pcdn-card pcdn-tc-card', 'data-card': 'tc-result' }, h('div', { className: 'pcdn-card-body' }, head, list,
-      r.ok && ctx.paths.length ? h('p', { className: 'pcdn-muted pcdn-small', text: 'پس از اعمال کانفیگ، Xray / sing-box را ری‌استارت و در صفحه تونل «تست اتصال» را بزنید.' }) : null));
+      r.ok && ctx.paths.length ? h('p', { className: 'pcdn-muted pcdn-small', text: t('پس از اعمال کانفیگ، Xray / sing-box را ری‌استارت و در صفحه تونل «تست اتصال» را بزنید.') }) : null));
   }
 
   // ================================================================== «تست سرعت» (§15.6 — the customer's own domain only)
@@ -536,7 +539,7 @@
       return fetch(base + path + (path.indexOf('?') >= 0 ? '&' : '?') + '_=' + rid(), Object.assign({}, opts, extra || {}, ac ? { signal: ac.signal } : {}))
         .then(function (r) { if (timer) clearTimeout(timer); return r; }, function (e) {
           if (timer) clearTimeout(timer);
-          if (timedOut) { var t = new Error('timeout'); t.code = 'timeout'; throw t; }
+          if (timedOut) { var tx = new Error('timeout'); tx.code = 'timeout'; throw tx; }
           throw e;
         });
     }
@@ -629,16 +632,16 @@
     var out = [];
     if (isNum(r.ping_ms)) {
       var p = r.ping_ms;
-      out.push(p < 60 ? 'تأخیر (پینگ) عالی است؛ برای بازی آنلاین و تماس تصویری مناسب است.' : p < 120 ? 'تأخیر خوب است؛ وب‌گردی و تماس صوتی/تصویری روان است.'
-        : p < 250 ? 'تأخیر متوسط است؛ وب‌گردی خوب است ولی بازی آنلاین ممکن است کمی کند باشد.' : 'تأخیر زیاد است؛ معمولاً به‌خاطر اینترنت شما یا شلوغی شبکه در این لحظه است. چند دقیقه بعد دوباره امتحان کنید.');
+      out.push(p < 60 ? t('تأخیر (پینگ) عالی است؛ برای بازی آنلاین و تماس تصویری مناسب است.') : p < 120 ? t('تأخیر خوب است؛ وب‌گردی و تماس صوتی/تصویری روان است.')
+        : p < 250 ? t('تأخیر متوسط است؛ وب‌گردی خوب است ولی بازی آنلاین ممکن است کمی کند باشد.') : t('تأخیر زیاد است؛ معمولاً به‌خاطر اینترنت شما یا شلوغی شبکه در این لحظه است. چند دقیقه بعد دوباره امتحان کنید.'));
     }
-    if (isNum(r.jitter_ms) && r.jitter_ms > 30) out.push('نوسان پینگ زیاد است (' + f1(r.jitter_ms) + ' میلی‌ثانیه)؛ اتصال اینترنت شما ناپایدار است (مثلاً Wi-Fi ضعیف).');
+    if (isNum(r.jitter_ms) && r.jitter_ms > 30) out.push(t('نوسان پینگ زیاد است (') + f1(r.jitter_ms) + t(' میلی‌ثانیه)؛ اتصال اینترنت شما ناپایدار است (مثلاً Wi-Fi ضعیف).'));
     if (isNum(r.down_mbps)) {
       var d = r.down_mbps;
-      out.push(d >= 50 ? 'سرعت دانلود عالی است؛ ویدیوی 4K هم روان پخش می‌شود.' : d >= 20 ? 'سرعت دانلود خوب است؛ ویدیوی Full HD روان پخش می‌شود.'
-        : d >= 5 ? 'سرعت دانلود متوسط است؛ برای وب‌گردی و ویدیوی معمولی کافی است.' : 'سرعت دانلود کم است؛ معمولاً سقف سرعت اینترنت شما یا شلوغی شبکه است.');
+      out.push(d >= 50 ? t('سرعت دانلود عالی است؛ ویدیوی 4K هم روان پخش می‌شود.') : d >= 20 ? t('سرعت دانلود خوب است؛ ویدیوی Full HD روان پخش می‌شود.')
+        : d >= 5 ? t('سرعت دانلود متوسط است؛ برای وب‌گردی و ویدیوی معمولی کافی است.') : t('سرعت دانلود کم است؛ معمولاً سقف سرعت اینترنت شما یا شلوغی شبکه است.'));
     }
-    if (isNum(r.up_mbps)) out.push(r.up_mbps >= 10 ? 'سرعت آپلود برای تماس تصویری و ارسال فایل خوب است.' : 'سرعت آپلود محدود است؛ ارسال فایل‌های بزرگ کندتر است (در اینترنت خانگی طبیعی است).');
+    if (isNum(r.up_mbps)) out.push(r.up_mbps >= 10 ? t('سرعت آپلود برای تماس تصویری و ارسال فایل خوب است.') : t('سرعت آپلود محدود است؛ ارسال فایل‌های بزرگ کندتر است (در اینترنت خانگی طبیعی است).'));
     return out;
   }
 
@@ -655,30 +658,30 @@
   function renderSpeed(Aa) {
     var SP = spState(), tg = speedTarget();
     var out = [];
-    var c = P.card({ title: 'تست سرعت تا CDN', icon: 'gauge', id: 'sp-card',
-      subtitle: 'از مرورگر شما تا دامنه‌ی خودتان، از طریق همان نودی که DNS به شما می‌دهد. نشانی هیچ نودی نمایش داده یا انتخاب نمی‌شود.' });
-    var gP = gauge('ping', 'clock', 'تأخیر (پینگ)', 'میلی‌ثانیه'), gD = gauge('down', 'download', 'دانلود', 'مگابیت بر ثانیه'), gU = gauge('up', 'upload', 'آپلود', 'مگابیت بر ثانیه');
+    var c = P.card({ title: t('تست سرعت تا CDN'), icon: 'gauge', id: 'sp-card',
+      subtitle: t('از مرورگر شما تا دامنه‌ی خودتان، از طریق همان نودی که DNS به شما می‌دهد. نشانی هیچ نودی نمایش داده یا انتخاب نمی‌شود.') });
+    var gP = gauge('ping', 'clock', t('تأخیر (پینگ)'), t('میلی‌ثانیه')), gD = gauge('down', 'download', t('دانلود'), t('مگابیت بر ثانیه')), gU = gauge('up', 'upload', t('آپلود'), t('مگابیت بر ثانیه'));
     var status = h('p', { className: 'pcdn-muted pcdn-sp-status', 'aria-live': 'polite' });
     var verdictBox = h('div', { className: 'pcdn-sp-verdict' });
     var ctrl = null;
-    var start = P.btn(SP.result ? 'تست دوباره' : 'شروع تست', { kind: 'primary', icon: 'gauge', cls: 'pcdn-sp-start', disabled: !tg.base, onclick: function () {
+    var start = P.btn(SP.result ? t('تست دوباره') : t('شروع تست'), { kind: 'primary', icon: 'gauge', cls: 'pcdn-sp-start', disabled: !tg.base, onclick: function () {
       if (ctrl) return;
       clear(verdictBox);
       [gP, gD, gU].forEach(function (g) { g.set('—', 0); });
       ctrl = window.AbortController ? new AbortController() : null;
       start.disabled = true;
       start.classList.add('is-busy');
-      status.textContent = 'در حال اندازه‌گیری تأخیر…';
+      status.textContent = t('در حال اندازه‌گیری تأخیر…');
       runSpeed(tg.base, { progress: function (kind, frac, v) {
-        if (kind === 'ping') { gP.set(num(Math.round(v)), frac); status.textContent = 'در حال اندازه‌گیری تأخیر… (' + num(Math.round(frac * PINGS)) + ' از ' + num(PINGS) + ')'; }
-        if (kind === 'down') { if (v !== null) gD.set(f1(v), frac); status.textContent = 'در حال اندازه‌گیری سرعت دانلود…'; }
-        if (kind === 'up') { if (v !== null) gU.set(f1(v), frac); status.textContent = 'در حال اندازه‌گیری سرعت آپلود…'; }
+        if (kind === 'ping') { gP.set(num(Math.round(v)), frac); status.textContent = t('در حال اندازه‌گیری تأخیر… (') + num(Math.round(frac * PINGS)) + t(' از ') + num(PINGS) + ')'; }
+        if (kind === 'down') { if (v !== null) gD.set(f1(v), frac); status.textContent = t('در حال اندازه‌گیری سرعت دانلود…'); }
+        if (kind === 'up') { if (v !== null) gU.set(f1(v), frac); status.textContent = t('در حال اندازه‌گیری سرعت آپلود…'); }
       } }, ctrl ? ctrl.signal : undefined).then(function (r) {
         ctrl = null;
         if (!document.body.contains(start)) return;
         start.disabled = false;
         start.classList.remove('is-busy');
-        start.querySelector('span').textContent = 'تست دوباره';
+        start.querySelector('span').textContent = t('تست دوباره');
         SP.result = r;   // in-memory only for this page view (never stored)
         paint(r);
       });
@@ -689,40 +692,40 @@
       gD.set(isNum(r.down_mbps) ? f1(r.down_mbps) : '—', isNum(r.down_mbps) ? 1 : 0);
       gU.set(isNum(r.up_mbps) ? f1(r.up_mbps) : '—', isNum(r.up_mbps) ? 1 : 0);
       clear(verdictBox);
-      status.textContent = r.error ? '' : 'تست کامل شد.';
+      status.textContent = r.error ? '' : t('تست کامل شد.');
       if (r.error === 'cors') {
-        verdictBox.appendChild(P.alertBox('warning', [h('strong', { text: 'مرورگر اجازه‌ی اندازه‌گیری کامل را نداد. ' }),
-          'دامنه در دسترس است' + (isNum(r.ping_ms) ? ' (یک رفت‌وبرگشت حدود ' + num(Math.round(r.ping_ms)) + ' میلی‌ثانیه)' : '') +
-          ' ولی سرور CDN هنوز اجازه‌ی تست سرعت از صفحه‌ی ناحیه کاربری را نمی‌دهد. چند دقیقه بعد دوباره امتحان کنید؛ اگر ادامه داشت به پشتیبانی اطلاع دهید.'], { icon: 'warn' }));
+        verdictBox.appendChild(P.alertBox('warning', [h('strong', { text: t('مرورگر اجازه‌ی اندازه‌گیری کامل را نداد. ') }),
+          t('دامنه در دسترس است') + (isNum(r.ping_ms) ? t(' (یک رفت‌وبرگشت حدود ') + num(Math.round(r.ping_ms)) + t(' میلی‌ثانیه)') : '') +
+          t(' ولی سرور CDN هنوز اجازه‌ی تست سرعت از صفحه‌ی ناحیه کاربری را نمی‌دهد. چند دقیقه بعد دوباره امتحان کنید؛ اگر ادامه داشت به پشتیبانی اطلاع دهید.')], { icon: 'warn' }));
         return;
       }
-      if (r.error === 'rate') { verdictBox.appendChild(P.alertBox('warning', 'تعداد تست‌ها در یک دقیقه زیاد شد؛ یک دقیقه صبر کنید و دوباره امتحان کنید.')); }
-      else if (r.error === 'timeout') verdictBox.appendChild(P.alertBox('danger', 'پاسخی از دامنه‌ی شما در زمان مناسب نرسید. اینترنت خود را بررسی کنید و چند دقیقه بعد دوباره امتحان کنید.'));
-      else if (r.error === 'network') verdictBox.appendChild(P.alertBox('danger', 'اتصال به دامنه‌ی شما برقرار نشد. اینترنت خود را بررسی کنید؛ اگر سایت در مرورگر هم باز نمی‌شود، وضعیت سرویس را در «نمای کلی» ببینید.'));
-      else if (r.error === 'http') verdictBox.appendChild(P.alertBox('danger', 'سرور CDN به تست پاسخ نداد (HTTP ' + num(r.status || 0) + '). کمی بعد دوباره امتحان کنید.'));
+      if (r.error === 'rate') { verdictBox.appendChild(P.alertBox('warning', t('تعداد تست‌ها در یک دقیقه زیاد شد؛ یک دقیقه صبر کنید و دوباره امتحان کنید.'))); }
+      else if (r.error === 'timeout') verdictBox.appendChild(P.alertBox('danger', t('پاسخی از دامنه‌ی شما در زمان مناسب نرسید. اینترنت خود را بررسی کنید و چند دقیقه بعد دوباره امتحان کنید.')));
+      else if (r.error === 'network') verdictBox.appendChild(P.alertBox('danger', t('اتصال به دامنه‌ی شما برقرار نشد. اینترنت خود را بررسی کنید؛ اگر سایت در مرورگر هم باز نمی‌شود، وضعیت سرویس را در «نمای کلی» ببینید.')));
+      else if (r.error === 'http') verdictBox.appendChild(P.alertBox('danger', t('سرور CDN به تست پاسخ نداد (HTTP ') + num(r.status || 0) + t('). کمی بعد دوباره امتحان کنید.')));
       else if (r.error === 'abort') return;
       var lines = verdict(r);
       if (lines.length) {
         verdictBox.appendChild(h('div', { className: 'pcdn-card pcdn-sp-result', 'data-card': 'sp-result' }, h('div', { className: 'pcdn-card-body' },
-          h('h4', { text: 'نتیجه به زبان ساده' }),
+          h('h4', { text: t('نتیجه به زبان ساده') }),
           h('ul', { className: 'pcdn-ul' }, lines.map(function (x) { return h('li', { text: x }); })),
-          h('p', { className: 'pcdn-muted pcdn-small', text: 'این تست سرعت مسیر «شما ← CDN» است. سرعت تونل علاوه بر این به مسیر نود تا سرور شما و پهنای باند آن سرور هم بستگی دارد؛ برای آن «کیفیت تونل» را ببینید.' }),
-          r.node ? h('p', { className: 'pcdn-muted pcdn-small' }, 'شناسه‌ی نود پاسخ‌دهنده (برای پشتیبانی): ', ltr(r.node)) : null)));
+          h('p', { className: 'pcdn-muted pcdn-small', text: t('این تست سرعت مسیر «شما ← CDN» است. سرعت تونل علاوه بر این به مسیر نود تا سرور شما و پهنای باند آن سرور هم بستگی دارد؛ برای آن «کیفیت تونل» را ببینید.') }),
+          r.node ? h('p', { className: 'pcdn-muted pcdn-small' }, t('شناسه‌ی نود پاسخ‌دهنده (برای پشتیبانی): '), ltr(r.node)) : null)));
       }
     }
     var notes = [];
-    if (tg.why === 'pending') notes.push(P.alertBox('info', 'تست سرعت پس از فعال شدن سایت روی CDN (تأیید نیم‌سرورها) در دسترس است.'));
-    if (tg.why === 'mixed') notes.push(P.alertBox('warning', 'گواهی SSL سایت هنوز فعال نیست و این صفحه روی HTTPS است؛ مرورگر اجازه‌ی تست روی HTTP را نمی‌دهد. پس از صدور گواهی دوباره امتحان کنید.'));
+    if (tg.why === 'pending') notes.push(P.alertBox('info', t('تست سرعت پس از فعال شدن سایت روی CDN (تأیید نیم‌سرورها) در دسترس است.')));
+    if (tg.why === 'mixed') notes.push(P.alertBox('warning', t('گواهی SSL سایت هنوز فعال نیست و این صفحه روی HTTPS است؛ مرورگر اجازه‌ی تست روی HTTP را نمی‌دهد. پس از صدور گواهی دوباره امتحان کنید.')));
     append(c.body, [notes, h('div', { className: 'pcdn-sp-gauges' }, gP.el, gD.el, gU.el),
       h('div', { className: 'pcdn-row-actions' }, start, status), verdictBox,
-      h('p', { className: 'pcdn-muted pcdn-small' }, 'مقصد تست: ', ltr(tg.base ? tg.base + '/__pcdn/speed/' : site().domain || ''),
-        ' — حدود ' + num(25) + ' مگابایت ترافیک مصرف می‌شود که مثل ترافیک عادی سایت حساب می‌شود.')]);
+      h('p', { className: 'pcdn-muted pcdn-small' }, t('مقصد تست: '), ltr(tg.base ? tg.base + '/__pcdn/speed/' : site().domain || ''),
+        t(' — حدود ') + num(25) + t(' مگابایت ترافیک مصرف می‌شود که مثل ترافیک عادی سایت حساب می‌شود.'))]);
     out.push(c);
-    var how = P.card({ title: 'چطور نتیجه را بخوانم؟', icon: 'bulb', tone: 'muted', id: 'sp-how' });
+    var how = P.card({ title: t('چطور نتیجه را بخوانم؟'), icon: 'bulb', tone: 'muted', id: 'sp-how' });
     append(how.body, h('ul', { className: 'pcdn-ul' },
-      h('li', { text: 'تأخیر (پینگ): زمان رفت و برگشت یک درخواست کوچک. هر چه کمتر بهتر؛ زیر ۱۰۰ میلی‌ثانیه خوب است.' }),
-      h('li', { text: 'دانلود و آپلود: سرعت دریافت و ارسال داده بین شما و CDN. معمولاً سقف آن را سرعت اینترنت خود شما تعیین می‌کند.' }),
-      h('li', { text: 'برای مقایسه‌ی منصفانه، تست را چند بار و در ساعت‌های مختلف تکرار کنید؛ Wi-Fi ضعیف و دانلودهای هم‌زمان نتیجه را پایین می‌آورند.' })));
+      h('li', { text: t('تأخیر (پینگ): زمان رفت و برگشت یک درخواست کوچک. هر چه کمتر بهتر؛ زیر ۱۰۰ میلی‌ثانیه خوب است.') }),
+      h('li', { text: t('دانلود و آپلود: سرعت دریافت و ارسال داده بین شما و CDN. معمولاً سقف آن را سرعت اینترنت خود شما تعیین می‌کند.') }),
+      h('li', { text: t('برای مقایسه‌ی منصفانه، تست را چند بار و در ساعت‌های مختلف تکرار کنید؛ Wi-Fi ضعیف و دانلودهای هم‌زمان نتیجه را پایین می‌آورند.') })));
     out.push(how);
     if (SP.result) setTimeout(function () { if (document.body.contains(start)) paint(SP.result); }, 0);
     onLeave(function () { if (ctrl) { try { ctrl.abort(); } catch (e) { /* ignore */ } ctrl = null; } });
@@ -732,33 +735,33 @@
   // ================================================================== registry
 
   pages.tquality = {
-    title: 'کیفیت تونل', icon: 'activity', heading: 'کیفیت تونل',
-    desc: 'نرخ موفقیت، قطع‌های غیرعادی و زمان اتصال هر مسیر تونل، همراه با مشکل اصلی و راه‌حل پیشنهادی.',
+    title: t('کیفیت تونل'), icon: 'activity', heading: t('کیفیت تونل'),
+    desc: t('نرخ موفقیت، قطع‌های غیرعادی و زمان اتصال هر مسیر تونل، همراه با مشکل اصلی و راه‌حل پیشنهادی.'),
     guide: {
-      what: 'برای هر مسیر تونل نشان می‌دهد چند درصد اتصال‌ها به سرور شما رسیده‌اند، چند نشست ناگهان قطع شده‌اند و نودها با چه سرعتی به سرور شما وصل می‌شوند.',
-      when: 'وقتی کاربران از قطعی یا کندی شکایت می‌کنند، یا بعد از تغییر کانفیگ سرور.',
-      rec: 'نرخ موفقیت بالای ۹۸٪ و قطع غیرعادی زیر ۲٪ یعنی مسیر سالم است.',
-      mistakes: ['تغییر پورت یا مسیر روی سرور بدون به‌روزرسانی مسیر در صفحه تونل.', 'بستن آی‌پی‌های CDN در فایروال سرور.'],
+      what: t('برای هر مسیر تونل نشان می‌دهد چند درصد اتصال‌ها به سرور شما رسیده‌اند، چند نشست ناگهان قطع شده‌اند و نودها با چه سرعتی به سرور شما وصل می‌شوند.'),
+      when: t('وقتی کاربران از قطعی یا کندی شکایت می‌کنند، یا بعد از تغییر کانفیگ سرور.'),
+      rec: t('نرخ موفقیت بالای ۹۸٪ و قطع غیرعادی زیر ۲٪ یعنی مسیر سالم است.'),
+      mistakes: [t('تغییر پورت یا مسیر روی سرور بدون به‌روزرسانی مسیر در صفحه تونل.'), t('بستن آی‌پی‌های CDN در فایروال سرور.')],
       tut: 'tunnel'
     },
     hidden: function () { return !supported() || !tunnelOn(); },
     render: renderQuality
   };
   pages.tusage = {
-    title: 'مصرف تونل', icon: 'chart', heading: 'مصرف تونل',
-    desc: 'مصرف روزانه‌ی تونل به تفکیک پروتکل و مسیر، مصرف این ماه و پیش‌بینی تاریخ اتمام ترافیک.',
+    title: t('مصرف تونل'), icon: 'chart', heading: t('مصرف تونل'),
+    desc: t('مصرف روزانه‌ی تونل به تفکیک پروتکل و مسیر، مصرف این ماه و پیش‌بینی تاریخ اتمام ترافیک.'),
     hidden: function () { return !supported() || !tunnelOn(); },
     render: renderUsage
   };
   pages.tconfig = {
-    title: 'بررسی کانفیگ سرور', icon: 'fileText', heading: 'بررسی کانفیگ سرور',
-    desc: 'کانفیگ Xray یا sing-box سرور خود را بچسبانید تا با مسیرهای تونل این سایت مقایسه و اشکال‌های رایج پیدا شود — فقط در مرورگر شما.',
+    title: t('بررسی کانفیگ سرور'), icon: 'fileText', heading: t('بررسی کانفیگ سرور'),
+    desc: t('کانفیگ Xray یا sing-box سرور خود را بچسبانید تا با مسیرهای تونل این سایت مقایسه و اشکال‌های رایج پیدا شود — فقط در مرورگر شما.'),
     hidden: function () { return !tunnelOn(); },
     render: renderConfigCheck
   };
   pages.speedtest = {
-    title: 'تست سرعت', icon: 'gauge', heading: 'تست سرعت',
-    desc: 'تأخیر، سرعت دانلود و آپلود از دستگاه شما تا دامنه‌ی شما روی CDN، با توضیح ساده‌ی نتیجه.',
+    title: t('تست سرعت'), icon: 'gauge', heading: t('تست سرعت'),
+    desc: t('تأخیر، سرعت دانلود و آپلود از دستگاه شما تا دامنه‌ی شما روی CDN، با توضیح ساده‌ی نتیجه.'),
     hidden: function () { return !supported(); },
     render: renderSpeed
   };

@@ -10,6 +10,7 @@
 (function () {
   'use strict';
   var P = window.PCDN = window.PCDN || {};
+  var t = P.t;  // i18n.js (SPEC §16.10)
   var pages = P.pages = P.pages || {};
   var h = P.h, append = P.append, clear = P.clear, icon = P.icon, ltr = P.ltr, clone = P.clone, num = P.num;
 
@@ -193,7 +194,7 @@
     for (var y = 0; y < q.size; y++) {
       for (var x = 0; x < q.size; x++) if (q.dark(x, y)) d += 'M' + (x + 4) + ' ' + (y + 4) + 'h1v1h-1z';
     }
-    var svg = P.s('svg', { viewBox: '0 0 ' + n + ' ' + n, width: px || 220, height: px || 220, role: 'img', 'aria-label': 'کد QR لینک اشتراک',
+    var svg = P.s('svg', { viewBox: '0 0 ' + n + ' ' + n, width: px || 220, height: px || 220, role: 'img', 'aria-label': t('کد QR لینک اشتراک'),
       'shape-rendering': 'crispEdges', class: 'pcdn-qr-svg', 'data-qr-version': q.version });
     svg.appendChild(P.s('rect', { width: n, height: n, style: 'fill:var(--pc-qr-bg)' }));
     svg.appendChild(P.s('path', { d: d, style: 'fill:var(--pc-qr-fg)' }));
@@ -206,19 +207,19 @@
   var DEFAULT = { enabled: false, paths: [], idle_timeout: 3600, per_connection_mbps: 0, max_connections_per_ip: 0, allowed_countries: [], fallback: 'origin' };
   var PATH_RE = /^\/[A-Za-z0-9._~\/-]{1,200}$/;
   var PROTOCOLS = [
-    ['grpc', 'gRPC', 'پایدار و سریع: چند جریان روی یک اتصال HTTP/2. برای بیشتر کاربران بهترین انتخاب است.', 'zap', 'پیشنهادی'],
-    ['xhttp', 'XHTTP', 'جدیدترین روش Xray؛ ترافیک شبیه درخواست‌های عادی وب است و در شبکه‌های سخت‌گیر خوب کار می‌کند. فقط کلاینت‌های با هسته Xray.', 'sparkles', 'جدیدترین'],
-    ['ws', 'WebSocket', 'سازگارترین: تقریباً همه کلاینت‌ها (v2rayNG، v2rayN، Hiddify، NekoBox، sing-box) پشتیبانی می‌کنند.', 'link', 'سازگارترین'],
-    ['httpupgrade', 'HTTPUpgrade', 'مثل WebSocket ولی سبک‌تر (بدون فریم‌بندی WebSocket)؛ در Xray و sing-box نسخه‌های جدید.', 'up'],
-    ['h2', 'HTTP/2 خام (h2)', 'جریان‌های HTTP/2 مستقیم به سرور h2c شما (XHTTP در حالت stream-one)؛ برای کاربران حرفه‌ای.', 'code']
+    ['grpc', 'gRPC', t('پایدار و سریع: چند جریان روی یک اتصال HTTP/2. برای بیشتر کاربران بهترین انتخاب است.'), 'zap', t('پیشنهادی')],
+    ['xhttp', 'XHTTP', t('جدیدترین روش Xray؛ ترافیک شبیه درخواست‌های عادی وب است و در شبکه‌های سخت‌گیر خوب کار می‌کند. فقط کلاینت‌های با هسته Xray.'), 'sparkles', t('جدیدترین')],
+    ['ws', 'WebSocket', t('سازگارترین: تقریباً همه کلاینت‌ها (v2rayNG، v2rayN، Hiddify، NekoBox، sing-box) پشتیبانی می‌کنند.'), 'link', t('سازگارترین')],
+    ['httpupgrade', 'HTTPUpgrade', t('مثل WebSocket ولی سبک‌تر (بدون فریم‌بندی WebSocket)؛ در Xray و sing-box نسخه‌های جدید.'), 'up'],
+    ['h2', t('HTTP/2 خام (h2)'), t('جریان‌های HTTP/2 مستقیم به سرور h2c شما (XHTTP در حالت stream-one)؛ برای کاربران حرفه‌ای.'), 'code']
   ];
   var PROTO = {};
   PROTOCOLS.forEach(function (p) { PROTO[p[0]] = { label: p[1], desc: p[2], icon: p[3] }; });
-  var XHTTP_MODES = [['auto', 'auto — خودکار (پیشنهادی)'], ['packet-up', 'packet-up — سازگارترین با شبکه‌های محدود'], ['stream-up', 'stream-up — سریع‌تر']];
+  var XHTTP_MODES = [['auto', t('auto — خودکار (پیشنهادی)')], ['packet-up', t('packet-up — سازگارترین با شبکه‌های محدود')], ['stream-up', t('stream-up — سریع‌تر')]];
   var FALLBACKS = [
-    ['origin', 'سایت عادی', 'مسیرهای دیگر مثل همیشه به سرور اصلی سایت شما می‌روند. وقتی روی این دامنه سایت واقعی دارید.', 'globe'],
-    ['decoy', 'صفحه استتار', 'بقیه مسیرها یک صفحه ساده و خنثی (کد ۲۰۰) می‌بینند تا دامنه شبیه یک سایت معمولی باشد و سرور شما دیده نشود.', 'eye', 'پیشنهادی'],
-    ['404', 'خطای ۴۰۴', 'همه مسیرهای دیگر پاسخ «یافت نشد» می‌گیرند.', 'ban']
+    ['origin', t('سایت عادی'), t('مسیرهای دیگر مثل همیشه به سرور اصلی سایت شما می‌روند. وقتی روی این دامنه سایت واقعی دارید.'), 'globe'],
+    ['decoy', t('صفحه استتار'), t('بقیه مسیرها یک صفحه ساده و خنثی (کد ۲۰۰) می‌بینند تا دامنه شبیه یک سایت معمولی باشد و سرور شما دیده نشود.'), 'eye', t('پیشنهادی')],
+    ['404', t('خطای ۴۰۴'), t('همه مسیرهای دیگر پاسخ «یافت نشد» می‌گیرند.'), 'ban']
   ];
 
   function S() { return A().S; }
@@ -268,9 +269,9 @@
   function maxPaths() { var m = feats().max_tunnel_paths; return m === undefined || m === null ? 10 : Math.max(0, Number(m) || 0); }
 
   function originText(p) {
-    if (p.pool) return 'استخر توزیع بار «' + p.pool + '»';
+    if (p.pool) return t('استخر توزیع بار «') + p.pool + '»';
     if (p.origin) return (p.origin.address || '?') + ':' + (p.origin.port || (p.origin.tls ? 443 : 80)) + (p.origin.tls ? ' (TLS)' : '');
-    return 'همان سرور اصلی سایت';
+    return t('همان سرور اصلی سایت');
   }
   /** Where the tunnel reaches the customer's server: {port, tls, note}. */
   function listenOf(p, host) {
@@ -348,7 +349,7 @@
   function codeBlock(text, label, id) {
     return h('figure', { className: 'pcdn-codeblock', 'data-code': id || null },
       h('figcaption', null, icon('terminal'), h('span', { dir: 'ltr', text: label }),
-        P.copyBtn(text, 'کپی ' + label, { text: 'کپی', cls: 'pcdn-copy-code', done: 'کپی شد' })),
+        P.copyBtn(text, t('کپی ') + label, { text: t('کپی'), cls: 'pcdn-copy-code', done: t('کپی شد') })),
       h('pre', { dir: 'ltr', tabindex: '0' }, h('code', { text: text })));
   }
   function dl(rows) {
@@ -362,27 +363,27 @@
     var x = orig ? clone(orig) : { id: '', path: randomPath(), protocol: 'grpc', origin: null, pool: null };
     var st = { mode: x.pool ? 'pool' : x.origin ? 'custom' : 'site' };
     var pl = pools(), lb = !!feats().load_balancer && pl.length > 0;
-    var d = P.dialog({ title: isNew ? 'مسیر تونل جدید' : 'ویرایش مسیر تونل', subtitle: 'آدرس مخفی، پروتکل و سرور مقصد این مسیر را تعیین کنید.', icon: 'tunnel', kind: 'drawer', wide: true });
+    var d = P.dialog({ title: isNew ? t('مسیر تونل جدید') : t('ویرایش مسیر تونل'), subtitle: t('آدرس مخفی، پروتکل و سرور مقصد این مسیر را تعیین کنید.'), icon: 'tunnel', kind: 'drawer', wide: true });
     d.el.classList.add('pcdn-tn-editor');
     var err = h('div'), holder = h('div', { className: 'pcdn-form' });
     append(d.body, [err, holder]);
     function draw() {
       clear(holder);
-      var pathIn = P.input(x, 'path', 'مسیر (آدرس مخفی)', { placeholder: '/my-secret-service', maxlength: 201,
-        help: h('span', null, 'با ', ltr('/'), ' شروع شود؛ فقط حروف انگلیسی، عدد و ', ltr('. _ ~ / -'), '. هر چه طولانی‌تر و تصادفی‌تر، امن‌تر. ',
-          x.protocol === 'grpc' ? h('span', null, 'در gRPC همین مسیر بدون ', ltr('/'), ' اول، serviceName است.') : null) });
-      var gen = P.btn('ساخت مسیر تصادفی', { icon: 'refresh', size: 'sm', write: true, cls: 'pcdn-tn-random', onclick: function () {
+      var pathIn = P.input(x, 'path', t('مسیر (آدرس مخفی)'), { placeholder: '/my-secret-service', maxlength: 201,
+        help: h('span', null, t('با '), ltr('/'), t(' شروع شود؛ فقط حروف انگلیسی، عدد و '), ltr('. _ ~ / -'), t('. هر چه طولانی‌تر و تصادفی‌تر، امن‌تر. '),
+          x.protocol === 'grpc' ? h('span', null, t('در gRPC همین مسیر بدون '), ltr('/'), t(' اول، serviceName است.')) : null) });
+      var gen = P.btn(t('ساخت مسیر تصادفی'), { icon: 'refresh', size: 'sm', write: true, cls: 'pcdn-tn-random', onclick: function () {
         x.path = randomPath();
         var inp = holder.querySelector('.pcdn-tn-pathrow input');
         if (inp) { inp.value = x.path; inp.dispatchEvent(new Event('input', { bubbles: true })); }
       } });
       append(holder, [
         h('div', { className: 'pcdn-tn-pathrow' }, pathIn, gen),
-        P.choice(x, 'protocol', 'پروتکل', PROTOCOLS, { cols: 2, onchange: draw }),
-        P.choice(st, 'mode', 'سرور مقصد (سرور VPN شما)', [
-          ['site', 'همان سرور اصلی سایت', 'به آدرس و پورت رکورد پروکسی‌شده (و پروتکل «اتصال به سرور اصلی» در SSL) وصل می‌شود.', 'server'],
-          ['custom', 'آدرس و پورت دلخواه', 'مثلاً سرور جداگانه Xray روی پورت ۲۰۵۳. پیشنهادی وقتی روی همین سرور سایت هم دارید.', 'edit'],
-          ['pool', 'استخر توزیع بار', lb ? 'بین چند سرور VPN تقسیم می‌شود و سرور خراب کنار گذاشته می‌شود.' : 'ابتدا در بخش «توزیع بار» یک استخر بسازید (در پلن شما: ' + (feats().load_balancer ? 'فعال' : 'غیرفعال') + ').', 'lb']
+        P.choice(x, 'protocol', t('پروتکل'), PROTOCOLS, { cols: 2, onchange: draw }),
+        P.choice(st, 'mode', t('سرور مقصد (سرور VPN شما)'), [
+          ['site', t('همان سرور اصلی سایت'), t('به آدرس و پورت رکورد پروکسی‌شده (و پروتکل «اتصال به سرور اصلی» در SSL) وصل می‌شود.'), 'server'],
+          ['custom', t('آدرس و پورت دلخواه'), t('مثلاً سرور جداگانه Xray روی پورت ۲۰۵۳. پیشنهادی وقتی روی همین سرور سایت هم دارید.'), 'edit'],
+          ['pool', t('استخر توزیع بار'), lb ? t('بین چند سرور VPN تقسیم می‌شود و سرور خراب کنار گذاشته می‌شود.') : t('ابتدا در بخش «توزیع بار» یک استخر بسازید (در پلن شما: ') + (feats().load_balancer ? t('فعال') : t('غیرفعال')) + ').', 'lb']
         ], { cols: 3, onchange: function (v) {
           if (v === 'custom') { x.origin = x.origin || { address: '', port: 2053, tls: false, sni: null, verify: false }; x.pool = null; }
           else if (v === 'pool') { x.origin = null; x.pool = x.pool || (pl[0] ? pl[0].name : null); }
@@ -391,37 +392,37 @@
         } }),
         st.mode === 'custom' ? h('div', { className: 'pcdn-subpanel' },
           h('div', { className: 'pcdn-grid' },
-            P.input(x.origin, 'address', 'آدرس سرور', { placeholder: '185.1.2.3', help: 'IPv4، IPv6 یا نام میزبان.' }),
-            P.input(x.origin, 'port', 'پورت', { type: 'number', min: 1, max: 65535, placeholder: x.origin.tls ? '443' : '80' })),
-          P.toggle(x.origin, 'tls', 'اتصال CDN به سرور با TLS', { help: 'معمولاً خاموش: CDN خودش TLS بازدیدکننده را باز می‌کند و سرور Xray بدون TLS گوش می‌دهد (ساده‌تر، بدون نیاز به گواهی روی سرور).', onchange: draw }),
+            P.input(x.origin, 'address', t('آدرس سرور'), { placeholder: '185.1.2.3', help: t('IPv4، IPv6 یا نام میزبان.') }),
+            P.input(x.origin, 'port', t('پورت'), { type: 'number', min: 1, max: 65535, placeholder: x.origin.tls ? '443' : '80' })),
+          P.toggle(x.origin, 'tls', t('اتصال CDN به سرور با TLS'), { help: t('معمولاً خاموش: CDN خودش TLS بازدیدکننده را باز می‌کند و سرور Xray بدون TLS گوش می‌دهد (ساده‌تر، بدون نیاز به گواهی روی سرور).'), onchange: draw }),
           x.origin.tls ? h('div', { className: 'pcdn-grid' },
-            P.input(x.origin, 'sni', 'SNI (اختیاری)', { nullable: true, placeholder: site().domain, help: 'خالی = نام دامنه سایت. باید با گواهی سرور شما بخواند.' }),
-            P.toggle(x.origin, 'verify', 'بررسی اعتبار گواهی سرور', { help: 'فقط اگر گواهی معتبر (مثلاً Let\'s Encrypt) روی سرور دارید.' })) : null) : null,
-        st.mode === 'pool' ? (lb ? P.select(x, 'pool', 'استخر', pl.map(function (p) { return [p.name, p.name + ' (' + num((p.origins || []).length) + ' سرور)']; }))
-          : P.alertBox('warning', ['هنوز استخری ندارید. ', A().goLink('pools', 'ساخت استخر در «توزیع بار»')])) : null,
-        x.protocol === 'grpc' && /\/.*\//.test(x.path) ? P.alertBox('warning', 'برای gRPC مسیر تک‌بخشی (بدون / میانی) بگذارید؛ بعضی کلاینت‌ها serviceName چندبخشی را پشتیبانی نمی‌کنند.') : null,
-        x.protocol === 'h2' ? P.alertBox('info', 'حالت h2: سرور شما باید HTTP/2 بدون TLS (h2c) یا با TLS را بپذیرد؛ در Xray، ورودی XHTTP با حالت stream-one.') : null
+            P.input(x.origin, 'sni', t('SNI (اختیاری)'), { nullable: true, placeholder: site().domain, help: t('خالی = نام دامنه سایت. باید با گواهی سرور شما بخواند.') }),
+            P.toggle(x.origin, 'verify', t('بررسی اعتبار گواهی سرور'), { help: t('فقط اگر گواهی معتبر (مثلاً Let\'s Encrypt) روی سرور دارید.') })) : null) : null,
+        st.mode === 'pool' ? (lb ? P.select(x, 'pool', t('استخر'), pl.map(function (p) { return [p.name, p.name + ' (' + num((p.origins || []).length) + t(' سرور)')]; }))
+          : P.alertBox('warning', [t('هنوز استخری ندارید. '), A().goLink('pools', t('ساخت استخر در «توزیع بار»'))])) : null,
+        x.protocol === 'grpc' && /\/.*\//.test(x.path) ? P.alertBox('warning', t('برای gRPC مسیر تک‌بخشی (بدون / میانی) بگذارید؛ بعضی کلاینت‌ها serviceName چندبخشی را پشتیبانی نمی‌کنند.')) : null,
+        x.protocol === 'h2' ? P.alertBox('info', t('حالت h2: سرور شما باید HTTP/2 بدون TLS (h2c) یا با TLS را بپذیرد؛ در Xray، ورودی XHTTP با حالت stream-one.')) : null
       ]);
       A().lockWrites(holder);
     }
     draw();
-    var ok = P.btn('تأیید', { kind: 'primary', icon: 'check', write: true, cls: 'pcdn-drawer-ok', onclick: function () {
+    var ok = P.btn(t('تأیید'), { kind: 'primary', icon: 'check', write: true, cls: 'pcdn-drawer-ok', onclick: function () {
       clear(err);
       x.path = String(x.path || '').trim();
       var problem = null;
-      if (!PATH_RE.test(x.path)) problem = 'مسیر باید با / شروع شود و فقط حروف انگلیسی، عدد و . _ ~ / - داشته باشد (حداکثر ۲۰۰ کاراکتر).';
-      else if (/^\/__pcdn/i.test(x.path)) problem = 'مسیرهای /__pcdn رزرو شده‌اند.';
-      else if (list.some(function (p) { return p !== orig && p.path === x.path; })) problem = 'این مسیر قبلاً برای مسیر دیگری استفاده شده است.';
-      else if (st.mode === 'custom' && !String(x.origin.address || '').trim()) problem = 'آدرس سرور مقصد را وارد کنید.';
-      else if (st.mode === 'custom' && !(Number(x.origin.port) >= 1 && Number(x.origin.port) <= 65535)) problem = 'پورت باید عددی بین ۱ و ۶۵۵۳۵ باشد.';
-      else if (st.mode === 'pool' && !x.pool) problem = 'یک استخر انتخاب کنید.';
+      if (!PATH_RE.test(x.path)) problem = t('مسیر باید با / شروع شود و فقط حروف انگلیسی، عدد و . _ ~ / - داشته باشد (حداکثر ۲۰۰ کاراکتر).');
+      else if (/^\/__pcdn/i.test(x.path)) problem = t('مسیرهای /__pcdn رزرو شده‌اند.');
+      else if (list.some(function (p) { return p !== orig && p.path === x.path; })) problem = t('این مسیر قبلاً برای مسیر دیگری استفاده شده است.');
+      else if (st.mode === 'custom' && !String(x.origin.address || '').trim()) problem = t('آدرس سرور مقصد را وارد کنید.');
+      else if (st.mode === 'custom' && !(Number(x.origin.port) >= 1 && Number(x.origin.port) <= 65535)) problem = t('پورت باید عددی بین ۱ و ۶۵۵۳۵ باشد.');
+      else if (st.mode === 'pool' && !x.pool) problem = t('یک استخر انتخاب کنید.');
       if (problem) { err.appendChild(P.alertBox('danger', problem)); return; }
       if (x.origin) { x.origin.address = String(x.origin.address).trim(); x.origin.port = Number(x.origin.port); if (!x.origin.tls) { x.origin.sni = null; x.origin.verify = false; } }
       if (!x.id) x.id = newId(list, x.protocol);
       d.close(true);
       done(x);
     } });
-    append(d.foot, [ok, P.btn('انصراف', { onclick: function () { d.close(); } })]);
+    append(d.foot, [ok, P.btn(t('انصراف'), { onclick: function () { d.close(); } })]);
     A().lockWrites(d.el);
     d.focusFirst();
   }
@@ -435,7 +436,7 @@
     st = st || {};
     var cur = apps.some(function (a) { return a.id === st.app; }) ? st.app : apps[0].id;
     var body = h('div', { className: 'pcdn-tn-app-body', 'aria-live': 'polite' });
-    var seg = P.segmented(apps.map(function (a) { return [a.id, a.name]; }), cur, function (v) { cur = st.app = v; draw(); }, 'برنامه‌ی کلاینت');
+    var seg = P.segmented(apps.map(function (a) { return [a.id, a.name]; }), cur, function (v) { cur = st.app = v; draw(); }, t('برنامه‌ی کلاینت'));
     seg.classList.add('pcdn-tn-app-seg');
     seg.setAttribute('data-seg', 'tn-app');
     function draw() {
@@ -447,13 +448,13 @@
       var a = apps.filter(function (x) { return x.id === cur; })[0] || apps[0];
       var sup = (a.support || {})[p.protocol] || 'yes', label = PROTO[p.protocol] ? PROTO[p.protocol].label : p.protocol;
       append(body, [
-        h('p', { className: 'pcdn-muted pcdn-small', text: a.name + ' — ' + a.os + ' — هسته ' + a.core }),
-        sup === 'no' ? P.alertBox('danger', a.name + ' پروتکل ' + label + ' را پشتیبانی نمی‌کند؛ برای کاربران این برنامه یک مسیر gRPC یا WebSocket بسازید.')
-          : sup === 'maybe' ? P.alertBox('warning', 'پشتیبانی ' + a.name + ' از ' + label + ' به نسخه‌ی برنامه بستگی دارد؛ اگر وصل نشد برنامه را به‌روز کنید یا از مسیر gRPC / WebSocket استفاده کنید.') : null,
+        h('p', { className: 'pcdn-muted pcdn-small', text: a.name + ' — ' + a.os + t(' — هسته ') + a.core }),
+        sup === 'no' ? P.alertBox('danger', a.name + t(' پروتکل ') + label + t(' را پشتیبانی نمی‌کند؛ برای کاربران این برنامه یک مسیر gRPC یا WebSocket بسازید.'))
+          : sup === 'maybe' ? P.alertBox('warning', t('پشتیبانی ') + a.name + t(' از ') + label + t(' به نسخه‌ی برنامه بستگی دارد؛ اگر وصل نشد برنامه را به‌روز کنید یا از مسیر gRPC / WebSocket استفاده کنید.')) : null,
         h('ol', { className: 'pcdn-ol pcdn-steps-ol pcdn-tn-app-steps', 'data-app': a.id }, (a.steps || []).map(function (x) { return h('li', { text: x }); }))]);
     }
     draw();
-    return h('div', { className: 'pcdn-tn-apps', 'data-apps': '1' }, h('h5', { className: 'pcdn-tn-apps-title', text: 'گام‌به‌گام در برنامه‌ی کاربر' }), seg, body);
+    return h('div', { className: 'pcdn-tn-apps', 'data-apps': '1' }, h('h5', { className: 'pcdn-tn-apps-title', text: t('گام‌به‌گام در برنامه‌ی کاربر') }), seg, body);
   }
 
   // ------------------------------------------------------------------ ready-to-use configs (drawer)
@@ -463,7 +464,7 @@
     try { mem = JSON.parse(P.store(key) || '{}') || {}; } catch (e) { mem = {}; }
     var hs = hosts();
     var st = { host: hs.indexOf(mem.host) >= 0 ? mem.host : (hs[0] || ''), uuid: /^[0-9a-f-]{36}$/i.test(mem.uuid || '') ? mem.uuid : uuid4(), mode: mem.mode || 'auto' };
-    var d = P.dialog({ title: 'پیکربندی آماده — ' + PROTO[p.protocol].label, subtitle: p.path, icon: 'qr', kind: 'drawer', wide: true });
+    var d = P.dialog({ title: t('پیکربندی آماده — ') + PROTO[p.protocol].label, subtitle: p.path, icon: 'qr', kind: 'drawer', wide: true });
     d.el.classList.add('pcdn-tn-config');
     var out = h('div', { className: 'pcdn-stack' });
     function remember() { P.store(key, JSON.stringify({ host: st.host, uuid: st.uuid, mode: st.mode })); }
@@ -477,32 +478,32 @@
       append(out, [
         h('section', { className: 'pcdn-tn-share', 'data-share': '1' },
           h('div', { className: 'pcdn-tn-share-text' },
-            h('h4', { text: '۱. لینک اشتراک برای کلاینت' }),
-            h('p', { className: 'pcdn-muted', text: 'در v2rayNG، v2rayN، Hiddify، Streisand یا NekoBox: لینک را کپی و «Import from clipboard» را بزنید یا QR را اسکن کنید.' }),
+            h('h4', { text: t('۱. لینک اشتراک برای کلاینت') }),
+            h('p', { className: 'pcdn-muted', text: t('در v2rayNG، v2rayN، Hiddify، Streisand یا NekoBox: لینک را کپی و «Import from clipboard» را بزنید یا QR را اسکن کنید.') }),
             h('div', { className: 'pcdn-tn-link' }, h('code', { dir: 'ltr', className: 'pcdn-tn-link-text', text: c.link }),
-              P.copyBtn(c.link, 'کپی لینک اشتراک', { text: 'کپی لینک', cls: 'pcdn-copy-link', done: 'لینک کپی شد' })),
-            p.protocol === 'xhttp' || p.protocol === 'h2' ? P.alertBox('info', 'XHTTP فقط در کلاینت‌های با هسته Xray (v2rayNG و v2rayN نسخه‌های جدید، Hiddify با هسته Xray، Streisand) کار می‌کند.') : null,
+              P.copyBtn(c.link, t('کپی لینک اشتراک'), { text: t('کپی لینک'), cls: 'pcdn-copy-link', done: t('لینک کپی شد') })),
+            p.protocol === 'xhttp' || p.protocol === 'h2' ? P.alertBox('info', t('XHTTP فقط در کلاینت‌های با هسته Xray (v2rayNG و v2rayN نسخه‌های جدید، Hiddify با هسته Xray، Streisand) کار می‌کند.')) : null,
             appGuide(p, st)),
-          q ? h('div', { className: 'pcdn-tn-qr', 'data-qr': '1' }, q) : h('p', { className: 'pcdn-muted', text: 'لینک برای QR بیش از حد طولانی است.' })),
+          q ? h('div', { className: 'pcdn-tn-qr', 'data-qr': '1' }, q) : h('p', { className: 'pcdn-muted', text: t('لینک برای QR بیش از حد طولانی است.') })),
         h('section', { 'data-server': '1' },
-          h('h4', { text: '۲. تنظیم سرور شما (Xray)' }),
-          h('p', { className: 'pcdn-muted' }, 'این فایل را در ', ltr('/usr/local/etc/xray/config.json'), ' بگذارید (یا فقط بخش inbounds را به پیکربندی فعلی اضافه کنید) و ', ltr('systemctl restart xray'), ' را اجرا کنید. ',
-            lis.tls ? 'چون اتصال CDN به سرور با TLS است، مسیر گواهی و کلید را اصلاح کنید.' : 'ورودی بدون TLS گوش می‌دهد؛ رمزنگاری بین بازدیدکننده و CDN انجام می‌شود.'),
-          codeBlock(c.xray, 'config.json — Xray (سرور)', 'xray'),
-          p.origin || p.pool ? null : P.alertBox('warning', ['مقصد این مسیر «همان سرور اصلی سایت» است، یعنی پورت ', ltr(String(lis.port)),
-            '. اگر وب‌سرور (nginx/Apache) روی این پورت است، یا مسیر را در وب‌سرور به Xray پاس دهید یا مقصد مسیر را «آدرس و پورت دلخواه» بگذارید. ', A().tutLink('tunnel', 'راهنما')])),
+          h('h4', { text: t('۲. تنظیم سرور شما (Xray)') }),
+          h('p', { className: 'pcdn-muted' }, t('این فایل را در '), ltr('/usr/local/etc/xray/config.json'), t(' بگذارید (یا فقط بخش inbounds را به پیکربندی فعلی اضافه کنید) و '), ltr('systemctl restart xray'), t(' را اجرا کنید. '),
+            lis.tls ? t('چون اتصال CDN به سرور با TLS است، مسیر گواهی و کلید را اصلاح کنید.') : t('ورودی بدون TLS گوش می‌دهد؛ رمزنگاری بین بازدیدکننده و CDN انجام می‌شود.')),
+          codeBlock(c.xray, t('config.json — Xray (سرور)'), 'xray'),
+          p.origin || p.pool ? null : P.alertBox('warning', [t('مقصد این مسیر «همان سرور اصلی سایت» است، یعنی پورت '), ltr(String(lis.port)),
+            t('. اگر وب‌سرور (nginx/Apache) روی این پورت است، یا مسیر را در وب‌سرور به Xray پاس دهید یا مقصد مسیر را «آدرس و پورت دلخواه» بگذارید. '), A().tutLink('tunnel', t('راهنما'))])),
         h('section', { 'data-singbox': '1' },
-          h('h4', { text: '۳. کلاینت sing-box (اختیاری)' }),
+          h('h4', { text: t('۳. کلاینت sing-box (اختیاری)') }),
           c.singbox ? codeBlock(c.singbox, 'outbound — sing-box', 'singbox')
-            : P.alertBox('info', 'sing-box از XHTTP پشتیبانی نمی‌کند؛ برای این مسیر از لینک اشتراک در کلاینت‌های مبتنی بر Xray استفاده کنید.'))
+            : P.alertBox('info', t('sing-box از XHTTP پشتیبانی نمی‌کند؛ برای این مسیر از لینک اشتراک در کلاینت‌های مبتنی بر Xray استفاده کنید.')))
       ]);
     }
-    var hostCtl = hs.length ? P.select(st, 'host', 'نام میزبان (رکورد پروکسی‌شده)', hs.map(function (x) { return [x, x]; }), { ltr: true, onchange: draw,
-      help: 'کلاینت به این نام روی پورت ۴۴۳ وصل می‌شود. رکورد باید در «رکوردها» پروکسی‌شده باشد.' })
-      : P.alertBox('warning', ['هیچ رکورد پروکسی‌شده‌ای ندارید؛ ابتدا یک رکورد (مثلاً ', ltr('vpn'), ') با پروکسی روشن بسازید. ', A().goLink('dns', 'رکوردها')]);
-    var uuidCtl = P.input(st, 'uuid', 'UUID کاربر', { oninput: function () { if (/^[0-9a-f-]{36}$/i.test(st.uuid)) draw(); },
-      help: 'شناسه کاربر در Xray؛ در سرور و کلاینت باید یکسان باشد. برای هر کاربر یک UUID جدا بسازید.' });
-    var newUuid = P.btn('UUID جدید', { icon: 'refresh', size: 'sm', cls: 'pcdn-tn-uuid', onclick: function () {
+    var hostCtl = hs.length ? P.select(st, 'host', t('نام میزبان (رکورد پروکسی‌شده)'), hs.map(function (x) { return [x, x]; }), { ltr: true, onchange: draw,
+      help: t('کلاینت به این نام روی پورت ۴۴۳ وصل می‌شود. رکورد باید در «رکوردها» پروکسی‌شده باشد.') })
+      : P.alertBox('warning', [t('هیچ رکورد پروکسی‌شده‌ای ندارید؛ ابتدا یک رکورد (مثلاً '), ltr('vpn'), t(') با پروکسی روشن بسازید. '), A().goLink('dns', t('رکوردها'))]);
+    var uuidCtl = P.input(st, 'uuid', t('UUID کاربر'), { oninput: function () { if (/^[0-9a-f-]{36}$/i.test(st.uuid)) draw(); },
+      help: t('شناسه کاربر در Xray؛ در سرور و کلاینت باید یکسان باشد. برای هر کاربر یک UUID جدا بسازید.') });
+    var newUuid = P.btn(t('UUID جدید'), { icon: 'refresh', size: 'sm', cls: 'pcdn-tn-uuid', onclick: function () {
       st.uuid = uuid4();
       var inp = uuidCtl.querySelector('input'); if (inp) inp.value = st.uuid;
       draw();
@@ -510,11 +511,11 @@
     newUuid.setAttribute('data-ro-ok', '1');
     append(d.body, [
       h('div', { className: 'pcdn-grid pcdn-tn-cfg-ctl' }, hostCtl, h('div', { className: 'pcdn-tn-pathrow' }, uuidCtl, newUuid),
-        p.protocol === 'xhttp' ? P.select(st, 'mode', 'حالت XHTTP کلاینت', XHTTP_MODES, { onchange: draw }) : null),
+        p.protocol === 'xhttp' ? P.select(st, 'mode', t('حالت XHTTP کلاینت'), XHTTP_MODES, { onchange: draw }) : null),
       out]);
     Array.prototype.forEach.call(d.body.querySelectorAll('input,select'), function (x) { x.setAttribute('data-ro-ok', '1'); });
     draw();
-    d.foot.appendChild(P.btn('بستن', { onclick: function () { d.close(); } }));
+    d.foot.appendChild(P.btn(t('بستن'), { onclick: function () { d.close(); } }));
     d.focusFirst();
     return d;
   }
@@ -522,16 +523,16 @@
   // ------------------------------------------------------------------ connectivity check + stats
 
   function checkCard(Aa) {
-    var c = P.card({ title: 'تست اتصال به سرور من', icon: 'activity', tone: 'success', id: 'check',
-      subtitle: 'CDN از سمت سرورهای خود به مقصد هر مسیر وصل می‌شود (TCP و در صورت نیاز TLS) تا مطمئن شوید سرور VPN شما در دسترس است.' });
+    var c = P.card({ title: t('تست اتصال به سرور من'), icon: 'activity', tone: 'success', id: 'check',
+      subtitle: t('CDN از سمت سرورهای خود به مقصد هر مسیر وصل می‌شود (TCP و در صورت نیاز TLS) تا مطمئن شوید سرور VPN شما در دسترس است.') });
     var res = h('div', { className: 'pcdn-tn-results', 'aria-live': 'polite' });
-    var b = P.btn('تست اتصال', { kind: 'primary', icon: 'refresh', write: true, cls: 'pcdn-tn-check', onclick: function () {
-      if (!saved().paths || !saved().paths.length) { P.toast('ابتدا یک مسیر تونل بسازید و ذخیره کنید.', 'warn'); return; }
+    var b = P.btn(t('تست اتصال'), { kind: 'primary', icon: 'refresh', write: true, cls: 'pcdn-tn-check', onclick: function () {
+      if (!saved().paths || !saved().paths.length) { P.toast(t('ابتدا یک مسیر تونل بسازید و ذخیره کنید.'), 'warn'); return; }
       clear(res);
       res.appendChild(P.skeleton(2));
       P.busy(b, P.api('POST', 'tunnel/check')).then(function (r) {
         clear(res);
-        if (!r.ok) { res.appendChild(P.errorBox(r, 'تست انجام نشد')); return; }
+        if (!r.ok) { res.appendChild(P.errorBox(r, t('تست انجام نشد'))); return; }
         var list = (r.data && Array.isArray(r.data.results)) ? r.data.results : [];
         var byId = {};
         (saved().paths || []).forEach(function (p) { byId[p.id] = p; });
@@ -543,28 +544,28 @@
             h('span', { className: 'pcdn-tn-res-icon pcdn-tone-' + (x.ok ? 'success' : 'danger') }, icon(x.ok ? 'checkCircle' : 'xCircle')),
             h('div', { className: 'pcdn-tn-res-main' },
               h('div', { className: 'pcdn-tn-res-head' }, p.protocol ? protoBadge(p.protocol) : null, h('bdi', { className: 'pcdn-vchip', dir: 'ltr', text: p.path }),
-                h('span', { className: 'pcdn-muted pcdn-tn-note', text: '← ' + originText(p) })),
-              h('div', { className: 'pcdn-tn-res-msg', text: x.ok ? 'در دسترس است' + (x.ms !== null && x.ms !== undefined ? ' — ' + num(x.ms) + ' میلی‌ثانیه' : '') : (x.error || 'در دسترس نیست') })));
+                h('span', { className: 'pcdn-muted pcdn-tn-note', text: P.arrow + ' ' + originText(p) })),
+              h('div', { className: 'pcdn-tn-res-msg', text: x.ok ? t('در دسترس است') + (x.ms !== null && x.ms !== undefined ? ' — ' + num(x.ms) + t(' میلی‌ثانیه') : '') : (x.error || t('در دسترس نیست')) })));
         })));
-        if (!list.length) res.appendChild(h('p', { className: 'pcdn-muted', text: 'مسیری برای تست وجود ندارد.' }));
+        if (!list.length) res.appendChild(h('p', { className: 'pcdn-muted', text: t('مسیری برای تست وجود ندارد.') }));
         if (bad) {
-          res.appendChild(P.alertBox('warning', [h('strong', { text: 'سرور در دسترس نیست؟ ' }),
-            'بررسی کنید سرویس Xray روشن است، پورت درست است، فایروال سرور (ufw / iptables / فایروال دیتاسنتر) آی‌پی‌های CDN را مسدود نکرده، و اگر TLS روشن است SNI و گواهی درست باشند. ',
-            Aa.tutLink('tunnel', 'عیب‌یابی تونل')]));
+          res.appendChild(P.alertBox('warning', [h('strong', { text: t('سرور در دسترس نیست؟ ') }),
+            t('بررسی کنید سرویس Xray روشن است، پورت درست است، فایروال سرور (ufw / iptables / فایروال دیتاسنتر) آی‌پی‌های CDN را مسدود نکرده، و اگر TLS روشن است SNI و گواهی درست باشند. '),
+            Aa.tutLink('tunnel', t('عیب‌یابی تونل'))]));
         }
-        P.toast(bad ? num(bad) + ' مسیر در دسترس نیست.' : 'همه مسیرها در دسترس‌اند.', bad ? 'warn' : 'success');
+        P.toast(bad ? num(bad) + t(' مسیر در دسترس نیست.') : t('همه مسیرها در دسترس‌اند.'), bad ? 'warn' : 'success');
       });
     } });
-    append(c.body, [h('div', { className: 'pcdn-row-actions' }, b, h('span', { className: 'pcdn-muted pcdn-tn-note', text: 'تست روی تنظیمات ذخیره‌شده انجام می‌شود.' })), res]);
+    append(c.body, [h('div', { className: 'pcdn-row-actions' }, b, h('span', { className: 'pcdn-muted pcdn-tn-note', text: t('تست روی تنظیمات ذخیره‌شده انجام می‌شود.') })), res]);
     return c;
   }
 
-  var PERIODS = [['24', '۲۴ ساعت'], ['168', '۷ روز']];
+  var PERIODS = [['24', t('۲۴ ساعت')], ['168', t('۷ روز')]];
   function statsCard(Aa) {
     var st = S();
     st.tnHours = st.tnHours || '24';
-    var c = P.card({ title: 'آمار تونل', icon: 'chart', tone: 'violet', id: 'tstats',
-      actions: P.segmented(PERIODS, st.tnHours, function (v) { st.tnHours = v; draw(); }, 'بازه آمار تونل') });
+    var c = P.card({ title: t('آمار تونل'), icon: 'chart', tone: 'violet', id: 'tstats',
+      actions: P.segmented(PERIODS, st.tnHours, function (v) { st.tnHours = v; draw(); }, t('بازه آمار تونل')) });
     var holder = h('div', { className: 'pcdn-stack' });
     c.body.appendChild(holder);
     function draw() {
@@ -578,21 +579,21 @@
       P.api('GET', 'tunnel/stats', undefined, { hours: hours }).then(function (r) {
         if (hours !== st.tnHours || !document.body.contains(holder)) return;
         clear(holder);
-        if (!r.ok) { holder.appendChild(P.errorBox(r, 'آمار تونل در دسترس نیست')); return; }
-        var data = r.data || {}, list = Array.isArray(data.hours) ? data.hours : [], t = data.totals || {};
+        if (!r.ok) { holder.appendChild(P.errorBox(r, t('آمار تونل در دسترس نیست'))); return; }
+        var data = r.data || {}, list = Array.isArray(data.hours) ? data.hours : [], tx = data.totals || {};
         var secs = list.reduce(function (a, x) { return a + (Number(x.seconds) || 0); }, 0);
-        var up = Number(t.bytes_up) || 0, down = Number(t.bytes_down) || 0;
+        var up = Number(tx.bytes_up) || 0, down = Number(tx.bytes_down) || 0;
         function kpi(ic, tone, label, value, sub, id) {
           return h('div', { className: 'pcdn-kpi', 'data-kpi': id }, h('div', { className: 'pcdn-kpi-top' }, h('span', { className: 'pcdn-kpi-icon pcdn-tone-' + tone }, icon(ic)), h('span', { className: 'pcdn-kpi-label', text: label })),
             h('div', { className: 'pcdn-kpi-value', text: value }), sub ? h('div', { className: 'pcdn-kpi-sub', text: sub }) : null);
         }
         append(holder, h('div', { className: 'pcdn-kpis' },
-          kpi('link', 'brand', 'نشست‌ها', num(t.sessions || 0), 'جریان‌های تونل پایان‌یافته', 'sessions'),
-          kpi('clock', 'violet', 'ساعت اتصال', P.num1(secs / 3600), 'مجموع مدت نشست‌ها', 'hours'),
-          kpi('upload', 'warning', 'آپلود', P.bytes(up), 'از کاربران به سرور شما', 'up'),
-          kpi('download', 'success', 'دانلود', P.bytes(down), 'از سرور شما به کاربران', 'down')));
+          kpi('link', 'brand', t('نشست‌ها'), num(tx.sessions || 0), t('جریان‌های تونل پایان‌یافته'), 'sessions'),
+          kpi('clock', 'violet', t('ساعت اتصال'), P.num1(secs / 3600), t('مجموع مدت نشست‌ها'), 'hours'),
+          kpi('upload', 'warning', t('آپلود'), P.bytes(up), t('از کاربران به سرور شما'), 'up'),
+          kpi('download', 'success', t('دانلود'), P.bytes(down), t('از سرور شما به کاربران'), 'down')));
         if (!list.length || up + down === 0) {
-          holder.appendChild(P.empty('chart', 'هنوز ترافیک تونلی ثبت نشده است', 'پس از اتصال اولین کاربر، آمار با چند دقیقه تأخیر اینجا نمایش داده می‌شود.'));
+          holder.appendChild(P.empty('chart', t('هنوز ترافیک تونلی ثبت نشده است'), t('پس از اتصال اولین کاربر، آمار با چند دقیقه تأخیر اینجا نمایش داده می‌شود.')));
           return;
         }
         // hourly for 24 h, daily for 7 d
@@ -606,12 +607,12 @@
         });
         var chart = h('div', { className: 'pcdn-tn-chart' });
         holder.appendChild(chart);
-        if (P.charts) P.charts.bar(chart, labels, buckets.map(function (b) { return b.v; }), 'var(--pc-c-bytes)', P.bytes, 'نمودار ترافیک تونل', 'ترافیک (آپلود + دانلود)');
+        if (P.charts) P.charts.bar(chart, labels, buckets.map(function (b) { return b.v; }), 'var(--pc-c-bytes)', P.bytes, t('نمودار ترافیک تونل'), t('ترافیک (آپلود + دانلود)'));
         var bp = data.by_protocol || {}, keys = Object.keys(bp).filter(function (k) { return PROTO[k] && Number(bp[k]) > 0; })
           .sort(function (a, b) { return bp[b] - bp[a]; });
         if (keys.length) {
           var max = Number(bp[keys[0]]) || 1, sum = keys.reduce(function (a, k) { return a + Number(bp[k]); }, 0);
-          holder.appendChild(h('div', { className: 'pcdn-tn-byproto' }, h('h4', { text: 'بر اساس پروتکل' }),
+          holder.appendChild(h('div', { className: 'pcdn-tn-byproto' }, h('h4', { text: t('بر اساس پروتکل') }),
             h('ul', { className: 'pcdn-barlist' }, keys.map(function (k) {
               return h('li', { 'data-proto': k }, h('div', { className: 'pcdn-barlist-row' },
                 h('span', { className: 'pcdn-barlist-label' }, h('span', { text: PROTO[k].label })),
@@ -630,13 +631,13 @@
   function renderTunnel(Aa) {
     var f = feats(), cap = capMbps(), maxP = maxPaths(), hs = hosts(), s = site();
     var notes = [];
-    if (!hs.length) notes.push(P.alertBox('warning', [h('strong', { text: 'رکورد پروکسی‌شده ندارید. ' }), 'کلاینت‌ها به یک نام پروکسی‌شده (مثلاً ', ltr('vpn.' + s.domain), ') روی پورت ۴۴۳ وصل می‌شوند. ابتدا در «رکوردها» یک رکورد A به آی‌پی سرور خود بسازید و پروکسی را روشن کنید. ', Aa.goLink('dns', 'رکوردها')]));
-    if (s.status !== 'active') notes.push(P.alertBox('info', 'تونل پس از فعال شدن سایت روی CDN (تأیید نیم‌سرورها) کار می‌کند؛ تا آن زمان می‌توانید مسیرها را آماده کنید.'));
+    if (!hs.length) notes.push(P.alertBox('warning', [h('strong', { text: t('رکورد پروکسی‌شده ندارید. ') }), t('کلاینت‌ها به یک نام پروکسی‌شده (مثلاً '), ltr('vpn.' + s.domain), t(') روی پورت ۴۴۳ وصل می‌شوند. ابتدا در «رکوردها» یک رکورد A به آی‌پی سرور خود بسازید و پروکسی را روشن کنید. '), Aa.goLink('dns', t('رکوردها'))]));
+    if (s.status !== 'active') notes.push(P.alertBox('info', t('تونل پس از فعال شدن سایت روی CDN (تأیید نیم‌سرورها) کار می‌کند؛ تا آن زمان می‌توانید مسیرها را آماده کنید.')));
     else if (!s.ssl || s.ssl.status !== 'active') {
       var needTls = (saved().paths || []).filter(function (p) { return p.protocol === 'grpc' || p.protocol === 'h2'; });
-      notes.push(P.alertBox('warning', [h('strong', { text: 'گواهی SSL سایت هنوز فعال نیست. ' }),
-        needTls.length ? 'مسیرهای gRPC و HTTP/2 (' + num(needTls.length) + ' مسیر) فقط روی HTTPS با ALPN h2 کار می‌کنند و تا صدور گواهی وصل نمی‌شوند. ' : 'کلاینت‌ها روی HTTPS (پورت ۴۴۳) وصل می‌شوند. ',
-        'گواهی پس از تأیید نیم‌سرورها خودکار صادر می‌شود.'], { icon: 'lock' }));
+      notes.push(P.alertBox('warning', [h('strong', { text: t('گواهی SSL سایت هنوز فعال نیست. ') }),
+        needTls.length ? t('مسیرهای gRPC و HTTP/2 (') + num(needTls.length) + t(' مسیر) فقط روی HTTPS با ALPN h2 کار می‌کنند و تا صدور گواهی وصل نمی‌شوند. ') : t('کلاینت‌ها روی HTTPS (پورت ۴۴۳) وصل می‌شوند. '),
+        t('گواهی پس از تأیید نیم‌سرورها خودکار صادر می‌شود.')], { icon: 'lock' }));
     }
 
     var form = Aa.sectionForm('tunnel', function (d, f2) {
@@ -644,23 +645,23 @@
       d.allowed_countries = Array.isArray(d.allowed_countries) ? d.allowed_countries : [];
       var full = d.paths.length >= maxP;
 
-      var sc = P.card({ title: 'وضعیت تونل', icon: 'tunnel', id: 'tstate' });
+      var sc = P.card({ title: t('وضعیت تونل'), icon: 'tunnel', id: 'tstate' });
       append(sc.body, [
-        P.toggle(d, 'enabled', 'تونل فعال باشد', { help: 'وقتی روشن است، مسیرهای زیر بدون کش، بدون بافر و بدون WAF و چالش مستقیم به سرور VPN شما می‌رسند.', onchange: f2.redraw }),
+        P.toggle(d, 'enabled', t('تونل فعال باشد'), { help: t('وقتی روشن است، مسیرهای زیر بدون کش، بدون بافر و بدون WAF و چالش مستقیم به سرور VPN شما می‌رسند.'), onchange: f2.redraw }),
         dl([
-          ['مسیرهای مجاز پلن', num(maxP)],
-          ['اتصال همزمان هر نود', f.max_tunnel_connections ? num(f.max_tunnel_connections) : 'نامحدود'],
-          ['نودهای پاسخ‌دهنده', f.edge_group === 'tunnel' ? 'نودهای مخصوص تونل' : 'نودهای عمومی']
+          [t('مسیرهای مجاز پلن'), num(maxP)],
+          [t('اتصال همزمان هر نود'), f.max_tunnel_connections ? num(f.max_tunnel_connections) : t('نامحدود')],
+          [t('نودهای پاسخ‌دهنده'), f.edge_group === 'tunnel' ? t('نودهای مخصوص تونل') : t('نودهای عمومی')]
         ]),
-        d.enabled && !d.paths.length ? P.alertBox('info', 'تونل روشن است ولی هنوز مسیری ندارد؛ یک مسیر اضافه کنید.') : null]);
+        d.enabled && !d.paths.length ? P.alertBox('info', t('تونل روشن است ولی هنوز مسیری ندارد؛ یک مسیر اضافه کنید.')) : null]);
 
-      var add = P.btn('مسیر جدید', { kind: 'primary', icon: 'plus', size: 'sm', write: true, cls: 'pcdn-tn-add', disabled: full,
-        title: full ? 'به سقف ' + num(maxP) + ' مسیر پلن رسیده‌اید' : null,
+      var add = P.btn(t('مسیر جدید'), { kind: 'primary', icon: 'plus', size: 'sm', write: true, cls: 'pcdn-tn-add', disabled: full,
+        title: full ? t('به سقف ') + num(maxP) + t(' مسیر پلن رسیده‌اید') : null,
         onclick: function () { pathEditor(null, d.paths, function (np) { np._new = true; d.paths.push(np); f2.redraw(); }); } });
-      var pc = P.card({ title: 'مسیرهای تونل', icon: 'link', id: 'tpaths', subtitle: 'هر مسیر یک آدرس مخفی روی دامنه شماست که با پروتکل انتخابی به سرور VPN می‌رسد.',
-        actions: [h('span', { className: 'pcdn-limit' + (full ? ' is-full' : '') }, num(d.paths.length) + ' از ' + num(maxP) + ' مسیر'), add] });
+      var pc = P.card({ title: t('مسیرهای تونل'), icon: 'link', id: 'tpaths', subtitle: t('هر مسیر یک آدرس مخفی روی دامنه شماست که با پروتکل انتخابی به سرور VPN می‌رسد.'),
+        actions: [h('span', { className: 'pcdn-limit' + (full ? ' is-full' : '') }, num(d.paths.length) + t(' از ') + num(maxP) + t(' مسیر')), add] });
       if (!d.paths.length) {
-        pc.body.appendChild(P.empty('tunnel', 'هنوز مسیری نساخته‌اید', 'با «مسیر جدید» یک آدرس مخفی (مثلاً ' + randomPath().slice(0, 9) + '…) بسازید؛ پروتکل پیشنهادی gRPC است.'));
+        pc.body.appendChild(P.empty('tunnel', t('هنوز مسیری نساخته‌اید'), t('با «مسیر جدید» یک آدرس مخفی (مثلاً ') + randomPath().slice(0, 9) + t('…) بسازید؛ پروتکل پیشنهادی gRPC است.')));
       } else {
         var ol = h('ol', { className: 'pcdn-rules pcdn-tn-paths' });
         d.paths.forEach(function (p, i) {
@@ -668,39 +669,39 @@
             h('span', { className: 'pcdn-rule-no', 'aria-hidden': 'true', text: num(i + 1) }),
             h('div', { className: 'pcdn-rule-main' },
               h('div', { className: 'pcdn-rule-name' }, protoBadge(p.protocol), h('bdi', { className: 'pcdn-vchip pcdn-tn-pathval', dir: 'ltr', text: p.path }),
-                p._new ? P.badge('ذخیره نشده', 'warning') : null),
-              h('div', { className: 'pcdn-sentence' }, h('span', { className: 'pcdn-w', text: 'مقصد:' }), h('span', { className: 'pcdn-w pcdn-w-strong', text: originText(p) }),
+                p._new ? P.badge(t('ذخیره نشده'), 'warning') : null),
+              h('div', { className: 'pcdn-sentence' }, h('span', { className: 'pcdn-w', text: t('مقصد:') }), h('span', { className: 'pcdn-w pcdn-w-strong', text: originText(p) }),
                 h('span', { className: 'pcdn-mini', dir: 'ltr', text: 'id: ' + (p.id || '—') }))),
             h('div', { className: 'pcdn-rule-ctl' },
-              h('button', { type: 'button', className: 'pcdn-btn pcdn-btn-sm pcdn-tn-cfg', 'data-ro-ok': '1', onclick: function () { configDrawer(p); } }, icon('qr'), h('span', { text: 'پیکربندی آماده' })),
-              P.iconBtn('edit', 'ویرایش مسیر ' + num(i + 1), function () { pathEditor(p, d.paths, function (np) { if (p._new) np._new = true; d.paths[i] = np; f2.redraw(); }); }, { write: true }),
-              P.iconBtn('trash', 'حذف مسیر ' + num(i + 1), function () { d.paths.splice(i, 1); f2.redraw(); P.toast('مسیر از فهرست حذف شد؛ برای اعمال «ذخیره» را بزنید.', 'info'); }, { write: true, cls: 'is-danger' })));
+              h('button', { type: 'button', className: 'pcdn-btn pcdn-btn-sm pcdn-tn-cfg', 'data-ro-ok': '1', onclick: function () { configDrawer(p); } }, icon('qr'), h('span', { text: t('پیکربندی آماده') })),
+              P.iconBtn('edit', t('ویرایش مسیر ') + num(i + 1), function () { pathEditor(p, d.paths, function (np) { if (p._new) np._new = true; d.paths[i] = np; f2.redraw(); }); }, { write: true }),
+              P.iconBtn('trash', t('حذف مسیر ') + num(i + 1), function () { d.paths.splice(i, 1); f2.redraw(); P.toast(t('مسیر از فهرست حذف شد؛ برای اعمال «ذخیره» را بزنید.'), 'info'); }, { write: true, cls: 'is-danger' })));
           P.reg('paths.' + i, li);
           ol.appendChild(li);
         });
         pc.body.appendChild(ol);
       }
 
-      var cc = P.card({ title: 'تنظیمات اتصال', icon: 'sliders', id: 'tsettings' });
-      var iran = P.btn('فقط ایران', { size: 'sm', write: true, cls: 'pcdn-tn-onlyir', onclick: function () { d.allowed_countries = ['IR']; f2.redraw(); } });
-      var all = P.btn('همه کشورها', { size: 'sm', write: true, cls: 'pcdn-tn-allcc', onclick: function () { d.allowed_countries = []; f2.redraw(); } });
-      var mbps = P.input(d, 'per_connection_mbps', 'سقف سرعت هر اتصال', { type: 'number', min: 0, max: cap || 100000, suffix: 'Mbps', suffixRtl: false, cls: 'pcdn-tn-mbps',
-        help: 'فعلاً اعمال نمی‌شود: محدودسازی سرعت روی جریان‌های تونل (gRPC، WebSocket و …) هنوز در نودها پشتیبانی نمی‌شود.' });
+      var cc = P.card({ title: t('تنظیمات اتصال'), icon: 'sliders', id: 'tsettings' });
+      var iran = P.btn(t('فقط ایران'), { size: 'sm', write: true, cls: 'pcdn-tn-onlyir', onclick: function () { d.allowed_countries = ['IR']; f2.redraw(); } });
+      var all = P.btn(t('همه کشورها'), { size: 'sm', write: true, cls: 'pcdn-tn-allcc', onclick: function () { d.allowed_countries = []; f2.redraw(); } });
+      var mbps = P.input(d, 'per_connection_mbps', t('سقف سرعت هر اتصال'), { type: 'number', min: 0, max: cap || 100000, suffix: 'Mbps', suffixRtl: false, cls: 'pcdn-tn-mbps',
+        help: t('فعلاً اعمال نمی‌شود: محدودسازی سرعت روی جریان‌های تونل (gRPC، WebSocket و …) هنوز در نودها پشتیبانی نمی‌شود.') });
       // Stored value is sent back unchanged; not editable while the edges cannot enforce a per-stream rate on tunnel traffic.
       mbps.querySelector('input').disabled = true;
       mbps.querySelector('input').setAttribute('data-ro-ok', '1');
       append(cc.body, [
         h('div', { className: 'pcdn-grid' },
-          P.duration(d, 'idle_timeout', 'مهلت بیکاری اتصال', { min: 60, max: 86400, picks: [[600, '۱۰ دقیقه'], [3600, '۱ ساعت'], [21600, '۶ ساعت'], [86400, '۱ روز']],
-            help: 'اتصالی که این مدت هیچ داده‌ای نداشته باشد بسته می‌شود (۶۰ ثانیه تا ۱ روز).' }),
+          P.duration(d, 'idle_timeout', t('مهلت بیکاری اتصال'), { min: 60, max: 86400, picks: [[600, t('۱۰ دقیقه')], [3600, t('۱ ساعت')], [21600, t('۶ ساعت')], [86400, t('۱ روز')]],
+            help: t('اتصالی که این مدت هیچ داده‌ای نداشته باشد بسته می‌شود (۶۰ ثانیه تا ۱ روز).') }),
           mbps,
-          P.input(d, 'max_connections_per_ip', 'حداکثر اتصال همزمان هر IP', { type: 'number', min: 0, max: 10000,
-            help: '۰ یعنی نامحدود (روی هر نود). هر جریان WebSocket یا gRPC یک اتصال حساب می‌شود و کلاینت‌ها چند جریان همزمان باز می‌کنند؛ کمتر از ۱۰ نگذارید. اضافه‌ها خطای ۴۲۹ می‌گیرند.' })),
+          P.input(d, 'max_connections_per_ip', t('حداکثر اتصال همزمان هر IP'), { type: 'number', min: 0, max: 10000,
+            help: t('۰ یعنی نامحدود (روی هر نود). هر جریان WebSocket یا gRPC یک اتصال حساب می‌شود و کلاینت‌ها چند جریان همزمان باز می‌کنند؛ کمتر از ۱۰ نگذارید. اضافه‌ها خطای ۴۲۹ می‌گیرند.') })),
         h('div', { className: 'pcdn-tn-cc' },
-          P.tags(d, 'allowed_countries', 'کشورهای مجاز', { upper: true, placeholder: 'IR', help: 'خالی = همه. کاربران کشورهای دیگر روی مسیرهای تونل خطای ۴۰۳ می‌گیرند (کد دوحرفی ISO، مثل IR).' }),
+          P.tags(d, 'allowed_countries', t('کشورهای مجاز'), { upper: true, placeholder: 'IR', help: t('خالی = همه. کاربران کشورهای دیگر روی مسیرهای تونل خطای ۴۰۳ می‌گیرند (کد دوحرفی ISO، مثل IR).') }),
           h('div', { className: 'pcdn-chips-row' }, iran, all)),
-        P.choice(d, 'fallback', 'بقیه مسیرهای دامنه', FALLBACKS, { cols: 3,
-          help: 'صفحه استتار (decoy) یعنی هر کس دامنه را در مرورگر باز کند یک سایت ساده و بی‌خطر می‌بیند، نه خطا یا سرور VPN شما.' })
+        P.choice(d, 'fallback', t('بقیه مسیرهای دامنه'), FALLBACKS, { cols: 3,
+          help: t('صفحه استتار (decoy) یعنی هر کس دامنه را در مرورگر باز کند یک سایت ساده و بی‌خطر می‌بیند، نه خطا یا سرور VPN شما.') })
       ]);
       return [sc, pc, cc];
     }, {
@@ -708,34 +709,34 @@
         (d.paths || []).forEach(function (p) { delete p._new; });
         return d;
       },
-      savedMsg: 'تغییرات ذخیره شد و تا چند ثانیه روی همه نودهای تونل اعمال می‌شود.'
+      savedMsg: t('تغییرات ذخیره شد و تا چند ثانیه روی همه نودهای تونل اعمال می‌شود.')
     });
     return [notes, form.el, h('div', { className: 'pcdn-grid-2 pcdn-tn-bottom' }, checkCard(Aa), guideCard(Aa)), statsCard(Aa)];
   }
 
   function guideCard(Aa) {
-    var c = P.card({ title: 'راه‌اندازی در ۴ قدم', icon: 'rocket', id: 'tsteps' });
+    var c = P.card({ title: t('راه‌اندازی در ۴ قدم'), icon: 'rocket', id: 'tsteps' });
     append(c.body, [
       h('ol', { className: 'pcdn-ol pcdn-steps-ol' },
-        h('li', { text: 'در «رکوردها» یک رکورد A (مثلاً vpn) به آی‌پی سرور VPN بسازید و پروکسی را روشن کنید.' }),
-        h('li', { text: 'تونل را روشن کنید، یک مسیر با پروتکل gRPC بسازید و ذخیره کنید.' }),
-        h('li', { text: 'از «پیکربندی آماده» فایل config.json سرور Xray را کپی و Xray را راه‌اندازی کنید.' }),
-        h('li', { text: 'لینک اشتراک یا QR را در کلاینت (v2rayNG، v2rayN، Hiddify) وارد و وصل شوید.' })),
-      Aa.tutLink('tunnel', 'آموزش کامل و عیب‌یابی')]);
+        h('li', { text: t('در «رکوردها» یک رکورد A (مثلاً vpn) به آی‌پی سرور VPN بسازید و پروکسی را روشن کنید.') }),
+        h('li', { text: t('تونل را روشن کنید، یک مسیر با پروتکل gRPC بسازید و ذخیره کنید.') }),
+        h('li', { text: t('از «پیکربندی آماده» فایل config.json سرور Xray را کپی و Xray را راه‌اندازی کنید.') }),
+        h('li', { text: t('لینک اشتراک یا QR را در کلاینت (v2rayNG، v2rayN، Hiddify) وارد و وصل شوید.') })),
+      Aa.tutLink('tunnel', t('آموزش کامل و عیب‌یابی'))]);
     return c;
   }
 
   pages.tunnel = {
-    title: 'تونل / VPN', icon: 'tunnel', heading: 'تونل / VPN پشت CDN',
-    desc: 'Xray / V2Ray / sing-box را با gRPC، XHTTP، WebSocket، HTTPUpgrade یا HTTP/2 از طریق نودهای داخل ایران به سرور خود برسانید.',
+    title: t('تونل / VPN'), icon: 'tunnel', heading: t('تونل / VPN پشت CDN'),
+    desc: t('Xray / V2Ray / sing-box را با gRPC، XHTTP، WebSocket، HTTPUpgrade یا HTTP/2 از طریق نودهای داخل ایران به سرور خود برسانید.'),
     guide: {
-      what: 'کاربران به نودهای CDN (داخل ایران) وصل می‌شوند و CDN جریان‌های طولانی را بدون کش و بافر به سرور VPN شما (مثلاً در خارج) می‌رساند؛ آی‌پی سرور شما پنهان می‌ماند.',
-      when: 'وقتی سرور Xray/V2Ray دارید و می‌خواهید اتصال کاربران پایدارتر باشد یا آی‌پی سرور مستقیم فیلتر یا کند شده است.',
-      rec: 'پروتکل gRPC، مسیر تصادفی طولانی، صفحه استتار برای بقیه مسیرها و در صورت نیاز «فقط ایران».',
-      mistakes: ['پروکسی نکردن رکورد DNS (ترافیک مستقیم به سرور می‌رود).', 'روشن کردن TLS روی ورودی Xray در حالی که «اتصال با TLS» در مسیر خاموش است (یا برعکس).', 'مسیر یا UUID متفاوت در سرور و کلاینت.', 'بستن آی‌پی‌های CDN در فایروال سرور.'],
+      what: t('کاربران به نودهای CDN (داخل ایران) وصل می‌شوند و CDN جریان‌های طولانی را بدون کش و بافر به سرور VPN شما (مثلاً در خارج) می‌رساند؛ آی‌پی سرور شما پنهان می‌ماند.'),
+      when: t('وقتی سرور Xray/V2Ray دارید و می‌خواهید اتصال کاربران پایدارتر باشد یا آی‌پی سرور مستقیم فیلتر یا کند شده است.'),
+      rec: t('پروتکل gRPC، مسیر تصادفی طولانی، صفحه استتار برای بقیه مسیرها و در صورت نیاز «فقط ایران».'),
+      mistakes: [t('پروکسی نکردن رکورد DNS (ترافیک مستقیم به سرور می‌رود).'), t('روشن کردن TLS روی ورودی Xray در حالی که «اتصال با TLS» در مسیر خاموش است (یا برعکس).'), t('مسیر یا UUID متفاوت در سرور و کلاینت.'), t('بستن آی‌پی‌های CDN در فایروال سرور.')],
       tut: 'tunnel'
     },
-    upsell: 'تونل / VPN در همه پلن‌های CDN گنجانده شده است. سرور Xray / V2Ray خود را پشت CDN و نودهای داخل ایران قرار دهید: اتصال پایدارتر، آی‌پی پنهان و بدون نیاز به دامنه یا سرور اضافه. اگر این بخش فعال نیست، پلن سرویس را به‌روزرسانی کنید یا با پشتیبانی تماس بگیرید.',
+    upsell: t('تونل / VPN در همه پلن‌های CDN گنجانده شده است. سرور Xray / V2Ray خود را پشت CDN و نودهای داخل ایران قرار دهید: اتصال پایدارتر، آی‌پی پنهان و بدون نیاز به دامنه یا سرور اضافه. اگر این بخش فعال نیست، پلن سرویس را به‌روزرسانی کنید یا با پشتیبانی تماس بگیرید.'),
     upsellMore: function () {
       return h('ul', { className: 'pcdn-tn-upsell' }, PROTOCOLS.map(function (p) {
         return h('li', null, protoBadge(p[0]), h('span', { text: p[2] }));

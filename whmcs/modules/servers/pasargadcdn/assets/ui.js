@@ -9,6 +9,7 @@
 (function () {
   'use strict';
   var P = window.PCDN = window.PCDN || {};
+  var t = P.t;  // i18n.js (SPEC §16.10)
 
   // ------------------------------------------------------------------ DOM
 
@@ -41,8 +42,8 @@
     if (text !== undefined) el.textContent = String(text);
     return el;
   }
-  function ltr(t, cls) { return h('bdi', { className: 'pcdn-ltr' + (cls ? ' ' + cls : ''), dir: 'ltr', text: t }); }
-  function code(t) { return h('code', { className: 'pcdn-code', dir: 'ltr', text: t }); }
+  function ltr(tx, cls) { return h('bdi', { className: 'pcdn-ltr' + (cls ? ' ' + cls : ''), dir: 'ltr', text: tx }); }
+  function code(tx) { return h('code', { className: 'pcdn-code', dir: 'ltr', text: tx }); }
   function clone(o) { return o === undefined ? undefined : JSON.parse(JSON.stringify(o)); }
   function uid(prefix) { return prefix + Math.random().toString(36).slice(2, 8); }
 
@@ -129,7 +130,10 @@
     port: 'M8 3.5v4.5|M16 3.5v4.5|M5.5 8h13v3.5a6.5 6.5 0 0 1-13 0z|M12 18v2.5',
     play: C + '|M10 8.5v7l6-3.5z'
   };
+  // Direction-bound icons point the other way on an LTR (English) page.
+  var MIRROR = { arrowLeft: 'arrowRight', arrowRight: 'arrowLeft', chevronLeft: 'chevronRight', chevronRight: 'chevronLeft' };
   function icon(name, cls) {
+    if (P.isEn && MIRROR[name]) name = MIRROR[name];
     var svg = s('svg', { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor',
       'stroke-width': 1.8, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false',
       class: 'pcdn-icon' + (cls ? ' ' + cls : '') });
@@ -137,12 +141,13 @@
     return svg;
   }
 
-  // ------------------------------------------------------------------ formatting (Persian digits for user-facing numbers)
+  // ------------------------------------------------------------------ formatting (per language: Persian digits only in fa)
 
   var nf = null, nf1 = null;
-  try { nf = new Intl.NumberFormat('fa-IR'); nf1 = new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 1 }); } catch (e) { /* old browser */ }
+  try { nf = new Intl.NumberFormat(P.locale); nf1 = new Intl.NumberFormat(P.locale, { maximumFractionDigits: 1 }); } catch (e) { /* old browser */ }
   var FA_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
-  function fa(str) { return String(str).replace(/[0-9]/g, function (d) { return FA_DIGITS[+d]; }); }
+  /** Digits of a user-facing number in the page language (Persian digits in fa, unchanged in en). */
+  function fa(str) { return P.isEn ? String(str) : String(str).replace(/[0-9]/g, function (d) { return FA_DIGITS[+d]; }); }
   function num(n) { n = Number(n) || 0; return nf ? nf.format(n) : fa(n); }
   function num1(n) { n = Number(n) || 0; return nf1 ? nf1.format(n) : fa(Math.round(n * 10) / 10); }
   function bytes(b) {
@@ -153,54 +158,55 @@
   }
   function short(n) {
     n = Number(n) || 0;
-    if (n >= 1e9) return num1(n / 1e9) + ' میلیارد';
-    if (n >= 1e6) return num1(n / 1e6) + ' میلیون';
-    if (n >= 1e3) return num1(n / 1e3) + ' هزار';
+    if (n >= 1e9) return t('{0} میلیارد', num1(n / 1e9));
+    if (n >= 1e6) return t('{0} میلیون', num1(n / 1e6));
+    if (n >= 1e3) return t('{0} هزار', num1(n / 1e3));
     return num(Math.round(n));
   }
-  function pct(a, b) { return b > 0 ? num(Math.round(a * 100 / b)) + '٪' : '—'; }
+  function pct(a, b) { return b > 0 ? num(Math.round(a * 100 / b)) + t('٪') : '—'; }
   function dur(sec) {
     sec = Number(sec) || 0;
-    if (sec <= 0) return '۰ ثانیه';
-    var parts = [], units = [[31536000, 'سال'], [2592000, 'ماه'], [86400, 'روز'], [3600, 'ساعت'], [60, 'دقیقه'], [1, 'ثانیه']];
+    if (sec <= 0) return t('۰ ثانیه');
+    var parts = [], units = [[31536000, t('سال')], [2592000, t('ماه')], [86400, t('روز')], [3600, t('ساعت')], [60, t('دقیقه')], [1, t('ثانیه')]];
     for (var i = 0; i < units.length && parts.length < 2; i++) {
       var q = Math.floor(sec / units[i][0]);
-      if (q > 0) { parts.push(num(q) + ' ' + units[i][1]); sec -= q * units[i][0]; }
+      // English units are plural nouns ("hours"); one of a unit drops the s.
+      if (q > 0) { parts.push(num(q) + ' ' + (P.isEn && q === 1 ? units[i][1].replace(/s$/, '') : units[i][1])); sec -= q * units[i][0]; }
     }
-    return parts.join(' و ');
+    return parts.join(t(' و '));
   }
   function date(iso, opts) {
     if (!iso) return '—';
     var d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso);
-    try { return d.toLocaleString('fa-IR', opts || { dateStyle: 'medium', timeStyle: 'short' }); } catch (e) { return d.toISOString(); }
+    try { return d.toLocaleString(P.locale, opts || { dateStyle: 'medium', timeStyle: 'short' }); } catch (e) { return d.toISOString(); }
   }
   function rel(iso) {
     var d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso || '—');
     var sec = Math.round((Date.now() - d.getTime()) / 1000);
     if (sec < 0) sec = 0;
-    if (sec < 45) return 'همین الان';
-    if (sec < 3600) return num(Math.max(1, Math.round(sec / 60))) + ' دقیقه پیش';
-    if (sec < 86400) return num(Math.round(sec / 3600)) + ' ساعت پیش';
-    if (sec < 30 * 86400) return num(Math.round(sec / 86400)) + ' روز پیش';
+    if (sec < 45) return t('همین الان');
+    if (sec < 3600) return num(Math.max(1, Math.round(sec / 60))) + t(' دقیقه پیش');
+    if (sec < 86400) return num(Math.round(sec / 3600)) + t(' ساعت پیش');
+    if (sec < 30 * 86400) return num(Math.round(sec / 86400)) + t(' روز پیش');
     return date(iso, { dateStyle: 'medium' });
   }
   /** Search normalisation: Arabic ي/ك → Persian, drop ZWNJ/diacritics, lower-case. */
-  function norm(t) {
-    return String(t || '').toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/[‌ً-ٟ]/g, '')
+  function norm(tx) {
+    return String(tx || '').toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/[‌ً-ٟ]/g, '')
       .replace(/[۰-۹]/g, function (c) { return String(c.charCodeAt(0) - 0x06f0); });
   }
 
   var COUNTRIES = {
-    IR: 'ایران', US: 'آمریکا', DE: 'آلمان', NL: 'هلند', GB: 'انگلستان', FR: 'فرانسه', CN: 'چین', RU: 'روسیه', TR: 'ترکیه',
-    AE: 'امارات', IQ: 'عراق', AF: 'افغانستان', CA: 'کانادا', SE: 'سوئد', FI: 'فنلاند', IN: 'هند', SG: 'سنگاپور', JP: 'ژاپن',
-    KR: 'کره جنوبی', UA: 'اوکراین', PL: 'لهستان', IT: 'ایتالیا', ES: 'اسپانیا', BR: 'برزیل', AM: 'ارمنستان', AZ: 'آذربایجان',
-    OM: 'عمان', QA: 'قطر', SA: 'عربستان', KW: 'کویت', BH: 'بحرین', PK: 'پاکستان', VN: 'ویتنام', HK: 'هنگ‌کنگ', RO: 'رومانی',
-    CH: 'سوئیس', AT: 'اتریش', BG: 'بلغارستان', CZ: 'چک', IE: 'ایرلند', AU: 'استرالیا', LT: 'لیتوانی', GE: 'گرجستان',
-    TM: 'ترکمنستان', TJ: 'تاجیکستان', UZ: 'ازبکستان', KZ: 'قزاقستان', ID: 'اندونزی', MY: 'مالزی', TH: 'تایلند', EG: 'مصر',
-    SY: 'سوریه', LB: 'لبنان', JO: 'اردن', BE: 'بلژیک', DK: 'دانمارک', NO: 'نروژ', CY: 'قبرس', GR: 'یونان', HU: 'مجارستان',
-    MX: 'مکزیک', AR: 'آرژانتین', ZA: 'آفریقای جنوبی', NG: 'نیجریه', IL: 'اسرائیل', TW: 'تایوان', PH: 'فیلیپین', BD: 'بنگلادش'
+    IR: t('ایران'), US: t('آمریکا'), DE: t('آلمان'), NL: t('هلند'), GB: t('انگلستان'), FR: t('فرانسه'), CN: t('چین'), RU: t('روسیه'), TR: t('ترکیه'),
+    AE: t('امارات'), IQ: t('عراق'), AF: t('افغانستان'), CA: t('کانادا'), SE: t('سوئد'), FI: t('فنلاند'), IN: t('هند'), SG: t('سنگاپور'), JP: t('ژاپن'),
+    KR: t('کره جنوبی'), UA: t('اوکراین'), PL: t('لهستان'), IT: t('ایتالیا'), ES: t('اسپانیا'), BR: t('برزیل'), AM: t('ارمنستان'), AZ: t('آذربایجان'),
+    OM: t('عمان'), QA: t('قطر'), SA: t('عربستان'), KW: t('کویت'), BH: t('بحرین'), PK: t('پاکستان'), VN: t('ویتنام'), HK: t('هنگ‌کنگ'), RO: t('رومانی'),
+    CH: t('سوئیس'), AT: t('اتریش'), BG: t('بلغارستان'), CZ: t('چک'), IE: t('ایرلند'), AU: t('استرالیا'), LT: t('لیتوانی'), GE: t('گرجستان'),
+    TM: t('ترکمنستان'), TJ: t('تاجیکستان'), UZ: t('ازبکستان'), KZ: t('قزاقستان'), ID: t('اندونزی'), MY: t('مالزی'), TH: t('تایلند'), EG: t('مصر'),
+    SY: t('سوریه'), LB: t('لبنان'), JO: t('اردن'), BE: t('بلژیک'), DK: t('دانمارک'), NO: t('نروژ'), CY: t('قبرس'), GR: t('یونان'), HU: t('مجارستان'),
+    MX: t('مکزیک'), AR: t('آرژانتین'), ZA: t('آفریقای جنوبی'), NG: t('نیجریه'), IL: t('اسرائیل'), TW: t('تایوان'), PH: t('فیلیپین'), BD: t('بنگلادش')
   };
   function country(code) { code = String(code || '').toUpperCase(); return COUNTRIES[code] || code || '—'; }
 
@@ -225,69 +231,82 @@
     // own sub-site row by this id; an explicit query.rop (reseller op) overrides it server-side.
     if (CFG.rsid && !(query && query.rop)) url += '&rsid=' + encodeURIComponent(CFG.rsid);
     Object.keys(query || {}).forEach(function (k) { url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
-    var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'Accept': 'application/json' } };
+    // X-PCDN-Lang: api.php answers its own error details in the app's language (SPEC §16.10).
+    var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'X-PCDN-Lang': P.lang || 'fa', 'Accept': 'application/json' } };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
     return fetch(url, init).then(function (r) {
-      return r.json().catch(function () { return { detail: 'پاسخ نامعتبر از سرور (HTTP ' + r.status + ')' }; })
+      return r.json().catch(function () { return { detail: t('پاسخ نامعتبر از سرور (HTTP ') + r.status + ')' }; })
         .then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
     }, function () {
-      return { ok: false, status: 0, data: { detail: 'ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.' } };
+      return { ok: false, status: 0, data: { detail: t('ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.') } };
     });
   }
 
   var LOC = {
-    rules: 'قانون', conditions: 'شرط', pools: 'استخر', origins: 'سرور', exclusions: 'استثنا', request: 'هدر درخواست',
-    response: 'هدر پاسخ', value: 'مقدار', name: 'نام', id: 'شناسه', path: 'مسیر', content: 'مقدار', ttl: 'TTL', type: 'نوع',
-    priority: 'اولویت', pool: 'استخر', origin_port: 'پورت سرور اصلی', health_port: 'پورت بررسی سلامت', address: 'آدرس',
-    port: 'پورت', weight: 'وزن', pattern: 'الگو', redirect: 'ریدایرکت', url: 'آدرس', edge_ttl: 'مدت کش CDN',
-    browser_ttl: 'مدت کش مرورگر', requests: 'تعداد درخواست', period: 'بازه', block_seconds: 'مدت مسدودی', methods: 'متدها',
-    action: 'اقدام', field: 'فیلد', op: 'عملگر', rule_id: 'شناسه قانون', health: 'بررسی سلامت', interval: 'فاصله',
-    timeout: 'مهلت', expect: 'کدهای سالم', host: 'هاست', quality: 'کیفیت', max_width: 'حداکثر عرض', extensions: 'پسوندها',
-    allowed_referers: 'دامنه‌های مجاز', bypass_cookies: 'کوکی‌های عبور از کش', threshold_rps: 'آستانه', clearance_ttl: 'اعتبار مجوز',
-    max_age: 'max-age', hsts: 'HSTS', cert: 'گواهی', key: 'کلید خصوصی', zone: 'فایل زون', paranoia: 'سطح حساسیت', groups: 'گروه‌ها',
+    rules: t('قانون'), conditions: t('شرط'), pools: t('استخر'), origins: t('سرور'), exclusions: t('استثنا'), request: t('هدر درخواست'),
+    response: t('هدر پاسخ'), value: t('مقدار'), name: t('نام'), id: t('شناسه'), path: t('مسیر'), content: t('مقدار'), ttl: 'TTL', type: t('نوع'),
+    priority: t('اولویت'), pool: t('استخر'), origin_port: t('پورت سرور اصلی'), health_port: t('پورت بررسی سلامت'), address: t('آدرس'),
+    port: t('پورت'), weight: t('وزن'), pattern: t('الگو'), redirect: t('ریدایرکت'), url: t('آدرس'), edge_ttl: t('مدت کش CDN'),
+    browser_ttl: t('مدت کش مرورگر'), requests: t('تعداد درخواست'), period: t('بازه'), block_seconds: t('مدت مسدودی'), methods: t('متدها'),
+    action: t('اقدام'), field: t('فیلد'), op: t('عملگر'), rule_id: t('شناسه قانون'), health: t('بررسی سلامت'), interval: t('فاصله'),
+    timeout: t('مهلت'), expect: t('کدهای سالم'), host: t('هاست'), quality: t('کیفیت'), max_width: t('حداکثر عرض'), extensions: t('پسوندها'),
+    allowed_referers: t('دامنه‌های مجاز'), bypass_cookies: t('کوکی‌های عبور از کش'), threshold_rps: t('آستانه'), clearance_ttl: t('اعتبار مجوز'),
+    max_age: 'max-age', hsts: 'HSTS', cert: t('گواهی'), key: t('کلید خصوصی'), zone: t('فایل زون'), paranoia: t('سطح حساسیت'), groups: t('گروه‌ها'),
     // Wave 6A (SPEC §14.1)
-    stale_while_revalidate: 'به‌روزرسانی در پس‌زمینه', stale_if_error: 'نسخه قدیمی هنگام خطای سرور اصلی', shield: 'Origin Shield',
-    key_device: 'نسخه جدا برای موبایل', key_cookies: 'کوکی‌های کلید کش', key_query_allow: 'پارامترهای مجاز کلید کش',
-    http3: 'HTTP/3', auto_webp: 'تبدیل خودکار به WebP', preload: 'Preload', as: 'نوع منبع',
+    stale_while_revalidate: t('به‌روزرسانی در پس‌زمینه'), stale_if_error: t('نسخه قدیمی هنگام خطای سرور اصلی'), shield: 'Origin Shield',
+    key_device: t('نسخه جدا برای موبایل'), key_cookies: t('کوکی‌های کلید کش'), key_query_allow: t('پارامترهای مجاز کلید کش'),
+    http3: 'HTTP/3', auto_webp: t('تبدیل خودکار به WebP'), preload: 'Preload', as: t('نوع منبع'),
     // Wave 6B (SPEC §14.2)
-    match: 'تطبیق', actions: 'اقدام', countries: 'کشورها', regex: 'عبارت منظم', replacement: 'مسیر جدید', source: 'مبدأ',
-    target: 'مقصد', status: 'کد وضعیت', preserve_query: 'حفظ Query String', packs: 'بسته‌های آماده', mode: 'حالت',
-    allow_verified: 'ربات‌های تأییدشده', block_empty_ua: 'User-Agent خالی', origin_client_auth: 'احراز هویت مبدأ', csv: 'CSV',
-    include_subdomains: 'زیردامنه‌ها', enabled: 'فعال',
+    match: t('تطبیق'), actions: t('اقدام'), countries: t('کشورها'), regex: t('عبارت منظم'), replacement: t('مسیر جدید'), source: t('مبدأ'),
+    target: t('مقصد'), status: t('کد وضعیت'), preserve_query: t('حفظ Query String'), packs: t('بسته‌های آماده'), mode: t('حالت'),
+    allow_verified: t('ربات‌های تأییدشده'), block_empty_ua: t('User-Agent خالی'), origin_client_auth: t('احراز هویت مبدأ'), csv: 'CSV',
+    include_subdomains: t('زیردامنه‌ها'), enabled: t('فعال'),
     // Wave 6D (SPEC §14.3)
-    s3_endpoint: 'نشانی سرویس', region: 'ناحیه', bucket: 'نام باکت', prefix: 'پیشوند', access_key: 'کلید دسترسی',
-    secret_key: 'کلید مخفی', anonymize_ip: 'ناشناس‌سازی آی‌پی', sample_rate: 'نرخ نمونه‌برداری', items: 'وب‌هوک',
-    events: 'رویدادها', description: 'توضیح', minutes: 'بازه', month: 'ماه', limit: 'تعداد',
+    s3_endpoint: t('نشانی سرویس'), region: t('ناحیه'), bucket: t('نام باکت'), prefix: t('پیشوند'), access_key: t('کلید دسترسی'),
+    secret_key: t('کلید مخفی'), anonymize_ip: t('ناشناس‌سازی آی‌پی'), sample_rate: t('نرخ نمونه‌برداری'), items: t('وب‌هوک'),
+    events: t('رویدادها'), description: t('توضیح'), minutes: t('بازه'), month: t('ماه'), limit: t('تعداد'),
     // Wave 8 (SPEC §16.4–§16.7)
-    apps: 'برنامه', protocol: 'پروتکل', edge_port: 'پورت روی CDN', origin: 'سرور مقصد', proxy_protocol: 'PROXY protocol',
-    ip_allow: 'آی‌پی‌های مجاز', idle_timeout: 'مهلت بیکاری', segment_ttl: 'مدت کش قطعه‌ها', manifest_ttl: 'مدت کش فهرست پخش',
-    prefetch_next: 'پیش‌بارگذاری قطعهٔ بعدی', avif: 'AVIF', smart_crop: 'برش هوشمند', primaries: 'سرورهای اصلی', tsig: 'TSIG',
-    algorithm: 'الگوریتم', secret: 'کلید مخفی', allow_axfr: 'آی‌پی‌های مجاز AXFR', health_type: 'نوع بررسی سلامت',
-    health_path: 'مسیر بررسی سلامت', health_check: 'بررسی سلامت'
+    apps: t('برنامه'), protocol: t('پروتکل'), edge_port: t('پورت روی CDN'), origin: t('سرور مقصد'), proxy_protocol: 'PROXY protocol',
+    ip_allow: t('آی‌پی‌های مجاز'), idle_timeout: t('مهلت بیکاری'), segment_ttl: t('مدت کش قطعه‌ها'), manifest_ttl: t('مدت کش فهرست پخش'),
+    prefetch_next: t('پیش‌بارگذاری قطعهٔ بعدی'), avif: 'AVIF', smart_crop: t('برش هوشمند'), primaries: t('سرورهای اصلی'), tsig: 'TSIG',
+    algorithm: t('الگوریتم'), secret: t('کلید مخفی'), allow_axfr: t('آی‌پی‌های مجاز AXFR'), health_type: t('نوع بررسی سلامت'),
+    health_path: t('مسیر بررسی سلامت'), health_check: t('بررسی سلامت')
   };
+  var FA_RE = /[\u0600-\u06FF]/;
+  /**
+   * A message that came from the controller as-is. Its texts are Persian; on an English page a
+   * Persian one is shown unchanged after a localized lead-in (SPEC §16.10).
+   */
+  function ctlText(msg) {
+    msg = String(msg === null || msg === undefined ? '' : msg);
+    var lead = t('پیام سرور CDN:') + ' ';
+    return P.isEn && FA_RE.test(msg) && msg.indexOf(lead) !== 0 ? lead + msg : msg;
+  }
   /** Controller errors → {summary, items:[{path, label, msg}]}. */
   function parseErrors(data, status) {
     var d = data && data.detail;
     if (Array.isArray(d)) {
-      return { summary: 'اطلاعات واردشده معتبر نیست.', items: d.map(function (e) {
+      return { summary: t('اطلاعات واردشده معتبر نیست.'), items: d.map(function (e) {
         var loc = Array.isArray(e.loc) ? e.loc.filter(function (x, i) { return !(i === 0 && (x === 'body' || x === 'query')); }) : [];
         var label = [];
         loc.forEach(function (x) {
           if (typeof x === 'number' && label.length) label[label.length - 1] += ' ' + num(x + 1);
           else if (typeof x !== 'number') label.push(LOC[x] || String(x));
         });
-        return { path: loc.join('.'), label: label.join(' › '), msg: String(e.msg || '') };
+        label = label.join(' › ');
+        if (P.isEn && label) label = label.charAt(0).toUpperCase() + label.slice(1);
+        return { path: loc.join('.'), label: label, msg: String(e.msg || '') };
       }) };
     }
-    if (typeof d === 'string' && d) return { summary: d, items: [] };
-    return { summary: status === 0 ? 'ارتباط با سرور برقرار نشد.' : 'خطای ناشناخته (HTTP ' + status + ')', items: [] };
+    if (typeof d === 'string' && d) return { summary: ctlText(d), items: [] };
+    return { summary: status === 0 ? t('ارتباط با سرور برقرار نشد.') : t('خطای ناشناخته (HTTP ') + status + ')', items: [] };
   }
   function errorText(res) {
     var e = parseErrors(res.data, res.status);
-    return e.summary + (e.items.length ? ' ' + e.items.map(function (x) { return (x.label ? x.label + ': ' : '') + x.msg; }).join('؛ ') : '');
+    return e.summary + (e.items.length ? ' ' + e.items.map(function (x) { return (x.label ? x.label + ': ' : '') + x.msg; }).join(t('؛ ')) : '');
   }
   function errorBox(res, title) {
     var e = parseErrors(res.data, res.status);
@@ -303,7 +322,7 @@
   var layer = null, toasts = null;
   function getLayer() {
     if (!layer) {
-      layer = h('div', { id: 'pcdn-layer', className: 'pcdn pcdn-layer', dir: 'rtl', lang: 'fa' });
+      layer = h('div', { id: 'pcdn-layer', className: 'pcdn pcdn-layer', dir: P.dir || 'rtl', lang: P.lang || 'fa' });
       toasts = h('div', { className: 'pcdn-toasts', role: 'status', 'aria-live': 'polite' });
       layer.appendChild(toasts);
       document.body.appendChild(layer);
@@ -315,16 +334,16 @@
   function toast(msg, kind, action) {
     getLayer();
     kind = kind || 'success';
-    var t = h('div', { className: 'pcdn-toast pcdn-toast-' + kind, role: kind === 'error' ? 'alert' : null },
+    var tx = h('div', { className: 'pcdn-toast pcdn-toast-' + kind, role: kind === 'error' ? 'alert' : null },
       icon(kind === 'error' ? 'xCircle' : kind === 'warn' ? 'warn' : kind === 'info' ? 'info' : 'checkCircle'),
       h('div', { className: 'pcdn-toast-msg', text: msg }),
       action ? h('button', { type: 'button', className: 'pcdn-toast-act', text: action.label, onclick: function () { close(); action.fn(); } }) : null,
-      h('button', { type: 'button', className: 'pcdn-toast-x', 'aria-label': 'بستن', onclick: function () { close(); } }, icon('x')));
-    function close() { if (t.parentNode) t.parentNode.removeChild(t); }
-    toasts.appendChild(t);
+      h('button', { type: 'button', className: 'pcdn-toast-x', 'aria-label': t('بستن'), onclick: function () { close(); } }, icon('x')));
+    function close() { if (tx.parentNode) tx.parentNode.removeChild(tx); }
+    toasts.appendChild(tx);
     while (toasts.children.length > 4) toasts.removeChild(toasts.firstChild);
     setTimeout(close, kind === 'error' ? 9000 : 4500);
-    return t;
+    return tx;
   }
 
   var FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -340,7 +359,7 @@
     var titleId = uid('pcdn-dlg-');
     var body = h('div', { className: 'pcdn-dlg-body' });
     var foot = h('div', { className: 'pcdn-dlg-foot' });
-    var closeBtn = h('button', { type: 'button', className: 'pcdn-iconbtn', 'aria-label': 'بستن', onclick: function () { api2.close(); } }, icon('x'));
+    var closeBtn = h('button', { type: 'button', className: 'pcdn-iconbtn', 'aria-label': t('بستن'), onclick: function () { api2.close(); } }, icon('x'));
     var box = h('div', { className: 'pcdn-dlg pcdn-dlg-' + (o.kind || 'modal') + (o.wide ? ' is-wide' : ''), role: o.role || 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId },
       h('div', { className: 'pcdn-dlg-head' },
         o.icon ? h('span', { className: 'pcdn-dlg-icon pcdn-tone-' + (o.tone || 'brand') }, icon(o.icon)) : null,
@@ -390,8 +409,8 @@
       var d = dialog({ title: o.title, icon: o.icon || (o.danger ? 'warn' : 'info'), tone: o.danger ? 'danger' : 'brand', role: 'alertdialog',
         onClose: function () { if (!done) { done = true; resolve(false); } } });
       append(d.body, typeof o.body === 'string' ? h('p', { text: o.body }) : o.body);
-      var cancel = h('button', { type: 'button', className: 'pcdn-btn', text: o.cancel || 'انصراف', onclick: function () { d.close(); } });
-      var ok = h('button', { type: 'button', className: 'pcdn-btn ' + (o.danger ? 'pcdn-btn-danger' : 'pcdn-btn-primary'), text: o.ok || 'تأیید',
+      var cancel = h('button', { type: 'button', className: 'pcdn-btn', text: o.cancel || t('انصراف'), onclick: function () { d.close(); } });
+      var ok = h('button', { type: 'button', className: 'pcdn-btn ' + (o.danger ? 'pcdn-btn-danger' : 'pcdn-btn-primary'), text: o.ok || t('تأیید'),
         'data-confirm': '1', onclick: function () { done = true; d.close(true); resolve(true); } });
       append(d.foot, [ok, cancel]);
       (o.danger ? cancel : ok).focus();
@@ -436,22 +455,22 @@
   }
   function copyBtn(text, label, o) {
     o = o || {};
-    var b = h('button', { type: 'button', className: 'pcdn-copy' + (o.cls ? ' ' + o.cls : ''), 'aria-label': label || 'کپی', title: label || 'کپی',
+    var b = h('button', { type: 'button', className: 'pcdn-copy' + (o.cls ? ' ' + o.cls : ''), 'aria-label': label || t('کپی'), title: label || t('کپی'),
       'data-copy': '1', 'data-ro-ok': '1', onclick: function (e) {
         e.stopPropagation();
         var v = typeof text === 'function' ? text() : text;
         copyText(v).then(function () {
           b.classList.add('is-done');
           setTimeout(function () { b.classList.remove('is-done'); }, 1500);
-          toast(o.done || 'کپی شد', 'success');
-        }, function () { toast('کپی خودکار ممکن نشد؛ متن را دستی انتخاب کنید.', 'error'); });
+          toast(o.done || t('کپی شد'), 'success');
+        }, function () { toast(t('کپی خودکار ممکن نشد؛ متن را دستی انتخاب کنید.'), 'error'); });
       } }, icon('copy'), icon('check', 'pcdn-copy-ok'), o.text ? h('span', { text: o.text }) : null);
     return b;
   }
   /** LTR value with a copy button next to it. */
   function copyable(text, o) {
     o = o || {};
-    return h('span', { className: 'pcdn-copyable' + (o.block ? ' is-block' : '') }, h('code', { dir: 'ltr', text: text }), copyBtn(text, o.label || ('کپی ' + text)));
+    return h('span', { className: 'pcdn-copyable' + (o.block ? ' is-block' : '') }, h('code', { dir: 'ltr', text: text }), copyBtn(text, o.label || (t('کپی ') + text)));
   }
 
   function badge(text, tone, ic) {
@@ -479,7 +498,7 @@
     var open = !!o.open;
     var head = c.querySelector('.pcdn-card-head');
     var tgl = h('button', { type: 'button', className: 'pcdn-collapse-btn', 'aria-expanded': String(open), 'data-ro-ok': '1',
-      'aria-label': (open ? 'بستن ' : 'باز کردن ') + o.title }, icon('chevronDown'));
+      'aria-label': (open ? t('بستن ') : t('باز کردن ')) + o.title }, icon('chevronDown'));
     head.appendChild(tgl);
     function set(v) {
       open = v;
@@ -498,7 +517,7 @@
       text ? h('p', { text: text }) : null, action || null);
   }
   function skeleton(lines, cls) {
-    var out = h('div', { className: 'pcdn-skel-wrap' + (cls ? ' ' + cls : ''), 'aria-busy': 'true', 'aria-label': 'در حال بارگذاری' });
+    var out = h('div', { className: 'pcdn-skel-wrap' + (cls ? ' ' + cls : ''), 'aria-busy': 'true', 'aria-label': t('در حال بارگذاری') });
     for (var i = 0; i < (lines || 3); i++) out.appendChild(h('div', { className: 'pcdn-skel', style: 'width:' + (100 - (i % 3) * 18) + '%' }));
     return out;
   }
@@ -633,7 +652,7 @@
     o = o || {};
     var hint = h('span', { className: 'pcdn-dur-hint' });
     function upd() { hint.textContent = obj[key] === null || obj[key] === undefined ? (o.nullText || '') : (Number(obj[key]) === 0 && o.zeroText ? o.zeroText : '≈ ' + dur(obj[key])); }
-    var inp = input(obj, key, null, { type: 'number', min: o.min, max: o.max, nullable: o.nullable, aria: label, suffix: 'ثانیه', suffixRtl: true,
+    var inp = input(obj, key, null, { type: 'number', min: o.min, max: o.max, nullable: o.nullable, aria: label, suffix: t('ثانیه'), suffixRtl: true,
       oninput: function () { upd(); if (o.oninput) o.oninput(obj[key]); } });
     var chips = h('div', { className: 'pcdn-chips-row' }, (o.picks || []).map(function (p) {
       return h('button', { type: 'button', className: 'pcdn-chip-btn', text: p[1], 'data-write': '1', onclick: function () {
@@ -683,7 +702,7 @@
       Array.prototype.slice.call(wrap.querySelectorAll('.pcdn-tag')).forEach(function (x) { wrap.removeChild(x); });
       list.forEach(function (v, i) {
         wrap.insertBefore(h('span', { className: 'pcdn-tag' }, h('span', { text: v }),
-          h('button', { type: 'button', className: 'pcdn-tag-x', 'aria-label': 'حذف ' + v, 'data-write': '1', onclick: function () { list.splice(i, 1); draw(); fire(); } }, icon('x'))), inp);
+          h('button', { type: 'button', className: 'pcdn-tag-x', 'aria-label': t('حذف ') + v, 'data-write': '1', onclick: function () { list.splice(i, 1); draw(); fire(); } }, icon('x'))), inp);
       });
       inp.placeholder = list.length ? '' : (o.placeholder || '');
     }
@@ -691,7 +710,7 @@
     wrap.addEventListener('click', function (e) { if (e.target === wrap) inp.focus(); });
     draw();
     if (label === null) { reg(pathOf(obj, key), wrap); return wrap; }
-    return field(label, wrap, { help: o.help || 'با Enter یا کاما اضافه کنید.', path: pathOf(obj, key) });
+    return field(label, wrap, { help: o.help || t('با Enter یا کاما اضافه کنید.'), path: pathOf(obj, key) });
   }
 
   /** Radio cards: [[value, title, description, icon?, badge?]]. */
@@ -791,7 +810,7 @@
     function lin(v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
     function lum(c) { return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]); }
     function contrast(a, b) { var x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
-    function mix(a, b, t) { return [0, 1, 2].map(function (i) { return a[i] + (b[i] - a[i]) * t; }).concat([1]); }
+    function mix(a, b, tx) { return [0, 1, 2].map(function (i) { return a[i] + (b[i] - a[i]) * tx; }).concat([1]); }
     function over(top, bot) {
       var a = top[3] + bot[3] * (1 - top[3]);
       if (!a) return [0, 0, 0, 0];
@@ -1063,7 +1082,7 @@
   var K = {
     h: h, s: s, append: append, clear: clear, ltr: ltr, code: code, clone: clone, uid: uid, icon: icon, ICONS: ICONS,
     fa: fa, num: num, num1: num1, bytes: bytes, short: short, pct: pct, dur: dur, date: date, rel: rel, norm: norm, country: country,
-    store: store, CFG: CFG, api: api, parseErrors: parseErrors, errorText: errorText, errorBox: errorBox,
+    store: store, CFG: CFG, api: api, parseErrors: parseErrors, errorText: errorText, errorBox: errorBox, ctlText: ctlText,
     toast: toast, dialog: dialog, confirm: confirmDlg, btn: btn, iconBtn: iconBtn, busy: busy, copyText: copyText, copyBtn: copyBtn,
     copyable: copyable, badge: badge, alertBox: alertBox, card: card, collapsible: collapsible, empty: empty, skeleton: skeleton, meter: meter,
     beginForm: beginForm, endForm: endForm, pathOf: pathOf, reg: reg, placeErrors: placeErrors, clearErrors: clearErrors,

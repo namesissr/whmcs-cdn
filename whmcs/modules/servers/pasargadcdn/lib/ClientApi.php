@@ -4,6 +4,8 @@ namespace PasargadCdn;
 
 use WHMCS\Database\Capsule;
 
+require_once __DIR__ . '/I18n.php';
+
 if (class_exists(__NAMESPACE__ . '\\ClientApi', false)) {
     return;
 }
@@ -27,6 +29,9 @@ if (class_exists(__NAMESPACE__ . '\\ClientApi', false)) {
  * can only ever reach a sub-site whose userid matches the logged-in client; the
  * same "not found" answer covers a missing row and one owned by someone else.
  * 'reseller_op' carries the reseller-level actions (list/create/delete/report).
+ *
+ * Language (SPEC §16.10): error details are written in Persian and answered in English when the
+ * client app is English ('lang' => 'en', from its X-PCDN-Lang header); admin mode stays Persian.
  */
 class ClientApi
 {
@@ -93,6 +98,7 @@ class ClientApi
      *   'admin_id' => WHMCS admin id (admin mode only — set by the addon, never from input),
      *   'readonly' => true for a WHMCS user without the manage-products permission (TeamAccess, §14.3.7):
      *                 every non-GET call is refused with 403 before anything else happens,
+     *   'lang' => 'fa' | 'en' — language of the error details (§16.10; ignored in admin mode),
      * ]
      * @param callable|null $clientFactory fn(array $serverParams): ApiClient (tests)
      * @return array [http status, response array]
@@ -104,6 +110,7 @@ class ClientApi
 
         $adminId = (int) ($req['admin_id'] ?? 0);
         $admin = $adminId > 0;
+        I18n::$current = !$admin && ($req['lang'] ?? '') === 'en' ? 'en' : 'fa';
         if (!$admin && (int) ($req['client_id'] ?? 0) <= 0) {
             return self::fail(401, 'لطفاً دوباره وارد حساب کاربری شوید.');
         }
@@ -241,11 +248,11 @@ class ClientApi
         }
         if ($code >= 500 || $code < 200 || ($code >= 300 && $code < 400)) {
             self::log($method . ' ' . $target, 'HTTP ' . $code);
-            return self::fail(502, 'خطای سرور CDN (HTTP ' . $code . ')');
+            return self::fail(502, I18n::tr('خطای سرور CDN (HTTP %s)', $code));
         }
         if (!is_array($data)) {
             // Empty/non-JSON body: fine for a 2xx, generic message for a 4xx.
-            return $code < 300 ? [$code, ['ok' => true]] : self::fail($code, 'درخواست توسط سرور CDN رد شد (HTTP ' . $code . ')');
+            return $code < 300 ? [$code, ['ok' => true]] : self::fail($code, I18n::tr('درخواست توسط سرور CDN رد شد (HTTP %s)', $code));
         }
         return [$code, $data];
     }
@@ -267,7 +274,7 @@ class ClientApi
         }
         if ($code !== 200 || !is_string($text)) {
             self::log('GET ' . $file, 'HTTP ' . $code);
-            return self::fail(502, 'دریافت گواهی از سرور CDN ممکن نشد (HTTP ' . $code . ')');
+            return self::fail(502, I18n::tr('دریافت گواهی از سرور CDN ممکن نشد (HTTP %s)', $code));
         }
         $pem = trim(str_replace("\r\n", "\n", $text)) . "\n";
         $block = '-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+\/=\s]+?)-----END CERTIFICATE-----';
@@ -335,7 +342,7 @@ class ClientApi
             $data = self::jsonBody($req);
             $rsid = (int) ($data['id'] ?? 0);
             [$ok, $msg] = Reseller::deleteSite($clientId, $rsid, $factory);
-            return $ok ? [200, ['ok' => true, 'detail' => $msg]] : self::fail(404, $msg);
+            return $ok ? [200, ['ok' => true, 'detail' => I18n::tr($msg)]] : self::fail(404, $msg);
         }
         return self::fail(405, 'متد مجاز نیست.');
     }
@@ -380,9 +387,10 @@ class ClientApi
         return $out ? '?' . http_build_query($out) : '';
     }
 
+    /** Error answer; a known Persian message is sent in the request's language (I18n::$current). */
     private static function fail(int $code, string $detail): array
     {
-        return [$code, ['detail' => $detail]];
+        return [$code, ['detail' => I18n::tr($detail)]];
     }
 
     private static function adminLog(int $adminId, string $method, string $path, $svc, string $result): void

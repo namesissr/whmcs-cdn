@@ -18,6 +18,7 @@
 (function () {
   'use strict';
   var P = window.PCDN = window.PCDN || {};
+  var t = P.t;  // i18n.js (SPEC §16.10)
   var pages = P.pages = P.pages || {};
   if (!P.h) return;
   var h = P.h, append = P.append, clear = P.clear, icon = P.icon, ltr = P.ltr, num = P.num, clone = P.clone;
@@ -83,7 +84,7 @@
   function codeBlock(text, caption) {
     return h('figure', { className: 'pcdn-codeblock' },
       h('figcaption', null, icon('terminal'), h('span', { dir: 'ltr', text: caption }),
-        P.copyBtn(text, 'کپی کد ' + caption, { text: 'کپی', cls: 'pcdn-copy-code', done: 'کد کپی شد' })),
+        P.copyBtn(text, t('کپی کد ') + caption, { text: t('کپی'), cls: 'pcdn-copy-code', done: t('کد کپی شد') })),
       h('pre', { dir: 'ltr', tabindex: '0' }, h('code', { text: text })));
   }
   function dl(rows) {
@@ -146,41 +147,41 @@
   function l4AppProblems(a, apps, self) {
     var out = [], r = l4Range();
     function bad(p, m) { out.push({ path: p, msg: m }); }
-    if (a.protocol !== 'tcp' && a.protocol !== 'udp') bad('protocol', 'پروتکل باید TCP یا UDP باشد.');
+    if (a.protocol !== 'tcp' && a.protocol !== 'udp') bad('protocol', t('پروتکل باید TCP یا UDP باشد.'));
     var ep = Number(a.edge_port), auto = a.edge_port === null || a.edge_port === '' || a.edge_port === undefined;
-    if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(String(a.id || ''))) bad('id', 'شناسهٔ برنامه نامعتبر است.');
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(String(a.id || ''))) bad('id', t('شناسهٔ برنامه نامعتبر است.'));
     if (auto) { /* allocated by the controller on save */ }
-    else if (!Number.isInteger(ep)) bad('edge_port', 'پورت روی CDN باید عدد صحیح باشد (یا خالی برای تعیین خودکار).');
-    else if (L4_RESERVED.indexOf(ep) >= 0) bad('edge_port', 'پورت ' + P.fa(ep) + ' رزرو شده است (۲۲، ۵۳، ۸۰ و ۴۴۳ هرگز داده نمی‌شوند).');
-    else if (ep < 1024 || ep > 65535) bad('edge_port', 'پورت روی CDN باید بین ۱۰۲۴ و ۶۵۵۳۵ باشد.');
-    else if (ep < r[0] || ep > r[1]) bad('edge_port', 'پورت روی CDN باید در بازهٔ ' + P.fa(r[0]) + ' تا ' + P.fa(r[1]) + ' باشد (این بازه روی نودها باز است).');
-    else if ((apps || []).some(function (x) { return x !== self && x.edge_port !== null && x.edge_port !== undefined && Number(x.edge_port) === ep; })) bad('edge_port', 'این پورت را برنامهٔ دیگری از همین سایت گرفته است.');
-    if ((apps || []).some(function (x) { return x !== self && x.id === a.id; })) bad('id', 'شناسهٔ برنامه تکراری است.');
+    else if (!Number.isInteger(ep)) bad('edge_port', t('پورت روی CDN باید عدد صحیح باشد (یا خالی برای تعیین خودکار).'));
+    else if (L4_RESERVED.indexOf(ep) >= 0) bad('edge_port', t('پورت ') + P.fa(ep) + t(' رزرو شده است (۲۲، ۵۳، ۸۰ و ۴۴۳ هرگز داده نمی‌شوند).'));
+    else if (ep < 1024 || ep > 65535) bad('edge_port', t('پورت روی CDN باید بین ۱۰۲۴ و ۶۵۵۳۵ باشد.'));
+    else if (ep < r[0] || ep > r[1]) bad('edge_port', t('پورت روی CDN باید در بازهٔ ') + P.fa(r[0]) + t(' تا ') + P.fa(r[1]) + t(' باشد (این بازه روی نودها باز است).'));
+    else if ((apps || []).some(function (x) { return x !== self && x.edge_port !== null && x.edge_port !== undefined && Number(x.edge_port) === ep; })) bad('edge_port', t('این پورت را برنامهٔ دیگری از همین سایت گرفته است.'));
+    if ((apps || []).some(function (x) { return x !== self && x.id === a.id; })) bad('id', t('شناسهٔ برنامه تکراری است.'));
     var o = a.origin || {}, addr = String(o.address || '').trim().replace(/^\[|\]$/g, '');
-    if (!addr) bad('origin.address', 'آدرس سرور مقصد را وارد کنید.');
-    else if (!ip(addr) && !hostname(addr)) bad('origin.address', 'آدرس سرور باید IPv4، IPv6 یا نام دامنه باشد.');
-    else if (privateIp(addr) || /^localhost$/i.test(addr)) bad('origin.address', 'آدرس سرور باید عمومی باشد (نه آی‌پی داخلی یا localhost).');
+    if (!addr) bad('origin.address', t('آدرس سرور مقصد را وارد کنید.'));
+    else if (!ip(addr) && !hostname(addr)) bad('origin.address', t('آدرس سرور باید IPv4، IPv6 یا نام دامنه باشد.'));
+    else if (privateIp(addr) || /^localhost$/i.test(addr)) bad('origin.address', t('آدرس سرور باید عمومی باشد (نه آی‌پی داخلی یا localhost).'));
     var op = Number(o.port);
-    if (o.port === null || o.port === '' || o.port === undefined || !Number.isInteger(op) || op < 1 || op > 65535) bad('origin.port', 'پورت سرور مقصد باید بین ۱ و ۶۵۵۳۵ باشد.');
-    if (['off', 'v1'].indexOf(a.proxy_protocol) < 0) bad('proxy_protocol', 'PROXY protocol نامعتبر است.');
-    else if (a.protocol === 'udp' && a.proxy_protocol !== 'off') bad('proxy_protocol', 'PROXY protocol فقط برای TCP است.');
-    (a.ip_allow || []).forEach(function (x) { if (!cidr(x)) bad('ip_allow', 'آدرس یا بازهٔ نامعتبر: ' + x + ' (مثل 203.0.113.7 یا 198.51.100.0/24)'); });
-    if ((a.ip_allow || []).length > 100) bad('ip_allow', 'حداکثر ۱۰۰ آدرس یا بازه مجاز است.');
+    if (o.port === null || o.port === '' || o.port === undefined || !Number.isInteger(op) || op < 1 || op > 65535) bad('origin.port', t('پورت سرور مقصد باید بین ۱ و ۶۵۵۳۵ باشد.'));
+    if (['off', 'v1'].indexOf(a.proxy_protocol) < 0) bad('proxy_protocol', t('PROXY protocol نامعتبر است.'));
+    else if (a.protocol === 'udp' && a.proxy_protocol !== 'off') bad('proxy_protocol', t('PROXY protocol فقط برای TCP است.'));
+    (a.ip_allow || []).forEach(function (x) { if (!cidr(x)) bad('ip_allow', t('آدرس یا بازهٔ نامعتبر: ') + x + t(' (مثل 203.0.113.7 یا 198.51.100.0/24)')); });
+    if ((a.ip_allow || []).length > 100) bad('ip_allow', t('حداکثر ۱۰۰ آدرس یا بازه مجاز است.'));
     var it = Number(a.idle_timeout);
-    if (!Number.isInteger(it) || it < 10 || it > 3600) bad('idle_timeout', 'مهلت بیکاری باید بین ۱۰ و ۳۶۰۰ ثانیه باشد.');
+    if (!Number.isInteger(it) || it < 10 || it > 3600) bad('idle_timeout', t('مهلت بیکاری باید بین ۱۰ و ۳۶۰۰ ثانیه باشد.'));
     return out;
   }
   function l4Problems(d) {
     var out = [];
     (d.apps || []).forEach(function (a, i) {
-      l4AppProblems(a, d.apps, a).forEach(function (x) { out.push({ path: 'apps.' + i + '.' + x.path, msg: 'برنامهٔ ' + num(i + 1) + ': ' + x.msg }); });
+      l4AppProblems(a, d.apps, a).forEach(function (x) { out.push({ path: 'apps.' + i + '.' + x.path, msg: t('برنامهٔ ') + num(i + 1) + ': ' + x.msg }); });
     });
     var max = l4Max();
-    if ((d.apps || []).length > max) out.push({ path: 'apps', msg: 'پلن شما حداکثر ' + num(max) + ' برنامه را مجاز می‌داند.' });
+    if ((d.apps || []).length > max) out.push({ path: 'apps', msg: t('پلن شما حداکثر ') + num(max) + t(' برنامه را مجاز می‌داند.') });
     return out;
   }
   // nginx stream sends PROXY protocol v1 only (sections.L4App: off | v1)
-  var PP_OPTS = [['off', 'خاموش'], ['v1', 'روشن (نسخهٔ ۱)']];
+  var PP_OPTS = [['off', t('خاموش')], ['v1', t('روشن (نسخهٔ ۱)')]];
   function ppLabel(v) { for (var i = 0; i < PP_OPTS.length; i++) if (PP_OPTS[i][0] === v) return PP_OPTS[i][1]; return String(v || '—'); }
   function l4Host(a) { return a.hostname || 'l4-' + a.id + '.' + domain(); }
   function l4Address(a) { return l4Host(a) + ':' + (a.edge_port === null || a.edge_port === undefined ? '…' : a.edge_port); }
@@ -193,33 +194,33 @@
     if (!draft.origin || typeof draft.origin !== 'object') draft.origin = { address: '', port: null };
     if (!Array.isArray(draft.ip_allow)) draft.ip_allow = [];
     var r = l4Range();
-    var dlg = P.dialog({ title: orig ? 'ویرایش برنامهٔ TCP/UDP' : 'برنامهٔ TCP/UDP جدید', subtitle: orig ? l4Address(orig) : 'پورتی روی CDN که ترافیک آن به سرور شما می‌رسد.', icon: 'port', kind: 'drawer', wide: true });
+    var dlg = P.dialog({ title: orig ? t('ویرایش برنامهٔ TCP/UDP') : t('برنامهٔ TCP/UDP جدید'), subtitle: orig ? l4Address(orig) : t('پورتی روی CDN که ترافیک آن به سرور شما می‌رسد.'), icon: 'port', kind: 'drawer', wide: true });
     dlg.el.classList.add('pcdn-l4-drawer');
     var err = h('div'), form = h('form', { className: 'pcdn-form', novalidate: true, onsubmit: function (e) { e.preventDefault(); ok(); } });
     var ctx = null;
     function draw() {
       clear(form);
       P.beginForm(draft);
-      var portIn = P.input(draft, 'edge_port', 'پورت روی CDN', { type: 'number', min: r[0], max: r[1], nullable: true, placeholder: 'خودکار',
-        help: 'کاربران به این پورت روی نشانی CDN وصل می‌شوند. خالی بگذارید تا هنگام ذخیره اولین پورت آزاد داده شود؛ یا پورتی در بازهٔ ' + P.fa(r[0]) + ' تا ' + P.fa(r[1]) + ' بدهید (اگر سرویس دیگری آن را گرفته باشد هنگام ذخیره خبر می‌دهیم).' });
+      var portIn = P.input(draft, 'edge_port', t('پورت روی CDN'), { type: 'number', min: r[0], max: r[1], nullable: true, placeholder: t('خودکار'),
+        help: t('کاربران به این پورت روی نشانی CDN وصل می‌شوند. خالی بگذارید تا هنگام ذخیره اولین پورت آزاد داده شود؛ یا پورتی در بازهٔ ') + P.fa(r[0]) + t(' تا ') + P.fa(r[1]) + t(' بدهید (اگر سرویس دیگری آن را گرفته باشد هنگام ذخیره خبر می‌دهیم).') });
       var pick = h('div', { className: 'pcdn-chips-row' },
-        h('button', { type: 'button', className: 'pcdn-chip-btn pcdn-l4-auto', 'data-write': '1', text: 'تعیین خودکار', onclick: function () { draft.edge_port = null; draw(); } }),
-        h('button', { type: 'button', className: 'pcdn-chip-btn pcdn-l4-pick', 'data-write': '1', text: 'پورت تصادفی', onclick: function () { draft.edge_port = l4FreePort(apps, draft.protocol, orig); draw(); } }));
+        h('button', { type: 'button', className: 'pcdn-chip-btn pcdn-l4-auto', 'data-write': '1', text: t('تعیین خودکار'), onclick: function () { draft.edge_port = null; draw(); } }),
+        h('button', { type: 'button', className: 'pcdn-chip-btn pcdn-l4-pick', 'data-write': '1', text: t('پورت تصادفی'), onclick: function () { draft.edge_port = l4FreePort(apps, draft.protocol, orig); draw(); } }));
       append(form, [
-        P.choice(draft, 'protocol', 'پروتکل', [['tcp', 'TCP', 'برای بازی‌های TCP، SSH، پایگاه داده، MQTT، RDP و هر سرویس اتصال‌گرا.', 'link'],
-          ['udp', 'UDP', 'برای بازی‌های UDP، DNS، VoIP و پخش زنده؛ PROXY protocol ندارد.', 'zap']], { cols: 2, onchange: function (v) { if (v === 'udp') draft.proxy_protocol = 'off'; draw(); } }),
+        P.choice(draft, 'protocol', t('پروتکل'), [['tcp', 'TCP', t('برای بازی‌های TCP، SSH، پایگاه داده، MQTT، RDP و هر سرویس اتصال‌گرا.'), 'link'],
+          ['udp', 'UDP', t('برای بازی‌های UDP، DNS، VoIP و پخش زنده؛ PROXY protocol ندارد.'), 'zap']], { cols: 2, onchange: function (v) { if (v === 'udp') draft.proxy_protocol = 'off'; draw(); } }),
         h('div', { className: 'pcdn-grid' }, h('div', null, portIn, pick),
-          P.input(draft, 'idle_timeout', 'مهلت بیکاری اتصال', { type: 'number', min: 10, max: 3600, suffix: 'ثانیه', suffixRtl: true,
-            help: 'اتصالی که این مدت هیچ داده‌ای رد و بدل نکند بسته می‌شود (۱۰ تا ۳۶۰۰؛ پیش‌فرض ۳۰۰).' })),
+          P.input(draft, 'idle_timeout', t('مهلت بیکاری اتصال'), { type: 'number', min: 10, max: 3600, suffix: t('ثانیه'), suffixRtl: true,
+            help: t('اتصالی که این مدت هیچ داده‌ای رد و بدل نکند بسته می‌شود (۱۰ تا ۳۶۰۰؛ پیش‌فرض ۳۰۰).') })),
         h('div', { className: 'pcdn-grid' },
-          P.input(draft.origin, 'address', 'آدرس سرور مقصد', { placeholder: '185.1.2.3', maxlength: 253, help: 'آی‌پی عمومی یا نام دامنهٔ سرور شما (نه آی‌پی داخلی).' }),
-          P.input(draft.origin, 'port', 'پورت سرور مقصد', { type: 'number', min: 1, max: 65535, nullable: true, placeholder: '25565' })),
+          P.input(draft.origin, 'address', t('آدرس سرور مقصد'), { placeholder: '185.1.2.3', maxlength: 253, help: t('آی‌پی عمومی یا نام دامنهٔ سرور شما (نه آی‌پی داخلی).') }),
+          P.input(draft.origin, 'port', t('پورت سرور مقصد'), { type: 'number', min: 1, max: 65535, nullable: true, placeholder: '25565' })),
         draft.protocol === 'tcp' ? P.select(draft, 'proxy_protocol', 'PROXY protocol', PP_OPTS,
-          { help: 'روشن کنید تا سرور شما آی‌پی واقعی کاربر را ببیند (هدر PROXY protocol نسخهٔ ۱)؛ فقط اگر نرم‌افزار سرور آن را پشتیبانی می‌کند و روشن کرده‌اید (وگرنه اتصال‌ها خراب می‌شوند).' })
-          : h('p', { className: 'pcdn-help' }, icon('info'), ' در UDP آی‌پی کاربر به سرور شما نمی‌رسد و سرور آی‌پی نودهای CDN را می‌بیند.'),
-        P.tags(draft, 'ip_allow', 'فقط این آی‌پی‌ها (اختیاری)', { placeholder: '198.51.100.0/24',
-          help: 'خالی = همه می‌توانند وصل شوند. با آی‌پی یا بازهٔ CIDR دسترسی را محدود کنید (مثلاً فقط دفتر شما). با Enter یا کاما اضافه کنید.' }),
-        P.toggle(draft, 'enabled', 'فعال', { help: 'برنامهٔ غیرفعال نگه داشته می‌شود ولی پورت آن روی نودها بسته است.' }),
+          { help: t('روشن کنید تا سرور شما آی‌پی واقعی کاربر را ببیند (هدر PROXY protocol نسخهٔ ۱)؛ فقط اگر نرم‌افزار سرور آن را پشتیبانی می‌کند و روشن کرده‌اید (وگرنه اتصال‌ها خراب می‌شوند).') })
+          : h('p', { className: 'pcdn-help' }, icon('info'), t(' در UDP آی‌پی کاربر به سرور شما نمی‌رسد و سرور آی‌پی نودهای CDN را می‌بیند.')),
+        P.tags(draft, 'ip_allow', t('فقط این آی‌پی‌ها (اختیاری)'), { placeholder: '198.51.100.0/24',
+          help: t('خالی = همه می‌توانند وصل شوند. با آی‌پی یا بازهٔ CIDR دسترسی را محدود کنید (مثلاً فقط دفتر شما). با Enter یا کاما اضافه کنید.') }),
+        P.toggle(draft, 'enabled', t('فعال'), { help: t('برنامهٔ غیرفعال نگه داشته می‌شود ولی پورت آن روی نودها بسته است.') }),
         h('button', { type: 'submit', hidden: true, tabindex: '-1', 'aria-hidden': 'true' })]);
       ctx = P.endForm();
       A().lockWrites(form);
@@ -241,10 +242,10 @@
       var nw = clone(draft);
       if (orig) { if (orig._new) nw._new = true; apps[idx] = nw; } else { nw._new = true; apps.push(nw); }
       f.redraw();
-      P.toast(orig ? 'تغییرات برنامه اعمال شد؛ برای ثبت «ذخیره» را بزنید.' : 'برنامه به فهرست اضافه شد؛ برای ثبت «ذخیره» را بزنید.', 'info');
+      P.toast(orig ? t('تغییرات برنامه اعمال شد؛ برای ثبت «ذخیره» را بزنید.') : t('برنامه به فهرست اضافه شد؛ برای ثبت «ذخیره» را بزنید.'), 'info');
     }
-    var okBtn = P.btn('تأیید', { kind: 'primary', icon: 'check', write: true, cls: 'pcdn-l4-ok', onclick: ok });
-    append(dlg.foot, [okBtn, P.btn('انصراف', { onclick: function () { dlg.close(); } })]);
+    var okBtn = P.btn(t('تأیید'), { kind: 'primary', icon: 'check', write: true, cls: 'pcdn-l4-ok', onclick: ok });
+    append(dlg.foot, [okBtn, P.btn(t('انصراف'), { onclick: function () { dlg.close(); } })]);
     append(dlg.body, [err, form]);
     draw();
     dlg.focusFirst();
@@ -256,12 +257,12 @@
     var f = Aa.sectionForm('l4', function (d, f2) {
       d.apps = Array.isArray(d.apps) ? d.apps : [];
       var apps = d.apps, full = apps.length >= max;
-      var add = P.btn('برنامهٔ جدید', { kind: 'primary', icon: 'plus', size: 'sm', write: true, cls: 'pcdn-l4-add', disabled: full,
-        title: full ? 'به سقف ' + num(max) + ' برنامهٔ پلن رسیده‌اید' : null, onclick: function () { l4Drawer(d, f2, -1); } });
-      var c = P.card({ title: 'برنامه‌های TCP/UDP', icon: 'port', id: 'l4-apps', subtitle: 'هر برنامه یک پورت روی CDN است که ترافیک را به سرور شما می‌رساند.',
-        actions: [P.kit && P.kit.limitText ? P.kit.limitText(apps.length, max, 'برنامه') : null, add] });
+      var add = P.btn(t('برنامهٔ جدید'), { kind: 'primary', icon: 'plus', size: 'sm', write: true, cls: 'pcdn-l4-add', disabled: full,
+        title: full ? t('به سقف ') + num(max) + t(' برنامهٔ پلن رسیده‌اید') : null, onclick: function () { l4Drawer(d, f2, -1); } });
+      var c = P.card({ title: t('برنامه‌های TCP/UDP'), icon: 'port', id: 'l4-apps', subtitle: t('هر برنامه یک پورت روی CDN است که ترافیک را به سرور شما می‌رساند.'),
+        actions: [P.kit && P.kit.limitText ? P.kit.limitText(apps.length, max, t('برنامه')) : null, add] });
       if (!apps.length) {
-        c.body.appendChild(P.empty('port', 'هنوز برنامه‌ای نساخته‌اید', 'برای سرویس‌های غیر وب (سرور بازی، SSH، پایگاه داده، MQTT، VoIP) یک پورت TCP یا UDP روی CDN بسازید تا آی‌پی سرورتان پنهان بماند و ترافیک از نودهای CDN عبور کند.'));
+        c.body.appendChild(P.empty('port', t('هنوز برنامه‌ای نساخته‌اید'), t('برای سرویس‌های غیر وب (سرور بازی، SSH، پایگاه داده، MQTT، VoIP) یک پورت TCP یا UDP روی CDN بسازید تا آی‌پی سرورتان پنهان بماند و ترافیک از نودهای CDN عبور کند.')));
       } else {
         var ul = h('ul', { className: 'pcdn-whs pcdn-l4s' });
         apps.forEach(function (a, i) {
@@ -271,22 +272,22 @@
             h('div', { className: 'pcdn-wh-main' },
               h('div', { className: 'pcdn-wh-urlline' },
                 P.badge(String(a.protocol || '').toUpperCase(), a.protocol === 'udp' ? 'violet' : 'brand'),
-                l4Ready(a) ? h('span', { className: 'pcdn-l4-addr' }, P.copyable(addr, { label: 'کپی نشانی اتصال ' + addr }))
+                l4Ready(a) ? h('span', { className: 'pcdn-l4-addr' }, P.copyable(addr, { label: t('کپی نشانی اتصال ') + addr }))
                   : h('span', { className: 'pcdn-l4-addr' }, h('bdi', { className: 'pcdn-wh-url', dir: 'ltr', text: addr }),
-                    h('span', { className: 'pcdn-muted', text: a.edge_port === null || a.edge_port === undefined ? ' — پورت هنگام ذخیره تعیین می‌شود' : ' — پس از ذخیره فعال می‌شود' })),
-                on ? null : P.badge('غیرفعال', 'muted'), a._new ? P.badge('ذخیره نشده', 'warning') : null,
+                    h('span', { className: 'pcdn-muted', text: a.edge_port === null || a.edge_port === undefined ? t(' — پورت هنگام ذخیره تعیین می‌شود') : t(' — پس از ذخیره فعال می‌شود') })),
+                on ? null : P.badge(t('غیرفعال'), 'muted'), a._new ? P.badge(t('ذخیره نشده'), 'warning') : null,
                 a.status && a.status !== 'active' && a.status !== 'ok' ? P.badge(String(a.status), 'warning') : null),
               h('div', { className: 'pcdn-l4-meta' },
-                h('span', null, 'مقصد: ', ltr(String(o.address || '—') + ':' + String(o.port || '—'))),
+                h('span', null, t('مقصد: '), ltr(String(o.address || '—') + ':' + String(o.port || '—'))),
                 a.protocol === 'tcp' && a.proxy_protocol && a.proxy_protocol !== 'off' ? h('span', { text: 'PROXY protocol ' + ppLabel(a.proxy_protocol) }) : null,
-                h('span', { text: (a.ip_allow || []).length ? 'محدود به ' + num(a.ip_allow.length) + ' آدرس/بازه' : 'دسترسی برای همه' }),
-                h('span', { text: 'مهلت بیکاری ' + P.dur(Number(a.idle_timeout) || 0) })),
+                h('span', { text: (a.ip_allow || []).length ? t('محدود به ') + num(a.ip_allow.length) + t(' آدرس/بازه') : t('دسترسی برای همه') }),
+                h('span', { text: t('مهلت بیکاری ') + P.dur(Number(a.idle_timeout) || 0) })),
               a.error ? h('div', { className: 'pcdn-help pcdn-tone-danger', dir: 'auto', text: String(a.error) }) : null),
             h('div', { className: 'pcdn-wh-ctl' },
-              P.switchInput(on, (on ? 'غیرفعال کردن' : 'فعال کردن') + ' برنامهٔ پورت ' + a.edge_port, function (v) { a.enabled = v; f2.redraw(); }, { write: true, small: true }),
-              P.iconBtn('edit', 'ویرایش برنامهٔ پورت ' + a.edge_port, function () { l4Drawer(d, f2, i); }, { write: true, cls: 'pcdn-l4-edit' }),
-              P.iconBtn('trash', 'حذف برنامهٔ پورت ' + a.edge_port, function () {
-                apps.splice(i, 1); f2.redraw(); P.toast('برنامه از فهرست حذف شد؛ برای اعمال «ذخیره» را بزنید.', 'info');
+              P.switchInput(on, (on ? t('غیرفعال کردن') : t('فعال کردن')) + t(' برنامهٔ پورت ') + a.edge_port, function (v) { a.enabled = v; f2.redraw(); }, { write: true, small: true }),
+              P.iconBtn('edit', t('ویرایش برنامهٔ پورت ') + a.edge_port, function () { l4Drawer(d, f2, i); }, { write: true, cls: 'pcdn-l4-edit' }),
+              P.iconBtn('trash', t('حذف برنامهٔ پورت ') + a.edge_port, function () {
+                apps.splice(i, 1); f2.redraw(); P.toast(t('برنامه از فهرست حذف شد؛ برای اعمال «ذخیره» را بزنید.'), 'info');
               }, { write: true, cls: 'is-danger pcdn-l4-del' })));
           P.reg('apps.' + i, li);
           ul.appendChild(li);
@@ -294,7 +295,7 @@
         c.body.appendChild(ul);
       }
       return [c, l4GuideCard(r)];
-    }, { serialize: l4Serialize, validate: l4Problems, savedMsg: 'برنامه‌ها ذخیره شد و تا چند ثانیه روی نودهای CDN باز می‌شوند.' });
+    }, { serialize: l4Serialize, validate: l4Problems, savedMsg: t('برنامه‌ها ذخیره شد و تا چند ثانیه روی نودهای CDN باز می‌شوند.') });
     return [f.el, usageCard('l4')];
   }
 
@@ -303,31 +304,31 @@
    * Hidden when the controller's analytics have no such totals.
    */
   function usageCard(kind) {
-    var c = P.card({ title: 'ترافیک ۳۰ روز اخیر', icon: 'chart', tone: 'muted', id: kind + '-usage' });
+    var c = P.card({ title: t('ترافیک ۳۰ روز اخیر'), icon: 'chart', tone: 'muted', id: kind + '-usage' });
     c.hidden = true;
     A().ensureAnalytics('30d').then(function (res) {
-      var t = res.ok && res.data && res.data.totals;
-      if (!t || !document.body.contains(c)) return;
-      if (kind === 'l4' && t.l4 && typeof t.l4 === 'object') {
-        var apps = t.l4.apps && typeof t.l4.apps === 'object' ? t.l4.apps : {};
+      var tx = res.ok && res.data && res.data.totals;
+      if (!tx || !document.body.contains(c)) return;
+      if (kind === 'l4' && tx.l4 && typeof tx.l4 === 'object') {
+        var apps = tx.l4.apps && typeof tx.l4.apps === 'object' ? tx.l4.apps : {};
         var ids = Object.keys(apps);
         append(c.body, [
-          dl([['ورودی (کاربران ← سرور شما)', h('span', { text: P.bytes(t.l4.bytes_in || 0) })], ['خروجی (سرور شما ← کاربران)', h('span', { text: P.bytes(t.l4.bytes_out || 0) })],
-            ['نشست‌ها', h('span', { text: num(t.l4.sessions || 0) })]]),
+          dl([[t('ورودی (کاربران ← سرور شما)'), h('span', { text: P.bytes(tx.l4.bytes_in || 0) })], [t('خروجی (سرور شما ← کاربران)'), h('span', { text: P.bytes(tx.l4.bytes_out || 0) })],
+            [t('نشست‌ها'), h('span', { text: num(tx.l4.sessions || 0) })]]),
           ids.length ? h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table pcdn-rtable pcdn-l4-usage' },
-            h('caption', { className: 'pcdn-sr', text: 'ترافیک هر برنامه' }),
-            h('thead', null, h('tr', null, ['برنامه', 'ورودی', 'خروجی', 'نشست‌ها'].map(function (x) { return h('th', { scope: 'col', text: x }); }))),
+            h('caption', { className: 'pcdn-sr', text: t('ترافیک هر برنامه') }),
+            h('thead', null, h('tr', null, [t('برنامه'), t('ورودی'), t('خروجی'), t('نشست‌ها')].map(function (x) { return h('th', { scope: 'col', text: x }); }))),
             h('tbody', null, ids.map(function (id) {
               var a = apps[id] || {};
-              return h('tr', { 'data-l4-usage': id }, h('td', { 'data-label': 'برنامه' }, ltr(id)), h('td', { 'data-label': 'ورودی', text: P.bytes(a.bytes_in || 0) }),
-                h('td', { 'data-label': 'خروجی', text: P.bytes(a.bytes_out || 0) }), h('td', { 'data-label': 'نشست‌ها', text: num(a.sessions || 0) }));
-            })))) : h('p', { className: 'pcdn-muted', text: 'هنوز ترافیکی از برنامه‌ها ثبت نشده است.' }),
-          h('p', { className: 'pcdn-help', text: 'ترافیک هر دو جهت از سهمیهٔ ماهانهٔ همین سرویس کم می‌شود.' })]);
+              return h('tr', { 'data-l4-usage': id }, h('td', { 'data-label': t('برنامه') }, ltr(id)), h('td', { 'data-label': t('ورودی'), text: P.bytes(a.bytes_in || 0) }),
+                h('td', { 'data-label': t('خروجی'), text: P.bytes(a.bytes_out || 0) }), h('td', { 'data-label': t('نشست‌ها'), text: num(a.sessions || 0) }));
+            })))) : h('p', { className: 'pcdn-muted', text: t('هنوز ترافیکی از برنامه‌ها ثبت نشده است.') }),
+          h('p', { className: 'pcdn-help', text: t('ترافیک هر دو جهت از سهمیهٔ ماهانهٔ همین سرویس کم می‌شود.') })]);
         c.hidden = false;
-      } else if (kind === 'video' && t.video && typeof t.video === 'object') {
-        var all = Number(t.bytes) || 0, vb = Number(t.video.bytes) || 0;
-        append(c.body, [dl([['حجم ویدیو', h('span', { text: P.bytes(vb) })], ['درخواست‌های ویدیو', h('span', { text: num(t.video.requests || 0) })],
-          all > 0 ? ['سهم از کل ترافیک سایت', h('span', { text: P.pct(vb, all) })] : null])]);
+      } else if (kind === 'video' && tx.video && typeof tx.video === 'object') {
+        var all = Number(tx.bytes) || 0, vb = Number(tx.video.bytes) || 0;
+        append(c.body, [dl([[t('حجم ویدیو'), h('span', { text: P.bytes(vb) })], [t('درخواست‌های ویدیو'), h('span', { text: num(tx.video.requests || 0) })],
+          all > 0 ? [t('سهم از کل ترافیک سایت'), h('span', { text: P.pct(vb, all) })] : null])]);
         c.hidden = false;
       }
     });
@@ -336,17 +337,17 @@
 
   function l4GuideCard(r) {
     var ips = A().edgeIps();
-    var c = P.collapsible ? P.collapsible({ title: 'راه‌اندازی و فایروال سرور', icon: 'book', tone: 'muted', id: 'l4-guide',
-      subtitle: 'کاربران به نشانی CDN وصل می‌شوند و نودها اتصال را به سرور شما می‌رسانند.' }) : P.card({ title: 'راه‌اندازی و فایروال سرور', icon: 'book', id: 'l4-guide' });
+    var c = P.collapsible ? P.collapsible({ title: t('راه‌اندازی و فایروال سرور'), icon: 'book', tone: 'muted', id: 'l4-guide',
+      subtitle: t('کاربران به نشانی CDN وصل می‌شوند و نودها اتصال را به سرور شما می‌رسانند.') }) : P.card({ title: t('راه‌اندازی و فایروال سرور'), icon: 'book', id: 'l4-guide' });
     append(c.body, [
       h('ol', { className: 'pcdn-ol' },
-        h('li', { text: 'برنامه را بسازید و ذخیره کنید؛ نشانی اتصال (نام میزبان:پورت) در فهرست نمایش داده می‌شود.' }),
-        h('li', { text: 'در برنامهٔ کاربر (کلاینت بازی، SSH و …) به‌جای آی‌پی سرور، همین نشانی و پورت را بدهید.' }),
-        h('li', { text: 'در فایروال سرور خودتان پورت مقصد را فقط برای آی‌پی نودهای CDN باز کنید تا کسی مستقیم به سرور نرسد.' }),
-        h('li', { text: 'اگر PROXY protocol را روشن کرده‌اید، آن را در نرم‌افزار سرور هم روشن کنید (مثلاً proxy_protocol در nginx یا send-proxy در HAProxy).' })),
-      ips.length ? h('div', null, h('p', { className: 'pcdn-help', text: 'آی‌پی نودهای CDN (اتصال‌ها از این آدرس‌ها به سرور شما می‌رسد):' }),
-        h('div', { className: 'pcdn-chips-row' }, ips.map(function (x) { return P.copyable(x, { label: 'کپی ' + x }); }))) : null,
-      h('p', { className: 'pcdn-help' }, 'پورت‌ها از بازهٔ ', ltr(r[0] + '–' + r[1]), ' انتخاب می‌شوند. ترافیک برنامه‌ها (ورودی و خروجی) مثل ترافیک وب از سهمیهٔ همین سرویس کم می‌شود.')
+        h('li', { text: t('برنامه را بسازید و ذخیره کنید؛ نشانی اتصال (نام میزبان:پورت) در فهرست نمایش داده می‌شود.') }),
+        h('li', { text: t('در برنامهٔ کاربر (کلاینت بازی، SSH و …) به‌جای آی‌پی سرور، همین نشانی و پورت را بدهید.') }),
+        h('li', { text: t('در فایروال سرور خودتان پورت مقصد را فقط برای آی‌پی نودهای CDN باز کنید تا کسی مستقیم به سرور نرسد.') }),
+        h('li', { text: t('اگر PROXY protocol را روشن کرده‌اید، آن را در نرم‌افزار سرور هم روشن کنید (مثلاً proxy_protocol در nginx یا send-proxy در HAProxy).') })),
+      ips.length ? h('div', null, h('p', { className: 'pcdn-help', text: t('آی‌پی نودهای CDN (اتصال‌ها از این آدرس‌ها به سرور شما می‌رسد):') }),
+        h('div', { className: 'pcdn-chips-row' }, ips.map(function (x) { return P.copyable(x, { label: t('کپی ') + x }); }))) : null,
+      h('p', { className: 'pcdn-help' }, t('پورت‌ها از بازهٔ '), ltr(r[0] + '–' + r[1]), t(' انتخاب می‌شوند. ترافیک برنامه‌ها (ورودی و خروجی) مثل ترافیک وب از سهمیهٔ همین سرویس کم می‌شود.'))
     ]);
     return c;
   }
@@ -361,40 +362,40 @@
       if (!has(d, k)) return;
       var v = Number(d[k]), lim = VIDEO_LIMITS[k];
       if (!Number.isInteger(v) || v < lim[0] || v > lim[1]) {
-        out.push({ path: k, msg: (k === 'segment_ttl' ? 'مدت کش قطعه‌ها' : 'مدت کش فهرست پخش') + ' باید بین ' + num(lim[0]) + ' و ' + num(lim[1]) + ' ثانیه باشد.' });
+        out.push({ path: k, msg: (k === 'segment_ttl' ? t('مدت کش قطعه‌ها') : t('مدت کش فهرست پخش')) + t(' باید بین ') + num(lim[0]) + t(' و ') + num(lim[1]) + t(' ثانیه باشد.') });
       }
     });
     if (!out.length && has(d, 'segment_ttl') && has(d, 'manifest_ttl') && Number(d.manifest_ttl) > Number(d.segment_ttl)) {
-      out.push({ path: 'manifest_ttl', msg: 'مدت کش فهرست پخش نباید از مدت کش قطعه‌ها بیشتر باشد.' });
+      out.push({ path: 'manifest_ttl', msg: t('مدت کش فهرست پخش نباید از مدت کش قطعه‌ها بیشتر باشد.') });
     }
     return out;
   }
   function renderVideo(Aa) {
     var f = Aa.sectionForm('video', function (d, f2) {
-      var c = P.card({ title: 'تحویل ویدیو (HLS / DASH)', icon: 'play', id: 'video' });
+      var c = P.card({ title: t('تحویل ویدیو (HLS / DASH)'), icon: 'play', id: 'video' });
       append(c.body, [
-        P.toggle(d, 'enabled', 'بهینه‌سازی تحویل ویدیو', { cls: 'pcdn-video-on', onchange: f2.redraw,
-          help: 'فهرست‌های پخش (m3u8 / mpd) با کش کوتاه و قطعه‌ها (ts، m4s، mp4، aac) با کش طولانی تحویل می‌شوند؛ فایل‌های بزرگ mp4 تکه‌تکه (۱ مگابایتی) کش می‌شوند تا جلو/عقب زدن سریع باشد.' }),
+        P.toggle(d, 'enabled', t('بهینه‌سازی تحویل ویدیو'), { cls: 'pcdn-video-on', onchange: f2.redraw,
+          help: t('فهرست‌های پخش (m3u8 / mpd) با کش کوتاه و قطعه‌ها (ts، m4s، mp4، aac) با کش طولانی تحویل می‌شوند؛ فایل‌های بزرگ mp4 تکه‌تکه (۱ مگابایتی) کش می‌شوند تا جلو/عقب زدن سریع باشد.') }),
         d.enabled ? h('div', { className: 'pcdn-grid' },
-          has(d, 'manifest_ttl') ? P.duration(d, 'manifest_ttl', 'مدت کش فهرست پخش', { min: VIDEO_LIMITS.manifest_ttl[0], max: VIDEO_LIMITS.manifest_ttl[1],
-            picks: [[2, '۲ ثانیه'], [5, '۵ ثانیه'], [60, '۱ دقیقه']], help: 'برای پخش زنده کوتاه (۱ تا ۴ ثانیه، حدود نصف طول هر قطعه)؛ برای ویدیوی آماده (VOD) می‌تواند طولانی‌تر باشد.' }) : null,
-          has(d, 'segment_ttl') ? P.duration(d, 'segment_ttl', 'مدت کش قطعه‌ها', { min: VIDEO_LIMITS.segment_ttl[0], max: VIDEO_LIMITS.segment_ttl[1],
-            picks: [[3600, '۱ ساعت'], [86400, '۱ روز'], [604800, '۱ هفته']], help: 'قطعه‌ها پس از ساخته شدن تغییر نمی‌کنند؛ مقدار پیشنهادی ۱ روز یا بیشتر.' }) : null) : null,
-        d.enabled && has(d, 'prefetch_next') ? P.toggle(d, 'prefetch_next', 'پیش‌بارگذاری قطعهٔ بعدی', { cls: 'pcdn-video-prefetch',
-          help: 'وقتی قطعه‌ای (مثل seg_120.ts) برای اولین بار درخواست شود، CDN قطعهٔ بعدی (seg_121.ts) را هم از سرور شما می‌گیرد تا بینندهٔ بعدی بدون انتظار ببیند. فقط برای نام‌هایی که به عدد ختم می‌شوند.' }) : null
+          has(d, 'manifest_ttl') ? P.duration(d, 'manifest_ttl', t('مدت کش فهرست پخش'), { min: VIDEO_LIMITS.manifest_ttl[0], max: VIDEO_LIMITS.manifest_ttl[1],
+            picks: [[2, t('۲ ثانیه')], [5, t('۵ ثانیه')], [60, t('۱ دقیقه')]], help: t('برای پخش زنده کوتاه (۱ تا ۴ ثانیه، حدود نصف طول هر قطعه)؛ برای ویدیوی آماده (VOD) می‌تواند طولانی‌تر باشد.') }) : null,
+          has(d, 'segment_ttl') ? P.duration(d, 'segment_ttl', t('مدت کش قطعه‌ها'), { min: VIDEO_LIMITS.segment_ttl[0], max: VIDEO_LIMITS.segment_ttl[1],
+            picks: [[3600, t('۱ ساعت')], [86400, t('۱ روز')], [604800, t('۱ هفته')]], help: t('قطعه‌ها پس از ساخته شدن تغییر نمی‌کنند؛ مقدار پیشنهادی ۱ روز یا بیشتر.') }) : null) : null,
+        d.enabled && has(d, 'prefetch_next') ? P.toggle(d, 'prefetch_next', t('پیش‌بارگذاری قطعهٔ بعدی'), { cls: 'pcdn-video-prefetch',
+          help: t('وقتی قطعه‌ای (مثل seg_120.ts) برای اولین بار درخواست شود، CDN قطعهٔ بعدی (seg_121.ts) را هم از سرور شما می‌گیرد تا بینندهٔ بعدی بدون انتظار ببیند. فقط برای نام‌هایی که به عدد ختم می‌شوند.') }) : null
       ]);
-      var how = P.card({ title: 'نحوهٔ استفاده', icon: 'book', tone: 'muted', id: 'video-how' });
+      var how = P.card({ title: t('نحوهٔ استفاده'), icon: 'book', tone: 'muted', id: 'video-how' });
       var ex = 'https://' + domain() + '/live/stream.m3u8';
       append(how.body, [
-        h('p', { text: 'کافی است رکورد سایت پروکسی‌شده باشد و پخش‌کننده (hls.js، video.js، Shaka، ExoPlayer یا AVPlayer) فایل را از همین دامنه بخواند:' }),
-        P.copyable(ex, { block: true, label: 'کپی نمونه آدرس' }),
+        h('p', { text: t('کافی است رکورد سایت پروکسی‌شده باشد و پخش‌کننده (hls.js، video.js، Shaka، ExoPlayer یا AVPlayer) فایل را از همین دامنه بخواند:') }),
+        P.copyable(ex, { block: true, label: t('کپی نمونه آدرس') }),
         h('ul', { className: 'pcdn-ul' },
-          h('li', null, 'پسوندهای ', ltr('.m3u8 .mpd'), ' فهرست پخش و ', ltr('.ts .m4s .mp4 .aac'), ' قطعه حساب می‌شوند؛ مسیر و نام دیگری لازم نیست.'),
-          h('li', { text: 'پاسخ فایل‌های ویدیو هدر CORS (Access-Control-Allow-Origin: *) دارند تا پخش‌کننده روی دامنهٔ دیگری هم کار کند.' }),
-          h('li', { text: 'برای پخش زنده، فهرست پخش در CDN تقریباً هم‌زمان با سرور شما به‌روز می‌شود و در صورت کندی سرور، نسخهٔ قبلی تا رسیدن نسخهٔ تازه تحویل داده می‌شود.' }),
-          h('li', { text: 'ترافیک ویدیو جداگانه شمرده می‌شود (کارت «ترافیک ۳۰ روز اخیر» در همین صفحه) و از همان سهمیهٔ سرویس کم می‌شود.' }))]);
+          h('li', null, t('پسوندهای '), ltr('.m3u8 .mpd'), t(' فهرست پخش و '), ltr('.ts .m4s .mp4 .aac'), t(' قطعه حساب می‌شوند؛ مسیر و نام دیگری لازم نیست.')),
+          h('li', { text: t('پاسخ فایل‌های ویدیو هدر CORS (Access-Control-Allow-Origin: *) دارند تا پخش‌کننده روی دامنهٔ دیگری هم کار کند.') }),
+          h('li', { text: t('برای پخش زنده، فهرست پخش در CDN تقریباً هم‌زمان با سرور شما به‌روز می‌شود و در صورت کندی سرور، نسخهٔ قبلی تا رسیدن نسخهٔ تازه تحویل داده می‌شود.') }),
+          h('li', { text: t('ترافیک ویدیو جداگانه شمرده می‌شود (کارت «ترافیک ۳۰ روز اخیر» در همین صفحه) و از همان سهمیهٔ سرویس کم می‌شود.') }))]);
       return [c, how];
-    }, { validate: videoProblems, savedMsg: 'تنظیمات ویدیو ذخیره شد و تا چند ثانیه روی همهٔ نودها اعمال می‌شود.' });
+    }, { validate: videoProblems, savedMsg: t('تنظیمات ویدیو ذخیره شد و تا چند ثانیه روی همهٔ نودها اعمال می‌شود.') });
     return [f.el, usageCard('video')];
   }
 
@@ -456,16 +457,16 @@
 
   /** The one-time transform-secret dialog. Nothing is kept once it is closed. */
   function secretDialog(secret, rotated) {
-    var d = P.dialog({ title: rotated ? 'کلید امضای تصویر جدید' : 'کلید امضای تصویر', icon: 'key', tone: 'warning', wide: true });
+    var d = P.dialog({ title: rotated ? t('کلید امضای تصویر جدید') : t('کلید امضای تصویر'), icon: 'key', tone: 'warning', wide: true });
     d.el.classList.add('pcdn-img-secret-dlg');
     append(d.body, [
-      P.alertBox('warning', [h('strong', { text: 'این کلید فقط همین یک بار نمایش داده می‌شود. ' }),
-        'همین حالا آن را کپی کنید و در تنظیمات برنامهٔ سایت (مثلاً متغیر محیطی PCDN_IMAGE_SECRET) ذخیره کنید؛ اگر گم شود باید کلید تازه بسازید.'], { icon: 'warn' }),
-      rotated ? P.alertBox('info', 'کلید قبلی باطل شد؛ نشانی‌های امضاشده با کلید قبلی از این پس رد می‌شوند و باید با کلید تازه دوباره امضا شوند.') : null,
+      P.alertBox('warning', [h('strong', { text: t('این کلید فقط همین یک بار نمایش داده می‌شود. ') }),
+        t('همین حالا آن را کپی کنید و در تنظیمات برنامهٔ سایت (مثلاً متغیر محیطی PCDN_IMAGE_SECRET) ذخیره کنید؛ اگر گم شود باید کلید تازه بسازید.')], { icon: 'warn' }),
+      rotated ? P.alertBox('info', t('کلید قبلی باطل شد؛ نشانی‌های امضاشده با کلید قبلی از این پس رد می‌شوند و باید با کلید تازه دوباره امضا شوند.')) : null,
       h('div', { className: 'pcdn-key-plain pcdn-img-secret' }, h('code', { className: 'pcdn-key-value', dir: 'ltr', text: String(secret) }),
-        P.copyBtn(String(secret), 'کپی کلید امضای تصویر', { text: 'کپی', done: 'کلید امضا کپی شد' })),
-      h('p', { className: 'pcdn-help', text: 'این کلید را هرگز در کد سمت مرورگر (JavaScript صفحه) قرار ندهید؛ امضا باید روی سرور شما ساخته شود.' })]);
-    var done = P.btn('کلید را ذخیره کردم', { kind: 'primary', icon: 'check', cls: 'pcdn-img-secret-ok', onclick: function () { d.close(); } });
+        P.copyBtn(String(secret), t('کپی کلید امضای تصویر'), { text: t('کپی'), done: t('کلید امضا کپی شد') })),
+      h('p', { className: 'pcdn-help', text: t('این کلید را هرگز در کد سمت مرورگر (JavaScript صفحه) قرار ندهید؛ امضا باید روی سرور شما ساخته شود.') })]);
+    var done = P.btn(t('کلید را ذخیره کردم'), { kind: 'primary', icon: 'check', cls: 'pcdn-img-secret-ok', onclick: function () { d.close(); } });
     done.setAttribute('data-ro-ok', '1');
     d.foot.appendChild(done);
     d.focusFirst();
@@ -479,28 +480,28 @@
   function imageCards(d, f) {
     if (!imageV2(d)) return [];
     var out = [];
-    var fmt = P.card({ title: 'AVIF و برش هوشمند', icon: 'sparkles', id: 'image-v2' });
+    var fmt = P.card({ title: t('AVIF و برش هوشمند'), icon: 'sparkles', id: 'image-v2' });
     append(fmt.body, [
-      has(d, 'avif') ? P.toggle(d, 'avif', 'تبدیل خودکار به AVIF', { cls: 'pcdn-img-avif',
-        help: 'برای مرورگرهایی که AVIF را می‌پذیرند (Accept: image/avif) تصاویر JPEG و PNG به AVIF تبدیل می‌شوند که معمولاً از WebP هم کم‌حجم‌تر است. نودهایی که ابزار تبدیل AVIF ندارند WebP یا همان فایل اصلی را می‌دهند؛ هیچ تصویری خراب نمی‌شود.' }) : null,
-      has(d, 'smart_crop') ? P.toggle(d, 'smart_crop', 'برش هوشمند', { cls: 'pcdn-img-smart',
-        help: 'وقتی عرض و ارتفاع با fit=cover خواسته شود، به‌جای برش از وسط، بخشِ پرجزئیات‌تر تصویر (معمولاً سوژه) نگه داشته می‌شود.' }) : null
+      has(d, 'avif') ? P.toggle(d, 'avif', t('تبدیل خودکار به AVIF'), { cls: 'pcdn-img-avif',
+        help: t('برای مرورگرهایی که AVIF را می‌پذیرند (Accept: image/avif) تصاویر JPEG و PNG به AVIF تبدیل می‌شوند که معمولاً از WebP هم کم‌حجم‌تر است. نودهایی که ابزار تبدیل AVIF ندارند WebP یا همان فایل اصلی را می‌دهند؛ هیچ تصویری خراب نمی‌شود.') }) : null,
+      has(d, 'smart_crop') ? P.toggle(d, 'smart_crop', t('برش هوشمند'), { cls: 'pcdn-img-smart',
+        help: t('وقتی عرض و ارتفاع با fit=cover خواسته شود، به‌جای برش از وسط، بخشِ پرجزئیات‌تر تصویر (معمولاً سوژه) نگه داشته می‌شود.') }) : null
     ]);
     out.push(fmt);
 
-    var params = P.card({ title: 'پارامترهای تبدیل در آدرس', icon: 'link', tone: 'muted', id: 'image-params' });
+    var params = P.card({ title: t('پارامترهای تبدیل در آدرس'), icon: 'link', tone: 'muted', id: 'image-params' });
     var ex = 'https://' + domain() + '/images/photo.jpg?w=800&h=600&fit=cover&q=80&fmt=webp';
-    var rows = [['w', 'عرض به پیکسل', '۱ تا ۴۰۹۶'], ['h', 'ارتفاع به پیکسل', '۱ تا ۴۰۹۶'], ['fit', 'cover: پر کردن کادر با برش / contain: جا شدن کامل بدون برش', 'cover | contain'],
-      ['q', 'کیفیت خروجی', '۱ تا ۱۰۰'], ['fmt', 'فرمت خروجی (اگر ندهید بر اساس مرورگر انتخاب می‌شود)', 'webp | avif | jpeg']];
+    var rows = [['w', t('عرض به پیکسل'), t('۱ تا ۴۰۹۶')], ['h', t('ارتفاع به پیکسل'), t('۱ تا ۴۰۹۶')], ['fit', t('cover: پر کردن کادر با برش / contain: جا شدن کامل بدون برش'), 'cover | contain'],
+      ['q', t('کیفیت خروجی'), t('۱ تا ۱۰۰')], ['fmt', t('فرمت خروجی (اگر ندهید بر اساس مرورگر انتخاب می‌شود)'), 'webp | avif | jpeg']];
     append(params.body, [
       h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table pcdn-rtable pcdn-img-params' },
-        h('caption', { className: 'pcdn-sr', text: 'پارامترهای تبدیل تصویر' }),
-        h('thead', null, h('tr', null, ['پارامتر', 'کاربرد', 'مقدار مجاز'].map(function (t) { return h('th', { scope: 'col', text: t }); }))),
+        h('caption', { className: 'pcdn-sr', text: t('پارامترهای تبدیل تصویر') }),
+        h('thead', null, h('tr', null, [t('پارامتر'), t('کاربرد'), t('مقدار مجاز')].map(function (tx) { return h('th', { scope: 'col', text: tx }); }))),
         h('tbody', null, rows.map(function (r) {
-          return h('tr', null, h('td', { 'data-label': 'پارامتر' }, ltr(r[0])), h('td', { 'data-label': 'کاربرد', text: r[1] }), h('td', { 'data-label': 'مقدار مجاز' }, /[a-z]/.test(r[2]) ? ltr(r[2]) : h('span', { text: r[2] })));
+          return h('tr', null, h('td', { 'data-label': t('پارامتر') }, ltr(r[0])), h('td', { 'data-label': t('کاربرد'), text: r[1] }), h('td', { 'data-label': t('مقدار مجاز') }, /[a-z]/.test(r[2]) ? ltr(r[2]) : h('span', { text: r[2] })));
         })))),
-      P.copyable(ex, { block: true, label: 'کپی نمونه آدرس' }),
-      h('p', { className: 'pcdn-help', text: 'مقدار خارج از بازه یا پارامتر ناشناخته نادیده گرفته می‌شود و اگر تبدیل ممکن نباشد همان تصویر اصلی تحویل داده می‌شود.' })]);
+      P.copyable(ex, { block: true, label: t('کپی نمونه آدرس') }),
+      h('p', { className: 'pcdn-help', text: t('مقدار خارج از بازه یا پارامتر ناشناخته نادیده گرفته می‌شود و اگر تبدیل ممکن نباشد همان تصویر اصلی تحویل داده می‌شود.') })]);
     out.push(params);
 
     if (has(d, 'transform_secret_set')) out.push(signCard(d, f));
@@ -509,10 +510,10 @@
 
   function signCard(d, f) {
     var set = !!d.transform_secret_set;
-    var c = P.card({ title: 'نشانی‌های امضاشده', icon: 'key', id: 'image-sign',
-      subtitle: 'جلوگیری از ساختن نسخه‌های بی‌شمار تصویر توسط دیگران',
+    var c = P.card({ title: t('نشانی‌های امضاشده'), icon: 'key', id: 'image-sign',
+      subtitle: t('جلوگیری از ساختن نسخه‌های بی‌شمار تصویر توسط دیگران'),
       actions: h('span', { className: 'pcdn-pill pcdn-tone-' + (set ? 'success' : 'muted'), 'data-secret-set': set ? '1' : '0' }, h('span', { className: 'pcdn-dot' }),
-        h('span', { text: set ? 'فقط نشانی امضاشده' : 'امضا لازم نیست' })) });
+        h('span', { text: set ? t('فقط نشانی امضاشده') : t('امضا لازم نیست') })) });
     function stored(v) {
       // the stored section only learns whether a key exists — the value lives only in the dialog
       var cur = A().config('image') || {};
@@ -521,9 +522,9 @@
       A().setConfig('image', cur);
       d.transform_secret_set = v;   // output-only: not part of the PUT body nor of the dirty check
     }
-    var gen = P.btn(set ? 'ساخت کلید جدید' : 'ساخت کلید امضا', { kind: set ? '' : 'primary', icon: 'key', size: 'sm', write: true, cls: 'pcdn-img-secret-gen', onclick: function () {
-      var pre = set ? P.confirm({ title: 'ساخت کلید امضای جدید', danger: true, ok: 'ساخت کلید جدید',
-        body: 'کلید فعلی بلافاصله باطل می‌شود و همهٔ نشانی‌هایی که با آن امضا شده‌اند (با خطای ۴۰۳) رد می‌شوند تا با کلید تازه دوباره امضا شوند.' }) : Promise.resolve(true);
+    var gen = P.btn(set ? t('ساخت کلید جدید') : t('ساخت کلید امضا'), { kind: set ? '' : 'primary', icon: 'key', size: 'sm', write: true, cls: 'pcdn-img-secret-gen', onclick: function () {
+      var pre = set ? P.confirm({ title: t('ساخت کلید امضای جدید'), danger: true, ok: t('ساخت کلید جدید'),
+        body: t('کلید فعلی بلافاصله باطل می‌شود و همهٔ نشانی‌هایی که با آن امضا شده‌اند (با خطای ۴۰۳) رد می‌شوند تا با کلید تازه دوباره امضا شوند.') }) : Promise.resolve(true);
       pre.then(function (ok) {
         if (!ok) return;
         P.busy(gen, P.api('POST', 'image/transform-secret')).then(function (res) {
@@ -531,45 +532,45 @@
           var sec = res.data && typeof res.data.secret === 'string' ? res.data.secret : (res.data && typeof res.data.transform_secret === 'string' ? res.data.transform_secret : '');
           stored(true);
           f.redraw();
-          if (sec) secretDialog(sec, set); else P.toast('کلید امضای تصویر ساخته شد.');
+          if (sec) secretDialog(sec, set); else P.toast(t('کلید امضای تصویر ساخته شد.'));
         });
       });
     } });
-    var del = set ? P.btn('حذف کلید', { kind: 'danger-soft', icon: 'trash', size: 'sm', write: true, cls: 'pcdn-img-secret-del', onclick: function () {
-      P.confirm({ title: 'حذف کلید امضای تصویر', danger: true, ok: 'حذف کلید',
-        body: 'پس از حذف، هر کسی می‌تواند با پارامترهای w، h، fit، q و fmt نسخه‌های تازه از تصاویر بسازد؛ نشانی‌های امضاشدهٔ فعلی هم بدون بررسی امضا کار می‌کنند.' })
+    var del = set ? P.btn(t('حذف کلید'), { kind: 'danger-soft', icon: 'trash', size: 'sm', write: true, cls: 'pcdn-img-secret-del', onclick: function () {
+      P.confirm({ title: t('حذف کلید امضای تصویر'), danger: true, ok: t('حذف کلید'),
+        body: t('پس از حذف، هر کسی می‌تواند با پارامترهای w، h، fit، q و fmt نسخه‌های تازه از تصاویر بسازد؛ نشانی‌های امضاشدهٔ فعلی هم بدون بررسی امضا کار می‌کنند.') })
         .then(function (ok) {
           if (!ok) return;
           P.busy(del, P.api('DELETE', 'image/transform-secret')).then(function (res) {
             if (!res.ok) { P.toast(P.errorText(res), 'error'); return; }
             stored(false);
             f.redraw();
-            P.toast('کلید امضای تصویر حذف شد؛ تبدیل بدون امضا دوباره مجاز است.');
+            P.toast(t('کلید امضای تصویر حذف شد؛ تبدیل بدون امضا دوباره مجاز است.'));
           });
         });
     } }) : null;
     append(c.body, [
-      h('p', { text: set ? 'کلید امضا ساخته شده است: درخواستی که پارامتر تبدیل (w، h، fit، q، fmt یا width/height) دارد فقط با امضای معتبر (sig) پاسخ می‌گیرد و بقیه با خطای ۴۰۳ رد می‌شوند. نشانی خود تصویر بدون پارامتر مثل همیشه تحویل داده می‌شود.'
-        : 'بدون کلید، هر کسی می‌تواند با تغییر پارامترها نسخه‌های بی‌شماری از تصاویر بسازد و ترافیک و پردازش شما را مصرف کند. با ساختن کلید، فقط نشانی‌هایی که سرور شما امضا کرده تبدیل می‌شوند.' }),
+      h('p', { text: set ? t('کلید امضا ساخته شده است: درخواستی که پارامتر تبدیل (w، h، fit، q، fmt یا width/height) دارد فقط با امضای معتبر (sig) پاسخ می‌گیرد و بقیه با خطای ۴۰۳ رد می‌شوند. نشانی خود تصویر بدون پارامتر مثل همیشه تحویل داده می‌شود.')
+        : t('بدون کلید، هر کسی می‌تواند با تغییر پارامترها نسخه‌های بی‌شماری از تصاویر بسازد و ترافیک و پردازش شما را مصرف کند. با ساختن کلید، فقط نشانی‌هایی که سرور شما امضا کرده تبدیل می‌شوند.') }),
       h('div', { className: 'pcdn-row-actions' }, gen, del),
-      h('p', { className: 'pcdn-help', text: set ? 'کلید فعلی دیگر قابل نمایش نیست. اگر آن را گم کرده‌اید کلید جدید بسازید و در برنامهٔ سایت جایگزین کنید.'
-        : 'کلید پس از ساخت فقط یک بار نمایش داده می‌شود. پیش از ساختن، کد امضا را در سایت آماده کنید؛ از همان لحظه نشانی‌های تبدیل بدون امضا با خطای ۴۰۳ رد می‌شوند.' })]);
-    var g = P.collapsible({ title: 'راهنمای امضای نشانی', icon: 'code', tone: 'muted', id: 'image-sign-guide', subtitle: 'ساخت sig روی سرور شما (PHP / Node.js)' });
+      h('p', { className: 'pcdn-help', text: set ? t('کلید فعلی دیگر قابل نمایش نیست. اگر آن را گم کرده‌اید کلید جدید بسازید و در برنامهٔ سایت جایگزین کنید.')
+        : t('کلید پس از ساخت فقط یک بار نمایش داده می‌شود. پیش از ساختن، کد امضا را در سایت آماده کنید؛ از همان لحظه نشانی‌های تبدیل بدون امضا با خطای ۴۰۳ رد می‌شوند.') })]);
+    var g = P.collapsible({ title: t('راهنمای امضای نشانی'), icon: 'code', tone: 'muted', id: 'image-sign-guide', subtitle: t('ساخت sig روی سرور شما (PHP / Node.js)') });
     var path = '/images/photo.jpg';
     append(g.body, [
       h('ol', { className: 'pcdn-ol' },
-        h('li', null, 'رشتهٔ امضا = مسیر تصویر (همان‌طور که در نشانی است) + ', ltr('?'), ' + پارامترهایی از ', ltr('w, h, fit, q, fmt, width, height'),
-          ' که در نشانی دارید، دقیقاً به همین ترتیب و به شکل ', ltr('k=v'), ' با ', ltr('&'), '.'),
-        h('li', null, 'امضا = ', ltr('HMAC-SHA256(secret, رشتهٔ امضا)'), ' به‌صورت hex با حروف کوچک (۶۴ نویسه).'),
-        h('li', null, 'امضا را با پارامتر ', ltr('sig'), ' به نشانی اضافه کنید؛ ترتیب پارامترها در خود نشانی مهم نیست.'),
-        h('li', null, 'درخواست دارای پارامتر تبدیل با امضای نادرست یا بدون امضا با خطای ۴۰۳ رد می‌شود.')),
+        h('li', null, t('رشتهٔ امضا = مسیر تصویر (همان‌طور که در نشانی است) + '), ltr('?'), t(' + پارامترهایی از '), ltr('w, h, fit, q, fmt, width, height'),
+          t(' که در نشانی دارید، دقیقاً به همین ترتیب و به شکل '), ltr('k=v'), t(' با '), ltr('&'), '.'),
+        h('li', null, t('امضا = '), ltr(t('HMAC-SHA256(secret, رشتهٔ امضا)')), t(' به‌صورت hex با حروف کوچک (۶۴ نویسه).')),
+        h('li', null, t('امضا را با پارامتر '), ltr('sig'), t(' به نشانی اضافه کنید؛ ترتیب پارامترها در خود نشانی مهم نیست.')),
+        h('li', null, t('درخواست دارای پارامتر تبدیل با امضای نادرست یا بدون امضا با خطای ۴۰۳ رد می‌شود.'))),
       h('ul', { className: 'pcdn-ul pcdn-help' },
-        h('li', null, 'نشانی: ', ltr('/images/photo.jpg?fit=cover&w=300')),
-        h('li', null, 'رشتهٔ امضا: ', ltr('/images/photo.jpg?w=300&fit=cover')),
-        h('li', null, 'نشانی نهایی: ', ltr('/images/photo.jpg?fit=cover&w=300&sig=…'))),
+        h('li', null, t('نشانی: '), ltr('/images/photo.jpg?fit=cover&w=300')),
+        h('li', null, t('رشتهٔ امضا: '), ltr('/images/photo.jpg?w=300&fit=cover')),
+        h('li', null, t('نشانی نهایی: '), ltr('/images/photo.jpg?fit=cover&w=300&sig=…'))),
       codeBlock(SIGN.php(path), 'PHP'),
       codeBlock(SIGN.node(path), 'Node.js'),
-      h('p', { className: 'pcdn-help', text: 'نشانی بدون پارامتر تبدیل (خود تصویر اصلی) امضا لازم ندارد. امضا را روی سرور بسازید، نه در مرورگر.' })]);
+      h('p', { className: 'pcdn-help', text: t('نشانی بدون پارامتر تبدیل (خود تصویر اصلی) امضا لازم ندارد. امضا را روی سرور بسازید، نه در مرورگر.') })]);
     return h('div', { className: 'pcdn-stack' }, c, g);
   }
 
@@ -591,9 +592,9 @@
     out.primaries = (out.primaries || []).map(function (x) { return String(x).trim(); }).filter(Boolean);
     if (Array.isArray(out.allow_axfr)) out.allow_axfr = out.allow_axfr.map(function (x) { return String(x).trim(); }).filter(Boolean);
     if (out.tsig && typeof out.tsig === 'object') {
-      var t = { name: String(out.tsig.name || '').trim().toLowerCase().replace(/\.$/, ''), algorithm: out.tsig.algorithm || 'hmac-sha256' };
-      if (typeof out.tsig.secret === 'string' && out.tsig.secret.trim() !== '') t.secret = out.tsig.secret.trim();
-      out.tsig = t;
+      var tx = { name: String(out.tsig.name || '').trim().toLowerCase().replace(/\.$/, ''), algorithm: out.tsig.algorithm || 'hmac-sha256' };
+      if (typeof out.tsig.secret === 'string' && out.tsig.secret.trim() !== '') tx.secret = out.tsig.secret.trim();
+      out.tsig = tx;
     } else if (has(out, 'tsig')) {
       out.tsig = null;
     }
@@ -613,34 +614,34 @@
     var out = [];
     function bad(p, m) { out.push({ path: p, msg: m }); }
     var pr = (d.primaries || []).map(function (x) { return String(x).trim(); }).filter(Boolean);
-    if (d.mode === 'primary_elsewhere' && !pr.length) bad('primaries', 'دست‌کم آی‌پی یک سرور DNS اصلی را وارد کنید.');
-    if (pr.length > 10) bad('primaries', 'حداکثر ۱۰ سرور اصلی مجاز است.');
+    if (d.mode === 'primary_elsewhere' && !pr.length) bad('primaries', t('دست‌کم آی‌پی یک سرور DNS اصلی را وارد کنید.'));
+    if (pr.length > 10) bad('primaries', t('حداکثر ۱۰ سرور اصلی مجاز است.'));
     pr.forEach(function (x) {
       var st = publicIp(x, false);
-      if (st === 'invalid') bad('primaries', 'آی‌پی نامعتبر: ' + x + ' (فقط آی‌پی، نه نام دامنه یا بازه)');
-      else if (st === 'private') bad('primaries', 'آی‌پی ' + x + ' عمومی نیست.');
+      if (st === 'invalid') bad('primaries', t('آی‌پی نامعتبر: ') + x + t(' (فقط آی‌پی، نه نام دامنه یا بازه)'));
+      else if (st === 'private') bad('primaries', t('آی‌پی ') + x + t(' عمومی نیست.'));
     });
     var ax = (d.allow_axfr || []).map(function (x) { return String(x).trim(); }).filter(Boolean);
-    if (ax.length > 20) bad('allow_axfr', 'حداکثر ۲۰ آدرس مجاز است.');
+    if (ax.length > 20) bad('allow_axfr', t('حداکثر ۲۰ آدرس مجاز است.'));
     ax.forEach(function (x) {
       var st = publicIp(x, true);
-      if (st === 'invalid') bad('allow_axfr', 'آی‌پی یا بازهٔ نامعتبر: ' + x);
-      else if (st === 'private') bad('allow_axfr', 'آدرس ' + x + ' عمومی نیست.');
+      if (st === 'invalid') bad('allow_axfr', t('آی‌پی یا بازهٔ نامعتبر: ') + x);
+      else if (st === 'private') bad('allow_axfr', t('آدرس ') + x + t(' عمومی نیست.'));
     });
-    var t = d.tsig;
-    if (ax.length && !(t && typeof t === 'object')) bad('allow_axfr', 'انتقال زون به سرورهای شما فقط با کلید TSIG مجاز است؛ «امضای انتقال با TSIG» را روشن کنید.');
-    if (t && typeof t === 'object') {
-      var name = String(t.name || '').trim().toLowerCase().replace(/\.$/, '');
-      if (!TSIG_NAME_RE.test(name)) bad('tsig.name', 'نام کلید TSIG معتبر نیست (مثل transfer-key یا key.example.com).');
-      if (TSIG_ALGS.indexOf(t.algorithm) < 0) bad('tsig.algorithm', 'الگوریتم TSIG را انتخاب کنید.');
-      var sec = typeof t.secret === 'string' ? t.secret.trim() : '';
+    var tx = d.tsig;
+    if (ax.length && !(tx && typeof tx === 'object')) bad('allow_axfr', t('انتقال زون به سرورهای شما فقط با کلید TSIG مجاز است؛ «امضای انتقال با TSIG» را روشن کنید.'));
+    if (tx && typeof tx === 'object') {
+      var name = String(tx.name || '').trim().toLowerCase().replace(/\.$/, '');
+      if (!TSIG_NAME_RE.test(name)) bad('tsig.name', t('نام کلید TSIG معتبر نیست (مثل transfer-key یا key.example.com).'));
+      if (TSIG_ALGS.indexOf(tx.algorithm) < 0) bad('tsig.algorithm', t('الگوریتم TSIG را انتخاب کنید.'));
+      var sec = typeof tx.secret === 'string' ? tx.secret.trim() : '';
       var n = sec ? b64Bytes(sec) : 0;
-      if (sec && n < 0) bad('tsig.secret', 'کلید مخفی TSIG باید base64 معتبر باشد (مثل خروجی tsig-keygen).');
-      else if (sec && n < 16) bad('tsig.secret', 'کلید مخفی TSIG باید دست‌کم ۱۶ بایت (۱۲۸ بیت) باشد.');
-      else if (sec.length > 512) bad('tsig.secret', 'کلید مخفی TSIG حداکثر ۵۱۲ نویسه است.');
+      if (sec && n < 0) bad('tsig.secret', t('کلید مخفی TSIG باید base64 معتبر باشد (مثل خروجی tsig-keygen).'));
+      else if (sec && n < 16) bad('tsig.secret', t('کلید مخفی TSIG باید دست‌کم ۱۶ بایت (۱۲۸ بیت) باشد.'));
+      else if (sec.length > 512) bad('tsig.secret', t('کلید مخفی TSIG حداکثر ۵۱۲ نویسه است.'));
       // a stored secret is kept only for the same key name (controller _same_tsig)
-      if (!sec && !(t.secret_set && name === storedTsigName())) {
-        bad('tsig.secret', t.secret_set ? 'با تغییر نام کلید، کلید مخفی را هم دوباره وارد کنید.' : 'کلید مخفی TSIG را وارد کنید.');
+      if (!sec && !(tx.secret_set && name === storedTsigName())) {
+        bad('tsig.secret', tx.secret_set ? t('با تغییر نام کلید، کلید مخفی را هم دوباره وارد کنید.') : t('کلید مخفی TSIG را وارد کنید.'));
       }
     }
     return out;
@@ -652,36 +653,36 @@
       if (!d.mode) d.mode = 'off';
       if (!Array.isArray(d.primaries)) d.primaries = [];
       var out = [], slave = d.mode === 'primary_elsewhere';
-      var c = P.card({ title: 'DNS اصلی دامنه کجاست؟', icon: 'server', id: 'dns-mode' });
+      var c = P.card({ title: t('DNS اصلی دامنه کجاست؟'), icon: 'server', id: 'dns-mode' });
       append(c.body, [
-        P.choice(d, 'mode', 'حالت DNS', [
-          ['off', 'پاسارگاد CDN', 'رکوردها را در همین پنل مدیریت می‌کنید (حالت عادی).', 'cloud'],
-          ['primary_elsewhere', 'سرور DNS خودم؛ پاسارگاد ثانویه', 'رکوردها روی سرور DNS شما می‌مانند و نیم‌سرورهای ما زون را با AXFR از آن کپی و پاسخ می‌دهند.', 'swap']],
+        P.choice(d, 'mode', t('حالت DNS'), [
+          ['off', t('پاسارگاد CDN'), t('رکوردها را در همین پنل مدیریت می‌کنید (حالت عادی).'), 'cloud'],
+          ['primary_elsewhere', t('سرور DNS خودم؛ پاسارگاد ثانویه'), t('رکوردها روی سرور DNS شما می‌مانند و نیم‌سرورهای ما زون را با AXFR از آن کپی و پاسخ می‌دهند.'), 'swap']],
           { cols: 2, onchange: function () { f2.redraw(); } })]);
       out.push(c);
       if (slave) {
-        var p = P.card({ title: 'سرورهای DNS اصلی شما', icon: 'download', id: 'dns-primaries' });
+        var p = P.card({ title: t('سرورهای DNS اصلی شما'), icon: 'download', id: 'dns-primaries' });
         append(p.body, [
-          P.tags(d, 'primaries', 'آی‌پی سرورهای اصلی', { placeholder: '203.0.113.53',
-            help: 'حداکثر ۱۰ آی‌پی عمومی. نیم‌سرورهای ما زون را از این سرورها انتقال می‌دهند؛ روی آن‌ها انتقال زون (AXFR) را برای نیم‌سرورهای ما مجاز کنید و NOTIFY را به آن‌ها بفرستید.' }),
-          P.alertBox('info', [h('strong', { text: 'در این حالت ' }), 'رکوردهای صفحهٔ «رکوردها» منتشر نمی‌شوند و هر تغییر را باید روی سرور DNS خودتان بدهید. برای عبور ترافیک از CDN، نام‌های وب را در زون خودتان به آی‌پی‌های CDN اشاره دهید.'])]);
+          P.tags(d, 'primaries', t('آی‌پی سرورهای اصلی'), { placeholder: '203.0.113.53',
+            help: t('حداکثر ۱۰ آی‌پی عمومی. نیم‌سرورهای ما زون را از این سرورها انتقال می‌دهند؛ روی آن‌ها انتقال زون (AXFR) را برای نیم‌سرورهای ما مجاز کنید و NOTIFY را به آن‌ها بفرستید.') }),
+          P.alertBox('info', [h('strong', { text: t('در این حالت ') }), t('رکوردهای صفحهٔ «رکوردها» منتشر نمی‌شوند و هر تغییر را باید روی سرور DNS خودتان بدهید. برای عبور ترافیک از CDN، نام‌های وب را در زون خودتان به آی‌پی‌های CDN اشاره دهید.')])]);
         out.push(p);
       }
-      var ax = P.card({ title: 'انتقال زون به سرور ثانویهٔ شما', icon: 'upload', id: 'dns-axfr', tone: 'muted' });
-      append(ax.body, [P.tags(d, 'allow_axfr', 'آی‌پی‌های مجاز برای AXFR (اختیاری)', { placeholder: '198.51.100.53',
-        help: 'اگر خودتان سرور DNS ثانویه دارید، آی‌پی یا بازهٔ آن را اضافه کنید تا زون را از نیم‌سرورهای ما انتقال دهد (حداکثر ۲۰؛ همیشه با کلید TSIG).' }),
-        P.alertBox('warning', [h('strong', { text: 'توجه: ' }), 'نام‌های پروکسی‌شده (و نشانی‌های TCP/UDP) در زون انتقالی به‌صورت رکورد LUA در PowerDNS هستند تا هر بار آی‌پی نودهای سالم را برگردانند. سرور ثانویه‌ای که PowerDNS (با LUA records فعال) نباشد — مثل BIND یا Knot — این رکوردها را نمی‌فهمد و برای آن نام‌ها پاسخ درست نمی‌دهد؛ چنین سروری را فقط برای نام‌های بدون پروکسی به کار ببرید.'], { cls: 'pcdn-ds-lua' })]);
+      var ax = P.card({ title: t('انتقال زون به سرور ثانویهٔ شما'), icon: 'upload', id: 'dns-axfr', tone: 'muted' });
+      append(ax.body, [P.tags(d, 'allow_axfr', t('آی‌پی‌های مجاز برای AXFR (اختیاری)'), { placeholder: '198.51.100.53',
+        help: t('اگر خودتان سرور DNS ثانویه دارید، آی‌پی یا بازهٔ آن را اضافه کنید تا زون را از نیم‌سرورهای ما انتقال دهد (حداکثر ۲۰؛ همیشه با کلید TSIG).') }),
+        P.alertBox('warning', [h('strong', { text: t('توجه: ') }), t('نام‌های پروکسی‌شده (و نشانی‌های TCP/UDP) در زون انتقالی به‌صورت رکورد LUA در PowerDNS هستند تا هر بار آی‌پی نودهای سالم را برگردانند. سرور ثانویه‌ای که PowerDNS (با LUA records فعال) نباشد — مثل BIND یا Knot — این رکوردها را نمی‌فهمد و برای آن نام‌ها پاسخ درست نمی‌دهد؛ چنین سروری را فقط برای نام‌های بدون پروکسی به کار ببرید.')], { cls: 'pcdn-ds-lua' })]);
       out.push(ax);
-      var tc = P.card({ title: 'کلید TSIG', icon: 'key', id: 'dns-tsig', tone: 'muted', subtitle: 'امضای انتقال زون با کلید مشترک — نام، الگوریتم و کلید باید در هر دو طرف یکسان باشد.' });
+      var tc = P.card({ title: t('کلید TSIG'), icon: 'key', id: 'dns-tsig', tone: 'muted', subtitle: t('امضای انتقال زون با کلید مشترک — نام، الگوریتم و کلید باید در هر دو طرف یکسان باشد.') });
       var tsigOn = { on: !!(d.tsig && typeof d.tsig === 'object') };
-      tc.body.appendChild(P.toggle(tsigOn, 'on', 'امضای انتقال با TSIG', { cls: 'pcdn-ds-tsig',
-        help: slave ? 'پیشنهاد می‌شود: انتقال از سرورهای اصلی شما با این کلید امضا می‌شود.' : 'برای «آی‌پی‌های مجاز AXFR» لازم است.',
+      tc.body.appendChild(P.toggle(tsigOn, 'on', t('امضای انتقال با TSIG'), { cls: 'pcdn-ds-tsig',
+        help: slave ? t('پیشنهاد می‌شود: انتقال از سرورهای اصلی شما با این کلید امضا می‌شود.') : t('برای «آی‌پی‌های مجاز AXFR» لازم است.'),
         onchange: function (v) { d.tsig = v ? { name: '', algorithm: 'hmac-sha256', secret: '' } : null; f2.redraw(); } }));
       if (tsigOn.on) tc.body.appendChild(tsigFields(d.tsig));
       out.push(tc);
       out.push(dsStatusCard(d, nss));
       return out;
-    }, { serialize: dsSerialize, validate: dsProblems, savedMsg: 'تنظیمات DNS ثانویه ذخیره شد و تا چند ثانیه روی نیم‌سرورها اعمال می‌شود.',
+    }, { serialize: dsSerialize, validate: dsProblems, savedMsg: t('تنظیمات DNS ثانویه ذخیره شد و تا چند ثانیه روی نیم‌سرورها اعمال می‌شود.'),
       onSaved: function () {
         // the TSIG secret is write-only: never keep a typed value in the stored copy
         var c = A().config('dns_secondary');
@@ -692,39 +693,39 @@
       } });
     return f.el;
   }
-  function tsigFields(t) {
-    var set = !!t.secret_set;
-    if (typeof t.secret !== 'string') t.secret = '';
-    var sec = P.input(t, 'secret', 'کلید مخفی (base64)', { type: 'password', maxlength: 512,
-      placeholder: set ? 'ذخیره شده — برای تغییر مقدار جدید وارد کنید' : 'خروجی tsig-keygen',
-      help: set ? 'کلید فعلی رمزنگاری‌شده نگهداری می‌شود و هرگز نمایش داده نمی‌شود؛ خالی بگذارید تا همان بماند (فقط اگر نام کلید عوض نشود).'
-        : 'مثلاً با دستور tsig-keygen -a hmac-sha256 transfer-key بسازید و مقدار secret آن را اینجا بگذارید.' });
+  function tsigFields(tx) {
+    var set = !!tx.secret_set;
+    if (typeof tx.secret !== 'string') tx.secret = '';
+    var sec = P.input(tx, 'secret', t('کلید مخفی (base64)'), { type: 'password', maxlength: 512,
+      placeholder: set ? t('ذخیره شده — برای تغییر مقدار جدید وارد کنید') : t('خروجی tsig-keygen'),
+      help: set ? t('کلید فعلی رمزنگاری‌شده نگهداری می‌شود و هرگز نمایش داده نمی‌شود؛ خالی بگذارید تا همان بماند (فقط اگر نام کلید عوض نشود).')
+        : t('مثلاً با دستور tsig-keygen -a hmac-sha256 transfer-key بسازید و مقدار secret آن را اینجا بگذارید.') });
     var si = sec.querySelector('input');
     if (si) { si.setAttribute('autocomplete', 'new-password'); si.setAttribute('data-secret-input', '1'); }
     return h('div', { className: 'pcdn-subpanel pcdn-ds-tsig-fields' },
       h('div', { className: 'pcdn-grid' },
-        P.input(t, 'name', 'نام کلید', { placeholder: 'transfer-key', maxlength: 253 }),
-        P.select(t, 'algorithm', 'الگوریتم', TSIG_ALGS.map(function (a) { return [a, a]; }), { ltr: true })),
+        P.input(tx, 'name', t('نام کلید'), { placeholder: 'transfer-key', maxlength: 253 }),
+        P.select(tx, 'algorithm', t('الگوریتم'), TSIG_ALGS.map(function (a) { return [a, a]; }), { ltr: true })),
       sec);
   }
   function dsStatusCard(d, nss) {
-    var c = P.card({ title: 'نیم‌سرورها و وضعیت', icon: 'activity', tone: 'muted', id: 'dns-status' });
+    var c = P.card({ title: t('نیم‌سرورها و وضعیت'), icon: 'activity', tone: 'muted', id: 'dns-status' });
     var st = d.status ? String(d.status) : null, slave = d.mode === 'primary_elsewhere';
     var good = st === 'ok' || st === 'active' || st === 'synced';
     var tone = good ? 'success' : st === 'error' || st === 'failed' ? 'danger' : 'muted';
     var src = d.transfer_ips || d.axfr_from || d.notify_from;
     append(c.body, [
       dl([
-        nss.length ? ['نیم‌سرورهای ما', h('span', null, nss.map(function (x) { return P.copyable(x, { label: 'کپی ' + x }); }))] : null,
-        Array.isArray(src) && src.length ? ['آی‌پی درخواست‌های انتقال', h('span', null, src.filter(function (x) { return typeof x === 'string'; }).map(function (x) { return P.copyable(x, { label: 'کپی ' + x }); }))] : null,
-        slave && st ? ['آخرین انتقال', P.badge(good ? 'موفق' : st === 'pending' ? 'در انتظار' : st, tone)] : null,
-        slave && d.serial ? ['سریال زون', ltr(String(d.serial))] : null,
-        slave && d.last_transfer ? ['زمان آخرین انتقال', h('span', { text: P.date(d.last_transfer) })] : null,
-        d.last_error ? ['خطا', h('span', { dir: 'auto', text: String(d.last_error) })] : null
+        nss.length ? [t('نیم‌سرورهای ما'), h('span', null, nss.map(function (x) { return P.copyable(x, { label: t('کپی ') + x }); }))] : null,
+        Array.isArray(src) && src.length ? [t('آی‌پی درخواست‌های انتقال'), h('span', null, src.filter(function (x) { return typeof x === 'string'; }).map(function (x) { return P.copyable(x, { label: t('کپی ') + x }); }))] : null,
+        slave && st ? [t('آخرین انتقال'), P.badge(good ? t('موفق') : st === 'pending' ? t('در انتظار') : st, tone)] : null,
+        slave && d.serial ? [t('سریال زون'), ltr(String(d.serial))] : null,
+        slave && d.last_transfer ? [t('زمان آخرین انتقال'), h('span', { text: P.date(d.last_transfer) })] : null,
+        d.last_error ? [t('خطا'), h('span', { dir: 'auto', text: String(d.last_error) })] : null
       ]),
       h('p', { className: 'pcdn-help', text: slave
-        ? 'نیم‌سرورهای ما را در ثبت‌کنندهٔ دامنه (کنار نیم‌سرورهای خودتان) و در رکوردهای NS زون اصلی وارد کنید. زون با هر NOTIFY و در فواصل SOA (refresh) به‌روز می‌شود.'
-        : 'در حالت عادی نیم‌سرورهای ما DNS اصلی دامنه هستند و رکوردها را در صفحهٔ «رکوردها» مدیریت می‌کنید.' })]);
+        ? t('نیم‌سرورهای ما را در ثبت‌کنندهٔ دامنه (کنار نیم‌سرورهای خودتان) و در رکوردهای NS زون اصلی وارد کنید. زون با هر NOTIFY و در فواصل SOA (refresh) به‌روز می‌شود.')
+        : t('در حالت عادی نیم‌سرورهای ما DNS اصلی دامنه هستند و رکوردها را در صفحهٔ «رکوردها» مدیریت می‌کنید.') })]);
     return c;
   }
 
@@ -741,7 +742,7 @@
     var s = site();
     return (recs || s.records || []).some(function (r) { return has(r, 'weight'); }) || (!(s.records || []).length && sectionOf(s, 'dns_secondary'));
   }
-  var HC_TYPES = [['tcp', 'TCP (اتصال به پورت)'], ['http', 'HTTP'], ['https', 'HTTPS']];
+  var HC_TYPES = [['tcp', t('TCP (اتصال به پورت)')], ['http', 'HTTP'], ['https', 'HTTPS']];
   /** SPEC §16.7: weight and health check on non-proxied A / AAAA / CNAME. */
   function weightable(r) { return !r.proxied && (r.type === 'A' || r.type === 'AAAA' || r.type === 'CNAME'); }
   function hcHttp(r) { return r.health_protocol === 'http' || r.health_protocol === 'https'; }
@@ -767,11 +768,11 @@
   function recordProblems(b, r) {
     var out = [];
     if (!recordsV2()) return out;
-    if (r && r.type === 'CNAME' && !r.proxied && r.health_check && !weighted(r)) out.push({ path: 'weight', msg: 'برای بررسی سلامت CNAME وزن را هم تعیین کنید (CNAME تنها جایگزینی ندارد).' });
-    if (has(b, 'weight') && (!Number.isInteger(b.weight) || b.weight < 0 || b.weight > 100)) out.push({ path: 'weight', msg: 'وزن باید عدد صحیحی بین ۰ و ۱۰۰ باشد.' });
+    if (r && r.type === 'CNAME' && !r.proxied && r.health_check && !weighted(r)) out.push({ path: 'weight', msg: t('برای بررسی سلامت CNAME وزن را هم تعیین کنید (CNAME تنها جایگزینی ندارد).') });
+    if (has(b, 'weight') && (!Number.isInteger(b.weight) || b.weight < 0 || b.weight > 100)) out.push({ path: 'weight', msg: t('وزن باید عدد صحیحی بین ۰ و ۱۰۰ باشد.') });
     if (b.health_check) {
-      if (b.health_port !== null && (!Number.isInteger(b.health_port) || b.health_port < 1 || b.health_port > 65535)) out.push({ path: 'health_port', msg: 'پورت بررسی سلامت باید بین ۱ و ۶۵۵۳۵ باشد.' });
-      if (has(b, 'health_path') && (b.health_path.length > 512 || !/^\/[^\s"'<>\\]*$/.test(b.health_path))) out.push({ path: 'health_path', msg: 'مسیر بررسی باید با / شروع شود و فاصله یا نویسهٔ نامعتبر نداشته باشد.' });
+      if (b.health_port !== null && (!Number.isInteger(b.health_port) || b.health_port < 1 || b.health_port > 65535)) out.push({ path: 'health_port', msg: t('پورت بررسی سلامت باید بین ۱ و ۶۵۵۳۵ باشد.') });
+      if (has(b, 'health_path') && (b.health_path.length > 512 || !/^\/[^\s"'<>\\]*$/.test(b.health_path))) out.push({ path: 'health_path', msg: t('مسیر بررسی باید با / شروع شود و فاصله یا نویسهٔ نامعتبر نداشته باشد.') });
     }
     return out;
   }
@@ -780,18 +781,18 @@
     if (!recordsV2() || !weightable(r)) return null;
     var box = h('div', { className: 'pcdn-rec-w8' });
     append(box, [
-      P.input(r, 'weight', 'وزن (اختیاری)', { type: 'number', min: 0, max: 100, nullable: true, placeholder: '—', cls: 'pcdn-rec-weight',
-        help: r.type === 'CNAME' ? 'چند CNAME هم‌نام فقط وقتی مجازند که همه وزن‌دار و بدون پروکسی باشند؛ در هر پاسخ یکی به نسبت وزن انتخاب می‌شود. ۰ = پشتیبان.'
-          : 'برای چند رکورد هم‌نام: سهم هر کدام از پاسخ‌ها به نسبت وزن (۱ تا ۱۰۰). ۰ = پشتیبان؛ فقط وقتی پاسخ داده می‌شود که هیچ عضو دیگری سالم نباشد. خالی = بدون وزن.' }),
-      P.toggle(r, 'health_check', 'بررسی سلامت', { cls: 'pcdn-rec-hc', onchange: redraw,
-        help: 'هر ۶۰ ثانیه از سرور ما بررسی می‌شود؛ آدرسی که پاسخ ندهد از پاسخ‌های DNS کنار گذاشته می‌شود — ولی هرگز همه با هم (اگر همه ناسالم باشند همه برگردانده می‌شوند).'
-          + (r.type === 'CNAME' ? ' برای CNAME فقط همراه با وزن (CNAME تنها جایگزینی ندارد).' : '') })]);
+      P.input(r, 'weight', t('وزن (اختیاری)'), { type: 'number', min: 0, max: 100, nullable: true, placeholder: '—', cls: 'pcdn-rec-weight',
+        help: r.type === 'CNAME' ? t('چند CNAME هم‌نام فقط وقتی مجازند که همه وزن‌دار و بدون پروکسی باشند؛ در هر پاسخ یکی به نسبت وزن انتخاب می‌شود. ۰ = پشتیبان.')
+          : t('برای چند رکورد هم‌نام: سهم هر کدام از پاسخ‌ها به نسبت وزن (۱ تا ۱۰۰). ۰ = پشتیبان؛ فقط وقتی پاسخ داده می‌شود که هیچ عضو دیگری سالم نباشد. خالی = بدون وزن.') }),
+      P.toggle(r, 'health_check', t('بررسی سلامت'), { cls: 'pcdn-rec-hc', onchange: redraw,
+        help: t('هر ۶۰ ثانیه از سرور ما بررسی می‌شود؛ آدرسی که پاسخ ندهد از پاسخ‌های DNS کنار گذاشته می‌شود — ولی هرگز همه با هم (اگر همه ناسالم باشند همه برگردانده می‌شوند).')
+          + (r.type === 'CNAME' ? t(' برای CNAME فقط همراه با وزن (CNAME تنها جایگزینی ندارد).') : '') })]);
     if (r.health_check) {
       if (!r.health_protocol) r.health_protocol = 'tcp';
       box.appendChild(h('div', { className: 'pcdn-grid' },
-        P.select(r, 'health_protocol', 'نوع بررسی', HC_TYPES, { onchange: redraw, cls: 'pcdn-rec-hctype' }),
-        P.input(r, 'health_port', 'پورت', { type: 'number', min: 1, max: 65535, nullable: true, placeholder: r.health_protocol === 'https' ? '443' : '80' })));
-      if (hcHttp(r)) box.appendChild(P.input(r, 'health_path', 'مسیر بررسی', { placeholder: '/health', maxlength: 512, help: 'پاسخ 2xx یا 3xx سالم حساب می‌شود.' }));
+        P.select(r, 'health_protocol', t('نوع بررسی'), HC_TYPES, { onchange: redraw, cls: 'pcdn-rec-hctype' }),
+        P.input(r, 'health_port', t('پورت'), { type: 'number', min: 1, max: 65535, nullable: true, placeholder: r.health_protocol === 'https' ? '443' : '80' })));
+      if (hcHttp(r)) box.appendChild(P.input(r, 'health_path', t('مسیر بررسی'), { placeholder: '/health', maxlength: 512, help: t('پاسخ 2xx یا 3xx سالم حساب می‌شود.') }));
       var hb = recordHealthLine(r);
       if (hb) box.appendChild(hb);
     }
@@ -799,17 +800,17 @@
   }
   /** Extras for the record list (weight). */
   function recordExtras(r) {
-    return r.weight !== null && r.weight !== undefined && !r.proxied ? [['وزن', String(r.weight)]] : [];
+    return r.weight !== null && r.weight !== undefined && !r.proxied ? [[t('وزن'), String(r.weight)]] : [];
   }
   /** The controller's last probe of a health-checked record: r.health = {ok, ms, fail, at, error, advertised} (services.record_to_dict). */
   function healthOf(r) { return r && r.health_check && !r.proxied && r.health && typeof r.health === 'object' ? r.health : null; }
   function recordHealthBadge(r) {
     var x = healthOf(r);
     if (!x) return null;
-    var st = x.ok === true ? ['سالم', 'success', 'checkCircle'] : x.ok === false ? ['ناسالم', 'danger', 'xCircle'] : ['در انتظار بررسی', 'muted', 'clock'];
-    var tip = [x.at ? 'آخرین بررسی: ' + P.date(x.at) : '', typeof x.ms === 'number' ? 'زمان پاسخ: ' + num(x.ms) + ' ms' : '',
-      x.advertised === false ? 'از پاسخ‌های DNS کنار گذاشته شده' : '', x.error ? String(x.error) : ''].filter(Boolean).join(' — ');
-    var b = P.badge(st[0] + (x.advertised === false ? ' — کنار گذاشته شده' : ''), st[1], st[2]);
+    var st = x.ok === true ? [t('سالم'), 'success', 'checkCircle'] : x.ok === false ? [t('ناسالم'), 'danger', 'xCircle'] : [t('در انتظار بررسی'), 'muted', 'clock'];
+    var tip = [x.at ? t('آخرین بررسی: ') + P.date(x.at) : '', typeof x.ms === 'number' ? t('زمان پاسخ: ') + num(x.ms) + ' ms' : '',
+      x.advertised === false ? t('از پاسخ‌های DNS کنار گذاشته شده') : '', x.error ? String(x.error) : ''].filter(Boolean).join(' — ');
+    var b = P.badge(st[0] + (x.advertised === false ? t(' — کنار گذاشته شده') : ''), st[1], st[2]);
     b.classList.add('pcdn-rec-health');
     b.setAttribute('data-health', x.ok === true ? 'up' : x.ok === false ? 'down' : 'pending');
     if (tip) b.title = tip;
@@ -818,50 +819,50 @@
   function recordHealthLine(r) {
     var x = healthOf(r), b = recordHealthBadge(r);
     if (!b) return null;
-    return h('p', { className: 'pcdn-help pcdn-rec-health-line' }, b, x.at ? ' آخرین بررسی ' + P.rel(x.at) : null,
+    return h('p', { className: 'pcdn-help pcdn-rec-health-line' }, b, x.at ? t(' آخرین بررسی ') + P.rel(x.at) : null,
       typeof x.ms === 'number' && x.ok ? ' — ' + num(x.ms) + ' ms' : null,
       x.ok === false && x.error ? h('span', { dir: 'auto', text: ' — ' + String(x.error) }) : null,
-      x.ok === false && x.advertised === true ? h('span', { text: ' — چون عضو سالم دیگری نیست، هنوز پاسخ داده می‌شود.' }) : null);
+      x.ok === false && x.advertised === true ? h('span', { text: t(' — چون عضو سالم دیگری نیست، هنوز پاسخ داده می‌شود.') }) : null);
   }
 
   // ================================================================== registry
 
   pages.tcpudp = {
-    title: 'پروکسی TCP/UDP', icon: 'port', heading: 'پروکسی TCP/UDP',
-    desc: 'سرویس‌های غیر وب (سرور بازی، SSH، پایگاه داده، MQTT، VoIP) را با یک پورت روی CDN منتشر کنید؛ آی‌پی سرور پنهان می‌ماند و ترافیک از نودهای CDN عبور می‌کند.',
+    title: t('پروکسی TCP/UDP'), icon: 'port', heading: t('پروکسی TCP/UDP'),
+    desc: t('سرویس‌های غیر وب (سرور بازی، SSH، پایگاه داده، MQTT، VoIP) را با یک پورت روی CDN منتشر کنید؛ آی‌پی سرور پنهان می‌ماند و ترافیک از نودهای CDN عبور می‌کند.'),
     guide: {
-      what: 'هر «برنامه» یک پورت TCP یا UDP روی نودهای CDN است؛ نودها هر اتصال را بدون تغییر محتوا به سرور و پورتی که تعیین کرده‌اید می‌رسانند.',
-      when: 'وقتی سرویسی غیر از وب (HTTP/HTTPS) دارید که باید از اینترنت در دسترس باشد ولی نمی‌خواهید آی‌پی سرور را منتشر کنید.',
-      rec: 'دسترسی را در صورت امکان به آی‌پی‌های مشخص محدود کنید، در فایروال سرور فقط آی‌پی نودهای CDN را باز کنید و PROXY protocol را فقط اگر نرم‌افزار سرور پشتیبانی می‌کند روشن کنید.',
-      mistakes: ['روشن کردن PROXY protocol بدون پشتیبانی سرور (اتصال‌ها خراب می‌شوند).', 'باز گذاشتن پورت سرور برای همه (دور زدن CDN با آی‌پی مستقیم).', 'استفاده از این بخش برای وب سایت؛ برای وب رکورد پروکسی‌شده کافی است.']
+      what: t('هر «برنامه» یک پورت TCP یا UDP روی نودهای CDN است؛ نودها هر اتصال را بدون تغییر محتوا به سرور و پورتی که تعیین کرده‌اید می‌رسانند.'),
+      when: t('وقتی سرویسی غیر از وب (HTTP/HTTPS) دارید که باید از اینترنت در دسترس باشد ولی نمی‌خواهید آی‌پی سرور را منتشر کنید.'),
+      rec: t('دسترسی را در صورت امکان به آی‌پی‌های مشخص محدود کنید، در فایروال سرور فقط آی‌پی نودهای CDN را باز کنید و PROXY protocol را فقط اگر نرم‌افزار سرور پشتیبانی می‌کند روشن کنید.'),
+      mistakes: [t('روشن کردن PROXY protocol بدون پشتیبانی سرور (اتصال‌ها خراب می‌شوند).'), t('باز گذاشتن پورت سرور برای همه (دور زدن CDN با آی‌پی مستقیم).'), t('استفاده از این بخش برای وب سایت؛ برای وب رکورد پروکسی‌شده کافی است.')]
     },
-    upsell: 'با ارتقای پلن می‌توانید سرویس‌های TCP و UDP (بازی، SSH، پایگاه داده و …) را هم از پشت CDN منتشر کنید.',
+    upsell: t('با ارتقای پلن می‌توانید سرویس‌های TCP و UDP (بازی، SSH، پایگاه داده و …) را هم از پشت CDN منتشر کنید.'),
     hidden: function (s) { return !sectionOf(s, 'l4'); },
     lock: function (f) { return f.l4_proxy !== true || !(Number(f.max_l4_apps) > 0); },
     render: function (Aa) { return renderL4(Aa); }
   };
   pages.video = {
-    title: 'تحویل ویدیو', icon: 'play', heading: 'تحویل ویدیو (HLS / DASH)',
-    desc: 'کش و تحویل بهینهٔ ویدیوی پخش زنده و آماده: فهرست پخش تازه، قطعه‌ها با کش طولانی و پیش‌بارگذاری قطعهٔ بعدی.',
+    title: t('تحویل ویدیو'), icon: 'play', heading: t('تحویل ویدیو (HLS / DASH)'),
+    desc: t('کش و تحویل بهینهٔ ویدیوی پخش زنده و آماده: فهرست پخش تازه، قطعه‌ها با کش طولانی و پیش‌بارگذاری قطعهٔ بعدی.'),
     guide: {
-      what: 'پخش‌کننده‌های HLS و DASH ابتدا فهرست پخش (m3u8 / mpd) و سپس قطعه‌های چندثانیه‌ای ویدیو را می‌گیرند؛ CDN هر کدام را با قاعدهٔ مناسب خودش کش می‌کند.',
-      when: 'وقتی ویدیو (زنده یا آماده) را با HLS یا DASH از سایت خود پخش می‌کنید.',
-      rec: 'کش فهرست پخش ۲ ثانیه برای زنده، کش قطعه‌ها ۱ روز و پیش‌بارگذاری روشن.',
-      mistakes: ['کش طولانی فهرست پخش در پخش زنده (بیننده عقب می‌ماند).', 'تغییر محتوای قطعه با همان نام فایل (نسخهٔ کش‌شدهٔ قدیمی دیده می‌شود).']
+      what: t('پخش‌کننده‌های HLS و DASH ابتدا فهرست پخش (m3u8 / mpd) و سپس قطعه‌های چندثانیه‌ای ویدیو را می‌گیرند؛ CDN هر کدام را با قاعدهٔ مناسب خودش کش می‌کند.'),
+      when: t('وقتی ویدیو (زنده یا آماده) را با HLS یا DASH از سایت خود پخش می‌کنید.'),
+      rec: t('کش فهرست پخش ۲ ثانیه برای زنده، کش قطعه‌ها ۱ روز و پیش‌بارگذاری روشن.'),
+      mistakes: [t('کش طولانی فهرست پخش در پخش زنده (بیننده عقب می‌ماند).'), t('تغییر محتوای قطعه با همان نام فایل (نسخهٔ کش‌شدهٔ قدیمی دیده می‌شود).')]
     },
-    upsell: 'با ارتقای پلن، ویدیوی سایت با تنظیمات مخصوص HLS/DASH تحویل داده می‌شود.',
+    upsell: t('با ارتقای پلن، ویدیوی سایت با تنظیمات مخصوص HLS/DASH تحویل داده می‌شود.'),
     hidden: function (s) { return !sectionOf(s, 'video'); },
     lock: function (f) { return f.video === false; },
     render: function (Aa) { return renderVideo(Aa); }
   };
   pages.secondary = {
-    title: 'DNS ثانویه', icon: 'swap', heading: 'DNS ثانویه و انتقال زون',
-    desc: 'اگر DNS اصلی دامنه جای دیگری است، سرورهای ما می‌توانند ثانویه باشند؛ یا به سرور ثانویهٔ خودتان اجازهٔ انتقال زون بدهید.',
+    title: t('DNS ثانویه'), icon: 'swap', heading: t('DNS ثانویه و انتقال زون'),
+    desc: t('اگر DNS اصلی دامنه جای دیگری است، سرورهای ما می‌توانند ثانویه باشند؛ یا به سرور ثانویهٔ خودتان اجازهٔ انتقال زون بدهید.'),
     guide: {
-      what: 'در حالت «اصلی جای دیگر»، زون با AXFR از سرور شما کپی و از نیم‌سرورهای ما هم پاسخ داده می‌شود. «AXFR مجاز» برعکس، به سرور ثانویهٔ شما اجازهٔ کپی زون از ما را می‌دهد.',
-      when: 'برای افزونگی DNS بین دو ارائه‌دهنده، یا وقتی سامانهٔ DNS خودتان را دارید و نمی‌خواهید رکوردها را جابه‌جا کنید.',
-      rec: 'همیشه TSIG با hmac-sha256 و فقط آی‌پی‌های مشخص.',
-      mistakes: ['فراموش کردن مجاز کردن انتقال زون روی سرور اصلی.', 'وارد نکردن نیم‌سرورهای ما در رکوردهای NS زون اصلی.', 'گم کردن کلید TSIG (نمایش داده نمی‌شود؛ مقدار تازه بدهید).']
+      what: t('در حالت «اصلی جای دیگر»، زون با AXFR از سرور شما کپی و از نیم‌سرورهای ما هم پاسخ داده می‌شود. «AXFR مجاز» برعکس، به سرور ثانویهٔ شما اجازهٔ کپی زون از ما را می‌دهد.'),
+      when: t('برای افزونگی DNS بین دو ارائه‌دهنده، یا وقتی سامانهٔ DNS خودتان را دارید و نمی‌خواهید رکوردها را جابه‌جا کنید.'),
+      rec: t('همیشه TSIG با hmac-sha256 و فقط آی‌پی‌های مشخص.'),
+      mistakes: [t('فراموش کردن مجاز کردن انتقال زون روی سرور اصلی.'), t('وارد نکردن نیم‌سرورهای ما در رکوردهای NS زون اصلی.'), t('گم کردن کلید TSIG (نمایش داده نمی‌شود؛ مقدار تازه بدهید).')]
     },
     hidden: function (s) { return !sectionOf(s, 'dns_secondary'); },
     render: function (Aa) { return renderSecondary(Aa); }

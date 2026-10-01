@@ -2,6 +2,8 @@
 
 namespace PasargadCdn;
 
+require_once __DIR__ . '/I18n.php';
+
 if (!class_exists(__NAMESPACE__ . '\\ApiException', false)) {
     class ApiException extends \Exception
     {
@@ -107,7 +109,7 @@ class ApiClient
                 logModuleCall('pasargadcdn', 'GET ' . $path, null, self::redact($raw), null, [$this->apiKey]);
             }
             if ($code === 0 || $raw === null || $raw === false) {
-                $out[$path] = ['code' => 0, 'data' => null, 'error' => 'اتصال به سرور CDN برقرار نشد' . ($err !== '' ? ': ' . $err : '')];
+                $out[$path] = ['code' => 0, 'data' => null, 'error' => $err !== '' ? I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err) : I18n::tr('اتصال به سرور CDN برقرار نشد')];
             } else {
                 $data = json_decode((string) $raw, true);
                 $out[$path] = ['code' => $code, 'data' => $data,
@@ -203,7 +205,7 @@ class ApiClient
             logModuleCall('pasargadcdn', $method . ' ' . $path, self::redact($payload), self::redact($raw), null, [$this->apiKey]);
         }
         if ($raw === false) {
-            throw new ApiException('اتصال به سرور CDN برقرار نشد: ' . $err);
+            throw new ApiException(I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err));
         }
         return [$code, json_decode((string) $raw, true)];
     }
@@ -229,7 +231,7 @@ class ApiClient
             logModuleCall('pasargadcdn', $method . ' ' . $path, null, self::redact(is_string($raw) ? substr($raw, 0, 4096) : $raw), null, [$this->apiKey]);
         }
         if ($raw === false) {
-            throw new ApiException('اتصال به سرور CDN برقرار نشد: ' . $err);
+            throw new ApiException(I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err));
         }
         return [$code, strlen((string) $raw) > $max ? null : (string) $raw];
     }
@@ -268,8 +270,8 @@ class ApiClient
                 $field = is_array($d['loc'] ?? null) ? end($d['loc']) : '';
                 $msgs[] = trim($field . ': ' . ($d['msg'] ?? ''), ': ');
             }
-            return implode('، ', $msgs);
+            return implode(I18n::tr('، '), $msgs);
         }
-        return 'خطای سرور CDN (HTTP ' . $code . ')';
+        return I18n::tr('خطای سرور CDN (HTTP %s)', $code);
     }
 }

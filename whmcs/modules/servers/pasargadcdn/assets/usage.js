@@ -9,6 +9,7 @@
 (function () {
   'use strict';
   var P = window.PCDN = window.PCDN || {};
+  var t = P.t;  // i18n.js (SPEC §16.10)
   if (!P.h) return;
   var h = P.h, append = P.append, clear = P.clear, icon = P.icon, num = P.num, api = P.api;
   var pages = P.pages = P.pages || {};
@@ -31,7 +32,7 @@
     }).filter(function (v) { return v >= 0; });
     if (!vals.length) return null;
     var recent = vals.slice(-7);
-    var rate = recent.reduce(function (t, v) { return t + v; }, 0) / recent.length; // GB/day
+    var rate = recent.reduce(function (tx, v) { return tx + v; }, 0) / recent.length; // GB/day
     if (rate <= 0) return null;
     return { days: Math.max(1, Math.ceil(remaining / rate)), rate: rate };
   }
@@ -41,7 +42,7 @@
   function forecastLine(series, usedGb, includedGb) {
     var f = usageForecast(series, usedGb, includedGb);
     if (!f) return null;
-    return 'با این روند، ترافیک شما حدود ' + num(f.days) + ' روز دیگر تمام می‌شود.';
+    return t('با این روند، ترافیک شما حدود ') + num(f.days) + t(' روز دیگر تمام می‌شود.');
   }
   P.usageForecastLine = forecastLine;
 
@@ -58,20 +59,20 @@
     var s = Aa.S.site || {}, lim = limits(Aa);
     var usedGb = (Number((s.usage_month || {}).bytes) || 0) / GB;
 
-    var card = P.card({ title: 'مصرف ماهانه', icon: 'activity', id: 'usage-live', tone: 'brand',
-      actions: h('span', { className: 'pcdn-live', 'data-live': '1' }, h('span', { className: 'pcdn-live-dot', 'aria-hidden': 'true' }), h('span', { text: 'زنده' })) });
+    var card = P.card({ title: t('مصرف ماهانه'), icon: 'activity', id: 'usage-live', tone: 'brand',
+      actions: h('span', { className: 'pcdn-live', 'data-live': '1' }, h('span', { className: 'pcdn-live-dot', 'aria-hidden': 'true' }), h('span', { text: t('زنده') })) });
 
     var usedEl = h('strong', { 'data-usage': 'used' });
     var remainEl = h('span', { 'data-usage': 'remaining' });
     var bar = h('div', { 'data-usage-bar': '1', className: 'pcdn-usage-bar' });
     var dl = h('dl', { className: 'pcdn-dl' },
-      h('div', null, h('dt', { text: 'مصرف این ماه' }), h('dd', null, usedEl)),
-      h('div', null, h('dt', { text: lim.unlimited ? 'ترافیک' : 'ترافیک ماهانه' }),
-        h('dd', { text: lim.unlimited ? 'نامحدود' : num(lim.included) + ' گیگابایت' + (Aa.wallet && Number(Aa.wallet.bought_gb) > 0 ? ' (' + num(Aa.wallet.plan_gb) + ' پلن + ' + num(Aa.wallet.bought_gb) + ' خریداری‌شده)' : '') })),
-      lim.unlimited ? null : h('div', null, h('dt', { text: 'باقی‌مانده' }), h('dd', null, remainEl)));
+      h('div', null, h('dt', { text: t('مصرف این ماه') }), h('dd', null, usedEl)),
+      h('div', null, h('dt', { text: lim.unlimited ? t('ترافیک') : t('ترافیک ماهانه') }),
+        h('dd', { text: lim.unlimited ? t('نامحدود') : num(lim.included) + t(' گیگابایت') + (Aa.wallet && Number(Aa.wallet.bought_gb) > 0 ? ' (' + num(Aa.wallet.plan_gb) + t(' پلن + ') + num(Aa.wallet.bought_gb) + t(' خریداری‌شده)') : '') })),
+      lim.unlimited ? null : h('div', null, h('dt', { text: t('باقی‌مانده') }), h('dd', null, remainEl)));
 
     var todayEl = h('dd', { 'data-usage': 'today', text: '—' });
-    var todayDl = h('dl', { className: 'pcdn-dl' }, h('div', null, h('dt', { text: 'مصرف امروز (۲۴ ساعت گذشته)' }), todayEl));
+    var todayDl = h('dl', { className: 'pcdn-dl' }, h('div', null, h('dt', { text: t('مصرف امروز (۲۴ ساعت گذشته)') }), todayEl));
 
     var forecastEl = h('p', { className: 'pcdn-usage-forecast', 'data-usage': 'forecast' });
 
@@ -90,14 +91,14 @@
     ctx.usedEl.textContent = P.bytes(used * GB);
     if (!lim.unlimited) {
       var remaining = Math.max(0, lim.included - used);
-      ctx.remainEl.textContent = num(Math.round(remaining * 10) / 10) + ' گیگابایت';
+      ctx.remainEl.textContent = num(Math.round(remaining * 10) / 10) + t(' گیگابایت');
       var ratio = lim.included > 0 ? used / lim.included : 0;
       var tone = ratio >= 1 ? 'danger' : ratio >= 0.85 ? 'warning' : 'brand';
       clear(ctx.bar);
       ctx.bar.appendChild(P.meter(Math.min(ratio, 1), tone));
       ctx.bar.appendChild(h('div', { className: 'pcdn-usage-bar-legend' },
-        h('span', { text: P.pct(used, lim.included) + ' مصرف‌شده' }),
-        h('span', { text: num(Math.round(used * 10) / 10) + ' از ' + num(lim.included) + ' گیگابایت' })));
+        h('span', { text: P.pct(used, lim.included) + t(' مصرف‌شده') }),
+        h('span', { text: num(Math.round(used * 10) / 10) + t(' از ') + num(lim.included) + t(' گیگابایت') })));
     }
   }
 
@@ -106,7 +107,7 @@
     ctx.Aa.ensureAnalytics('24h').then(function (res) {
       if (!alive(ctx) || !res.ok) return;
       var series = (res.data && res.data.series) || [];
-      var todayBytes = series.reduce(function (t, p) { return t + (Number(p.bytes) || 0); }, 0);
+      var todayBytes = series.reduce(function (tx, p) { return tx + (Number(p.bytes) || 0); }, 0);
       ctx.todayEl.textContent = P.bytes(todayBytes);
     });
     ctx.Aa.ensureAnalytics('7d').then(function (res) {
@@ -118,9 +119,9 @@
         ctx.forecastEl.appendChild(icon('activity'));
         ctx.forecastEl.appendChild(h('span', { text: ' ' + line }));
       } else if (!ctx.lim.unlimited && ctx.usedGb >= ctx.lim.included) {
-        ctx.forecastEl.appendChild(h('span', { className: 'pcdn-text-danger', text: 'ترافیک این ماه به سقف رسیده است.' }));
+        ctx.forecastEl.appendChild(h('span', { className: 'pcdn-text-danger', text: t('ترافیک این ماه به سقف رسیده است.') }));
       } else {
-        ctx.forecastEl.appendChild(h('span', { className: 'pcdn-muted', text: 'برای پیش‌بینی، به داده مصرف چند روز اخیر نیاز است.' }));
+        ctx.forecastEl.appendChild(h('span', { className: 'pcdn-muted', text: t('برای پیش‌بینی، به داده مصرف چند روز اخیر نیاز است.') }));
       }
     });
   }
@@ -146,8 +147,8 @@
   }
 
   pages.usage = {
-    title: 'مصرف زنده', icon: 'activity',
-    desc: 'مصرف ترافیک این ماه به‌صورت زنده، مصرف امروز و پیش‌بینی زمان اتمام ترافیک.',
+    title: t('مصرف زنده'), icon: 'activity',
+    desc: t('مصرف ترافیک این ماه به‌صورت زنده، مصرف امروز و پیش‌بینی زمان اتمام ترافیک.'),
     render: function (Aa) { return render(Aa); }
   };
 })();

@@ -4,6 +4,8 @@ namespace PasargadCdn;
 
 use WHMCS\Database\Capsule;
 
+require_once __DIR__ . '/I18n.php';
+
 if (class_exists(__NAMESPACE__ . '\\Reseller', false)) {
     return;
 }
@@ -199,7 +201,7 @@ class Reseller
     {
         $server = $server ?: self::server();
         if (!$server) {
-            throw new ApiException('هیچ سروری از نوع Pasargad CDN تنظیم نشده است.');
+            throw new ApiException(I18n::tr('هیچ سروری از نوع Pasargad CDN تنظیم نشده است.'));
         }
         return $factory ? $factory($server) : ApiClient::fromServerRow($server, $timeout);
     }
@@ -228,41 +230,41 @@ class Reseller
     public static function createSite(int $userid, string $domain, string $originIp, string $label, ?callable $factory = null): array
     {
         if (!self::has(self::TBL_SITES)) {
-            return [false, 'جدول نمایندگان آماده نیست.'];
+            return [false, I18n::tr('جدول نمایندگان آماده نیست.')];
         }
         $cfg = self::config($userid);
         if (!$cfg['enabled']) {
-            return [false, 'حساب شما به‌عنوان نماینده فعال نیست.'];
+            return [false, I18n::tr('حساب شما به‌عنوان نماینده فعال نیست.')];
         }
         $domain = \pasargadcdn_domain(['domain' => $domain]);
         $label = trim(mb_substr($label, 0, 120));
         if (!self::validDomain($domain)) {
-            return [false, 'دامنه معتبر نیست.'];
+            return [false, I18n::tr('دامنه معتبر نیست.')];
         }
         if (!self::validOrigin($originIp)) {
-            return [false, 'آی‌پی سرور اصلی (Origin) باید یک IPv4 عمومی معتبر باشد.'];
+            return [false, I18n::tr('آی‌پی سرور اصلی (Origin) باید یک IPv4 عمومی معتبر باشد.')];
         }
         if ($label === '') {
-            return [false, 'نام مشتری نهایی را وارد کنید.'];
+            return [false, I18n::tr('نام مشتری نهایی را وارد کنید.')];
         }
         $max = $cfg['max_sites'];
         if ($max > 0 && self::siteCount($userid) >= $max) {
-            return [false, 'به سقف تعداد سایت‌های مجاز (' . $max . ') رسیده‌اید.'];
+            return [false, I18n::tr('به سقف تعداد سایت‌های مجاز (%s) رسیده‌اید.', $max)];
         }
         // Domain already taken (by any reseller / normal service)?
         if (Capsule::table(self::TBL_SITES)->where('domain', $domain)->exists()) {
-            return [false, 'این دامنه قبلاً به‌عنوان زیرسایت نمایندگی ثبت شده است.'];
+            return [false, I18n::tr('این دامنه قبلاً به‌عنوان زیرسایت نمایندگی ثبت شده است.')];
         }
         try {
             if (Capsule::table('tblhosting')->whereRaw('LOWER(domain) = ?', [$domain])->exists()) {
-                return [false, 'این دامنه به یک سرویس WHMCS تعلق دارد و به‌عنوان زیرسایت نمایندگی قابل ثبت نیست.'];
+                return [false, I18n::tr('این دامنه به یک سرویس WHMCS تعلق دارد و به‌عنوان زیرسایت نمایندگی قابل ثبت نیست.')];
             }
         } catch (\Throwable $e) {
             // best effort
         }
         $server = self::server();
         if (!$server) {
-            return [false, 'سرور CDN تنظیم نشده است؛ با پشتیبانی تماس بگیرید.'];
+            return [false, I18n::tr('سرور CDN تنظیم نشده است؛ با پشتیبانی تماس بگیرید.')];
         }
         $plan = self::wholesalePlan();
         $body = [
@@ -275,7 +277,7 @@ class Reseller
         try {
             $r = self::api($server, 15, $factory)->post('/api/v1/sites', $body);
         } catch (\Throwable $e) {
-            return [false, 'ساخت سایت روی کنترلر ناموفق بود: ' . $e->getMessage()];
+            return [false, I18n::tr('ساخت سایت روی کنترلر ناموفق بود: %s', $e->getMessage())];
         }
         $ctlId = (int) ($r['id'] ?? 0);
         $now = date('Y-m-d H:i:s');
@@ -286,7 +288,7 @@ class Reseller
                 'created_at' => $now, 'updated_at' => $now,
             ]);
         } catch (\Throwable $e) {
-            return [false, 'ثبت محلی زیرسایت ناموفق بود: ' . $e->getMessage()];
+            return [false, I18n::tr('ثبت محلی زیرسایت ناموفق بود: %s', $e->getMessage())];
         }
         self::log('reseller sub-site ' . $domain . ' created for client #' . $userid . ' (' . $label . ')', $userid);
         return [true, ['id' => $id, 'domain' => $domain, 'label' => $label, 'controller_site_id' => $ctlId]];
@@ -310,7 +312,7 @@ class Reseller
     {
         $row = self::ownedSite($userid, $rsid);
         if (!$row) {
-            return [false, 'زیرسایت یافت نشد.'];
+            return [false, I18n::tr('زیرسایت یافت نشد.')];
         }
         $domain = \pasargadcdn_domain(['domain' => (string) $row->domain]);
         $server = self::server();
@@ -320,17 +322,17 @@ class Reseller
             } catch (\Throwable $e) {
                 // A 404 on the controller is fine (already gone); other errors abort so nothing is orphaned.
                 if (!($e instanceof ApiException && $e->getCode() === 404)) {
-                    return [false, 'حذف سایت از کنترلر ناموفق بود: ' . $e->getMessage()];
+                    return [false, I18n::tr('حذف سایت از کنترلر ناموفق بود: %s', $e->getMessage())];
                 }
             }
         }
         try {
             Capsule::table(self::TBL_SITES)->where('id', $rsid)->where('userid', $userid)->delete();
         } catch (\Throwable $e) {
-            return [false, 'حذف رکورد محلی ناموفق بود: ' . $e->getMessage()];
+            return [false, I18n::tr('حذف رکورد محلی ناموفق بود: %s', $e->getMessage())];
         }
         self::log('reseller sub-site ' . $domain . ' removed by client #' . $userid, $userid);
-        return [true, 'زیرسایت حذف شد.'];
+        return [true, I18n::tr('زیرسایت حذف شد.')];
     }
 
     // ------------------------------------------------------------------ rolled-up usage & cost report
@@ -374,7 +376,7 @@ class Reseller
                     $out['error'] = $e->getMessage();
                 }
             } else {
-                $out['error'] = 'سرور CDN تنظیم نشده است.';
+                $out['error'] = I18n::tr('سرور CDN تنظیم نشده است.');
             }
         }
         foreach ($rows as $r) {
