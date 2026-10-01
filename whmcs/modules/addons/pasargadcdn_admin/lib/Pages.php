@@ -566,6 +566,9 @@ final class Pages
         'http3' => ['HTTP/3', 'این نود HTTP/3 (QUIC) را پشتیبانی می‌کند'],
         'early_hints' => ['Early Hints', 'این نود پاسخ 103 Early Hints را برای Preload پشتیبانی می‌کند'],
         'webp_convert' => ['WebP', 'این نود تصاویر JPEG/PNG را خودش به WebP تبدیل می‌کند'],
+        // SPEC §14.3: agents of Wave 6D and later
+        'live_analytics' => ['آمار زنده', 'این نود آمار دقیقه‌ای (آمار زنده) را گزارش می‌کند'],
+        'logship' => ['ارسال لاگ', 'این نود لاگ دسترسی سایت‌های دارای «ارسال لاگ» را می‌فرستد'],
     ];
 
     /**

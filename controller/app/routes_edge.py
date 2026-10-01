@@ -68,6 +68,21 @@ class Capabilities(BaseModel):
     early_hints: bool = False
     webp_convert: bool = False
     modules: list[str] = Field(default_factory=list)
+    # SPEC §14.2: managed WAF pack versions ({pack: version}); SPEC §14.3: the agent sends `live`
+    # minute aggregates and ships access-log records. Older agents omit them (False / {}).
+    waf_packs: dict[str, int] = Field(default_factory=dict)
+    live_analytics: bool = False
+    logship: bool = False
+
+    @field_validator("waf_packs", mode="before")
+    @classmethod
+    def _waf_packs(cls, v):
+        if not isinstance(v, dict):
+            return {}
+        # junk entries are dropped (not rejected), like module names
+        out = {k: n for k, n in v.items() if isinstance(k, str) and CAP_MODULE_RE.match(k)
+               and isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 1_000_000}
+        return dict(sorted(out.items())[:CAP_MODULES_MAX])
 
     @field_validator("modules", mode="before")
     @classmethod

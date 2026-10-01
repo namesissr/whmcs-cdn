@@ -275,7 +275,8 @@ def test_heartbeat_capabilities_stored_and_sanitised(client):
                                   "modules": mods, "future_key": 1})
     caps = edge_obj(client, "e1")["capabilities"]
     assert caps == {"http3": True, "early_hints": True, "webp_convert": False,
-                    "modules": ["brotli", "image_filter", "njs"]}
+                    "modules": ["brotli", "image_filter", "njs"],
+                    "waf_packs": {}, "live_analytics": False, "logship": False}
     # a heartbeat without capabilities keeps the last report
     hb(client, tok)
     assert edge_obj(client, "e1")["capabilities"] == caps
@@ -283,6 +284,20 @@ def test_heartbeat_capabilities_stored_and_sanitised(client):
     hb(client, tok, capabilities={"modules": [f"m{i:03d}" for i in range(500)]})
     caps2 = edge_obj(client, "e1")["capabilities"]
     assert len(caps2["modules"]) == 64 and caps2["http3"] is False
+
+
+def test_heartbeat_capabilities_wave6_fields(client):
+    """SPEC §14.2/§14.3: WAF pack versions and the 6D agent features are kept for the panel; junk
+    pack entries are dropped without failing the heartbeat."""
+    tok = mk_edge(client, "e1", "5.160.1.10")["token"]
+    hb(client, tok, capabilities={"http3": False, "live_analytics": True, "logship": True,
+                                  "waf_packs": {"generic": 1, "wordpress": 2, "bad name": 1,
+                                                "api": "x", "joomla": True, "drupal": -1}})
+    caps = edge_obj(client, "e1")["capabilities"]
+    assert caps["live_analytics"] is True and caps["logship"] is True
+    assert caps["waf_packs"] == {"generic": 1, "wordpress": 2}
+    hb(client, tok, capabilities={"waf_packs": "v1"})
+    assert edge_obj(client, "e1")["capabilities"]["waf_packs"] == {}
 
 
 @pytest.mark.parametrize("bad", [
@@ -304,7 +319,8 @@ def test_heartbeat_malformed_capabilities_are_ignored_not_fatal(client, bad):
     # ...the node stays online and the previous capabilities are kept
     assert after["last_seen_at"] >= before["last_seen_at"]
     assert after["capabilities"] == {"http3": True, "early_hints": False, "webp_convert": False,
-                                     "modules": ["njs"]}
+                                     "modules": ["njs"], "waf_packs": {}, "live_analytics": False,
+                                     "logship": False}
 
 
 # ------------------------------------------------------------------ edge config: per-site fields
