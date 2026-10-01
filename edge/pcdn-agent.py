@@ -190,6 +190,18 @@ DEFAULTS = {
     "GUARD_UDP_RATE": "20000",      # UDP/<HTTPS_PORT> (QUIC) packets / s per source address
     "GUARD_ICMP_RATE": "100",       # ICMP echo requests / s (host-wide)
     "GUARD_SYNPROXY": "auto",       # auto (install.sh probes kernel support) | no
+    # SPEC §16.9 edge functions (install.sh --functions): pcdn-fn runs customer JS in sandboxed QuickJS
+    # workers. The agent writes the code bundle to FN_DIR (group FN_GROUP, default NGINX_USER's group),
+    # routes bound paths to FN_SOCKET, serves fetch() to the site's own origin on FN_FETCH_SOCKET, reads
+    # pcdn-fn's self-test from FN_STATUS and bills FN_USAGE_LOG. FN_WALL_MS mirrors pcdn-fn's cap.
+    "FUNCTIONS": "no",
+    "FN_DIR": "/var/lib/pcdn-fn",
+    "FN_GROUP": "",
+    "FN_SOCKET": "/run/pcdn-fn/fn.sock",
+    "FN_FETCH_SOCKET": "/run/pcdn-fnfetch/fetch.sock",
+    "FN_STATUS": "/run/pcdn-fn/status.json",
+    "FN_USAGE_LOG": "/var/log/pcdn-fn/usage.log",
+    "FN_WALL_MS": "5000",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -445,7 +457,9 @@ def heartbeat_capabilities(cfg: dict) -> dict:
             "l4": l4_ready(cfg), "l4_port_range": "%d-%d" % l4_port_range(cfg),
             "slice": bool(c.get("slice")), "video": True,
             "avif": image_capabilities(cfg)["avif"], "image_transform": image_capabilities(cfg)["transform"],
-            "net_guard": guard_installed(cfg)}
+            "net_guard": guard_installed(cfg),
+            # SPEC §16.9: true only while pcdn-fn runs and its sandbox self-test passes
+            "edge_functions": functions_ready(cfg)}
 
 
 _GUARD = re.compile(r"^# @if (\w+)\n(.*?)(?:^# @else \1\n(.*?))?^# @endif \1\n", re.S | re.M)
@@ -1487,6 +1501,260 @@ def render_l4(config: dict, cfg: dict) -> dict:
     return files
 
 
+# ----------------------------------------------------------------- edge functions (SPEC §16.9)
+#
+# Customer JavaScript never runs in nginx/njs. nginx only routes the bound path prefixes over a unix
+# socket to pcdn-fn (pcdn-fn.py, systemd/pcdn-fn.service), which runs every invocation in a fresh
+# sandboxed QuickJS process. The agent (1) validates the site's `functions` section, (2) writes the
+# code bundle pcdn-fn reads (FN_DIR/manifest.json + FN_DIR/code/<sha256>.js, root:<nginx group> 0640,
+# content-addressed so a sandboxed worker cannot even probe which sites have functions), (3) renders
+# one `location ^~ <route>` per function plus a local fetch() server per host, (4) reports the
+# `edge_functions` capability only while pcdn-fn's self-test passes and (5) bills the usage lines
+# pcdn-fn appends to FN_USAGE_LOG.
+
+FN_ROUTE = re.compile(r"^/[A-Za-z0-9._~/-]{0,255}$")
+FN_MAX_CODE = 256 * 1024          # bytes of UTF-8 source per function
+FN_MAX_PER_SITE = 32
+FN_TIMEOUT_MS = (1, 200, 50)      # (min, max, default) CPU milliseconds per invocation
+FN_MEMORY_MB = (8, 128, 32)       # (min, max, default) JS heap per invocation
+FN_ON_ERROR = ("502", "origin")   # default first: fail closed (a broken auth function never opens the origin)
+FN_STATUS_MAX_AGE = 180           # pcdn-fn rewrites its status file every 30 s
+
+
+def functions_enabled(cfg: dict) -> bool:
+    """install.sh --functions (FUNCTIONS=yes in agent.conf): pcdn-fn is installed on this node."""
+    return str(cfg.get("FUNCTIONS") or "").lower() == "yes"
+
+
+def _fn_bounded(v, lim: tuple):
+    if v is None:
+        return lim[2]
+    if isinstance(v, bool) or not isinstance(v, int) or not lim[0] <= v <= lim[1]:
+        return None
+    return v
+
+
+def norm_functions(site: dict, tunnel_prefixes=()) -> list[dict]:
+    """Validated, enabled functions of a site (SPEC §16.9): [{id, route, code, sha256, timeout_ms,
+    memory_mb, on_error}]. Invalid items are skipped, never "fixed"; the first item wins a duplicate
+    id or route; a route equal to / nested with a tunnel path prefix is skipped (tunnel paths keep
+    their own location)."""
+    sec = _sec(site, "functions")
+    if sec.get("enabled") is not True:
+        return []
+    site_err = sec.get("on_error") if sec.get("on_error") in FN_ON_ERROR else FN_ON_ERROR[0]
+    out, ids, routes = [], set(), set()
+    for f in sec.get("items") or []:
+        if not isinstance(f, dict) or f.get("enabled") is False:
+            continue
+        fid, route, code = f.get("id"), f.get("route"), f.get("code")
+        if not (isinstance(fid, str) and SAFE_ID.match(fid) and isinstance(route, str) and FN_ROUTE.match(route)
+                and isinstance(code, str) and code.strip()):
+            log.warning("site %s: skipping invalid function %r", site.get("id"), fid)
+            continue
+        segs = route.split("/")[1:-1] if route.endswith("/") else route.split("/")[1:]
+        if (route.startswith("/__pcdn") or "//" in route or any(x in (".", "..") for x in segs)
+                or fid in ids or route in routes):
+            log.warning("site %s: skipping function %s (route %s)", site.get("id"), fid, route)
+            continue
+        if any(route.startswith(p) or p.startswith(route) for p in tunnel_prefixes):
+            log.warning("site %s: function %s route %s overlaps a tunnel path", site.get("id"), fid, route)
+            continue
+        raw = code.encode("utf-8", "surrogatepass")
+        tmo, mem = _fn_bounded(f.get("timeout_ms"), FN_TIMEOUT_MS), _fn_bounded(f.get("memory_mb"), FN_MEMORY_MB)
+        on_err = f.get("on_error", site_err)
+        if len(raw) > FN_MAX_CODE or tmo is None or mem is None or on_err not in FN_ON_ERROR:
+            log.warning("site %s: skipping function %s (size / limits / on_error)", site.get("id"), fid)
+            continue
+        ids.add(fid)
+        routes.add(route)
+        out.append({"id": fid, "route": route, "code": code, "sha256": hashlib.sha256(raw).hexdigest(),
+                    "timeout_ms": tmo, "memory_mb": mem, "on_error": on_err})
+        if len(out) >= FN_MAX_PER_SITE:
+            break
+    return out
+
+
+def _fn_tunnel_prefixes(site: dict) -> list[str]:
+    tn = norm_tunnel(site, norm_pools(site))
+    return [p["path"] for p in tn["paths"]] if tn else []
+
+
+def _fn_site_ok(site: dict) -> bool:
+    """Functions run only for active sites that serve origin content (not decoy / 404 tunnel hosts)."""
+    if site.get("status", "active") in ("suspended", "over_quota"):
+        return False
+    tn = norm_tunnel(site, norm_pools(site))
+    return not tn or tn["fallback"] == "origin"
+
+
+def render_functions(config: dict, cfg: dict) -> dict:
+    """The pcdn-fn bundle {rel path: text} (empty when FUNCTIONS is off or no site has functions):
+    manifest.json {"v": 1, "sites": {"<id>": {"domain", "hosts", "functions": {"<fn id>": {route,
+    sha256, timeout_ms, memory_mb}}}}} and code/<sha256>.js."""
+    if not functions_enabled(cfg):
+        return {}
+    files, sites = {}, {}
+    for site in config.get("sites", []):
+        if not _fn_site_ok(site):
+            continue
+        fns = norm_functions(site, _fn_tunnel_prefixes(site))
+        if not fns:
+            continue
+        hosts = sorted({str(h.get("name") or "").lower() for h in site.get("hosts") or []
+                        if SAFE_NAME.match(str(h.get("name") or "").lower())})
+        sites[str(int(site["id"]))] = {
+            "domain": str(site.get("domain") or "").lower(), "hosts": hosts,
+            "functions": {f["id"]: {"route": f["route"], "sha256": f["sha256"], "timeout_ms": f["timeout_ms"],
+                                    "memory_mb": f["memory_mb"]} for f in fns}}
+        for f in fns:
+            files[f"code/{f['sha256']}.js"] = f["code"]
+    if not sites:
+        return {}
+    files["manifest.json"] = json.dumps({"v": 1, "sites": sites}, sort_keys=True, separators=(",", ":")) + "\n"
+    return files
+
+
+def _fn_gid(cfg: dict) -> int | None:
+    """Group that may read the bundle and connect to the sockets: FN_GROUP or NGINX_USER's group."""
+    import grp  # noqa: PLC0415
+    import pwd  # noqa: PLC0415
+    try:
+        if cfg.get("FN_GROUP"):
+            return grp.getgrnam(cfg["FN_GROUP"]).gr_gid
+        return pwd.getpwnam(cfg.get("NGINX_USER") or "www-data").pw_gid
+    except (KeyError, OSError):
+        return None
+
+
+def write_functions(cfg: dict, files: dict):
+    """Atomically replace FN_DIR with the bundle (dirs 0750, files 0640, group = _fn_gid). pcdn-fn
+    re-reads manifest.json when it changes; an empty bundle leaves an empty FN_DIR."""
+    root = (cfg.get("FN_DIR") or "/var/lib/pcdn-fn").rstrip("/")
+    if not SAFE_FSPATH.match(root):
+        raise ValueError("unsafe FN_DIR")
+    gid = _fn_gid(cfg)
+    new, old = root + ".new", root + ".old"
+    shutil.rmtree(new, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
+    os.makedirs(os.path.join(new, "code"), mode=0o750)
+    for d in (new, os.path.join(new, "code")):
+        os.chmod(d, 0o750)
+        if gid is not None:
+            os.chown(d, 0 if os.geteuid() == 0 else -1, gid)
+    for rel, content in files.items():
+        path = os.path.join(new, rel)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+        with os.fdopen(fd, "wb") as f:
+            f.write(content.encode("utf-8", "surrogatepass"))
+        os.chmod(path, 0o640)
+        if gid is not None:
+            os.chown(path, 0 if os.geteuid() == 0 else -1, gid)
+    if os.path.exists(root):
+        os.rename(root, old)
+    os.rename(new, root)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def sync_functions(config: dict, cfg: dict, state: dict):
+    """Write the bundle when it changed (agent-side, independent of the nginx reload: pcdn-fn picks
+    the new code up without one). Called before the nginx tree is applied, so a new route never
+    reaches pcdn-fn before its code."""
+    files = render_functions(config, cfg)
+    digest = tree_digest(files)
+    root = (cfg.get("FN_DIR") or "/var/lib/pcdn-fn").rstrip("/")
+    if digest == state.get("fn_digest") and (not files or os.path.isfile(os.path.join(root, "manifest.json"))):
+        return
+    if not files and not os.path.exists(root):
+        state["fn_digest"] = digest
+        return
+    write_functions(cfg, files)
+    state["fn_digest"] = digest
+
+
+def functions_status(cfg: dict) -> dict | None:
+    """pcdn-fn's status file (self-test result) when it is fresh, else None."""
+    path = cfg.get("FN_STATUS") or "/run/pcdn-fn/status.json"
+    try:
+        if time.time() - os.path.getmtime(path) > FN_STATUS_MAX_AGE:
+            return None
+        with open(path) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def functions_ready(cfg: dict) -> bool:
+    """SPEC §16.9 capability `edge_functions`: installed (FUNCTIONS=yes), the engine binary present,
+    pcdn-fn alive (fresh status + its socket) and its sandbox self-test passed."""
+    if not functions_enabled(cfg):
+        return False
+    st = functions_status(cfg)
+    if not st or st.get("ok") is not True or not all((st.get("checks") or {"x": False}).values()):
+        return False
+    import stat as _stat  # noqa: PLC0415
+    try:
+        return _stat.S_ISSOCK(os.stat(cfg.get("FN_SOCKET") or "/run/pcdn-fn/fn.sock").st_mode)
+    except OSError:
+        return False
+
+
+FN_READ_MAX = 8 * 1024 * 1024
+
+
+def _account_fn(e: dict, pending: dict):
+    """One pcdn-fn usage line {"t","h","n","c","e","o"} -> the `functions` counters of the host-hour."""
+    host = str(e.get("h") or "").lower()
+    if not SAFE_NAME.match(host):
+        return
+    _, hour, _ = _times(e["t"])
+    a = _bucket(pending, f"{host}|{hour}")
+    c = a.setdefault("functions", {"invocations": 0, "cpu_ms": 0, "errors": 0, "timeouts": 0})
+    for k, src in (("invocations", "n"), ("cpu_ms", "c"), ("errors", "e"), ("timeouts", "o")):
+        c[k] += max(0, int(e.get(src) or 0))
+
+
+def _consume_fn(path: str, pos: int, pending: dict, max_bytes: int) -> int:
+    read = 0
+    with open(path, "rb") as f:
+        f.seek(pos)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break
+            pos += len(raw)
+            read += len(raw)
+            try:
+                _account_fn(json.loads(raw), pending)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
+            if read >= max_bytes:
+                break
+    return pos
+
+
+def read_fn_usage(state: dict, path: str, max_bytes: int = FN_READ_MAX) -> None:
+    """Fold new pcdn-fn usage lines into state['pending'] (own offset / inode: fn_pos, fn_inode).
+    pcdn-fn rotates usage.log -> usage.log.1 itself; the rest of the old file is read first."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    pending = state.setdefault("pending", {})
+    pos, ino = int(state.get("fn_pos") or 0), state.get("fn_inode")
+    if ino is not None and ino != st.st_ino:
+        try:
+            if os.stat(path + ".1").st_ino == ino:
+                _consume_fn(path + ".1", pos, pending, max_bytes)
+        except OSError:
+            pass
+        pos = 0
+    elif st.st_size < pos:
+        pos = 0
+    state["fn_pos"] = _consume_fn(path, pos, pending, max_bytes)
+    state["fn_inode"] = st.st_ino
+
+
 def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None,
             tf_resp: list | None = None, video: dict | None = None) -> dict:
     """Per-site data for njs (sites.js). Only validated / typed values end up here."""
@@ -2104,6 +2372,31 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     mtls_lines = [f"proxy_ssl_certificate {cfg['NGINX_DIR']}/mtls/{mtls_id}.crt;",
                   f"proxy_ssl_certificate_key {cfg['NGINX_DIR']}/mtls/{mtls_id}.key;"] if mtls_id else []
     meta = {"mtls_resizer": None}
+
+    # --- edge functions (SPEC §16.9): customer JS runs in pcdn-fn, never here. Each enabled function
+    # becomes `location ^~ <route>` proxied over FN_SOCKET; pcdn-fn answers with the function's
+    # response or an X-Accel-Redirect to @pcdn_fn_pass (continue to the origin) / the on_error target
+    # (@pcdn_fn_pass for "origin", @pcdn_fn_err -> 502 for "502"). A node without pcdn-fn renders a
+    # plain 502 for fail-closed ("502") functions and nothing for "origin" ones.
+    fns = norm_functions(site, tn_prefixes) if (active and fallback == "origin") else []
+    fn_live = bool(fns) and functions_enabled(cfg)
+    fn_root = any(f["route"] == "/" for f in fns if fn_live or f["on_error"] == "502")
+    if fns and not fn_live:
+        log.warning("site %s has edge functions but this node has no pcdn-fn (install.sh --functions)", sid)
+    fn_sock = cfg.get("FN_SOCKET") or "/run/pcdn-fn/fn.sock"
+    fn_fetch_sock = cfg.get("FN_FETCH_SOCKET") or "/run/pcdn-fnfetch/fetch.sock"
+    if fn_live and not (SAFE_FSPATH.match(fn_sock) and SAFE_FSPATH.match(fn_fetch_sock)):
+        raise ValueError("unsafe FN_SOCKET / FN_FETCH_SOCKET")
+    fn_bodychk, fn_imgw = "$pcdn_bodychk", "$pcdn_img_w"
+    if fn_live:
+        # function routes are never rewritten into the WAF body inspector or the image resizer
+        # (both would proxy the request to the origin and bypass the function)
+        alt = "|".join(f["route"].replace(".", "\\.") for f in fns)
+        out.append(f'map $uri $pcdn_fnr_{sid} {{\n    default 0;\n    "~^(?:{alt})" 1;\n}}')
+        out.append(f'map $pcdn_fnr_{sid} $pcdn_fnbc_{sid} {{\n    1 "";\n    default $pcdn_bodychk;\n}}')
+        out.append(f'map $pcdn_fnr_{sid} $pcdn_fniw_{sid} {{\n    1 "";\n    default $pcdn_img_w;\n}}')
+        fn_bodychk, fn_imgw = f"$pcdn_fnbc_{sid}", f"$pcdn_fniw_{sid}"
+    fn_wall = _int(cfg.get("FN_WALL_MS"), 5000, 100, 60000)
     # @pcdn_body proxies the visitor's original URI (or its rewrite_path result) explicitly: the
     # request URI there is the internal /__pcdn/body/... one
     body_uri = "$request_uri"
@@ -2313,6 +2606,71 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             out_l += ["    location = /__pcdn/vpf {"] + ind(L) + ["    }"]
         return out_l
 
+    def fn_locations(host_name):
+        """The function routes of one server plus @pcdn_fn_pass (the site's default origin handling,
+        used for `pass` and on_error "origin") and @pcdn_fn_err (502 through the site's error pages)."""
+        L = []
+        common = loc_common(hdrs=[])   # the site's response headers (HSTS, Alt-Svc, header rules)
+        for f in fns:
+            err = "@pcdn_fn_pass" if f["on_error"] == "origin" else "@pcdn_fn_err"
+            B = [f"client_max_body_size {1024 * 1024};",
+                 f"client_body_buffer_size {1024 * 1024};", "proxy_request_buffering on;",
+                 "proxy_http_version 1.0;", "proxy_set_header Host $host;", 'proxy_set_header Connection "";',
+                 f"proxy_set_header X-Pcdn-Fn-Site {sid};", f"proxy_set_header X-Pcdn-Fn-Id {f['id']};",
+                 f"proxy_set_header X-Pcdn-Fn-Host {_q(host_name)};",
+                 'proxy_set_header X-Pcdn-Fn-Url "$scheme://$host$request_uri";',
+                 "proxy_set_header X-Pcdn-Fn-Ip $remote_addr;",
+                 "proxy_set_header X-Pcdn-Fn-Country $pcdn_country;",
+                 "proxy_set_header X-Pcdn-Fn-Pass @pcdn_fn_pass;", f"proxy_set_header X-Pcdn-Fn-Err {err};",
+                 'proxy_set_header X-Pcdn-Shield "";',
+                 # never replace a function's own 4xx/5xx with the site's error pages
+                 "proxy_intercept_errors off;", "proxy_connect_timeout 2s;", "proxy_send_timeout 30s;",
+                 f"proxy_read_timeout {fn_wall // 1000 + 10}s;", "proxy_buffer_size 64k;",
+                 "proxy_buffers 16 64k;", "proxy_busy_buffers_size 128k;", "proxy_cache off;",
+                 "add_header X-Cache BYPASS always;"] + common
+            if f["on_error"] == "origin":
+                # pcdn-fn down / unreachable (nginx-generated 502/504): continue to the origin
+                B.append("error_page 502 504 = @pcdn_fn_pass;")
+            B.append(f"proxy_pass http://unix:{fn_sock}:;")
+            L += [f"    location ^~ {f['route']} {{"] + ind(B) + ["    }"]
+        L.append("    location @pcdn_fn_err { return 502; }")
+        if cache_on:
+            L += proxy_loc("@pcdn_fn_pass", "aggressive" if level == "aggressive" else "dynamic",
+                           edge_ttl if level == "aggressive" else 0, 0, ignore_q)
+        else:
+            L += proxy_loc("@pcdn_fn_pass", "bypass", 0, 0, False)
+        return L
+
+    def fn_fetch_server(host_name, proto, pool, target):
+        """fetch() of this host's functions: listens only on the local FN_FETCH_SOCKET (pcdn-fn is its
+        only client: the socket's directory is root:<nginx group> 0750 and pcdn-fn has no network) and
+        proxies to the host's own origin, never cached, never logged/billed. pcdn-fn has already
+        restricted the target to this site's hosts and sets X-Pcdn-Fn-Client to the visitor's address."""
+        F = ["server {", f"    listen unix:{fn_fetch_sock};", f"    server_name {host_name};", "    access_log off;",
+             "    set_real_ip_from unix:;", "    real_ip_header X-Pcdn-Fn-Client;", f"    set $pcdn_site {sid};",
+             f"    set $pcdn_proto {proto};", f"    client_max_body_size {1024 * 1024};",
+             f"    client_body_buffer_size {1024 * 1024};"]
+        if pool:
+            F += [f"    set $pcdn_pool {_q(pool)};", "    set $pcdn_target $pcdn_upstream;"]
+        else:
+            F.append(f"    set $pcdn_target {_q(target)};")
+        F += ["    proxy_ssl_server_name on;", "    proxy_ssl_name $host;"]
+        if proto == "https" and sslo.get("origin_verify"):
+            F += ["    proxy_ssl_verify on;", f"    proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
+                  "    proxy_ssl_verify_depth 4;"]
+        hd = [("Host", "$host"), ("X-Real-IP", "$remote_addr"), ("X-Forwarded-For", "$remote_addr"),
+              ("X-Forwarded-Proto", "$scheme"), ("X-Pcdn-Shield", '""'), ("X-Pcdn-Fn-Client", '""'),
+              ("X-Pcdn-Fn-Site", '""'), ("Connection", '""')]
+        hd = [(n, v) for n, v in hd if n.lower() not in req_headers] + list(req_headers.values())
+        # pcdn-fn names the calling site: a request that reached another site's fetch server (e.g. a
+        # wildcard host of this site shadowed by another site's exact host) is refused
+        L = [f'if ($http_x_pcdn_fn_site != "{sid}") {{ return 421; }}']
+        L += [f"proxy_set_header {n} {v};" for n, v in hd]
+        L += ["proxy_cache off;", "proxy_intercept_errors off;", f"proxy_read_timeout {fn_wall // 1000 + 5}s;"]
+        L += (mtls_lines if proto == "https" else []) + ["proxy_pass $pcdn_proto://$pcdn_target;"]
+        F += ["    location / {"] + ind(L) + ["    }", "}"]
+        return "\n".join(F)
+
     for host in site["hosts"]:
         name = str(host["name"]).lower()
         res = resolve_origin(host, pools, origin_proto)
@@ -2401,11 +2759,11 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         for code in rd_codes:   # SPEC §14.2 redirect rules (first matching rule, see redirect_maps)
             s.append(f"    if ({rd_var} ~ \"^{code}(.*)$\") {{ return {code} $1; }}")
         if body_on:
-            s.append("    if ($pcdn_bodychk) { rewrite ^ /__pcdn/body$uri last; }")
+            s.append(f"    if ({fn_bodychk}) {{ rewrite ^ /__pcdn/body$uri last; }}")
         if image_on:
             if imv2["secret"]:   # SPEC §16.6 signed transform URLs: unsigned / wrong signature -> 403
-                s.append('    if ($pcdn_img_w = "!") { return 403; }')
-            s.append("    if ($pcdn_img_w) { rewrite ^ /__pcdn/img$uri last; }")
+                s.append(f'    if ({fn_imgw} = "!") {{ return 403; }}')
+            s.append(f"    if ({fn_imgw}) {{ rewrite ^ /__pcdn/img$uri last; }}")
         if rps > 0:
             s.append(f"    limit_req zone=pcdn_rlk_{sid} burst={rps * 2} nodelay;")
             s.append("    limit_req_status 429;")
@@ -2467,6 +2825,13 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             L.append(f"proxy_pass http://127.0.0.1:{resize_port}{tf_uri};")
             s += ["    location ^~ /__pcdn/img/ {"] + ["        " + x for x in L] + ["    }"]
 
+        if fn_live:
+            s += fn_locations(name)
+        else:
+            for f in fns:   # no pcdn-fn on this node: fail closed where the customer asked for it
+                if f["on_error"] == "502":
+                    s.append(f"    location ^~ {f['route']} {{ return 502; }}")
+
         # tunnel paths: "^~" prefix locations, so no page rule / static regex location can take them
         if tunnel:
             for p in tunnel["paths"]:
@@ -2511,16 +2876,20 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         if cache_on:
             # static assets: cached at the edge even without origin headers
             s += proxy_loc(f"~* \\.(?:{STATIC_EXT})$", "static", edge_ttl, browser_ttl, ignore_q)
-            s += proxy_loc("/", "aggressive" if level == "aggressive" else "dynamic",
-                           edge_ttl if level == "aggressive" else 0, 0, ignore_q)
-        else:
+            if not fn_root:   # a function bound to "/" owns `location ^~ /`
+                s += proxy_loc("/", "aggressive" if level == "aggressive" else "dynamic",
+                               edge_ttl if level == "aggressive" else 0, 0, ignore_q)
+        elif not fn_root:
             s += proxy_loc("/", "bypass", 0, 0, False)
         s.append("}")
         out.append("\n".join(s))
+        if fn_live:
+            out.append(fn_fetch_server(name, proto, pool, target))
 
     if mtls_used and mtls_id != "platform":
         files[f"mtls/{sid}.crt"], files[f"mtls/{sid}.key"] = mtls_pair
     meta["mtls_platform"] = mtls_used and mtls_id == "platform"
+    meta["functions"] = fn_live and bool(valid_hosts)
     js = (site_js(site, valid_hosts, pools, sslo, tunnel, tf_resp, video if vprefetch else None)
           if active and valid_hosts else None)
     return "\n\n".join(out) + "\n", files, js, meta
@@ -2569,9 +2938,10 @@ def render_all(config: dict, cfg: dict) -> dict:
         files["shield.conf"] = sh_conf
     platform = norm_origin_pull(config)   # node-wide platform client certificate (SPEC §14.2)
     platform_pair = (platform["cert"], platform["key"]) if platform else None
-    resizer_pairs, platform_used = {}, False
+    resizer_pairs, platform_used, fn_any = {}, False, False
     for site in config.get("sites", []):
         text, extra, js, meta = _render_site(site, cfg, shield, platform_pair)
+        fn_any = fn_any or bool(meta.get("functions"))
         files[f"sites/{int(site['id'])}.conf"] = text
         files.update(extra)
         platform_used = platform_used or meta.get("mtls_platform")
@@ -2596,6 +2966,10 @@ def render_all(config: dict, cfg: dict) -> dict:
         files["mtls.conf"] = mtls_conf
     files["http.conf"] = render_http(cfg, max_timeout + 1, shield, bool(bots_conf), bool(mtls_conf),
                                      norm_node(config, cfg))
+    if fn_any:   # SPEC §16.9: the fetch() socket answers 421 for any host without a fetch server
+        files["http.conf"] += ("\n# edge functions fetch() socket (SPEC §16.9): unknown hosts\nserver {\n"
+                               f"    listen unix:{cfg.get('FN_FETCH_SOCKET') or '/run/pcdn-fnfetch/fetch.sock'} "
+                               "default_server;\n    server_name _;\n    access_log off;\n    return 421;\n}\n")
     # JSON is valid JS; ensure_ascii keeps U+2028 & co. out of the source
     files["js/sites.js"] = ("// generated by pcdn-agent, do not edit\nexport default "
                             + json.dumps(js_sites, ensure_ascii=True, sort_keys=True) + ";\n")
@@ -3612,6 +3986,9 @@ def usage_item(key: str, a) -> dict:
     if a.get("l4"):      # SPEC §16.4 (optional): per app; NOT included in bytes (billed by the controller)
         item["l4"] = {app: {k: int(c.get(k) or 0) for k in ("bytes_in", "bytes_out", "sessions")}
                       for app, c in sorted(a["l4"].items())}
+    if a.get("functions"):   # SPEC §16.9 (optional): edge function invocations of this host-hour
+        item["functions"] = {k: int(a["functions"].get(k) or 0)
+                             for k in ("invocations", "cpu_ms", "errors", "timeouts")}
     return item
 
 
@@ -4937,6 +5314,10 @@ class Agent:
                 st.pop("video_hosts", None)
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
+        try:   # SPEC §16.9: the pcdn-fn code bundle (before the nginx tree: code precedes its route)
+            sync_functions(body, cfg, st)
+        except Exception as e:  # noqa: BLE001
+            log.error("edge functions bundle update failed: %s", e)
         version = body["version"]
         etag = hdrs.get("ETag") or hdrs.get("etag")
         body = with_cached_bot_ranges(body, st)   # SPEC §14.2: keep the last good crawler ranges
@@ -5048,6 +5429,11 @@ class Agent:
             read_l4_usage(self.state, self.cfg.get("L4_ACCESS_LOG") or "/var/log/nginx/pcdn-l4.log")
         except Exception as e:  # noqa: BLE001 - never let L4 accounting break HTTP usage
             log.error("L4 usage read failed: %s", e)
+        if functions_enabled(self.cfg):   # SPEC §16.9: pcdn-fn usage lines
+            try:
+                read_fn_usage(self.state, self.cfg.get("FN_USAGE_LOG") or "/var/log/pcdn-fn/usage.log")
+            except Exception as e:  # noqa: BLE001 - never let function accounting break HTTP usage
+                log.error("functions usage read failed: %s", e)
         self._enqueue_usage()
         # F8: persist the outbox (with its batch_ids and the advanced log_pos) BEFORE the first POST,
         # so a crash or restart replays the SAME batch rather than a different one. A save failure is

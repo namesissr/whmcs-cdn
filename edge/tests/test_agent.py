@@ -1105,7 +1105,8 @@ def test_heartbeat_reports_capabilities(tmp_path):
                                     "live_analytics": True, "logship": True,   # SPEC §14.3
                                     # SPEC §16.3-§16.6 (wave 8)
                                     "l4": False, "l4_port_range": "20000-29999", "slice": True, "video": True,
-                                    "avif": False, "image_transform": True, "net_guard": False}
+                                    "avif": False, "image_transform": True, "net_guard": False,
+                                    "edge_functions": False}
     json.dumps(body)
 
 

@@ -48,7 +48,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q nginx libnginx-mod-http-js libnginx-mod-http-geoip2 \
             libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter libnginx-mod-stream \
-            python3-pil nftables python3-pytest
+            python3-pil nftables quickjs python3-pytest
           sudo systemctl stop nginx
           sudo pip install --break-system-packages -q mmdb-writer netaddr
       # nginx -t binds the listen ports, so the tests run as root

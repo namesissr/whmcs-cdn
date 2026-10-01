@@ -1,0 +1,77 @@
+[Unit]
+Description=Pasargad CDN edge functions (sandboxed QuickJS workers, SPEC 16.9)
+Documentation=file:/usr/local/bin/pcdn-fn
+After=local-fs.target
+Before=nginx.service
+
+[Service]
+Type=simple
+# settings (FN_*): written by install.sh --functions; world-readable, no secrets (agent.conf is never read)
+Environment=PCDN_FN_CONFIG=/etc/pcdn/fn.conf
+ExecStart=/usr/bin/python3 -I /usr/local/bin/pcdn-fn serve
+Restart=always
+RestartSec=2
+# Customer code is untrusted multi-tenant code. This unit is the OUTER layer: every invocation also
+# runs in its own process with Landlock (read-only qjs + libs, nothing else), a seccomp allow-list
+# (no sockets / processes / signals / ioctl), rlimits and a CPU timer applied by pcdn-fn itself.
+DynamicUser=yes
+# nginx workers connect to /run/pcdn-fn/fn.sock (0660, this group) and pcdn-fn reaches nginx's fetch()
+# socket in /run/pcdn-fnfetch (root:<group> 0750). install.sh replaces the group with nginx's own in
+# /etc/systemd/system/pcdn-fn.service.d/group.conf (www-data = the distro build, nginx = nginx.org).
+SupplementaryGroups=www-data
+RuntimeDirectory=pcdn-fn
+RuntimeDirectoryMode=0755
+LogsDirectory=pcdn-fn
+LogsDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+# no network namespace access at all: the only I/O are the unix sockets (filesystem sockets work across
+# network namespaces) and the workers' pipes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+# nothing of the node's secrets, caches or other services' data is visible (the bundle lives in
+# /var/lib/pcdn-fn; agent.conf is root-only anyway)
+InaccessiblePaths=-/etc/nginx -/var/cache/pcdn -/var/lib/pcdn -/var/log/nginx -/etc/ssl/private -/etc/letsencrypt -/etc/pcdn/agent.conf -/etc/pcdn/guard.nft -/srv -/opt -/mnt -/media
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+KeyringMode=private
+LockPersonality=yes
+# QuickJS is an interpreter (no JIT); pcdn-fn additionally sets PR_SET_MDWE per worker
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+# @sandbox: landlock_* + seccomp for the per-worker sandbox. setrlimit / chown come back after the
+# group removals: rlimits for workers, the socket group for nginx.
+SystemCallFilter=@system-service @sandbox
+SystemCallFilter=~@privileged @resources @setuid @mount @debug @module @raw-io @reboot @swap @cpu-emulation @obsolete @clock @keyring
+SystemCallFilter=setrlimit chown fchown fchownat
+# whole-pool caps (per invocation: memory_mb + 64 MB address space; 2 x CPUs workers by default)
+MemoryMax=1536M
+MemorySwapMax=0
+TasksMax=256
+LimitNOFILE=4096
+LimitCORE=0
+CPUWeight=50
+Nice=5
+OOMScoreAdjust=700
+
+[Install]
+WantedBy=multi-user.target

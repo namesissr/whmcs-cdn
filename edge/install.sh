@@ -33,6 +33,12 @@
 #   --no-harden-net    remove the guard (table, service, sysctls); --upgrade keeps the installed state
 #   --no-avif          do not install libavif-bin (AVIF output then needs Pillow's own AVIF plugin);
 #                      default: installed when the distribution has it (SPEC §16.6)
+#   --functions        opt-in edge functions (SPEC §16.9): package quickjs (universe) + service pcdn-fn, which
+#                      runs customer JavaScript in one sandboxed QuickJS process per invocation (Landlock +
+#                      seccomp + rlimits + CPU timer inside a DynamicUser / PrivateNetwork systemd unit).
+#                      Needs Landlock in the kernel (Ubuntu 24.04: yes). The node reports edge_functions
+#                      only while pcdn-fn's sandbox self-test passes.
+#   --no-functions     remove pcdn-fn (service, bundle, sockets); --upgrade keeps the installed state
 # L4 proxy (SPEC §16.4): the stream module is installed (libnginx-mod-stream / built into nginx.org) and
 # nginx.conf includes /etc/nginx/pcdn/l4/*.conf at the main context. Open L4_PORT_RANGE (default
 # 20000-29999, TCP and UDP) in the host / provider firewall. Images v2: python3-pil + service
@@ -57,6 +63,7 @@ KEEP_CONF="" # operator-tuned agent.conf lines carried over by --upgrade (log ex
 SHUTDOWN_TIMEOUT=1h
 HARDEN_NET=""  # yes | no ("" = not given: no, or the installed GUARD value on --upgrade)
 AVIF=""        # yes | no ("" = not given: yes, or the installed value on --upgrade)
+FUNCTIONS=""   # yes | no ("" = not given: no, or the installed value on --upgrade)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 while [ $# -gt 0 ]; do
@@ -79,6 +86,8 @@ while [ $# -gt 0 ]; do
     --no-harden-net) HARDEN_NET=no; shift ;;
     --avif) AVIF=yes; shift ;;
     --no-avif) AVIF=no; shift ;;
+    --functions) FUNCTIONS=yes; shift ;;
+    --no-functions) FUNCTIONS=no; shift ;;
     *) echo "unknown option: $1"; exit 1 ;;
   esac
 done
@@ -105,16 +114,19 @@ if [ "$UPGRADE" = yes ]; then
   # wave 8: the host guard (SPEC §16.3) and AVIF tooling (§16.6) stay as installed unless a flag says
   if [ -z "${HARDEN_NET:-}" ]; then v="$(conf GUARD)"; case "$v" in yes|no) HARDEN_NET="$v" ;; esac; fi
   if [ -z "${AVIF:-}" ]; then v="$(conf AVIF)"; case "$v" in yes|no) AVIF="$v" ;; esac; fi
+  # SPEC §16.9 edge functions stay as installed unless --functions / --no-functions says otherwise
+  if [ -z "${FUNCTIONS:-}" ]; then v="$(conf FUNCTIONS)"; case "$v" in yes|no) FUNCTIONS="$v" ;; esac; fi
   # kept across --upgrade: log-export tunables (SPEC §14.3.2) and the wave-7 node settings an operator
   # may have added (SPEC §15.2 fair-share capacity / share, §15.6 speed-test node name / file)
   # and the wave-8 settings (SPEC §16.3 GUARD_* values, §16.4 L4_*, §16.6 IMAGE*/IMAGED)
-  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY))=' \
+  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS))=' \
     /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
 HTTP3="${HTTP3:-no}"
 HARDEN_NET="${HARDEN_NET:-no}"
 AVIF="${AVIF:-yes}"
+FUNCTIONS="${FUNCTIONS:-no}"
 [ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || { echo "usage: $0 --controller URL --token TOKEN"; exit 1; }
 [ -f /etc/debian_version ] || { echo "only Ubuntu 24.04 (or a Debian derivative with njs >= 0.8.1) is supported"; exit 1; }
 case "$HTTP_PORT$HTTPS_PORT" in *[!0-9]*) echo "ports must be numeric"; exit 1 ;; esac
@@ -340,7 +352,7 @@ if [ -n "$KEEP_CONF" ]; then printf '%s\n' "$KEEP_CONF" >> /etc/pcdn/agent.conf;
 # >>> pcdn wave8 conf (edge/tests/test_agent.py runs this)
 # SPEC §16.3 / §16.6 install choices (read back by --upgrade) and the SSH ports the guard never limits
 # (detected from sshd unless the operator set GUARD_SSH_PORTS)
-printf 'GUARD=%s\nAVIF=%s\n' "$HARDEN_NET" "$AVIF" >> /etc/pcdn/agent.conf
+printf 'GUARD=%s\nAVIF=%s\nFUNCTIONS=%s\n' "$HARDEN_NET" "$AVIF" "${FUNCTIONS:-no}" >> /etc/pcdn/agent.conf
 if ! grep -q '^GUARD_SSH_PORTS=' /etc/pcdn/agent.conf; then
   SSH_PORTS="$( (sshd -T 2>/dev/null || true) | awk '$1 == "port" {print $2}' | sort -un | tr '\n' ' ' | sed 's/ *$//')"
   echo "GUARD_SSH_PORTS=${SSH_PORTS:-22}" >> /etc/pcdn/agent.conf
@@ -499,6 +511,64 @@ elif [ -f "$GUARD_UNIT" ] || [ -f /etc/pcdn/guard.nft ]; then
   systemctl daemon-reload
 fi
 # <<< pcdn guard
+
+# >>> pcdn functions (SPEC §16.9; opt-in, removable)
+FN_UNIT=/etc/systemd/system/pcdn-fn.service
+NGINX_GROUP="$(id -gn "$NGINX_USER" 2>/dev/null || echo www-data)"
+if [ "$FUNCTIONS" = yes ]; then
+  echo "==> edge functions (pcdn-fn: sandboxed QuickJS workers)"
+  command -v qjs >/dev/null 2>&1 || apt-get install -y -q quickjs \
+    || echo "warning: package quickjs is not available (enable the 'universe' component)"
+  if command -v qjs >/dev/null 2>&1; then
+    install -d -m 755 /usr/share/pcdn/fn
+    install -m 644 "$HERE/fn/runtime.js" /usr/share/pcdn/fn/runtime.js
+    install -m 755 "$HERE/pcdn-fn.py" /usr/local/bin/pcdn-fn
+    install -m 644 "$HERE/systemd/pcdn-fn.service" "$FN_UNIT"
+    # nginx workers connect to pcdn-fn's socket and pcdn-fn to nginx's fetch() socket through this group
+    install -d -m 755 /etc/systemd/system/pcdn-fn.service.d
+    printf '[Service]\nSupplementaryGroups=\nSupplementaryGroups=%s\n' "$NGINX_GROUP" \
+      > /etc/systemd/system/pcdn-fn.service.d/group.conf
+    # the fetch() socket directory must exist before nginx loads a config that listens on it (also at boot)
+    printf 'd /run/pcdn-fnfetch 0750 root %s -\n' "$NGINX_GROUP" > /etc/tmpfiles.d/pcdn-fn.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/pcdn-fn.conf
+    # the code bundle written by the agent (root:<nginx group> 0750 / 0640; pcdn-fn reads it via the group)
+    install -d -m 750 -o root -g "$NGINX_GROUP" /var/lib/pcdn-fn
+    aval() { v="$(sed -n "s/^$1=//p" /etc/pcdn/agent.conf | tail -1)"; echo "${v:-$2}"; }
+    printf 'FN_SOCKET_GROUP=%s\nFN_WALL_MS=%s\nFN_WORKERS=%s\nFN_SITE_WORKERS=%s\nFN_MAX_FETCHES=%s\nFN_FETCH_TIMEOUT_MS=%s\nFN_STARTUP_MS=%s\nFN_QUEUE_MS=%s\n' \
+      "$NGINX_GROUP" "$(aval FN_WALL_MS 5000)" "$(aval FN_WORKERS 0)" "$(aval FN_SITE_WORKERS 4)" \
+      "$(aval FN_MAX_FETCHES 8)" "$(aval FN_FETCH_TIMEOUT_MS 5000)" "$(aval FN_STARTUP_MS 30)" \
+      "$(aval FN_QUEUE_MS 1000)" > /etc/pcdn/fn.conf
+    chmod 644 /etc/pcdn/fn.conf
+    systemctl daemon-reload
+    systemctl enable pcdn-fn >/dev/null
+    systemctl restart pcdn-fn
+    # the sandbox self-test runs at start; the capability stays false until it passes
+    ok=no
+    for _ in $(seq 1 20); do
+      if grep -q '"ok": true' /run/pcdn-fn/status.json 2>/dev/null; then ok=yes; break; fi
+      sleep 1
+    done
+    if [ "$ok" = yes ]; then
+      echo "    pcdn-fn self-test passed ($(sed -n 's/.*"engine": "\([^"]*\)".*/\1/p' /run/pcdn-fn/status.json))"
+    else
+      echo "warning: pcdn-fn self-test did not pass (see journalctl -u pcdn-fn and /run/pcdn-fn/status.json);"
+      echo "         the node does NOT report edge_functions and bound routes follow their on_error setting"
+    fi
+  else
+    sed -i 's/^FUNCTIONS=yes$/FUNCTIONS=no/' /etc/pcdn/agent.conf
+    echo "warning: edge functions are NOT installed (no QuickJS engine)"
+  fi
+elif [ -f "$FN_UNIT" ] || [ -f /usr/local/bin/pcdn-fn ]; then
+  echo "==> removing edge functions (pcdn-fn)"
+  systemctl disable --now pcdn-fn >/dev/null 2>&1 || true
+  # /run/pcdn-fnfetch stays (empty) until reboot: the nginx tree on disk may still listen there until
+  # the agent re-renders without functions (its render revision includes FUNCTIONS), and nginx -t below
+  # must keep passing
+  rm -rf "$FN_UNIT" /etc/systemd/system/pcdn-fn.service.d /etc/tmpfiles.d/pcdn-fn.conf /usr/local/bin/pcdn-fn \
+    /usr/share/pcdn/fn /var/lib/pcdn-fn /var/lib/pcdn-fn.new /var/lib/pcdn-fn.old /etc/pcdn/fn.conf
+  systemctl daemon-reload
+fi
+# <<< pcdn functions
 
 echo "==> GeoIP (DB-IP IP to Country Lite, CC BY 4.0)"
 systemctl daemon-reload
