@@ -1,0 +1,63 @@
+# GoReleaser config of the `pcdn` CLI (SPEC §16.2). Run by .github/workflows/release.yml on a tag
+# `cli/vX.Y.Z`; see docs/CLI.md («انتشار نسخه») for the GPG secrets and the manual steps.
+#
+# GoReleaser OSS cannot read prefixed (monorepo) tags, so the workflow sets
+# GORELEASER_CURRENT_TAG=vX.Y.Z on a local, never-pushed tag and uploads dist/ to the GitHub release of
+# the real tag `cli/vX.Y.Z` itself — hence `release.disable` below.
+version: 2
+
+project_name: pcdn
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: pcdn
+    main: ./cmd/pcdn
+    binary: pcdn
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .ShortCommit }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: pcdn
+    ids: [pcdn]
+    name_template: "pcdn_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    # just the binary (docs live in docs/CLI.md of the repository)
+    files:
+      - none*
+
+checksum:
+  name_template: "pcdn_{{ .Version }}_SHA256SUMS"
+  algorithm: sha256
+
+# Detached binary signature of the checksum file (pcdn_X.Y.Z_SHA256SUMS.sig). The key is imported by
+# the workflow from the GPG_PRIVATE_KEY / PASSPHRASE repository secrets; GPG_FINGERPRINT is the
+# fingerprint that import step reports. Nothing secret lives in this repository.
+signs:
+  - artifacts: checksum
+    args:
+      - --batch
+      - --local-user
+      - "{{ .Env.GPG_FINGERPRINT }}"
+      - --output
+      - ${signature}
+      - --detach-sign
+      - ${artifact}
+
+release:
+  disable: true
+
+changelog:
+  disable: true

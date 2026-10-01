@@ -87,3 +87,44 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./...
+
+  cli:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          # the CLI has no third-party dependencies (no go.sum)
+          cache-dependency-path: cli/go.mod
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: cross-compile (release targets)
+        run: |
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -o /dev/null ./cmd/pcdn
+            done
+          done
+      # validates both release configs (cli/ and terraform-provider-pcdn/) without building or signing
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          workdir: cli
+          args: check
+      - name: goreleaser check (provider)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          workdir: terraform-provider-pcdn
+          args: check

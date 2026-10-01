@@ -1,0 +1,75 @@
+# GoReleaser config of terraform-provider-pcdn (SPEC §16.2), laid out the way a Terraform provider
+# registry expects (the same layout as HashiCorp's terraform-provider-scaffolding-framework):
+#   terraform-provider-pcdn_{{.Version}}_{{.Os}}_{{.Arch}}.zip   (binary terraform-provider-pcdn_v{{.Version}})
+#   terraform-provider-pcdn_{{.Version}}_SHA256SUMS              (includes the manifest)
+#   terraform-provider-pcdn_{{.Version}}_SHA256SUMS.sig          (binary detached GPG signature)
+#   terraform-provider-pcdn_{{.Version}}_manifest.json           (protocol version 6.0)
+# Run by .github/workflows/release.yml on a tag `provider/vX.Y.Z`; see docs/CLI.md for the GPG secrets.
+#
+# GoReleaser OSS cannot read prefixed (monorepo) tags, so the workflow sets
+# GORELEASER_CURRENT_TAG=vX.Y.Z on a local, never-pushed tag and uploads dist/ (plus the manifest) to
+# the GitHub release of `provider/vX.Y.Z` itself — hence `release.disable` below.
+version: 2
+
+project_name: terraform-provider-pcdn
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: provider
+    main: .
+    binary: "{{ .ProjectName }}_v{{ .Version }}"
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos: [linux, darwin, windows, freebsd]
+    goarch: [amd64, arm64, "386", arm]
+    ignore:
+      - goos: darwin
+        goarch: "386"
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+
+archives:
+  - id: provider
+    ids: [provider]
+    formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # the registry wants the bare binary in the zip
+    files:
+      - none*
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
+  algorithm: sha256
+  extra_files:
+    - glob: terraform-registry-manifest.json
+      name_template: "{{ .ProjectName }}_{{ .Version }}_manifest.json"
+
+# Detached binary (not armored) signature of the SHA256SUMS file, as the registry requires. The key is
+# imported by the workflow from the GPG_PRIVATE_KEY / PASSPHRASE repository secrets; GPG_FINGERPRINT is
+# the fingerprint that import step reports. Nothing secret lives in this repository.
+signs:
+  - artifacts: checksum
+    args:
+      - --batch
+      - --local-user
+      - "{{ .Env.GPG_FINGERPRINT }}"
+      - --output
+      - ${signature}
+      - --detach-sign
+      - ${artifact}
+
+release:
+  disable: true
+
+changelog:
+  disable: true
