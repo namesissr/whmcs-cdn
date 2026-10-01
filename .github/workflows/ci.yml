@@ -59,3 +59,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: find whmcs -name '*.php' -print0 | xargs -0 -n1 php -l
+
+  terraform:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: terraform-provider-pcdn
+    env:
+      # the plan/apply tests (terraform-plugin-testing against an in-process httptest fake controller,
+      # no network) are skipped without a Terraform CLI; in CI a missing CLI is a failure instead
+      PCDN_REQUIRE_TERRAFORM: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: terraform-provider-pcdn/go.mod
+          cache-dependency-path: terraform-provider-pcdn/go.sum
+      # the wrapper script breaks terraform-plugin-testing (it rewrites stdout), so it stays off
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...
