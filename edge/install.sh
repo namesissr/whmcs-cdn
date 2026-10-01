@@ -290,7 +290,10 @@ nginx -t
 systemctl enable --now nginx
 systemctl reload nginx
 PCDN_CONFIG=/etc/pcdn/agent.conf /usr/bin/python3 /usr/local/bin/pcdn-agent once </dev/null || true
-systemctl enable --now pcdn-agent
+# enable for boot, then restart so an --upgrade actually loads the NEW agent code:
+# `enable --now` would NOT restart an already-running service, leaving the old code in memory.
+systemctl enable pcdn-agent
+systemctl restart pcdn-agent
 
 echo
 echo "Edge installed. Check: systemctl status pcdn-agent ; journalctl -u pcdn-agent -f"
