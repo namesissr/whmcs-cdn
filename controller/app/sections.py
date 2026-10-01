@@ -61,6 +61,21 @@ class Features(Strict):
 
 # ------------------------------------------------------------------ sections
 
+COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,64}$")
+QUERY_PARAM_RE = re.compile(r"^[A-Za-z0-9_\-.\[\]]{1,64}$")
+
+
+def _cookie_names(v: list[str], dedupe: bool = False) -> list[str]:
+    out = []
+    for c in v:
+        c = c.strip()
+        if not COOKIE_NAME_RE.match(c):
+            raise ValueError(f"نام کوکی نامعتبر: {c}")
+        if not dedupe or c not in out:
+            out.append(c)
+    return out
+
+
 class Cache(Strict):
     enabled: bool = True
     dev_mode: bool = False
@@ -71,17 +86,42 @@ class Cache(Strict):
     bypass_cookies: list[str] = Field(default_factory=lambda: ["wordpress_logged_in", "wp-postpass", "PHPSESSID"],
                                       max_length=20)
     always_online: bool = True
+    # SPEC §14.1 (6A): stale content, origin shield and cache-key options
+    stale_while_revalidate: bool = True
+    stale_if_error: int = Field(86400, ge=0, le=604800)
+    shield: bool = False  # tiered cache through the edge group's shield edges (when it has any)
+    key_device: bool = False  # separate desktop / mobile variants
+    key_cookies: list[str] = Field(default_factory=list, max_length=10)  # cookie values join the key
+    key_query_allow: list[str] = Field(default_factory=list, max_length=50)  # only these params key
 
     @field_validator("bypass_cookies")
     @classmethod
     def _cookies(cls, v):
+        return _cookie_names(v)
+
+    @field_validator("key_cookies")
+    @classmethod
+    def _key_cookies(cls, v):
+        return _cookie_names(v, dedupe=True)
+
+    @field_validator("key_query_allow")
+    @classmethod
+    def _key_query(cls, v):
         out = []
-        for c in v:
-            c = c.strip()
-            if not re.match(r"^[A-Za-z0-9_\-.]{1,64}$", c):
-                raise ValueError(f"نام کوکی نامعتبر: {c}")
-            out.append(c)
+        for p in v:
+            p = p.strip()
+            if not QUERY_PARAM_RE.match(p):
+                raise ValueError(f"نام پارامتر نامعتبر: {p}")
+            if p not in out:
+                out.append(p)
         return out
+
+    @model_validator(mode="after")
+    def _query_conflict(self):
+        if self.key_query_allow and self.ignore_query:
+            raise ValueError("key_query_allow با ignore_query=true سازگار نیست؛ وقتی کل رشته پرس‌وجو از "
+                             "کلید کش حذف می‌شود، فهرست پارامترهای مجاز معنا ندارد. یکی را خاموش کنید.")
+        return self
 
 
 class Hsts(Strict):
@@ -97,6 +137,8 @@ class Ssl(Strict):
     min_tls: Literal["1.2", "1.3"] = "1.2"
     origin_protocol: Literal["http", "https"] = "http"
     origin_verify: bool = False
+    # HTTP/3 (QUIC) on this site; only rendered on nodes reporting the http3 capability (SPEC §14.1)
+    http3: bool = True
 
 
 class WafExclusion(Strict):
@@ -223,6 +265,33 @@ class Redirect(Strict):
     code: Literal[301, 302, 307, 308] = 301
 
 
+# A preload URL ends up inside a `Link: <url>; rel=preload; as=...` header that the edge renders
+# into nginx config, so only RFC 3986 URL characters are allowed: no whitespace/CR/LF, quotes,
+# angle brackets, backslash, `$` (nginx variable interpolation) or braces.
+PRELOAD_URL_CHARS_RE = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!&()*+,;=%]+$")
+
+
+class Preload(Strict):
+    """One `Link: rel=preload` / 103 Early Hints entry of a page rule (SPEC §14.1)."""
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    url: str = Field(max_length=2048)
+    as_: Literal["script", "style", "image", "font", "fetch"] = Field(alias="as")
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v):
+        v = (v or "").strip()
+        if not v or not PRELOAD_URL_CHARS_RE.match(v):
+            raise ValueError("آدرس preload نامعتبر است (فاصله، گیومه، < > و کاراکترهای خاص مجاز نیستند)")
+        if v.startswith("/"):
+            if v.startswith("//"):
+                raise ValueError("آدرس preload باید مسیری با / (مثل /app.css) یا آدرس کامل https:// باشد")
+            return v
+        if not re.match(r"^https://[A-Za-z0-9.\-]+(:\d{1,5})?(/|$)", v, re.IGNORECASE):
+            raise ValueError("آدرس preload باید مسیری با / (مثل /app.css) یا آدرس کامل https:// باشد")
+        return v
+
+
 class PageRule(Strict):
     id: str = Field(pattern=ID_RE)
     enabled: bool = True
@@ -233,6 +302,8 @@ class PageRule(Strict):
     ignore_query: bool | None = None
     waf: Literal[False] | None = None
     redirect: Redirect | None = None
+    # `Link: <url>; rel=preload; as=<as>` headers (and 103 Early Hints on capable nodes), SPEC §14.1
+    preload: list[Preload] = Field(default_factory=list, max_length=10)
 
     @field_validator("pattern")
     @classmethod
@@ -427,6 +498,9 @@ class Image(Strict):
     enabled: bool = False
     quality: int = Field(85, ge=10, le=100)
     max_width: int = Field(2000, ge=16, le=8000)
+    # serve WebP for JPEG/PNG to clients sending Accept: image/webp (SPEC §14.1); independent of the
+    # resizing toggle `enabled`, but like it gated by features.image_optimization
+    auto_webp: bool = False
 
 
 class ErrorPages(Strict):
@@ -594,7 +668,28 @@ def section_warnings(site, name: str, value: dict) -> list[str]:
         if value.get("force_https") and get_section(site, "tunnel").get("paths"):
             out.append("force_https روشن شد ولی این سایت مسیر تونل دارد؛ کلاینت‌های تونل روی پورت ۸۰ "
                        "با ریدایرکت ۳۰۱ روبه‌رو می‌شوند و نمی‌توانند وصل شوند.")
+    elif name == "cache":
+        # SPEC §14.1: cache.shield is inert until the site's edge group has an enabled shield edge
+        if value.get("shield") and not _group_has_shield(site):
+            out.append("در گروه لبه این سایت هنوز هیچ سرور سپر (shield) فعالی وجود ندارد؛ تنظیم ذخیره شد "
+                       "ولی تا وقتی مدیر سامانه سرور سپری اضافه نکند، درخواست‌ها مستقیم به مبدأ می‌روند.")
     return out
+
+
+def _group_has_shield(site) -> bool:
+    """True when the site's edge group has at least one enabled shield edge (online or not)."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import object_session
+
+    from .dnsbuild import site_edge_group
+    from .models import Edge
+
+    db = object_session(site)
+    if db is None:
+        return True  # cannot tell: do not warn
+    group = site_edge_group(site)
+    return db.scalar(select(Edge.id).where(Edge.enabled.is_(True), Edge.shield.is_(True),
+                                           Edge.group == group).limit(1)) is not None
 
 
 def _force_https_on(site) -> bool:
@@ -624,7 +719,7 @@ def _is_enabled(name: str, value: dict) -> bool:
     if name == "ddos":
         return value["mode"] != "off"
     if name == "image":
-        return value["enabled"]
+        return value["enabled"] or value["auto_webp"]
     if name == "pools":
         return bool(value["pools"])
     if name == "tunnel":

@@ -21,6 +21,7 @@ from .services import (
     month_start,
     queue_purge,
     record_to_dict,
+    edge_capabilities,
     edge_metrics,
     site_to_dict,
     sync_all_dns,
@@ -158,6 +159,7 @@ class EdgeIn(BaseModel):
     region: str = Field(default="global", pattern="^(home|global)$")
     group: Literal["general", "tunnel"] = "general"
     capacity_mbps: int = Field(default=0, ge=0, le=10_000_000)  # 0 = unknown (never shed)
+    shield: bool = False  # origin shield / tiered cache node (SPEC §14.1)
 
 
 class EdgePatch(BaseModel):
@@ -166,6 +168,7 @@ class EdgePatch(BaseModel):
     group: Literal["general", "tunnel"] | None = None
     capacity_mbps: int | None = Field(default=None, ge=0, le=10_000_000)
     region: str | None = Field(default=None, pattern="^(home|global)$")
+    shield: bool | None = None  # origin shield / tiered cache node (SPEC §14.1)
 
 
 class EdgeAddressIn(BaseModel):
@@ -678,6 +681,10 @@ def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
         "has_logs": bool(e.logs and e.logs not in ("[]", "null")),
         # running bundle version (SPEC §11.1); the panel compares it to GET /edge/version
         "bundle_version": e.bundle_version,
+        # origin shield flag + heartbeat-reported node capabilities (SPEC §14.1); capabilities is
+        # {"http3", "early_hints", "webp_convert", "modules"} or null when never reported
+        "shield": e.shield,
+        "capabilities": edge_capabilities(e),
     }
 
 
@@ -714,11 +721,12 @@ def create_edge(body: EdgeIn, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(409, "edge name exists")
     token = new_token()
     edge = Edge(name=body.name, ipv4=ipv4, ipv6=ipv6, region=body.region, token_hash=hash_token(token),
-                group=body.group, capacity_mbps=body.capacity_mbps)
+                group=body.group, capacity_mbps=body.capacity_mbps, shield=body.shield)
     db.add(edge)
     db.commit()
     _audit(db, request, "edge.add", edge.name,
-           {"region": edge.region, "group": edge.group, "capacity_mbps": edge.capacity_mbps})
+           {"region": edge.region, "group": edge.group, "capacity_mbps": edge.capacity_mbps,
+            "shield": edge.shield})
     # DNS changes once the edge sends its first heartbeat
     return {**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)}
 
@@ -775,7 +783,8 @@ def rotate_edge_token(edge_id: int, request: Request, db: Session = Depends(get_
 @router.patch("/edges/{edge_id}")
 def update_edge(edge_id: int, request: Request, enabled: bool | None = None,
                 body: EdgePatch | None = Body(default=None), db: Session = Depends(get_db)):
-    """JSON body {enabled?, group?, capacity_mbps?, region?}; v1 clients send ?enabled=true|false."""
+    """JSON body {enabled?, group?, capacity_mbps?, region?, shield?}; v1 clients send ?enabled=true|false.
+    A shield change reaches the edges through their next config poll (SPEC §14.1)."""
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")

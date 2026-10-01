@@ -178,6 +178,12 @@ class Edge(Base):
     # running edge bundle version the agent reports (SPEC §11.1); compared to the controller's
     # current bundle (GET /edge/version) to flag nodes that are behind ("update available")
     bundle_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # origin shield / tiered cache (SPEC §14.1): admin-set; non-shield edges of the same group send
+    # cache misses of sites with cache.shield to the online shield edges (services.shield_peers)
+    shield: Mapped[bool] = mapped_column(Boolean, default=False)
+    # node capabilities from the latest heartbeat (SPEC §14.1), JSON
+    # {"http3": bool, "early_hints": bool, "webp_convert": bool, "modules": [str]}; NULL = never reported
+    capabilities: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # additional addresses of the same node for health-based failover (SPEC §12); ipv4/ipv6
     # above stay the primary address

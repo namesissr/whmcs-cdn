@@ -25,7 +25,7 @@ DETAIL_WHITELIST = {
     "reseller_client_id", "reseller_label",
     # edges / addresses
     "name", "region", "group", "capacity_mbps", "enabled", "ipv4", "ipv6",
-    "family", "ip", "label", "address_id", "count",
+    "family", "ip", "label", "address_id", "count", "shield",
     # records / config / keys / purge
     "record_id", "type", "section", "key_id", "scopes", "name_count",
     "everything", "urls", "prefixes", "items", "fields",

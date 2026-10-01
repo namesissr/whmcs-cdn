@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import logging
 from collections import defaultdict
@@ -323,8 +324,67 @@ def resolve_origin(site: Site, rec) -> str | None:
     return rec.content if rec.type == "A" else f"[{rec.content}]"
 
 
-def build_edge_config(db: Session) -> dict:
+SHIELD_CONTEXT = b"pcdn-shield"
+EDGE_IP_PLACEHOLDER = "0.0.0.0"  # batch-created edges (SPEC §11.1) until the node reports itself
+
+
+def shield_secret() -> str:
+    """Fleet-wide key for the `X-Pcdn-Shield` hop header (SPEC §14.1).
+
+    HMAC-SHA256(server-side secret material, "pcdn-shield"): every controller of an HA set derives
+    the same value, every edge gets the same value, and neither the raw DATA_ENCRYPTION_KEY nor
+    the ADMIN_API_KEY ever leaves the controller (HMAC is one-way). The primary (first)
+    DATA_ENCRYPTION_KEY is preferred, ADMIN_API_KEY otherwise; rotating that key rotates this one
+    (one config bump on every edge). Empty when neither is configured: the shield is then off."""
+    material = (settings.data_encryption_key or "").split(",")[0].strip() or (settings.admin_api_key or "")
+    if not material:
+        return ""
+    return hmac.new(material.encode(), SHIELD_CONTEXT, hashlib.sha256).hexdigest()
+
+
+def _edge_addr(e: Edge) -> str | None:
+    """The address other edges reach this edge on: the primary IPv4, else the primary IPv6."""
+    if e.ipv4 and e.ipv4 != EDGE_IP_PLACEHOLDER:
+        return e.ipv4
+    return e.ipv6 or None
+
+
+def shield_peers(db: Session, edge: Edge | None) -> list[str]:
+    """Addresses of the enabled + online shield edges of `edge`'s group, `edge` itself excluded,
+    ordered by edge id (stable, so every edge builds the same consistent-hash ring)."""
+    if edge is None:
+        return []
+    group = dnsbuild.edge_group(edge)
     out = []
+    for e in online_edges(db):  # enabled and heartbeating, ordered by id
+        if not e.shield or e.id == edge.id or dnsbuild.edge_group(e) != group:
+            continue
+        addr = _edge_addr(e)
+        if addr and addr not in out:
+            out.append(addr)
+    return out
+
+
+def edge_capabilities(e: Edge) -> dict | None:
+    """Capabilities from the edge's latest heartbeat (SPEC §14.1), or None when never reported."""
+    if not e.capabilities:
+        return None
+    try:
+        caps = json.loads(e.capabilities)
+    except ValueError:
+        return None
+    return caps if isinstance(caps, dict) else None
+
+
+def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
+    """The config body for one edge (SPEC §5). `edge` is the requesting node: it decides the
+    node-wide `shield` block (self flag, peers without itself) and therefore the version too.
+    Without an edge the shield block is inert."""
+    out = []
+    secret = shield_secret()
+    peers = shield_peers(db, edge) if secret else []
+    group = dnsbuild.edge_group(edge) if edge is not None else None
+    shield_used = False
     for site in db.scalars(select(Site).order_by(Site.id)):
         hosts, seen = [], set()
         for r in site.records:
@@ -361,17 +421,25 @@ def build_edge_config(db: Session) -> dict:
         cache = dict(cfg["cache"])
         if cache["dev_mode"]:
             cache["enabled"] = False
+        # SPEC §14.1: cache.shield takes effect only on an edge of the site's own group that has
+        # at least one online shield peer (the site's group has ≥1 enabled, online shield edge);
+        # otherwise it is folded to false so the edge fetches from the origin as before. A foreign-
+        # group edge only serves the site in DNS fail-open, i.e. when that group has no online edge
+        # (and so no online shield) at all.
+        site_group = dnsbuild.site_edge_group(site)
+        cache["shield"] = bool(cache["shield"] and cache["enabled"] and peers and site_group == group)
         ssl_opts = dict(cfg["ssl"])
         if ssl is None:
             ssl_opts["force_https"] = False
             ssl_opts["hsts"] = dict(ssl_opts["hsts"], enabled=False)
+            ssl_opts["http3"] = False  # QUIC needs the HTTPS server, which is not rendered
         # a feature switched off by the plan wins over what the customer saved
         if not feats["waf"]:
             cfg["waf"] = dict(cfg["waf"], mode="off")
         if not feats["ddos"]:
             cfg["ddos"] = dict(cfg["ddos"], mode="off")
         if not feats["image_optimization"]:
-            cfg["image"] = dict(cfg["image"], enabled=False)
+            cfg["image"] = dict(cfg["image"], enabled=False, auto_webp=False)
         if not feats["load_balancer"]:
             cfg["pools"] = {"pools": []}
             hosts = [h for h in hosts if "pool" not in h["origin"]]
@@ -382,6 +450,7 @@ def build_edge_config(db: Session) -> dict:
         hosts = [h for h in hosts if "pool" not in h["origin"] or h["origin"]["pool"] in pool_names]
         if not hosts:
             continue
+        shield_used = shield_used or cache["shield"]
 
         out.append({
             "id": site.id,
@@ -409,7 +478,20 @@ def build_edge_config(db: Session) -> dict:
             "errorpages": cfg["errorpages"],
             "tunnel": tunnel_for_edge(site, cfg["tunnel"], feats, pool_names),
         })
-    body = {"sites": out}
+    body = {
+        "sites": out,
+        # node-wide origin shield block (SPEC §14.1). `self`: this node is a shield (accepts shield
+        # hops carrying a valid X-Pcdn-Shield, never re-shields). `peers`: the shield edges this
+        # node sends cache misses of shield-enabled sites to — listed only while at least one site
+        # actually uses them, so a shield going on/offline does not bump every node's version (and
+        # reload) when nobody shields. `secret`: fleet-wide hop key (shield_secret).
+        "shield": {
+            "self": bool(edge is not None and edge.shield and secret),
+            "peers": peers if shield_used else [],
+            "secret": secret,
+        },
+    }
+    # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     return {"version": version, **body}
 

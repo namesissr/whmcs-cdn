@@ -41,12 +41,12 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0003: edge group / capacity / metrics columns; 0004: edges.cpu_high; 0005: probe fields;
     # 0009: logs / logs_at / bundle_version (centralized node logs + bundle version);
     # 0011: per-family primary probe (probe_ok4/fail4/ok6/fail6, F32) + shed hysteresis
-    # (shed_high / shed_since, F25)
+    # (shed_high / shed_since, F25); 0013: origin shield flag + heartbeat capabilities (SPEC §14.1)
     added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "edges")
-    assert added == ["bundle_version", "capacity_mbps", "cpu_high", "group", "load_high", "logs",
-                     "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
+    assert added == ["bundle_version", "capabilities", "capacity_mbps", "cpu_high", "group", "load_high",
+                     "logs", "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
                      "probe_fail4", "probe_fail6", "probe_ms", "probe_ok", "probe_ok4", "probe_ok6",
-                     "shed", "shed_high", "shed_since"], diff
+                     "shed", "shed_high", "shed_since", "shield"], diff
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
@@ -88,11 +88,11 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
     assert _diff(any_engine) == []
     with any_engine.connect() as c:
         assert c.execute(text("SELECT domain, secret FROM sites")).one() == ("legacy.com", "ab" * 32)
-        # 0003/0004/0005 fill in the new edge columns of existing edges
+        # 0003/0004/0005/0013 fill in the new edge columns of existing edges
         assert tuple(c.execute(text(
-            'SELECT "group", capacity_mbps, shed, load_high, cpu_high, metrics, probe_fail, probe_ok'
-            " FROM edges")).one()) \
-            == ("general", 0, False, 0, 0, None, 0, None)
+            'SELECT "group", capacity_mbps, shed, load_high, cpu_high, metrics, probe_fail, probe_ok,'
+            " shield, capabilities FROM edges")).one()) \
+            == ("general", 0, False, 0, 0, None, 0, None, False, None)
         assert not migrate.is_legacy(c)
 
 

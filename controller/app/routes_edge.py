@@ -2,10 +2,13 @@
 
 import ipaddress
 import json
+import logging
+import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -13,7 +16,9 @@ from sqlalchemy.orm import Session
 from .auth import require_edge
 from .db import get_db
 from .models import Edge, Purge, SecurityEvent, Site, State, UsageBatch, UsageHourly, utcnow
-from .services import build_edge_config, record_metrics
+from .services import EDGE_IP_PLACEHOLDER, build_edge_config, record_metrics
+
+log = logging.getLogger("pcdn")
 
 router = APIRouter(prefix="/edge/v1")
 
@@ -27,7 +32,8 @@ def config(
 ):
     edge.last_seen_at = utcnow()
     db.commit()
-    cfg = build_edge_config(db)
+    # per-edge: the node-wide `shield` block (self flag, peer list without this edge) differs by node
+    cfg = build_edge_config(db, edge)
     etag = f'"{cfg["version"]}"'
     if if_none_match == etag:
         return Response(status_code=304, headers={"ETag": etag})
@@ -47,6 +53,34 @@ class Metrics(BaseModel):
     mem_pct: float | None = Field(default=None, ge=0, le=100)
 
 
+CAP_MODULES_MAX = 64
+CAP_MODULE_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+
+
+class Capabilities(BaseModel):
+    """What this node's nginx can do (SPEC §14.1); unknown keys are ignored. The agent detects
+    them (`nginx -V`, module files present) and the edge renders the matching directives only where
+    supported; the controller just keeps the latest report for the panel."""
+    http3: bool = False
+    early_hints: bool = False
+    webp_convert: bool = False
+    modules: list[str] = Field(default_factory=list)
+
+    @field_validator("modules", mode="before")
+    @classmethod
+    def _modules(cls, v):
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            raise ValueError("modules must be a list of module names")
+        out: list[str] = []
+        for m in v:
+            # junk names are dropped (not rejected) so a quirky build never fails the heartbeat
+            if isinstance(m, str) and CAP_MODULE_RE.match(m) and m not in out:
+                out.append(m)
+        return sorted(out)[:CAP_MODULES_MAX]
+
+
 class Heartbeat(BaseModel):
     applied_version: str | None = None
     error: str | None = Field(default=None, max_length=4000)
@@ -61,9 +95,19 @@ class Heartbeat(BaseModel):
     # edge enforces allowed_countries at the node — it doesn't here, and geoip provisioning is a node
     # concern. Accepted for observability; older agents omit it.
     geoip: bool | None = None
+    # node capabilities (SPEC §14.1); older agents omit them. A malformed report is ignored (the
+    # previously stored capabilities are kept) instead of failing the heartbeat: a 422 here would
+    # make a healthy node look silent and drop it from DNS over an informational field.
+    capabilities: Capabilities | None = None
 
-
-EDGE_IP_PLACEHOLDER = "0.0.0.0"  # batch-created edges (SPEC §11.1) until the node reports itself
+    @field_validator("capabilities", mode="wrap")
+    @classmethod
+    def _capabilities(cls, v, handler):
+        try:
+            return handler(v)
+        except PydanticValidationError:
+            log.warning("ignoring malformed capabilities in an edge heartbeat")
+            return None
 
 
 def _self_register_ip(edge: Edge, request: Request) -> None:
@@ -99,6 +143,8 @@ def heartbeat(body: Heartbeat, request: Request, edge: Edge = Depends(require_ed
         if body.group is not None:
             edge.group = body.group
     _self_register_ip(edge, request)
+    if body.capabilities is not None:
+        edge.capabilities = json.dumps(body.capabilities.model_dump(), sort_keys=True)
     if body.metrics is not None:
         # the shed flag changes here; scheduler.job_edges rewrites DNS on its next tick
         record_metrics(edge, body.metrics.model_dump(), edge.last_seen_at)
