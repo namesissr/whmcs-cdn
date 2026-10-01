@@ -58,17 +58,20 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
     # 0010: edge_addresses (multi-address edges / health-based failover);
     # 0011: usage_batches (idempotent usage reports, F7); 0012: audit_log (SPEC §13.2);
-    # 0015: analytics_minute, log_spool, webhook_delivery (analytics & platform, SPEC §14.3)
+    # 0015: analytics_minute, log_spool, webhook_delivery (analytics & platform, SPEC §14.3);
+    # 0016: site_events (tunnel origin-down / origin-up events, SPEC §15.4)
     tables = {d[1].name for d in flat if d[0] == "add_table"}
     assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses",
-            "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery"} <= tables, diff
+            "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
+            "site_events"} <= tables, diff
     # 0002: sites.secret String(64) -> Text
     assert any(d[0] == "modify_type" and d[2:4] == ("sites", "secret") for d in flat), diff
     # nothing else changed between 0001 and head
     other = [d for d in flat if d[0] not in ("add_column", "add_table", "modify_type")
              and not (d[0] == "add_index" and d[1].table.name in
                       ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses",
-                       "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery"))]
+                       "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
+                       "site_events"))]
     assert other == [], other
 
 
@@ -98,7 +101,8 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
         # 0015: no integration secret / quota warning on existing sites; the new tables are empty
         assert tuple(c.execute(text("SELECT integration_secrets, quota_warned_at FROM sites")).one()) \
             == (None, None)
-        for table in ("analytics_minute", "log_spool", "webhook_delivery"):
+        # 0016: the site_events table is empty
+        for table in ("analytics_minute", "log_spool", "webhook_delivery", "site_events"):
             assert c.execute(text(f"SELECT count(*) FROM {table}")).scalar() == 0
         # 0003/0004/0005/0013 fill in the new edge columns of existing edges
         assert tuple(c.execute(text(

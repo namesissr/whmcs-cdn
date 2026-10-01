@@ -113,15 +113,21 @@ def _body(event_id: str, event: str, site: Site, data: dict, now: datetime) -> s
                        "data": data}, ensure_ascii=False, separators=(",", ":"))
 
 
-def emit(db: Session, site: Site, event: str, data: dict | None = None, now: datetime | None = None) -> int:
+def new_event_id() -> str:
+    return "evt_" + pysecrets.token_hex(8)
+
+
+def emit(db: Session, site: Site, event: str, data: dict | None = None, now: datetime | None = None,
+         event_id: str | None = None) -> int:
     """Queue `event` for every matching hook of `site` (pending rows, caller's transaction). Never
-    raises; returns the number of deliveries queued."""
+    raises; returns the number of deliveries queued. `event_id` lets a caller that also records the
+    event elsewhere (site_events, SPEC §15.4) use the same id in the webhook body."""
     try:
         hooks = active_hooks(site, event)
         if not hooks:
             return 0
         now = now or utcnow()
-        event_id = "evt_" + pysecrets.token_hex(8)
+        event_id = event_id or new_event_id()
         payload = _body(event_id, event, site, data or {}, now)
         for h in hooks:
             db.add(WebhookDelivery(delivery_id="dlv_" + pysecrets.token_hex(8), site_id=site.id, hook_id=h["id"],

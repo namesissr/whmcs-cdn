@@ -55,6 +55,7 @@ def ingest(db: Session, items: list[dict], site_for_host, merge, now: datetime |
         a["b"] += it["bytes"]
         a["h"] += it["cache_hits"]
         merge(a["d"], {k: it.get(k) or {} for k in DETAIL_KEYS})
+        add_tunnel_counters(a["d"], it)
     for (sid, minute), a in sorted(agg.items()):  # a fixed lock order across concurrent edges
         # every edge reports the same (site, minute): create the bucket race-free, then lock it
         kv.insert_ignore(db, AnalyticsMinute, {"site_id": sid, "minute": minute, "requests": 0, "bytes": 0,
@@ -65,8 +66,22 @@ def ingest(db: Session, items: list[dict], site_for_host, merge, now: datetime |
         row.requests += a["r"]
         row.bytes += a["b"]
         row.cache_hits += a["h"]
-        row.details = json.dumps(merge(_loads(row.details), a["d"]))
+        details = merge(_loads(row.details), a["d"])
+        add_tunnel_counters(details, a["d"])
+        row.details = json.dumps(details)
     return len(agg)
+
+
+TUNNEL_COUNTERS = ("tunnel_attempts", "tunnel_errors")
+
+
+def add_tunnel_counters(dst: dict, src: dict) -> None:
+    """SPEC §15.4: sum the optional per-minute `tunnel_attempts` / `tunnel_errors` (origin errors)
+    into the minute bucket details; absent / zero counters add no key."""
+    for k in TUNNEL_COUNTERS:
+        n = max(int(src.get(k) or 0), 0)
+        if n:
+            dst[k] = int(dst.get(k) or 0) + n
 
 
 def prune(db: Session, now: datetime | None = None) -> None:

@@ -238,12 +238,68 @@ TUNNEL_COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down")
 BIG = 10**18
 
 
+# SPEC §15.1: per tunnel path id quality counters (wave 7). Pre-wave-7 agents omit `paths`.
+TUNNEL_PATH_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+TUNNEL_MAX_PATHS = 50
+TUNNEL_ERROR_KEYS = ("origin_refused", "origin_timeout", "origin_error", "limit", "country", "protocol", "edge")
+TUNNEL_PATH_COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down", "abnormal", "connect_ms_sum",
+                        "connect_n")
+
+
+class TunnelPathErrors(BaseModel):
+    """Request counts per error class (SPEC §15.1); unknown keys are ignored (dropped)."""
+    origin_refused: int = Field(0, ge=0, le=BIG)
+    origin_timeout: int = Field(0, ge=0, le=BIG)
+    origin_error: int = Field(0, ge=0, le=BIG)
+    limit: int = Field(0, ge=0, le=BIG)
+    country: int = Field(0, ge=0, le=BIG)
+    protocol: int = Field(0, ge=0, le=BIG)
+    edge: int = Field(0, ge=0, le=BIG)
+
+
+class TunnelPathUsage(BaseModel):
+    """One path id of one host-hour (SPEC §15.1); unknown keys are ignored (dropped)."""
+    sessions: int = Field(0, ge=0, le=BIG)
+    seconds: float = Field(0, ge=0, le=BIG)
+    bytes_up: int = Field(0, ge=0, le=BIG)
+    bytes_down: int = Field(0, ge=0, le=BIG)
+    abnormal: int = Field(0, ge=0, le=BIG)
+    connect_ms_sum: float = Field(0, ge=0, le=BIG)
+    connect_n: int = Field(0, ge=0, le=BIG)
+    errors: TunnelPathErrors = Field(default_factory=TunnelPathErrors)
+
+
 class TunnelUsage(BaseModel):
     sessions: int = Field(0, ge=0, le=BIG)
     seconds: float = Field(0, ge=0, le=BIG)
     bytes_up: int = Field(0, ge=0, le=BIG)    # received from the client (billed too, SPEC §7.3)
     bytes_down: int = Field(0, ge=0, le=BIG)  # sent to the client (already part of `bytes`)
     by_protocol: Counts = {}                  # protocol -> bytes (up + down)
+    # SPEC §15.1: {path id: counters}. Ids not matching [a-z0-9_-]{1,32} are dropped, and at most 50
+    # ids are kept (the busiest ones) instead of rejecting the batch: a 422 here would block the
+    # agent's billing outbox on an informational field. Negative / non-numeric counters -> 422 like
+    # every other usage counter.
+    paths: dict[str, TunnelPathUsage] = {}
+
+    @field_validator("paths", mode="before")
+    @classmethod
+    def _path_ids(cls, v):
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError("tunnel.paths must be an object of path id -> counters")
+        return {k: c for k, c in v.items() if isinstance(k, str) and TUNNEL_PATH_ID_RE.match(k)}
+
+    @field_validator("paths", mode="after")
+    @classmethod
+    def _cap(cls, v):
+        if len(v) <= TUNNEL_MAX_PATHS:
+            return v
+        busiest = sorted(v.items(), key=lambda kv: (-(kv[1].sessions + sum(kv[1].errors.model_dump().values())),
+                                                    kv[0]))
+        log.warning("dropping %d tunnel path ids beyond %d in a usage item", len(v) - TUNNEL_MAX_PATHS,
+                    TUNNEL_MAX_PATHS)
+        return dict(busiest[:TUNNEL_MAX_PATHS])
 
 
 class UsageItem(BaseModel):
@@ -273,6 +329,11 @@ class LiveItem(BaseModel):
     status: Counts = {}
     countries: Counts = {}
     paths: Counts = {}
+    # SPEC §15.4 (wave 7, optional): tunnel requests in this minute that were attributed to a tunnel
+    # path, and how many of them failed to reach the origin (origin_refused + origin_timeout). The
+    # controller's origin-down detection reads them; older agents omit them (0).
+    tunnel_attempts: int = Field(default=0, ge=0, le=BIG)
+    tunnel_errors: int = Field(default=0, ge=0, le=BIG)
 
 
 class EventIn(BaseModel):
@@ -327,7 +388,27 @@ def _merge_details(current: dict, add: dict) -> dict:
         for k, v in (tn.get("by_protocol") or {}).items():
             if k in TUNNEL_PROTOCOLS:
                 protos[k] = protos.get(k, 0) + max(int(v), 0)
+        if tn.get("paths"):
+            merge_tunnel_paths(dst.setdefault("paths", {}), tn["paths"])
     return current
+
+
+def merge_tunnel_paths(dst: dict, add: dict) -> dict:
+    """Sum per path id counters (SPEC §15.1/§15.3) into `dst`; at most TUNNEL_MAX_PATHS ids per
+    hourly row (new ids beyond the cap are dropped), unknown counter / error keys are ignored."""
+    for pid, src in add.items():
+        pid = str(pid)
+        if not TUNNEL_PATH_ID_RE.match(pid) or not isinstance(src, dict):
+            continue
+        if pid not in dst and len(dst) >= TUNNEL_MAX_PATHS:
+            continue
+        p = dst.setdefault(pid, {})
+        for k in TUNNEL_PATH_COUNTERS:
+            p[k] = int(p.get(k) or 0) + max(int(round(src.get(k) or 0)), 0)
+        errs = p.setdefault("errors", {})
+        for k in TUNNEL_ERROR_KEYS:
+            errs[k] = int(errs.get(k) or 0) + max(int((src.get("errors") or {}).get(k) or 0), 0)
+    return dst
 
 
 def _site_for_host(host: str, domains: dict[str, int]) -> int | None:

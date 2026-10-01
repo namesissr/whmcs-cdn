@@ -1166,7 +1166,9 @@ class Logs(Strict):
 
 
 WEBHOOK_EVENTS = ("purge.completed", "ssl.issued", "ssl.failed", "quota.warning", "quota.exceeded",
-                  "site.suspended", "site.unsuspended", "attack.detected")
+                  "site.suspended", "site.unsuspended", "attack.detected",
+                  # SPEC §15.4: the site's tunnel origin went down / came back
+                  "tunnel.origin_down", "tunnel.origin_up")
 WEBHOOK_ID_RE = re.compile(r"^wh_[0-9a-f]{8}$")
 
 

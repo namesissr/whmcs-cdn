@@ -19,7 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import sections
+from . import sections, tunnel_quality
 from .audit import record_audit
 from .auth import hash_token
 from .config import settings
@@ -35,6 +35,7 @@ from .routes_admin import (
     update_record_of,
 )
 from .routes_platform import live_of
+from .routes_tunnel import quality_of, usage_of
 from .routes_v2 import (
     csv_body,
     import_redirects_of,
@@ -185,6 +186,27 @@ def analytics_live(minutes: int = 60, key: ApiKey = Depends(require_scope("stats
                    db: Session = Depends(get_db)):
     """Per-minute series of the last `minutes` (1..1440) minutes (SPEC §14.3.1)."""
     return live_of(db, _site(key), minutes)
+
+
+# ------------------------------------------------------------------ tunnel (scope: stats, SPEC §15.3/§15.4)
+
+@router.get("/tunnel/quality")
+def tunnel_quality_report(hours: int = 24, key: ApiKey = Depends(require_scope("stats")),
+                          db: Session = Depends(get_db)):
+    """Per-path / per-edge tunnel quality of the last `hours` (1..744) hours."""
+    return quality_of(db, _site(key), hours)
+
+
+@router.get("/tunnel/usage")
+def tunnel_usage(days: int = 30, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Daily tunnel usage of the last `days` (1..90) days and the month forecast."""
+    return usage_of(db, _site(key), days)
+
+
+@router.get("/tunnel/health")
+def tunnel_health(key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Origin health of the site's tunnel paths as seen by the edges: up | down | unknown."""
+    return tunnel_quality.health(db, _site(key))
 
 
 # ------------------------------------------------------------------ records + config (scope: dns)

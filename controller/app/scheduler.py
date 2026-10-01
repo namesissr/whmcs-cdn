@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import and_, delete, or_, select
 
-from . import alerts, dnsbuild, geocheck, live, logexport, nscheck, ssl, uptime, webhooks
+from . import alerts, dnsbuild, geocheck, live, logexport, nscheck, ssl, tunnel_quality, uptime, webhooks
 from .config import settings
 from .db import SessionLocal
 from .leader import instance_id, make_elector
@@ -290,6 +290,8 @@ def job_cleanup(db):
     # SPEC §14.3: live analytics minute buckets live 24 h, webhook delivery rows 7 days
     live.prune(db)
     webhooks.prune(db)
+    # SPEC §15.4: tunnel origin-down / origin-up site events are kept SITE_EVENTS_RETENTION_DAYS
+    tunnel_quality.prune_events(db)
     db.commit()
 
 
@@ -426,13 +428,28 @@ def job_log_export(db, now: datetime | None = None, wait: bool = False):
     return logexport.run_uploads(db, now=now, wait=wait)
 
 
+def job_tunnel_origin(db, now: datetime | None = None):
+    """Every tick (~1 min): tunnel origin-down / origin-up detection from the edges' per-minute
+    tunnel counters of the last 5 minutes (SPEC §15.4, leader only)."""
+    if not settings.tunnel_origin_check:
+        return []
+    return tunnel_quality.check_origins(db, now)
+
+
+def job_capacity(db, now: datetime | None = None, force: bool = False):
+    """Daily: edge-group capacity alert from the 3-day p95 of the hourly tx (SPEC §15.5, leader
+    only)."""
+    return tunnel_quality.check_capacity(db, now, force=force)
+
+
 # metrics: per-job last-completed timestamps are stored in the State table under this prefix
 # (read by routes_metrics for pcdn_scheduler_job_last_run_age_seconds)
 JOBRUN_PREFIX = "jobrun:"
 
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
-JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_cleanup,
-        job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks, job_log_export, job_bot_ranges]
+JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
+        job_capacity, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
+        job_log_export, job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
 FAST_JOBS = [job_webhooks]
 FAST_INTERVAL = 30.0

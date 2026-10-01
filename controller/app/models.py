@@ -455,3 +455,19 @@ class WebhookDelivery(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class SiteEvent(Base):
+    """A customer-facing site event the WHMCS cron polls (SPEC §15.4): `GET /api/v1/events?type=tunnel`
+    lists the tunnel origin transitions (`tunnel.origin_down` / `tunnel.origin_up`) so WHMCS can
+    e-mail the service owner, deduped by the stable `event_id` (the same id the webhook body carries).
+    Rows are pruned after SITE_EVENTS_RETENTION_DAYS (job_cleanup)."""
+
+    __tablename__ = "site_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(24), unique=True)  # "evt_" + 16 hex
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    type: Mapped[str] = mapped_column(String(32), index=True)  # e.g. tunnel.origin_down
+    data: Mapped[str] = mapped_column(Text, default="{}")  # JSON
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

@@ -209,4 +209,17 @@ class Settings:
         default_factory=lambda: max(1, int(os.getenv("ATTACK_EVENTS_PER_5M") or 1000)))
 
 
+    # wave 7 (SPEC §15.4/§15.5): tunnel origin-down detection (leader job every scheduler tick; the
+    # thresholds are fixed by the SPEC), how long site events (GET /api/v1/events?type=tunnel) are
+    # kept, and the edge-group capacity alert (open at >= CAPACITY_ALERT_PERCENT of the group's summed
+    # capacity_mbps at the 3-day p95, resolve below CAPACITY_RESOLVE_PERCENT)
+    tunnel_origin_check: bool = field(default_factory=lambda: _bool("TUNNEL_ORIGIN_CHECK", True))
+    site_events_retention_days: int = field(
+        default_factory=lambda: max(1, int(os.getenv("SITE_EVENTS_RETENTION_DAYS") or 30)))
+    capacity_alert_percent: float = field(
+        default_factory=lambda: float(os.getenv("CAPACITY_ALERT_PERCENT") or 70))
+    capacity_resolve_percent: float = field(
+        default_factory=lambda: float(os.getenv("CAPACITY_RESOLVE_PERCENT") or 60))
+
+
 settings = Settings()

@@ -11,6 +11,7 @@ from . import (
     routes_metrics,
     routes_ops,
     routes_platform,
+    routes_tunnel,
     routes_v2,
 )
 from .config import settings
@@ -75,6 +76,8 @@ app.include_router(routes_admin.router)
 app.include_router(routes_v2.router)
 # analytics & platform (SPEC §14.3): live analytics, log export, webhooks, SLA
 app.include_router(routes_platform.router)
+# wave 7 (SPEC §15.3/§15.4): tunnel quality, usage forecast, origin health
+app.include_router(routes_tunnel.router)
 # public, unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)
 app.include_router(routes_v2.public_router)
 app.include_router(routes_capi.router)

@@ -573,6 +573,7 @@ def overview(db: Session = Depends(get_db)):
     domains = dict(db.execute(select(Site.id, Site.domain)).all())
     online = {e.id for e in online_edges(db)}
     edges = list(db.scalars(select(Edge).order_by(Edge.id)))
+    from . import tunnel_quality
     from . import uptime as up
     from .services import edge_metrics
     ups = up.summaries(db)
@@ -590,6 +591,8 @@ def overview(db: Session = Depends(get_db)):
         "top_sites": [{"domain": domains.get(sid, "?"), "bytes": b, "requests": requests[sid]}
                       for sid, b in usage.most_common(10)],
         "nameservers": settings.nameservers,
+        # SPEC §15.5: per edge group, 3-day p95 of the hourly tx vs the group's summed capacity
+        "capacity": tunnel_quality.capacity(db),
     }
 
 
@@ -691,13 +694,49 @@ def update_incident(incident_id: int, body: IncidentPatch, db: Session = Depends
     return incident_dict(inc)
 
 
+def _since(value: str | None):
+    """`since` query value: ISO 8601 (`Z` / offset / naive = UTC) -> naive UTC; 422 otherwise."""
+    if value is None or value == "":
+        return None
+    from datetime import datetime, timezone
+
+    raw = value.strip().replace("Z", "+00:00").replace("z", "+00:00")
+    dt = None
+    # an unencoded "+hh:mm" offset arrives as " hh:mm"
+    for candidate in (raw, raw[:-6] + "+" + raw[-5:] if len(raw) > 6 and raw[-6] == " " else None):
+        try:
+            dt = datetime.fromisoformat(candidate) if candidate else None
+        except ValueError:
+            continue
+        if dt is not None:
+            break
+    if dt is None:
+        bad(ValidationError("since باید یک زمان ISO 8601 باشد (مثلاً 2026-10-01T12:00:00Z)"))
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 @router.get("/events")
-def all_events(limit: int = 100, source: str | None = None, db: Session = Depends(get_db)):
-    """Newest security events across every site (admin panel)."""
+def all_events(limit: int = 100, source: str | None = None, type: str | None = None, since: str | None = None,
+               db: Session = Depends(get_db)):
+    """Security events across every site, newest first (admin panel; default / `type=security`), or
+    with `type=tunnel` the tunnel origin-down / origin-up site events (SPEC §15.4), oldest first,
+    created at or after `since` — polled by the WHMCS cron, deduped by the stable event `id`."""
+    from . import tunnel_quality
+
+    kind = (type or "security").strip().lower()
+    if kind not in ("security", *tunnel_quality.EVENT_TYPES):
+        bad(ValidationError("type باید security یا tunnel باشد"))
+    after = _since(since)
+    if kind in tunnel_quality.EVENT_TYPES:
+        return tunnel_quality.list_events(db, kind, after, limit)
     limit = max(1, min(limit, 1000))
     q = select(SecurityEvent, Site.domain).join(Site, Site.id == SecurityEvent.site_id)
     if source:
         q = q.where(SecurityEvent.source == source)
+    if after is not None:
+        q = q.where(SecurityEvent.ts >= after)
     rows = db.execute(q.order_by(SecurityEvent.ts.desc(), SecurityEvent.id.desc()).limit(limit)).all()
     return [{"domain": d, "t": e.ts.isoformat() + "Z", "ip": e.ip, "country": e.country, "method": e.method,
              "host": e.host, "path": e.path, "action": e.action, "source": e.source, "rule": e.rule,
