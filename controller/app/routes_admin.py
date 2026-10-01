@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import bundle, dnsbuild, nscheck, pdns, sections, webhooks
+from . import bundle, dnsbuild, l4, nscheck, pdns, sections, webhooks
 from .audit import record_audit
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
@@ -92,6 +92,9 @@ class FeaturesIn(BaseModel):
     log_export: bool | None = None
     max_webhooks: int | None = Field(default=None, ge=0, le=sections.WEBHOOKS_MAX)
     sla_target: float | None = Field(default=None, ge=0, le=100)
+    # TCP/UDP proxy (SPEC §16.4)
+    l4_proxy: bool | None = None
+    max_l4_apps: int | None = Field(default=None, ge=0, le=sections.L4_APPS_MAX)
 
 
 class Plan(BaseModel):
@@ -152,6 +155,11 @@ class RecordIn(BaseModel):
     origin_port: int | None = Field(default=None, ge=1, le=65535)
     health_check: bool = False
     health_port: int | None = Field(default=None, ge=1, le=65535)
+    # SPEC §16.7: weighted / failover sets of non-proxied A/AAAA/CNAME records and the controller's
+    # probe protocol (null = tcp; on an unweighted A/AAAA set null keeps the PowerDNS port check)
+    weight: int | None = Field(default=None, ge=0, le=100)
+    health_protocol: Literal["tcp", "http", "https"] | None = None
+    health_path: str | None = Field(default=None, max_length=512, pattern=r"^/[^\s\"'<>\\]*$")
 
 
 class PurgeIn(BaseModel):
@@ -288,15 +296,29 @@ def read_site(domain: str, db: Session = Depends(get_db)):
 @router.patch("/sites/{domain}/plan")
 def update_plan(domain: str, plan: Plan, request: Request, db: Session = Depends(get_db)):
     site = lock_site(db, get_site(db, domain))  # read-modify-write of site.features
-    group = sections.features_of(site)["edge_group"]
+    before = sections.features_of(site)
+    group = before["edge_group"]
     apply_plan(site, plan)
+    after = sections.features_of(site)
+    moved = []
+    if after["edge_group"] != group:
+        # SPEC §16.4: the site's TCP/UDP edge ports move to the new group (re-allocated on conflict)
+        try:
+            moved = l4.rehome(db, site)
+        except l4.PortConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
     # a raised/lowered bandwidth limit takes effect now, not on the next scheduler tick
     refresh_quota(db, site)
     db.commit()
     _audit(db, request, "site.plan", site.domain, plan.model_dump(exclude_none=True))
-    if sections.features_of(site)["edge_group"] != group:
-        sync_site_dns(db, site)  # the site is now answered by the other group of edges
-    return site_to_dict(db, site)
+    if after["edge_group"] != group or (before["l4_proxy"], before["max_l4_apps"]) != (
+            after["l4_proxy"], after["max_l4_apps"]):
+        sync_site_dns(db, site)  # other edges answer / the l4-<id> names appear or go
+    out = site_to_dict(db, site)
+    if moved:
+        out["l4_reallocated"] = moved
+    return out
 
 
 @router.patch("/sites/{domain}/reseller")
@@ -537,11 +559,15 @@ def revoke_api_key(domain: str, key_id: int, db: Session = Depends(get_db)):
 
 # ------------------------------------------------------------------ records
 
-def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None):
+def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None, weighted: bool = False):
     others = [r for r in site.records if r.name == name and r.id != exclude_id]
-    if rtype == "CNAME" and others:
-        raise ValidationError("رکورد CNAME نمی‌تواند با رکورد دیگری هم‌نام باشد")
-    if any(r.type == "CNAME" for r in others):
+    # SPEC §16.7: several weighted non-proxied CNAMEs may share a name (one is answered per query)
+    cname_set = weighted and rtype == "CNAME" and all(
+        r.type == "CNAME" and not r.proxied and r.weight is not None for r in others)
+    if rtype == "CNAME" and others and not cname_set:
+        raise ValidationError("رکورد CNAME نمی‌تواند با رکورد دیگری هم‌نام باشد (چند CNAME هم‌نام فقط وقتی همه "
+                              "وزن‌دار و بدون پروکسی باشند مجاز است)")
+    if any(r.type == "CNAME" for r in others) and not cname_set:
         raise ValidationError("برای این نام یک رکورد CNAME وجود دارد")
     # ALIAS answers A/AAAA itself, so it cannot share a name with address records
     address = {"A", "AAAA", "ALIAS"}
@@ -556,20 +582,31 @@ def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> d
         raise ValidationError("CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است؛ از ALIAS استفاده کنید")
     if rtype == "NS" and name == "@":
         raise ValidationError("نیم‌سرورهای ریشه به‌صورت خودکار مدیریت می‌شوند")
-    _conflicts(site, name, rtype, exclude_id)
+    weighted = body.weight is not None
+    if weighted and (proxied or rtype not in ("A", "AAAA", "CNAME")):
+        raise ValidationError("وزن (weight) فقط برای رکوردهای A، AAAA و CNAME بدون پروکسی مجاز است")
+    _conflicts(site, name, rtype, exclude_id, weighted)
+    if name.startswith("l4-") and name[3:] in {a["id"] for a in sections.get_section(site, "l4")["apps"]}:
+        raise ValidationError(f"نام {name} برای برنامه TCP/UDP همین سرویس رزرو شده است")
     pool = body.pool if proxied else None
     if pool:
         if not sections.features_of(site)["load_balancer"]:
             raise PermissionError("توزیع بار در پلن شما فعال نیست")
         if pool not in {p["name"] for p in sections.get_section(site, "pools")["pools"]}:
             raise ValidationError(f"استخر {pool} تعریف نشده است")
-    health = body.health_check and not proxied and rtype in ("A", "AAAA")
+    health = body.health_check and not proxied and rtype in ("A", "AAAA", "CNAME")
+    if rtype == "CNAME" and health and not weighted:
+        health = False  # a lone CNAME has nothing to fail over to
+    protocol = body.health_protocol if health else None
     return {
         "name": name, "type": rtype, "content": content, "priority": prio, "proxied": proxied, "ttl": body.ttl,
         "pool": pool,
         "origin_port": body.origin_port if proxied and not pool else None,
         "health_check": health,
         "health_port": body.health_port if health else None,
+        "weight": body.weight,
+        "health_protocol": protocol,
+        "health_path": (body.health_path or "/") if protocol in ("http", "https") else None,
     }
 
 

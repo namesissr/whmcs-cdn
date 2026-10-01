@@ -44,17 +44,20 @@ class PdnsClient:
         r = self._req("GET", f"/zones/{dot(domain)}")
         return None if r.status_code == 404 else r.json()
 
-    def create_zone(self, domain: str):
-        body = {
-            "name": dot(domain),
-            "kind": "Native",
-            "nameservers": [],
-            "soa_edit_api": "INCEPTION-INCREMENT",
-            "rrsets": [{
-                "name": dot(domain), "type": "SOA", "ttl": 3600,
-                "records": [{"content": soa_content(domain), "disabled": False}],
-            }],
-        }
+    def create_zone(self, domain: str, kind: str = "Native", masters: list[str] | None = None):
+        if kind == "Slave":  # secondary DNS (SPEC §16.7): the content comes from the masters (AXFR)
+            body = {"name": dot(domain), "kind": "Slave", "masters": list(masters or []), "nameservers": []}
+        else:
+            body = {
+                "name": dot(domain),
+                "kind": "Native",
+                "nameservers": [],
+                "soa_edit_api": "INCEPTION-INCREMENT",
+                "rrsets": [{
+                    "name": dot(domain), "type": "SOA", "ttl": 3600,
+                    "records": [{"content": soa_content(domain), "disabled": False}],
+                }],
+            }
         self._req("POST", "/zones", json=body)
 
     def delete_zone(self, domain: str):
@@ -63,11 +66,22 @@ class PdnsClient:
     def patch(self, domain: str, rrsets: list[dict]):
         self._req("PATCH", f"/zones/{dot(domain)}", json={"rrsets": rrsets})
 
-    def sync_zone(self, site, edges) -> None:
+    def sync_zone(self, site, edges, force_secondary: bool = False) -> None:
+        from .dns_secondary import spec as secondary_spec
+
+        sec = secondary_spec(site, force=force_secondary)
         zone = self.get_zone(site.domain)
         if zone is None:
-            self.create_zone(site.domain)
-            zone = self.get_zone(site.domain) or {"rrsets": []}
+            kind = sec["kind"] if sec else "Native"
+            self.create_zone(site.domain, kind, sec["masters"] if sec else None)
+            zone = self.get_zone(site.domain) or {"rrsets": [], "kind": kind}
+        if sec is not None or zone.get("kind") == "Slave":
+            from .dns_secondary import OFF
+
+            sec = sec or dict(OFF)
+            self.sync_secondary(site.domain, zone, sec)
+            if sec["kind"] == "Slave":
+                return  # a slave zone's content comes from the customer's primaries
         desired = build_rrsets(site, edges)
         want = {(r["name"], r["type"]) for r in desired}
         patch = [dict(r, changetype="REPLACE") for r in desired]
@@ -77,6 +91,50 @@ class PdnsClient:
                 continue
             patch.append({"name": rr["name"], "type": rr["type"], "changetype": "DELETE"})
         self.patch(site.domain, patch)
+
+    # --- secondary DNS (SPEC §16.7) ---------------------------------------
+    def set_zone_kind(self, domain: str, kind: str, masters: list[str]):
+        self._req("PUT", f"/zones/{dot(domain)}", json={"kind": kind, "masters": list(masters)})
+
+    def axfr_retrieve(self, domain: str):
+        self._req("PUT", f"/zones/{dot(domain)}/axfr-retrieve")
+
+    def set_metadata(self, domain: str, kind: str, values: list[str]):
+        """Replace one zone metadata kind; an empty list removes it."""
+        if values:
+            self._req("PUT", f"/zones/{dot(domain)}/metadata/{kind}", json={"kind": kind, "metadata": list(values)})
+        else:
+            self._req("DELETE", f"/zones/{dot(domain)}/metadata/{kind}")
+
+    def ensure_tsigkey(self, name: str, algorithm: str, secret: str):
+        r = self._req("GET", f"/tsigkeys/{dot(name)}")
+        body = {"name": name, "algorithm": algorithm, "key": secret}
+        if r.status_code == 404:
+            self._req("POST", "/tsigkeys", json=body)
+            return
+        cur = r.json()
+        if cur.get("algorithm", "").rstrip(".").lower() != algorithm or cur.get("key") != secret:
+            self._req("PUT", f"/tsigkeys/{cur.get('id') or dot(name)}", json=body)
+
+    def delete_tsigkey(self, name: str):
+        self._req("DELETE", f"/tsigkeys/{dot(name)}")
+
+    def sync_secondary(self, domain: str, zone: dict, sec: dict):
+        """Zone kind / masters, TSIG key and transfer metadata as `sec` (dns_secondary.spec) says."""
+        tsig = sec.get("tsig")
+        if tsig:
+            self.ensure_tsigkey(tsig["name"], tsig["algorithm"], tsig["secret"])
+        kind, masters = sec["kind"], sec["masters"]
+        if zone.get("kind", "Native") != kind or _masters(zone.get("masters")) != _masters(masters):
+            self.set_zone_kind(domain, kind, masters)
+            if kind == "Slave":
+                try:
+                    self.axfr_retrieve(domain)  # first transfer now rather than at the next refresh
+                except PdnsError:
+                    log.warning("axfr-retrieve of %s failed; PowerDNS retries on its own", domain)
+        self.set_metadata(domain, "ALLOW-AXFR-FROM", sec["allow_axfr"])
+        self.set_metadata(domain, "TSIG-ALLOW-AXFR", [tsig["name"]] if tsig and sec["allow_axfr"] else [])
+        self.set_metadata(domain, "AXFR-MASTER-TSIG", [tsig["name"]] if tsig and kind == "Slave" else [])
 
     def set_txt(self, zone: str, name: str, values: list[str]):
         if values:
@@ -131,8 +189,11 @@ class PdnsCluster:
         if errors:
             raise PdnsError("; ".join(errors.values()), errors)
 
-    def sync_zone(self, site, edges):
-        self._each(lambda c: c.sync_zone(site, edges))
+    def sync_zone(self, site, edges, force_secondary: bool = False):
+        self._each(lambda c: c.sync_zone(site, edges, force_secondary))
+
+    def delete_tsigkey(self, name: str):
+        self._each(lambda c: c.delete_tsigkey(name))
 
     def delete_zone(self, domain: str):
         self._each(lambda c: c.delete_zone(domain))
@@ -191,6 +252,19 @@ class PdnsCluster:
         # prefer SHA-256 digests (digest type 2)
         ds = [d for d in k.get("ds", []) if d.split()[2:3] == ["2"]] or k.get("ds", [])
         return {"enabled": True, "ds": ds, "dnskey": k.get("dnskey")}
+
+
+def _masters(values) -> list[str]:
+    """Comparable master list: PowerDNS may report "ip:53" for an address configured as "ip"."""
+    out = []
+    for v in values or []:
+        v = str(v).strip()
+        if v.startswith("[") and v.endswith("]:53"):
+            v = v[1:-4]
+        elif v.count(":") == 1 and v.endswith(":53"):
+            v = v[:-3]
+        out.append(v.strip("[]"))
+    return sorted(out)
 
 
 def ping(c: PdnsClient, timeout: float = 5) -> str | None:

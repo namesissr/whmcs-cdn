@@ -143,8 +143,37 @@ class Record(Base):
     origin_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     health_check: Mapped[bool] = mapped_column(Boolean, default=False)
     health_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # wave 8 (SPEC §16.7): weighted / failover sets of non-proxied A/AAAA/CNAME records. weight 0..100
+    # (NULL = not weighted; 0 = standby, answered only while no member with weight > 0 is healthy).
+    # health_protocol tcp | http | https (NULL = tcp) and health_path (http/https) of the controller's
+    # 60 s probe; health_ok / health_fail / health_at / health_ms / health_error are its last result
+    # and consecutive-failure counter (withdrawn after PROBE_FAIL_CHECKS failures, never all members)
+    weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    health_protocol: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    health_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    health_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    health_fail: Mapped[int] = mapped_column(Integer, default=0)
+    health_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    health_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    health_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     site: Mapped[Site] = relationship(back_populates="records")
+
+
+class L4Port(Base):
+    """An edge port allocated to one TCP/UDP proxy app (SPEC §16.4). Unique per edge group across
+    every site (the nginx `stream` listeners of one group share the nodes' ports); the row of an app
+    is replaced on every write of the site's `l4` section and removed with the app / the site."""
+
+    __tablename__ = "l4_ports"
+    __table_args__ = (UniqueConstraint("group", "port", name="uq_l4_ports_group_port"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group: Mapped[str] = mapped_column(String(16))  # edge group: general | tunnel
+    port: Mapped[int] = mapped_column(Integer)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    app_id: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Edge(Base):

@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass, field
 
 
@@ -20,6 +21,27 @@ def _raw_list(name: str) -> list[str]:
 def _default_edge_dir() -> str:
     """The repo's edge/ tree resolved relative to this package: <repo>/edge (controller/app -> ../../edge)."""
     return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "edge"))
+
+
+L4_DEFAULT_RANGE = (20000, 29999)
+
+
+def _port_range(raw: str | None) -> tuple[int, int]:
+    """"20000-29999" -> (20000, 29999); anything invalid -> the default. Clamped to 1024..65535."""
+    m = re.match(r"^\s*(\d{1,5})\s*-\s*(\d{1,5})\s*$", raw or "")
+    if not m:
+        return L4_DEFAULT_RANGE
+    lo, hi = max(1024, int(m.group(1))), min(65535, int(m.group(2)))
+    return (lo, hi) if lo <= hi else L4_DEFAULT_RANGE
+
+
+def _ports(raw: str) -> set[int]:
+    out = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if x.isdigit() and 1 <= int(x) <= 65535:
+            out.add(int(x))
+    return out
 
 
 @dataclass
@@ -224,6 +246,16 @@ class Settings:
     # node's new tunnel sessions is throttled at admission (edge config `node.fair_share_pct`)
     fair_share_pct: int = field(
         default_factory=lambda: min(100, max(1, int(os.getenv("FAIR_SHARE_PCT") or 25))))
+
+    # wave 8 (SPEC §16.4): TCP/UDP proxy ("Spectrum"). Customer edge ports are allocated inside this
+    # inclusive range (unique per edge group); the operator must open it in the edges' firewall.
+    # L4_RESERVED_PORTS: extra ports never handed out (22, 53, 80 and 443 are always reserved).
+    l4_port_range: tuple[int, int] = field(default_factory=lambda: _port_range(os.getenv("L4_PORT_RANGE")))
+    l4_reserved_ports: set[int] = field(default_factory=lambda: _ports(os.getenv("L4_RESERVED_PORTS", "")))
+    # wave 8 (SPEC §16.7): controller-side health checks of non-proxied DNS records (weighted /
+    # failover sets): the scheduler leader probes them every 60 s
+    record_probe_enabled: bool = field(default_factory=lambda: _bool("RECORD_PROBE_ENABLED", True))
+    record_probe_timeout: float = field(default_factory=lambda: float(os.getenv("RECORD_PROBE_TIMEOUT") or 5))
 
 
 settings = Settings()

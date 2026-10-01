@@ -267,6 +267,11 @@ def test_edge_patch_shield_and_audit(client):
 
 # ------------------------------------------------------------------ edge: heartbeat capabilities
 
+# SPEC §16 (wave 8) capability defaults of an agent that does not report them
+WAVE8_CAPS = {"l4": False, "l4_port_range": None, "slice": False, "video": False, "avif": False,
+              "image_transform": False, "net_guard": False}
+
+
 def test_heartbeat_capabilities_stored_and_sanitised(client):
     tok = mk_edge(client, "e1", "5.160.1.10")["token"]
     assert edge_obj(client, "e1")["capabilities"] is None  # never reported
@@ -276,7 +281,7 @@ def test_heartbeat_capabilities_stored_and_sanitised(client):
     caps = edge_obj(client, "e1")["capabilities"]
     assert caps == {"http3": True, "early_hints": True, "webp_convert": False,
                     "modules": ["brotli", "image_filter", "njs"],
-                    "waf_packs": {}, "live_analytics": False, "logship": False}
+                    "waf_packs": {}, "live_analytics": False, "logship": False, **WAVE8_CAPS}
     # a heartbeat without capabilities keeps the last report
     hb(client, tok)
     assert edge_obj(client, "e1")["capabilities"] == caps
@@ -320,7 +325,7 @@ def test_heartbeat_malformed_capabilities_are_ignored_not_fatal(client, bad):
     assert after["last_seen_at"] >= before["last_seen_at"]
     assert after["capabilities"] == {"http3": True, "early_hints": False, "webp_convert": False,
                                      "modules": ["njs"], "waf_packs": {}, "live_analytics": False,
-                                     "logship": False}
+                                     "logship": False, **WAVE8_CAPS}
 
 
 # ------------------------------------------------------------------ edge config: per-site fields

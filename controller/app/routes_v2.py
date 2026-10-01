@@ -12,9 +12,10 @@ import pydantic
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import logexport, origin_pull, pdns, sections, ssl, tunnel, webhooks
+from . import dns_secondary, images, l4, logexport, origin_pull, pdns, sections, ssl, tunnel, webhooks
 from .audit import record_audit
 from .auth import require_admin
 from .config import settings
@@ -82,13 +83,44 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
     except ValidationError as e:
         bad(e)
     new_secrets = None
+    stale_tsig = None
     if section == "logs":  # write-only secret_key: stored encrypted outside the section (SPEC §14.3.2)
         value = logexport.apply_write(site, value)
     elif section == "webhooks":  # ids + signing secrets assigned by the controller (SPEC §14.3.3)
         value, new_secrets = webhooks.apply_write(site, value)
+    elif section == "image":  # write-only transform_secret (SPEC §16.6)
+        value = images.apply_write(site, value)
+    elif section == "dns_secondary":  # write-only TSIG secret, key name unique per site (SPEC §16.7)
+        try:
+            value, stale_tsig = dns_secondary.apply_write(db, site, value)
+        except dns_secondary.TsigConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
+    elif section == "l4":  # edge ports allocated / checked across the edge group (SPEC §16.4)
+        try:
+            value = l4.apply_write(db, site, value)
+        except l4.PortConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(409, "همین حالا پورتی که انتخاب شد به سرویس دیگری داده شد؛ دوباره تلاش کنید")
     sections.store_section(site, section, value)
-    db.commit()
-    if section in ("logs", "webhooks"):
+    try:
+        db.commit()
+    except IntegrityError:  # l4: a concurrent writer took the same port (unique group + port)
+        db.rollback()
+        raise HTTPException(409, "همین حالا پورتی که انتخاب شد به سرویس دیگری داده شد؛ دوباره تلاش کنید")
+    dns_error = None
+    if section in ("l4", "dns_secondary"):
+        # the l4-<id> names / the zone kind and transfer settings live in PowerDNS
+        if section == "dns_secondary" and stale_tsig and settings.pdns_enabled:
+            try:
+                pdns.client().delete_tsigkey(stale_tsig)
+            except Exception as e:  # noqa: BLE001 - a stale key is harmless; reported only
+                log.warning("could not remove TSIG key %s: %s", stale_tsig, e)
+        dns_error = sync_site_dns(db, site, force_secondary=section == "dns_secondary")
+    if section in ("logs", "webhooks", "image", "dns_secondary", "l4"):
         # the stored view: secrets never returned, only secret_key_set / secret_set; the secrets of
         # newly created webhooks are shown this once
         value = sections.get_section(site, section)
@@ -108,6 +140,8 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
         warnings = sections.section_warnings(site, section, value)
         if warnings:
             response.headers["X-Pcdn-Warnings"] = json.dumps(warnings)
+        if dns_error:  # the section is saved; the zone is re-synced by the scheduler (DNS dirty)
+            response.headers["X-Pcdn-Dns-Error"] = json.dumps(dns_error[:500])
     return value
 
 
@@ -122,6 +156,45 @@ def write_section(domain: str, section: str, body: dict, response: Response, req
     site = get_site(db, domain)
     result = write_section_of(db, site, section, body, response)
     _audit(db, request, "config.update", site.domain, {"section": section})
+    return result
+
+
+# ------------------------------------------------------------------ images v2 (SPEC §16.6)
+
+def image_secret_create_of(db: Session, site: Site) -> dict:
+    """Generate (or replace) the site's image transform secret; returned this once."""
+    if not sections.features_of(site)["image_optimization"]:
+        raise HTTPException(403, "بهینه‌سازی تصویر در پلن شما فعال نیست")
+    site = lock_site(db, site)  # read-modify-write of site.integration_secrets
+    secret = images.rotate(site)
+    db.commit()
+    return {"transform_secret": secret, "transform_secret_set": True,
+            "algorithm": "hex(HMAC-SHA256(transform_secret, canonical))",
+            "signed_params": list(images.SIGNED_PARAMS)}
+
+
+def image_secret_delete_of(db: Session, site: Site) -> dict:
+    site = lock_site(db, site)
+    if not images.remove(site):
+        raise HTTPException(404, "کلید امضای تبدیل تصویر ثبت نشده است")
+    db.commit()
+    return {"transform_secret_set": False}
+
+
+@router.post("/sites/{domain}/image/transform-secret")
+def image_secret_create(domain: str, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = image_secret_create_of(db, site)
+    # the secret itself is never written to the audit log
+    _audit(db, request, "image.transform_secret", site.domain, {"mode": "rotate"})
+    return result
+
+
+@router.delete("/sites/{domain}/image/transform-secret")
+def image_secret_delete(domain: str, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = image_secret_delete_of(db, site)
+    _audit(db, request, "image.transform_secret", site.domain, {"mode": "remove"})
     return result
 
 
@@ -427,7 +500,10 @@ def site_analytics(db: Session, site: Site, period: str) -> dict:
 
     totals = {"requests": 0, "bytes": 0, "cache_hits": 0,
               "status": {k: 0 for k in ("2xx", "3xx", "4xx", "5xx")},
-              "security": {k: 0 for k in SECURITY_SOURCES}}
+              "security": {k: 0 for k in SECURITY_SOURCES},
+              # SPEC §16.5 / §16.4: video bytes (part of `bytes`) and TCP/UDP proxy traffic
+              "video": {"bytes": 0, "requests": 0, "cache_hits": 0},
+              "l4": {"bytes_in": 0, "bytes_out": 0, "sessions": 0, "apps": {}}}
     buckets: dict[str, dict] = {}
     countries, paths, codes = Counter(), Counter(), Counter()
     for row in rows:
@@ -447,6 +523,15 @@ def site_analytics(db: Session, site: Site, period: str) -> dict:
         countries.update({k: int(v) for k, v in d.get("countries", {}).items()})
         paths.update({k: int(v) for k, v in d.get("paths", {}).items()})
         codes.update({k: int(v) for k, v in d.get("codes", {}).items()})
+        v = d.get("video") or {}
+        totals["video"]["bytes"] += int(v.get("bytes") or 0)
+        totals["video"]["requests"] += int(v.get("requests") or 0)
+        totals["video"]["cache_hits"] += int(v.get("cache_hits") or 0)
+        for app_id, c in (d.get("l4") or {}).items():
+            a = totals["l4"]["apps"].setdefault(app_id, {"bytes_in": 0, "bytes_out": 0, "sessions": 0})
+            for k in ("bytes_in", "bytes_out", "sessions"):
+                a[k] += int(c.get(k) or 0)
+                totals["l4"][k] += int(c.get(k) or 0)
 
     # zero-filled series so charts have a point per hour/day
     series, step = [], timedelta(hours=1) if hourly else timedelta(days=1)

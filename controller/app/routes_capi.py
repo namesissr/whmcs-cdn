@@ -38,6 +38,8 @@ from .routes_platform import live_of
 from .routes_tunnel import quality_of, usage_of
 from .routes_v2 import (
     csv_body,
+    image_secret_create_of,
+    image_secret_delete_of,
     import_redirects_of,
     read_section_of,
     site_analytics,
@@ -261,6 +263,23 @@ def import_redirects(request: Request, response: Response, mode: str | None = No
     mode = body["mode"] or mode or "append"
     result = import_redirects_of(db, _site(_rate_limit_config(key)), body["csv"], mode, response)
     _audit(db, request, key, "redirects.import", {"count": result["imported"], "mode": mode})
+    return result
+
+
+@router.post("/image/transform-secret")
+def image_secret_create(request: Request, key: ApiKey = Depends(require_scope("dns")),
+                        db: Session = Depends(get_db)):
+    """Generate a new signed-URL key for image transforms (SPEC §16.6); shown this once."""
+    result = image_secret_create_of(db, _site(_rate_limit_config(key)))
+    _audit(db, request, key, "image.transform_secret", {"mode": "rotate"})
+    return result
+
+
+@router.delete("/image/transform-secret")
+def image_secret_delete(request: Request, key: ApiKey = Depends(require_scope("dns")),
+                        db: Session = Depends(get_db)):
+    result = image_secret_delete_of(db, _site(_rate_limit_config(key)))
+    _audit(db, request, key, "image.transform_secret", {"mode": "remove"})
     return result
 
 

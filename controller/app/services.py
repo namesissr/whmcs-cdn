@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import botranges, dnsbuild, logexport, origin_pull, pdns, sections, webhooks
+from . import botranges, dnsbuild, images, l4, logexport, origin_pull, pdns, sections, webhooks
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -158,16 +158,21 @@ def rebalance_pool_shed(db: Session, now: datetime | None = None) -> None:
 DNS_DIRTY_KEY = "dns_dirty"
 
 
-def sync_site_dns(db: Session, site: Site, server_errors: dict[int, str] | None = None) -> str | None:
+def sync_site_dns(db: Session, site: Site, server_errors: dict[int, str] | None = None,
+                  force_secondary: bool = False) -> str | None:
     """Push the zone to PowerDNS. Returns an error string on failure.
 
     A failure marks DNS as dirty so the scheduler re-syncs every zone once the
-    PowerDNS server is reachable again (see scheduler.job_edges).
+    PowerDNS server is reachable again (see scheduler.job_edges). `force_secondary`: also apply an
+    "off" secondary-DNS setting (clears transfer metadata left by an earlier setting, SPEC §16.7).
     """
     if not settings.pdns_enabled:
         return None
     try:
-        pdns.client().sync_zone(site, online_edges(db))
+        if force_secondary:
+            pdns.client().sync_zone(site, online_edges(db), force_secondary=True)
+        else:
+            pdns.client().sync_zone(site, online_edges(db))
         return None
     except Exception as e:  # noqa: BLE001 - never break the API because DNS is down
         log.exception("DNS sync failed for %s", site.domain)
@@ -328,6 +333,11 @@ def record_to_dict(r) -> dict:
         "ttl": r.ttl, "priority": r.priority, "proxied": r.proxied,
         "pool": r.pool, "origin_port": r.origin_port,
         "health_check": r.health_check, "health_port": r.health_port,
+        # SPEC §16.7: weighted / failover sets and the controller's probe of non-proxied records
+        "weight": r.weight, "health_protocol": r.health_protocol, "health_path": r.health_path,
+        "health": ({"ok": r.health_ok, "ms": r.health_ms, "fail": r.health_fail or 0,
+                    "at": r.health_at.isoformat() + "Z" if r.health_at else None, "error": r.health_error,
+                    "advertised": dnsbuild.record_advertised(r)} if r.health_check else None),
     }
 
 
@@ -472,8 +482,6 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             cfg["waf"] = dict(cfg["waf"], mode="off")
         if not feats["ddos"]:
             cfg["ddos"] = dict(cfg["ddos"], mode="off")
-        if not feats["image_optimization"]:
-            cfg["image"] = dict(cfg["image"], enabled=False, auto_webp=False)
         if not feats["load_balancer"]:
             cfg["pools"] = {"pools": []}
             hosts = [h for h in hosts if "pool" not in h["origin"]]
@@ -514,7 +522,13 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "pools": cfg["pools"],
             "headers": cfg["headers"],
             "hotlink": cfg["hotlink"],
-            "image": cfg["image"],
+            # SPEC §16.6: avif / smart_crop and the signed-URL key in clear (images.py); the plan's
+            # image_optimization switch folds every image feature off
+            "image": images.edge_block(site, cfg["image"], feats),
+            # SPEC §16.5: HLS/DASH delivery settings, passed through
+            "video": cfg["video"],
+            # SPEC §16.4: this site's TCP/UDP apps for this node (same apps as the node-wide `l4`)
+            "l4": l4.site_block(site, edge),
             "errorpages": cfg["errorpages"],
             "tunnel": tunnel_for_edge(site, cfg["tunnel"], feats, pool_names),
             # rules & security (SPEC §14.2); waf.packs travels inside "waf"
@@ -548,6 +562,9 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "capacity_mbps": int(edge.capacity_mbps or 0) if edge is not None else 0,
             "fair_share_pct": settings.fair_share_pct,
         },
+        # SPEC §16.4: the TCP/UDP proxy apps this node listens for — apps of the node's own edge
+        # group, of active sites whose plan has l4_proxy, enabled apps only (l4.edge_block)
+        "l4": l4.edge_block(db, edge),
     }
     # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
@@ -587,6 +604,7 @@ def delete_platform_data(db: Session, site_id: int) -> None:
 
     for model in (ApiKey, UsageHourly, SecurityEvent, Purge, AnalyticsMinute, LogSpool, WebhookDelivery):
         db.execute(delete(model).where(model.site_id == site_id))
+    l4.delete_site(db, site_id)  # SPEC §16.4: the site's edge ports are free again
     keys = [logexport.STATUS_KEY.format(site_id), logexport.DROPPED_KEY.format(site_id),
             webhooks.ATTACK_KEY.format(site_id)]
     db.execute(delete(State).where(State.key.in_(keys)))

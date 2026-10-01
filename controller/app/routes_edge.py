@@ -73,6 +73,23 @@ class Capabilities(BaseModel):
     waf_packs: dict[str, int] = Field(default_factory=dict)
     live_analytics: bool = False
     logship: bool = False
+    # wave 8 (SPEC §16.3-§16.6), older agents omit them (False / None): `l4` = the node can carry the
+    # TCP/UDP listeners (nginx stream module + include) and its L4_PORT_RANGE, `slice` = byte-range
+    # slicing for video, `video`, `avif` (avifenc/libavif), `image_transform` (resizer present),
+    # `net_guard` (install.sh --harden-net nftables guard)
+    l4: bool = False
+    l4_port_range: str | None = None
+    slice: bool = False
+    video: bool = False
+    avif: bool = False
+    image_transform: bool = False
+    net_guard: bool = False
+
+    @field_validator("l4_port_range", mode="before")
+    @classmethod
+    def _range(cls, v):
+        # informational: a malformed value is dropped, never fails the heartbeat
+        return v if isinstance(v, str) and re.match(r"^\d{1,5}-\d{1,5}$", v) else None
 
     @field_validator("waf_packs", mode="before")
     @classmethod
@@ -302,6 +319,26 @@ class TunnelUsage(BaseModel):
         return dict(busiest[:TUNNEL_MAX_PATHS])
 
 
+L4_APP_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+L4_MAX_APPS = 100
+L4_COUNTERS = ("bytes_in", "bytes_out", "sessions")
+
+
+class L4AppUsage(BaseModel):
+    """One TCP/UDP proxy app of one site-hour (SPEC §16.4); unknown keys are ignored."""
+    bytes_in: int = Field(0, ge=0, le=BIG)   # client -> edge
+    bytes_out: int = Field(0, ge=0, le=BIG)  # edge -> client
+    sessions: int = Field(0, ge=0, le=BIG)
+
+
+class VideoUsage(BaseModel):
+    """Video part of an item's traffic (SPEC §16.5): bytes (already included in `bytes`) and requests
+    of manifests + segments. A bare integer is accepted as the byte count."""
+    bytes: int = Field(0, ge=0, le=BIG)
+    requests: int = Field(0, ge=0, le=BIG)
+    cache_hits: int = Field(0, ge=0, le=BIG)
+
+
 class UsageItem(BaseModel):
     host: str
     hour: datetime
@@ -317,6 +354,27 @@ class UsageItem(BaseModel):
     # SPEC §14.3.1: responses with status >= 500 the edge produced itself (no upstream status, no
     # security action); origin errors never count. Summed into the hourly details for the SLA report.
     platform_errors: int = Field(default=0, ge=0, le=BIG)
+    # SPEC §16.4: {app id: {bytes_in, bytes_out, sessions}} of the TCP/UDP proxy apps of the item's
+    # site (host = the site domain or an app's l4-<id> hostname). NOT part of `bytes`: both directions
+    # are added to the billed bytes here. Unknown ids are dropped, at most 100 per item.
+    l4: dict[str, L4AppUsage] = {}
+    # SPEC §16.5: the video share of `bytes` (breakdown only, not billed twice)
+    video: VideoUsage | None = None
+
+    @field_validator("l4", mode="before")
+    @classmethod
+    def _l4_ids(cls, v):
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError("l4 must be an object of app id -> counters")
+        out = {k: c for k, c in v.items() if isinstance(k, str) and L4_APP_ID_RE.match(k)}
+        return dict(list(out.items())[:L4_MAX_APPS])
+
+    @field_validator("video", mode="before")
+    @classmethod
+    def _video_int(cls, v):
+        return {"bytes": v} if isinstance(v, int) and not isinstance(v, bool) else v
 
 
 class LiveItem(BaseModel):
@@ -379,6 +437,21 @@ def _merge_details(current: dict, add: dict) -> dict:
             k = str(k)[:512]
             if k in dst or len(dst) < MAX_KEYS.get(key, 50):
                 dst[k] = dst.get(k, 0) + max(int(v), 0)
+    vd = add.get("video")
+    if vd:
+        dst = current.setdefault("video", {})
+        for k in ("bytes", "requests", "cache_hits"):
+            dst[k] = int(dst.get(k) or 0) + max(int(vd.get(k) or 0), 0)
+    if add.get("l4"):
+        apps = current.setdefault("l4", {})
+        for app_id, c in add["l4"].items():
+            if not L4_APP_ID_RE.match(str(app_id)) or not isinstance(c, dict):
+                continue
+            if app_id not in apps and len(apps) >= L4_MAX_APPS:
+                continue
+            a = apps.setdefault(app_id, {})
+            for k in L4_COUNTERS:
+                a[k] = int(a.get(k) or 0) + max(int(c.get(k) or 0), 0)
     tn = add.get("tunnel")
     if tn:
         dst = current.setdefault("tunnel", {})
@@ -446,6 +519,8 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         a = agg.setdefault((sid, hour), {"b": 0, "r": 0, "h": 0, "d": {}})
         # tunnels are charged in both directions: `bytes` is what the edge sent to the client
         a["b"] += it.bytes + (it.tunnel.bytes_up if it.tunnel else 0)
+        # SPEC §16.4: TCP/UDP proxy traffic is billed in both directions, like tunnels
+        a["b"] += sum(u.bytes_in + u.bytes_out for u in it.l4.values())
         a["r"] += it.requests
         a["h"] += it.cache_hits
         _merge_details(a["d"], it.model_dump())

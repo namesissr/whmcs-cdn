@@ -304,12 +304,16 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
     # bulk-silence guard, this keeps a control-plane outage from exposing/last-known-losing the tunnel.
     tunnel = is_tunnel_site(site)
 
-    # non-proxied A/AAAA sets where the customer asked for health checks (never a tunnel-site origin)
-    checked: dict[tuple[str, str], list] = defaultdict(list)
+    # non-proxied A/AAAA(/CNAME) sets (never a tunnel-site origin) that are weighted or health checked
+    sets: dict[tuple[str, str], list] = defaultdict(list)
     for r in site.records:
-        if not (r.proxied and have_v4) and r.type in ("A", "AAAA") and not (tunnel and r.proxied):
-            checked[(fqdn(r.name, domain), r.type)].append(r)
-    checked = {k: v for k, v in checked.items() if any(getattr(r, "health_check", False) for r in v)}
+        if not (r.proxied and have_v4) and r.type in ("A", "AAAA", "CNAME") and not (tunnel and r.proxied):
+            sets[(fqdn(r.name, domain), r.type)].append(r)
+    # SPEC §16.7: weighted sets and sets with an explicit health_protocol follow the controller's own
+    # probe (record_health.py); legacy health-checked A/AAAA sets keep PowerDNS ifportup (SPEC §3)
+    managed = {k: v for k, v in sets.items() if is_managed_set(v)}
+    checked = {k: v for k, v in sets.items() if k not in managed and k[1] in ("A", "AAAA")
+               and any(getattr(r, "health_check", False) for r in v)}
 
     proxied_names: dict[str, list] = defaultdict(list)
     for r in site.records:
@@ -322,7 +326,7 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             if tunnel:
                 continue  # F10(c): never expose a tunnel site's origin
             ttl = min(ttl, settings.proxied_ttl)  # F10(d): bound how long a stale origin answer lives
-        if (name, r.type) in checked:
+        if (name, r.type) in checked or (name, r.type) in managed:
             continue
         if r.type in ("CNAME", "NS", "ALIAS"):
             add(name, r.type, ttl, dot(r.content))
@@ -343,8 +347,27 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
         add(name, "LUA", min(ttl, settings.proxied_ttl),
             f"{rtype} \"ifportup({int(port)}, {_lua_list(ips)}, {{selector='all', backupSelector='all'}})\"")
 
+    for (name, rtype), recs in managed.items():
+        ttl = min(min(r.ttl or settings.default_ttl for r in recs), settings.proxied_ttl)
+        content = managed_content(rtype, recs)
+        if content.startswith("LUA "):
+            add(name, "LUA", ttl, content[4:])
+        else:
+            for c in content.split("\n"):
+                add(name, rtype, ttl, c)
+
     home_alive, global_alive = bool(v4_home), bool(v4_global)
     selector = _site_selector(site)
+    # SPEC §16.4: the l4-<id> hostnames of TCP/UDP proxy apps answer like proxied hosts (never the
+    # origin: without an online edge they are left out)
+    if have_v4:
+        from .l4 import dns_names
+
+        for label in dns_names(site):
+            name = fqdn(label, domain)
+            if name in proxied_names or any(k[0] == dot(name) for k in grouped):
+                continue
+            proxied_names[name] = []
     for name in proxied_names:
         # The customer sees their record; resolvers see our edges.
         add(name, "LUA", settings.proxied_ttl,
@@ -357,6 +380,66 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
         add(f"{DIAG_LABEL}.{domain}", "LUA", 5, "TXT \"" + diag_expression(home_alive, global_alive) + "\"")
 
     return list(grouped.values())
+
+
+def record_advertised(r) -> bool:
+    """A member of a weighted / controller-checked record set may be answered: no health check, or
+    not yet failed PROBE_FAIL_CHECKS controller probes in a row (like edge addresses, §12.1)."""
+    if not getattr(r, "health_check", False):
+        return True
+    return address_advertised(True, getattr(r, "health_ok", None), getattr(r, "health_fail", 0))
+
+
+def _controller_checked(r) -> bool:
+    return bool(getattr(r, "health_check", False)) and (
+        getattr(r, "health_protocol", None) is not None or getattr(r, "weight", None) is not None)
+
+
+def is_managed_set(recs: list) -> bool:
+    """A record set answered from the controller's view (SPEC §16.7): weighted, or health checked
+    with an explicit health_protocol, or a health-checked CNAME."""
+    return any(getattr(r, "weight", None) is not None or _controller_checked(r)
+               or (r.type == "CNAME" and getattr(r, "health_check", False)) for r in recs)
+
+
+def _weight(r) -> int:
+    w = getattr(r, "weight", None)
+    return 1 if w is None else int(w)
+
+
+def managed_content(rtype: str, recs: list) -> str:
+    """The answer of one managed set: "LUA <content>" (weighted random over several members) or the
+    plain record contents joined by newlines.
+
+    Members whose controller probe failed PROBE_FAIL_CHECKS times in a row are withdrawn — never all
+    of them (fail-open: every member is answered again). Weighted sets: weight 0 = standby, answered
+    only while no member with weight > 0 is healthy; a member without a weight counts as 1. PowerDNS
+    LUA `pickwrandom` draws one member per query with probability weight / sum of weights."""
+    healthy = [r for r in recs if record_advertised(r)]
+    weighted = any(getattr(r, "weight", None) is not None for r in recs)
+
+    def value(r) -> str:
+        return dot(r.content) if rtype == "CNAME" else r.content
+
+    if not weighted:
+        members = healthy or recs
+        if rtype == "CNAME":
+            members = members[:1]  # a name has one CNAME
+        return "\n".join(dict.fromkeys(value(r) for r in members))
+    active = [(r, _weight(r)) for r in healthy if _weight(r) > 0]
+    if not active:  # every primary member is down: the standby (weight 0) members take over
+        active = [(r, 1) for r in healthy if _weight(r) == 0]
+    if not active:  # nothing healthy at all: fail open
+        active = [(r, w) for r in recs if (w := _weight(r)) > 0] or [(r, 1) for r in recs]
+    weights: dict[str, int] = {}
+    for r, w in active:
+        weights[value(r)] = weights.get(value(r), 0) + w
+    if len(weights) == 1:
+        return next(iter(weights))
+    if len(set(weights.values())) == 1 and rtype != "CNAME":
+        return "\n".join(weights)  # equal weights: plain round robin of the healthy members
+    lst = ",".join(f"{{{w},'{v}'}}" for v, w in weights.items())
+    return f'LUA {rtype} "pickwrandom({{{lst}}})"'
 
 
 def soa_content(domain: str) -> str:

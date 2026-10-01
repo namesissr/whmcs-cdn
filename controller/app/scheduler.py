@@ -393,6 +393,23 @@ def job_probe(db, now: datetime | None = None, force: bool = False):
     db.commit()
 
 
+def job_record_health(db, now: datetime | None = None, force: bool = False):
+    """Every ~60s: controller health probe of non-proxied health-checked DNS records (SPEC §16.7,
+    leader only); zones whose answer changes are re-synced at once."""
+    if not settings.record_probe_enabled:
+        return []
+    from . import record_health
+
+    now = now or utcnow()
+    last = _state(db, "record_probe:last_run")
+    if not force and last and now - datetime.fromisoformat(last) < PROBE_INTERVAL:
+        return []
+    synced = record_health.run(db, now)
+    _set_state(db, "record_probe:last_run", now.isoformat())
+    db.commit()
+    return synced
+
+
 def job_origin_pull(db, now: datetime | None = None):
     """Renew the platform origin-pull client certificate when fewer than 30 days remain (SPEC §14.2,
     leader only). Never creates the platform CA: that happens lazily on first use."""
@@ -447,7 +464,7 @@ def job_capacity(db, now: datetime | None = None, force: bool = False):
 JOBRUN_PREFIX = "jobrun:"
 
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
-JOBS = [job_edges, job_uptime, job_probe, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
+JOBS = [job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
         job_capacity, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
         job_log_export, job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads

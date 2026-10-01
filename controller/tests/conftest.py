@@ -28,6 +28,9 @@ class FakePdns:
     def __init__(self):
         self.zones: dict[str, dict] = {}
         self.down = False  # simulate an unreachable server
+        # secondary DNS (SPEC §16.7): TSIG keys by id ("name."), zone metadata, axfr-retrieve calls
+        self.tsigkeys: dict[str, dict] = {}
+        self.axfr_retrieved: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.split("/api/v1/servers/localhost", 1)[1]
@@ -37,10 +40,30 @@ class FakePdns:
             return httpx.Response(200, json={"id": "localhost", "type": "Server"})
         if path == "/zones" and request.method == "POST":
             body = json.loads(request.content)
-            self.zones[body["name"]] = {"name": body["name"], "rrsets": body["rrsets"]}
+            self.zones[body["name"]] = {"name": body["name"], "rrsets": body.get("rrsets", []),
+                                        "kind": body.get("kind", "Native"), "masters": body.get("masters", []),
+                                        "metadata": {}}
             return httpx.Response(201, json=self.zones[body["name"]])
         if "/cryptokeys" in path:
             return self.cryptokeys(request, path)
+        if path.startswith("/tsigkeys"):
+            return self.tsig(request, path)
+        if "/metadata/" in path:
+            zone_name, _, kind = path.removeprefix("/zones/").partition("/metadata/")
+            zone = self.zones.get(zone_name)
+            if zone is None:
+                return httpx.Response(404)
+            meta = zone.setdefault("metadata", {})
+            if request.method == "PUT":
+                meta[kind] = json.loads(request.content)["metadata"]
+                return httpx.Response(200, json={"kind": kind, "metadata": meta[kind]})
+            if request.method == "DELETE":
+                meta.pop(kind, None)
+                return httpx.Response(204)
+            return httpx.Response(200, json={"kind": kind, "metadata": meta.get(kind, [])})
+        if path.endswith("/axfr-retrieve") and request.method == "PUT":
+            self.axfr_retrieved.append(path.removeprefix("/zones/").removesuffix("/axfr-retrieve"))
+            return httpx.Response(200, json={"result": "queued"})
         name = path.removeprefix("/zones/")
         zone = self.zones.get(name)
         if request.method == "GET":
@@ -48,14 +71,44 @@ class FakePdns:
         if request.method == "DELETE":
             self.zones.pop(name, None)
             return httpx.Response(204)
+        if request.method == "PUT":  # zone kind / masters
+            if zone is None:
+                return httpx.Response(404)
+            body = json.loads(request.content)
+            zone.update({k: body[k] for k in ("kind", "masters") if k in body})
+            return httpx.Response(204)
         if request.method == "PATCH":
             if zone is None:
                 return httpx.Response(404)
+            if zone.get("kind") == "Slave":  # PowerDNS refuses rrset edits of a slave zone
+                return httpx.Response(422, json={"error": "Modifying RRsets in Slave zones is prohibited"})
             for rr in json.loads(request.content)["rrsets"]:
                 key = (rr["name"], rr["type"])
                 zone["rrsets"] = [r for r in zone["rrsets"] if (r["name"], r["type"]) != key]
                 if rr["changetype"] == "REPLACE":
                     zone["rrsets"].append({k: v for k, v in rr.items() if k != "changetype"})
+            return httpx.Response(204)
+        return httpx.Response(400)
+
+    def tsig(self, request, path):
+        key_id = path.removeprefix("/tsigkeys").strip("/")
+        if request.method == "POST" and not key_id:
+            body = json.loads(request.content)
+            kid = body["name"].rstrip(".") + "."
+            if kid in self.tsigkeys:
+                return httpx.Response(409)
+            self.tsigkeys[kid] = {"id": kid, "name": body["name"], "algorithm": body["algorithm"], "key": body["key"]}
+            return httpx.Response(201, json=self.tsigkeys[kid])
+        key = self.tsigkeys.get(key_id)
+        if request.method == "GET":
+            return httpx.Response(404) if key is None else httpx.Response(200, json=key)
+        if request.method == "PUT":
+            if key is None:
+                return httpx.Response(404)
+            key.update({k: v for k, v in json.loads(request.content).items() if k in ("algorithm", "key")})
+            return httpx.Response(200, json=key)
+        if request.method == "DELETE":
+            self.tsigkeys.pop(key_id, None)
             return httpx.Response(204)
         return httpx.Response(400)
 

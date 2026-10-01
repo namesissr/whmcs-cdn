@@ -41,9 +41,13 @@ DEFAULT_FEATURES = {
     "log_export": True,           # section `logs` may be enabled
     "max_webhooks": 10,           # items of section `webhooks`, 0 = none
     "sla_target": 99.9,           # monthly availability target (%) of the SLA report
+    # wave 8 (SPEC §16.4): TCP/UDP proxy apps (section `l4`)
+    "l4_proxy": False,
+    "max_l4_apps": 0,
 }
 EDGE_GROUPS = ("general", "tunnel")
 WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
+L4_APPS_MAX = 100  # hard cap of section `l4` apps, whatever the plan says
 
 
 class Strict(BaseModel):
@@ -71,6 +75,8 @@ class Features(Strict):
     log_export: bool = True
     max_webhooks: int = Field(10, ge=0, le=WEBHOOKS_MAX)
     sla_target: float = Field(99.9, ge=0, le=100)
+    l4_proxy: bool = False
+    max_l4_apps: int = Field(0, ge=0, le=L4_APPS_MAX)
 
 
 # ------------------------------------------------------------------ sections
@@ -524,13 +530,198 @@ class Hotlink(Strict):
         return out
 
 
+TRANSFORM_SECRET_RE = re.compile(r"^[A-Za-z0-9_\-]{32,128}$")
+
+
 class Image(Strict):
+    """Image optimization. SPEC §16.6 (images v2): `avif` (AVIF for clients accepting it, on nodes
+    with the `avif` capability), `smart_crop` (entropy crop for fit=cover) and the signed-URL key
+    `transform_secret`: write-only — stored encrypted outside the section (site_secrets), GET returns
+    "" plus `transform_secret_set`; a PUT with ""/omitted keeps the stored key (generate one with
+    POST /sites/{domain}/image/transform-secret, remove it with DELETE). While a key is set the
+    edges only build variants for URLs carrying a valid `sig` (see app/images.py for the algorithm).
+    `transform_secret_set` is output only and ignored on input."""
     enabled: bool = False
     quality: int = Field(85, ge=10, le=100)
     max_width: int = Field(2000, ge=16, le=8000)
     # serve WebP for JPEG/PNG to clients sending Accept: image/webp (SPEC §14.1); independent of the
     # resizing toggle `enabled`, but like it gated by features.image_optimization
     auto_webp: bool = False
+    avif: bool = False
+    smart_crop: bool = False
+    transform_secret: str = Field("", max_length=128)
+    transform_secret_set: bool | None = None
+
+    @field_validator("transform_secret")
+    @classmethod
+    def _secret(cls, v):
+        v = (v or "").strip()
+        if v and not TRANSFORM_SECRET_RE.match(v):
+            raise ValueError("کلید امضای تبدیل تصویر باید ۳۲ تا ۱۲۸ نویسه از حروف انگلیسی، عدد، - و _ باشد")
+        return v
+
+
+# ------------------------------------------------------------------ video (SPEC §16.5)
+
+class Video(Strict):
+    """HLS/DASH delivery: manifests (*.m3u8, *.mpd) cached `manifest_ttl` seconds with
+    stale-while-revalidate, segments (*.ts, *.m4s, *.mp4, *.aac) `segment_ttl` seconds (byte-range
+    slices of large mp4), CORS * on media, optional prefetch of the next numbered segment."""
+    enabled: bool = False
+    segment_ttl: int = Field(86400, ge=60, le=31536000)
+    manifest_ttl: int = Field(2, ge=1, le=3600)
+    prefetch_next: bool = True
+
+
+# ------------------------------------------------------------------ TCP/UDP proxy (SPEC §16.4)
+
+L4_ID_RE = r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$"  # also the DNS label of l4-<id>.<domain>
+L4_PORT_MIN = 1024
+ALWAYS_RESERVED_PORTS = {22, 53, 80, 443}
+
+
+class L4Origin(Strict):
+    address: str
+    port: int = Field(ge=1, le=65535)
+
+    @field_validator("address")
+    @classmethod
+    def _addr(cls, v):
+        return _origin_address(v)
+
+
+class L4App(Strict):
+    """One TCP/UDP proxy app. `edge_port` null/omitted = allocated by the controller (and kept on
+    later writes of the same app id); `hostname` (l4-<id>.<domain>, resolving to the edges of the
+    site's group) is output only and ignored on input."""
+    id: str = Field(pattern=L4_ID_RE)
+    protocol: Literal["tcp", "udp"] = "tcp"
+    edge_port: int | None = Field(None, ge=L4_PORT_MIN, le=65535)
+    origin: L4Origin
+    proxy_protocol: Literal["off", "v1"] = "off"  # nginx stream sends PROXY protocol v1 only
+    ip_allow: list[str] = Field(default_factory=list, max_length=100)  # empty = every client
+    idle_timeout: int = Field(300, ge=10, le=3600)
+    enabled: bool = True
+    hostname: str | None = None
+
+    @field_validator("ip_allow")
+    @classmethod
+    def _cidrs(cls, v):
+        out = []
+        for c in v:
+            try:
+                net = str(ipaddress.ip_network(str(c).strip(), strict=False))
+            except ValueError:
+                raise ValueError(f"IP/CIDR نامعتبر: {c}") from None
+            if net not in out:
+                out.append(net)
+        return out
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.protocol == "udp" and self.proxy_protocol != "off":
+            raise ValueError("PROXY protocol فقط برای برنامه‌های TCP پشتیبانی می‌شود")
+        return self
+
+
+class L4(Strict):
+    apps: list[L4App] = Field(default_factory=list, max_length=L4_APPS_MAX)
+
+    @field_validator("apps")
+    @classmethod
+    def _unique(cls, v):
+        ids = [a.id for a in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError("شناسه برنامه‌ها باید یکتا باشد")
+        ports = [a.edge_port for a in v if a.edge_port is not None]
+        if len(ports) != len(set(ports)):
+            raise ValueError("پورت لبه (edge_port) هر برنامه باید یکتا باشد")
+        return v
+
+
+# ------------------------------------------------------------------ secondary DNS (SPEC §16.7)
+
+TSIG_NAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}"
+                          r"[a-z0-9_])?)*$")
+TSIG_ALGORITHMS = ("hmac-sha256", "hmac-sha384", "hmac-sha512", "hmac-sha1", "hmac-md5")
+
+
+def _public_ip(v: str, what: str, cidr: bool = False) -> str:
+    v = str(v or "").strip()
+    try:
+        net = ipaddress.ip_network(v, strict=False) if cidr else None
+        ip = net.network_address if net is not None else ipaddress.ip_address(v)
+    except ValueError:
+        raise ValueError(f"{what} نامعتبر است: {v}") from None
+    if ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local \
+            or ip.is_reserved:
+        raise ValueError(f"{what} باید آدرس عمومی باشد: {v}")
+    if net is not None:
+        return str(net)
+    return str(ip)
+
+
+class TsigKey(Strict):
+    """TSIG key shared with the customer's DNS servers. `secret` (base64) is write-only: stored
+    encrypted outside the section, GET returns "" plus `secret_set`; ""/omitted keeps the stored one."""
+    name: str = Field(max_length=253)
+    algorithm: Literal["hmac-sha256", "hmac-sha384", "hmac-sha512", "hmac-sha1", "hmac-md5"] = "hmac-sha256"
+    secret: str = Field("", max_length=512)
+    secret_set: bool | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        v = (v or "").strip().lower().rstrip(".")
+        if not TSIG_NAME_RE.match(v):
+            raise ValueError("نام کلید TSIG نامعتبر است (مثل transfer-key یا key.example.com)")
+        return v
+
+    @field_validator("secret")
+    @classmethod
+    def _secret(cls, v):
+        import base64
+        import binascii
+
+        v = (v or "").strip()
+        if not v:
+            return ""
+        try:
+            raw = base64.b64decode(v, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("کلید مخفی TSIG باید base64 باشد") from None
+        if len(raw) < 16:
+            raise ValueError("کلید مخفی TSIG باید دست‌کم ۱۶ بایت (۱۲۸ بیت) باشد")
+        return v
+
+
+class DnsSecondary(Strict):
+    """Secondary DNS (SPEC §16.7). mode primary_elsewhere: our nameservers serve the zone as a
+    PowerDNS slave zone transferred (AXFR) from the customer's `primaries` (with `tsig` when set);
+    the records managed here are then NOT published. `allow_axfr`: addresses of the customer's own
+    secondaries allowed to transfer the zone from us (requires `tsig`)."""
+    mode: Literal["off", "primary_elsewhere"] = "off"
+    primaries: list[str] = Field(default_factory=list, max_length=10)
+    tsig: TsigKey | None = None
+    allow_axfr: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("primaries")
+    @classmethod
+    def _primaries(cls, v):
+        return list(dict.fromkeys(_public_ip(x, "آدرس سرور اصلی (primary)") for x in v))
+
+    @field_validator("allow_axfr")
+    @classmethod
+    def _axfr(cls, v):
+        return list(dict.fromkeys(_public_ip(x, "آدرس مجاز انتقال زون", cidr=True) for x in v))
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.mode == "primary_elsewhere" and not self.primaries:
+            raise ValueError("برای حالت primary_elsewhere دست‌کم یک آدرس سرور اصلی (primaries) لازم است")
+        if self.allow_axfr and self.tsig is None:
+            raise ValueError("انتقال زون به سرورهای شما (allow_axfr) فقط با کلید TSIG مجاز است")
+        return self
 
 
 class ErrorPages(Strict):
@@ -1240,11 +1431,15 @@ SECTIONS: dict[str, type[BaseModel]] = {
     "bots": Bots,
     "logs": Logs,
     "webhooks": Webhooks,
+    # wave 8 (SPEC §16)
+    "l4": L4,
+    "video": Video,
+    "dns_secondary": DnsSecondary,
 }
 
 # section -> feature flag that must be on to write it
 FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
-                 "tunnel": "tunnel", "logs": "log_export"}
+                 "tunnel": "tunnel", "logs": "log_export", "l4": "l4_proxy"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -1311,7 +1506,22 @@ def redact(site, cfg: dict) -> dict:
         ids = site_secrets.webhook_secret_ids(site)
         cfg["webhooks"] = {**cfg["webhooks"],
                            "items": [dict(i, secret_set=i["id"] in ids) for i in cfg["webhooks"]["items"]]}
+    if "image" in cfg:
+        cfg["image"] = dict(cfg["image"], transform_secret="",
+                            transform_secret_set=site_secrets.has_secret(site, "image_transform"))
+    if "dns_secondary" in cfg and cfg["dns_secondary"].get("tsig"):
+        cfg["dns_secondary"] = dict(cfg["dns_secondary"], tsig=dict(
+            cfg["dns_secondary"]["tsig"], secret="", secret_set=site_secrets.has_secret(site, "tsig")))
+    if "l4" in cfg:
+        domain = getattr(site, "domain", "")
+        cfg["l4"] = {**cfg["l4"], "apps": [dict(a, hostname=l4_hostname(a["id"], domain))
+                                           for a in cfg["l4"]["apps"]]}
     return cfg
+
+
+def l4_hostname(app_id: str, domain: str) -> str:
+    """The DNS name of a TCP/UDP proxy app (SPEC §16.4), answered with the site's edges."""
+    return f"l4-{app_id}.{domain}"
 
 
 def storable(name: str, value: dict) -> dict:
@@ -1320,6 +1530,12 @@ def storable(name: str, value: dict) -> dict:
         return {k: v for k, v in value.items() if k not in ("secret_key", "secret_key_set")}
     if name == "webhooks":
         return {**value, "items": [{k: v for k, v in i.items() if k != "secret_set"} for i in value["items"]]}
+    if name == "image":
+        return {k: v for k, v in value.items() if k not in ("transform_secret", "transform_secret_set")}
+    if name == "dns_secondary" and value.get("tsig"):
+        return {**value, "tsig": {k: v for k, v in value["tsig"].items() if k not in ("secret", "secret_set")}}
+    if name == "l4":
+        return {**value, "apps": [{k: v for k, v in a.items() if k != "hostname"} for a in value["apps"]]}
     return value
 
 
@@ -1345,7 +1561,7 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
     limits = {"firewall": ("rules", "max_firewall_rules"), "ratelimit": ("rules", "max_ratelimit_rules"),
               "pagerules": ("rules", "max_page_rules"), "pools": ("pools", "max_pools"),
               "transform": ("rules", "max_transform_rules"), "redirects": ("rules", "max_redirects"),
-              "webhooks": ("items", "max_webhooks")}
+              "webhooks": ("items", "max_webhooks"), "l4": ("apps", "max_l4_apps")}
     if name in limits:
         key, feat = limits[name]
         if len(value[key]) > feats[feat]:
@@ -1365,6 +1581,10 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
         raise ValidationError("preload نیازمند includeSubDomains و max-age حداقل یک سال است")
     if name == "logs" and value["enabled"] and not (value["secret_key"] or _has_logs_secret(site)):
         raise ValidationError("برای فعال‌سازی خروجی لاگ، کلید مخفی (secret_key) لازم است")
+    if name == "l4":
+        _check_l4(site, value)
+    if name == "dns_secondary" and value["tsig"] and not value["tsig"]["secret"] and not _same_tsig(site, value):
+        raise ValidationError("کلید مخفی TSIG (tsig.secret) لازم است")
     if vet:
         check_targets(name, value)
     return value
@@ -1503,15 +1723,48 @@ def _check_tunnel(site, value: dict, feats: dict):
             raise ValidationError(f"استخر {p['pool']} در بخش استخرها (pools) تعریف نشده است")
 
 
+def _check_l4(site, value: dict):
+    """Ports of the l4 section: inside L4_PORT_RANGE and not reserved; app hostnames must not clash
+    with the site's own records. Uniqueness across sites is enforced by l4.apply_write (409)."""
+    from .config import settings
+
+    lo, hi = settings.l4_port_range
+    reserved = ALWAYS_RESERVED_PORTS | settings.l4_reserved_ports
+    names = {getattr(r, "name", None) for r in getattr(site, "records", None) or []}
+    for a in value["apps"]:
+        p = a["edge_port"]
+        if p is not None and (p < lo or p > hi):
+            raise ValidationError(f"پورت لبه برنامه «{a['id']}» باید در بازه {lo} تا {hi} باشد")
+        if p is not None and p in reserved:
+            raise ValidationError(f"پورت {p} رزرو شده است")
+        if f"l4-{a['id']}" in names:
+            raise ValidationError(f"رکورد l4-{a['id']} از قبل وجود دارد؛ شناسه دیگری برای برنامه انتخاب کنید")
+
+
+def _same_tsig(site, value: dict) -> bool:
+    """A TSIG key without a new secret keeps the stored secret — only for the same key name."""
+    from . import site_secrets
+
+    if not site_secrets.has_secret(site, "tsig"):
+        return False
+    try:
+        old = (json.loads(site.config or "{}").get("dns_secondary") or {}).get("tsig") or {}
+    except (ValueError, AttributeError):
+        old = {}
+    return old.get("name") == value["tsig"]["name"]
+
+
 def _is_enabled(name: str, value: dict) -> bool:
     if name == "waf":
         return value["mode"] != "off"
     if name == "ddos":
         return value["mode"] != "off"
     if name == "image":
-        return value["enabled"] or value["auto_webp"]
+        return value["enabled"] or value["auto_webp"] or value["avif"]
     if name == "pools":
         return bool(value["pools"])
+    if name == "l4":
+        return bool(value["apps"])
     if name in ("tunnel", "logs"):
         return value["enabled"]
     return True
