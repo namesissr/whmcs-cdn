@@ -1097,11 +1097,15 @@ def test_nginx_capabilities_probed_once(tmp_path, monkeypatch):
 def test_heartbeat_reports_capabilities(tmp_path):
     a = agent.Agent.__new__(agent.Agent)
     a.cfg = caps_cfg(tmp_path, modules=ORG_MODULES, **H3)
+    a.cfg["IMAGE_CAPS"] = {"transform": True, "webp": True, "avif": False}
     body = a._hb(applied_version="v1")
     assert body["capabilities"] == {"http3": True, "early_hints": True, "webp_convert": False,
                                     "webp_mode": "accept_key", "modules": ORG_MODULES, "nginx": "1.29.1",
                                     "waf_packs": agent.WAF_PACK_VERSIONS,
-                                    "live_analytics": True, "logship": True}   # SPEC §14.3
+                                    "live_analytics": True, "logship": True,   # SPEC §14.3
+                                    # SPEC §16.3-§16.6 (wave 8)
+                                    "l4": False, "l4_port_range": "20000-29999", "slice": True, "video": True,
+                                    "avif": False, "image_transform": True, "net_guard": False}
     json.dumps(body)
 
 

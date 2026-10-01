@@ -11,7 +11,8 @@
 //   tunnelFair js_set $pcdn_tn_fair — "1" refuses a NEW tunnel session while the node is hot (SPEC §15.2)
 //   fairSet                        — js_content of the localhost-only /__pcdn/fair (agent: hot flag)
 //   speedDown / speedUp            — js_content of /__pcdn/speed/down|up (SPEC §15.6)
-//   imgW/imgH/imgQ js_set          — image resize parameters ("" = no resize)
+//   imgW/imgH/imgQ js_set          — image resize / transform parameters ("" = none; SPEC §2, §16.6)
+//   videoNext js_set $pcdn_vnext   — next HLS/DASH segment to prefetch ("" = none; SPEC §16.5)
 //   bodyNeed js_set $pcdn_bodychk  — "1" when a WAF pack inspects this request's body (SPEC §14.2)
 //   bodyInspect                    — js_content for /__pcdn/body/*: inspects the body, then proxies
 //   tfHeaders js_header_filter     — conditional transform-rule response headers (SPEC §14.2)
@@ -474,7 +475,12 @@ function prepSite(id, s) {
     });
 
     const im = s.image || {};
-    P.image = im.enabled ? { quality: Math.min(100, Math.max(1, +im.quality || 85)), max: Math.max(16, +im.max_width || 2000) } : null;
+    P.image = im.enabled ? { quality: Math.min(100, Math.max(1, +im.quality || 85)), max: Math.max(16, +im.max_width || 2000),
+        // images v2 (SPEC §16.6): only present in sites.js when the site uses them
+        avif: im.avif === true, smart: im.smart === true,
+        secret: typeof im.secret === 'string' && im.secret.length >= 16 ? im.secret : '' } : null;
+    // video delivery (SPEC §16.5): next-segment prefetch flag
+    P.video = s.video && s.video.prefetch === true ? { prefetch: true } : null;
     return P;
 }
 
@@ -1073,22 +1079,133 @@ async function health() {
     await Promise.all(jobs);
 }
 
-// ------------------------------------------------------------------ image resize parameters
+// ------------------------------------------------------------------ image resize / transform parameters
+//
+// Legacy (SPEC §2): ?width=N&height=N -> $pcdn_img_w / $pcdn_img_h are "N" or "-" (capped at
+// max_width), $pcdn_img_q the site quality.
+// Images v2 (SPEC §16.6): ?w=&h=&fit=cover|contain&q=&fmt=webp|avif|jpeg. $pcdn_img_w stays "N" or "-"
+// (w,h <= min(4096, max_width)); $pcdn_img_h carries the whole transform spec
+// "<h|->:<fit>:<fmt|keep>:<q>:<smart 0|1>" (the loopback resizer routes on the ":"), so the cache key
+// "w=$pcdn_img_w&h=$pcdn_img_h" covers every output-relevant parameter. With image.avif, a request
+// without parameters from a client that accepts AVIF is converted when this node can encode AVIF
+// ($pcdn_avif_ok). With image.transform_secret every request carrying transform parameters must be
+// signed: sig = hex HMAC-SHA256(secret, "<raw path>?<k=v&...>" over w,h,fit,q,fmt,width,height in
+// that order, the ones present, raw values); a missing / wrong signature gives "!" (403).
+
+const IMG_SRC = /\.(?:jpe?g|png|gif|webp)$/i;
+const IMG_V2_KEYS = ['w', 'h', 'fit', 'q', 'fmt'];
+const IMG_SIG_KEYS = ['w', 'h', 'fit', 'q', 'fmt', 'width', 'height'];
+const IMG_MAX_DIM = 4096;
+const IMG_FMT = { webp: 1, avif: 1, jpeg: 1 };
+
+function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+
+// raw (still percent-encoded) query arguments, first occurrence wins
+function rawArgs(q) {
+    const o = {};
+    String(q || '').split('&').forEach(function (p) {
+        if (!p) return;
+        const i = p.indexOf('=');
+        const k = i < 0 ? p : p.substring(0, i);
+        if (!own(o, k)) o[k] = i < 0 ? '' : p.substring(i + 1);
+    });
+    return o;
+}
+
+function imgSigBase(path, a) {
+    const parts = [];
+    IMG_SIG_KEYS.forEach(function (k) { if (own(a, k)) parts.push(k + '=' + a[k]); });
+    return path + '?' + parts.join('&');
+}
+
+function avifOk(r) { return String(r.variables.pcdn_avif_ok || '') === '1'; }
 
 function imgParams(r) {
     const site = siteOf(r);
-    if (!site || !site.image || !/\.(?:jpe?g|png|gif|webp)$/i.test(r.uri) || inTunnel(site, r.uri)) return null;
-    const dim = function (v) {
-        if (!/^\d{1,5}$/.test(String(v || ''))) return '-';
-        return String(Math.min(site.image.max, Math.max(1, +v)));
+    if (!site || !site.image || !IMG_SRC.test(r.uri) || inTunnel(site, r.uri)) return null;
+    const im = site.image;
+    const a = rawArgs(r.variables.args);
+    const v2 = IMG_V2_KEYS.some(function (k) { return own(a, k); });
+    const legacy = own(a, 'width') || own(a, 'height');
+    const quality = String(im.quality);
+    if (!v2 && !legacy) {
+        // image.avif: plain image URL, client accepts AVIF, node can encode it -> convert
+        if (im.avif && avifOk(r) && !/\.gif$/i.test(r.uri) && /image\/avif/i.test(String(r.headersIn.Accept || ''))) {
+            return { w: '-', h: '-:contain:avif:' + quality + ':0', q: quality };
+        }
+        return null;
+    }
+    if (im.secret) {
+        const raw = String(r.variables.request_uri || '');
+        const qi = raw.indexOf('?');
+        const sig = own(a, 'sig') ? String(a.sig).toLowerCase() : '';
+        if (!safeEq(sig, hmac(im.secret, imgSigBase(qi < 0 ? raw : raw.substring(0, qi), a)))) {
+            return { w: '!', h: '!', q: '' };
+        }
+    }
+    if (!v2) {
+        const dim = function (v) {
+            if (!/^\d{1,5}$/.test(String(v || ''))) return '-';
+            return String(Math.min(im.max, Math.max(1, +v)));
+        };
+        const w = dim(r.args.width), h = dim(r.args.height);
+        if (w === '-' && h === '-') return null;
+        return { w: w, h: h, q: quality };
+    }
+    const cap = Math.min(IMG_MAX_DIM, im.max);
+    const dim2 = function (k) {
+        const v = own(a, k) ? a[k] : '';
+        if (!/^\d{1,5}$/.test(v) || +v < 1) return '-';
+        return String(Math.min(cap, +v));
     };
-    const w = dim(r.args.width), h = dim(r.args.height);
-    if (w === '-' && h === '-') return null;
-    return { w: w, h: h, q: String(site.image.quality) };
+    const w = dim2('w'), h = dim2('h');
+    const fit = a.fit === 'cover' ? 'cover' : 'contain';
+    const qGiven = own(a, 'q') && /^\d{1,3}$/.test(a.q) && +a.q >= 1 && +a.q <= 100;
+    const q = qGiven ? String(+a.q) : quality;
+    let fmt = own(a, 'fmt') && own(IMG_FMT, a.fmt) ? a.fmt : '';
+    if (fmt === 'avif' && !avifOk(r)) fmt = 'keep';   // unsupported here: the source format is kept
+    if (!fmt) {
+        fmt = im.avif && avifOk(r) && !/\.gif$/i.test(r.uri) && /image\/avif/i.test(String(r.headersIn.Accept || ''))
+            ? 'avif' : 'keep';
+    }
+    if (w === '-' && h === '-' && fmt === 'keep' && !qGiven) return null;   // nothing to do
+    const smart = im.smart && fit === 'cover' ? '1' : '0';
+    return { w: w, h: [h, fit, fmt, q, smart].join(':'), q: q };
 }
 function imgW(r) { const p = imgParams(r); return p ? p.w : ''; }
 function imgH(r) { const p = imgParams(r); return p ? p.h : ''; }
 function imgQ(r) { const p = imgParams(r); return p ? p.q : ''; }
+
+// ------------------------------------------------------------------ video next-segment prefetch (SPEC §16.5)
+//
+// js_set $pcdn_vnext, evaluated in the mirror subrequest (/__pcdn/vpf) of a segment request: the raw
+// path of the NEXT segment ("seg_0042.ts" -> "seg_0043.ts", zero padding kept) when the name ends in
+// a number, the site enables prefetch_next, this next segment was not prefetched in the last
+// pcdn_vpf zone timeout (once) and fewer than VPF_RATE prefetches were started this second on this
+// node (bounded); "" otherwise (the mirror location then answers 204 without any upstream request).
+
+const VPF_RATE = 100;
+const VPF_RE = /^(.*?)(\d{1,9})(\.(?:ts|m4s|aac))$/i;
+
+function videoNext(r) {
+    const site = siteOf(r);
+    const dict = ngx.shared.pcdn_vpf;
+    if (!site || !site.video || !dict) return '';
+    const raw = String(r.variables.request_uri || '');
+    const qi = raw.indexOf('?');
+    const m = VPF_RE.exec(qi < 0 ? raw : raw.substring(0, qi));
+    if (!m) return '';
+    let n = String(+m[2] + 1);
+    while (n.length < m[2].length) n = '0' + n;
+    const next = m[1] + n + m[3];
+    try {
+        if (!dict.add('s|' + site.id + '|' + r.variables.host + '|' + next, 1)) return '';
+        if (dict.incr('r|' + now(), 1, 0) > VPF_RATE) return '';
+    } catch (e) {
+        return '';   // dictionary full / unavailable: no prefetch (it is only an optimisation)
+    }
+    return next;
+}
 
 // ------------------------------------------------------------------ pages
 
@@ -1292,4 +1409,4 @@ function captcha(r) {
 }
 
 export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
-    bodyNeed, bodyInspect, tfHeaders, tunnelFair, fairSet, speedDown, speedUp };
+    bodyNeed, bodyInspect, tfHeaders, tunnelFair, fairSet, speedDown, speedUp, videoNext };

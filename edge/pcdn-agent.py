@@ -10,6 +10,9 @@ events. Standard library only, so it runs on any stock Debian/Ubuntu python3.
     pcdn-agent once       one sync (config, purges, usage)
     pcdn-agent bootstrap  write an empty tree if none exists (used by install.sh
                           so nginx can start before the first sync)
+    pcdn-agent imaged     loopback image transformer (images v2, service pcdn-imaged)
+    pcdn-agent guard [--synproxy]
+                          print the nftables host guard ruleset (install.sh --harden-net)
 """
 
 import collections
@@ -164,6 +167,29 @@ DEFAULTS = {
     "NODE_NAME": "",
     # SPEC §15.6 speed-test random file (10 MiB + 64 B, written once; empty = speed.bin next to STATE_FILE)
     "SPEED_FILE": "",
+    # SPEC §16.4 L4 proxy: the port range edge_port must fall into (the operator opens it in the host /
+    # provider firewall), the JSON stream access log the agent bills from, and the nginx.conf that must
+    # include NGINX_DIR/l4/*.conf at the main context (install.sh adds it) before stream {} is rendered
+    "L4_PORT_RANGE": "20000-29999",
+    "L4_ACCESS_LOG": "/var/log/nginx/pcdn-l4.log",
+    "NGINX_CONF": "/etc/nginx/nginx.conf",
+    # SPEC §16.6 images v2: the loopback image transformer (`pcdn-agent imaged`, service pcdn-imaged)
+    # IMAGED auto = used when python3-pil is importable; no = never (nginx image_filter only)
+    "IMAGED": "auto",
+    "IMAGE_PORT": "8090",
+    "IMAGE_WORKERS": "2",           # concurrent transforms; more wait up to 5 s, then 503 -> fallback
+    "IMAGE_MAX_SOURCE_MB": "20",    # originals larger than this are not transformed (fallback)
+    # SPEC §16.3 host hardening (install.sh --harden-net renders /etc/pcdn/guard.nft from these with
+    # `pcdn-agent guard`; the agent itself only reports whether the guard is installed)
+    "GUARD": "no",
+    "GUARD_SSH_PORTS": "22",
+    "GUARD_ALLOW": "",              # extra never-limited CIDRs (comma/space separated)
+    "GUARD_SYN_RATE": "1000",       # new TCP connections / s per source /24 (IPv6: /64; CGNAT-safe)
+    "GUARD_SYN_BURST": "2000",
+    "GUARD_SYN_GLOBAL": "50000",    # new TCP connections / s for the whole host
+    "GUARD_UDP_RATE": "20000",      # UDP/<HTTPS_PORT> (QUIC) packets / s per source address
+    "GUARD_ICMP_RATE": "100",       # ICMP echo requests / s (host-wide)
+    "GUARD_SYNPROXY": "auto",       # auto (install.sh probes kernel support) | no
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -278,7 +304,10 @@ _STATIC_MODULE = {"njs": re.compile(r"--add-module=\S*njs"), "geoip2": re.compil
 WEBP_MODE = "accept_key"
 # what an undetectable nginx is assumed to be: today's distro build (Ubuntu 1.24 + all modules)
 LEGACY_CAPS = {"nginx": None, "http3": False, "early_hints": False, "http2_directive": False,
-               "webp_convert": False, "webp_mode": WEBP_MODE, "modules": sorted(MODULE_FILES), "flv": True}
+               "webp_convert": False, "webp_mode": WEBP_MODE, "modules": sorted(MODULE_FILES), "flv": True,
+               # SPEC §16.4 / §16.5: ngx_stream_module (libnginx-mod-stream was not installed before
+               # wave 8, so an undetectable nginx is assumed without it) and the slice module
+               "stream": False, "slice": True}
 _CAPS_CACHE: dict = {}
 
 
@@ -314,7 +343,11 @@ def parse_nginx_v(text: str, modules_dir: str | None = None, exists=os.path.isfi
             "early_hints": ver >= (1, 29, 0), "http2_directive": ver >= (1, 25, 1),
             "webp_convert": False, "webp_mode": WEBP_MODE, "modules": mods,
             # SPEC §15.6: the speed-test download is served through the (static) flv module
-            "flv": bool(re.search(r"(?:^|\s)--with-http_flv_module(?:\s|$)", args))}
+            "flv": bool(re.search(r"(?:^|\s)--with-http_flv_module(?:\s|$)", args)),
+            # SPEC §16.4: stream compiled in (nginx.org) or the dynamic module file (libnginx-mod-stream)
+            "stream": bool(re.search(r"(?:^|\s)--with-stream(?:\s|$)", args)) or exists(os.path.join(mdir, STREAM_SO)),
+            # SPEC §16.5: byte-range slicing of large mp4 files (static module only)
+            "slice": bool(re.search(r"(?:^|\s)--with-http_slice_module(?:\s|$)", args))}
 
 
 def nginx_capabilities(cfg: dict) -> dict:
@@ -340,6 +373,64 @@ def has_module(cfg: dict, name: str) -> bool:
     return name in nginx_capabilities(cfg)["modules"]
 
 
+STREAM_SO = "ngx_stream_module.so"
+
+
+def l4_ready(cfg: dict) -> bool:
+    """SPEC §16.4: stream {} is rendered only when nginx has the stream module AND the main nginx.conf
+    includes NGINX_DIR/l4/*.conf at the main context (install.sh adds it). Otherwise the node reports
+    `l4: false` and renders no L4 app (a stream block nginx cannot load would fail every apply)."""
+    caps = nginx_capabilities(cfg)
+    if "l4" in caps:   # tests / operator tools may pin it
+        return bool(caps["l4"])
+    if not caps.get("stream"):
+        return False
+    want = cfg["NGINX_DIR"].rstrip("/") + "/l4/*.conf"
+    try:
+        with open(cfg.get("NGINX_CONF") or "/etc/nginx/nginx.conf") as f:
+            text = f.read()
+    except OSError:
+        return False
+    return any(re.match(r"^\s*include\s+" + re.escape(want) + r"\s*;", line) for line in text.splitlines())
+
+
+_IMAGE_CAPS: dict = {}
+
+
+def image_capabilities(cfg: dict) -> dict:
+    """SPEC §16.6: what the loopback image transformer (pcdn-agent imaged) can do on this node, probed
+    once per agent start: transform = python3-pil importable (and IMAGED != no); webp = Pillow WebP;
+    avif = transform and (Pillow AVIF plugin or the avifenc binary of libavif-bin). Tests / tools may
+    pass a ready dict as cfg["IMAGE_CAPS"]."""
+    caps = cfg.get("IMAGE_CAPS")
+    if isinstance(caps, dict):
+        return {"transform": bool(caps.get("transform")), "webp": bool(caps.get("webp")),
+                "avif": bool(caps.get("transform") and caps.get("avif")),
+                "pillow_avif": bool(caps.get("pillow_avif"))}
+    if str(cfg.get("IMAGED") or "auto").lower() in ("no", "off", "0", "false"):
+        return {"transform": False, "webp": False, "avif": False, "pillow_avif": False}
+    if "v" not in _IMAGE_CAPS:
+        out = {"transform": False, "webp": False, "avif": False, "pillow_avif": False}
+        try:
+            from PIL import features  # noqa: PLC0415 - optional dependency (python3-pil)
+            out["transform"] = True
+            out["webp"] = bool(features.check("webp"))
+            try:
+                out["pillow_avif"] = bool(features.check("avif"))
+            except (ValueError, KeyError):   # Pillow < 11.2 has no "avif" feature name
+                out["pillow_avif"] = False
+        except Exception:  # noqa: BLE001 - ImportError or a broken install: no transformer
+            pass
+        out["avif"] = bool(out["transform"] and (out["pillow_avif"] or shutil.which("avifenc")))
+        _IMAGE_CAPS["v"] = out
+    return dict(_IMAGE_CAPS["v"])
+
+
+def guard_installed(cfg: dict) -> bool:
+    """SPEC §16.3: install.sh --harden-net installed the nftables guard (GUARD=yes + its rule file)."""
+    return str(cfg.get("GUARD") or "").lower() == "yes" and os.path.isfile(cfg.get("GUARD_FILE") or "/etc/pcdn/guard.nft")
+
+
 def heartbeat_capabilities(cfg: dict) -> dict:
     """The `capabilities` object of the heartbeat (SPEC §14.1)."""
     c = nginx_capabilities(cfg)
@@ -349,7 +440,12 @@ def heartbeat_capabilities(cfg: dict) -> dict:
             "waf_packs": dict(WAF_PACK_VERSIONS),   # SPEC §14.2 managed rule-set versions
             # SPEC §14.3: this agent sends 1-minute `live` aggregates + platform_errors with its usage
             # and ships sampled access-log records to /edge/v1/logship
-            "live_analytics": True, "logship": True}
+            "live_analytics": True, "logship": True,
+            # SPEC §16.3-§16.6 (wave 8)
+            "l4": l4_ready(cfg), "l4_port_range": "%d-%d" % l4_port_range(cfg),
+            "slice": bool(c.get("slice")), "video": True,
+            "avif": image_capabilities(cfg)["avif"], "image_transform": image_capabilities(cfg)["transform"],
+            "net_guard": guard_installed(cfg)}
 
 
 _GUARD = re.compile(r"^# @if (\w+)\n(.*?)(?:^# @else \1\n(.*?))?^# @endif \1\n", re.S | re.M)
@@ -543,6 +639,7 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
         "LISTEN_H2": "" if caps["http2_directive"] else " http2",
         "HTTPS_DEFAULT_EXTRA": "\n".join(extra),
         "NODE_TAG": node_tag((node or norm_node({}, cfg))["name"]),
+        "RESIZER": render_resizer(cfg),
     }
     if not SAFE_FSPATH.match(subst["NGINX_DIR"]):
         raise ValueError("unsafe NGINX_DIR")
@@ -551,6 +648,96 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
     if not _v6(cfg):
         text = "\n".join(line for line in text.splitlines() if "listen [::]" not in line) + "\n"
     return text
+
+
+def render_resizer(cfg: dict) -> str:
+    """The loopback image server block of http.conf (SPEC §2 resize, §16.6 images v2).
+
+    Site image locations proxy here with Host, X-Pcdn-Origin (origin base URL), X-Pcdn-W/-H/-Q
+    (pcdn.js imgW/imgH/imgQ) and X-Pcdn-Mtls. $pcdn_rz_mode picks the handler per request:
+      resize - nginx image_filter resize (legacy ?width/?height: exactly the pre-wave-8 behaviour)
+      crop   - image_filter crop (v2 fit=cover without the transformer; center crop)
+      v2     - the transformer (`pcdn-agent imaged`, IMAGE_PORT): resize / cover / smart crop and
+               WebP / AVIF / JPEG output; any failure (not running, 415, 5xx, timeout) falls back to
+               image_filter resize (or the untouched original) cached for 60 s only
+      src    - the untouched original (v2 request without dimensions and no transformer)
+    /__pcdn_rz/src/ is also how the transformer fetches originals (through this server, so origin
+    TLS / client certificates / resolver work exactly as for the resizer)."""
+    caps = nginx_capabilities(cfg)
+    filt = "image_filter" in caps["modules"]
+    v2 = image_capabilities(cfg)["transform"]
+    avif = "1" if image_capabilities(cfg)["avif"] else "0"
+    out = ["# AVIF output possible on this node (SPEC §16.6, pcdn.js avifOk)",
+           f"map $uri $pcdn_avif_ok {{\n    default \"{avif}\";\n}}"]
+    if "njs" not in caps["modules"] or not (filt or v2):
+        out.append("# no image resizer on this node (needs njs and image_filter or the image transformer)")
+        return "\n".join(out)
+    port = _int(cfg.get("RESIZE_PORT"), 8089, 1, 65535)
+    iport = _int(cfg.get("IMAGE_PORT"), 8090, 1, 65535)
+    legacy = "resize" if filt else "v2"
+    if v2:
+        v2_rules = '    "~^[^|]*[|][^:]*:" v2;\n'
+    else:   # no transformer: v2 specs map onto image_filter (fmt / smart crop ignored)
+        v2_rules = ('    "~^-[|]-:" src;\n    "~^[^|]*[|][^:]*:cover:" crop;\n'
+                    '    "~^[^|]*[|][^:]*:" resize;\n')
+    out += [
+        "map $http_x_pcdn_w $pcdn_rz_w {\n    default \"-\";\n    \"~^(\\d+)$\" $1;\n}",
+        "map $http_x_pcdn_h $pcdn_rz_h {\n    default \"-\";\n    \"~^(\\d+)\" $1;\n}",
+        "map $http_x_pcdn_q $pcdn_rz_q {\n    default 85;\n    \"~^(\\d{1,3})$\" $1;\n}",
+        f"map \"$http_x_pcdn_w|$http_x_pcdn_h\" $pcdn_rz_mode {{\n    default {legacy};\n{v2_rules}}}",
+    ]
+    common = ["proxy_set_header Host $host;", 'proxy_set_header X-Pcdn-Origin "";', 'proxy_set_header X-Pcdn-W "";',
+              'proxy_set_header X-Pcdn-H "";', 'proxy_set_header X-Pcdn-Q "";', 'proxy_set_header X-Pcdn-Mtls "";',
+              'proxy_set_header Accept-Encoding "";', "proxy_ssl_server_name on;", "proxy_ssl_name $host;",
+              # SPEC §14.2 authenticated origin pulls: the calling site names its client certificate in
+              # X-Pcdn-Mtls ("" = none; an empty certificate variable sends no client certificate)
+              "proxy_ssl_certificate $pcdn_mtls_crt;", "proxy_ssl_certificate_key $pcdn_mtls_key;"]
+
+    def filt_lines(op):
+        return [f"image_filter {op} $pcdn_rz_w $pcdn_rz_h;", "image_filter_jpeg_quality $pcdn_rz_q;",
+                "image_filter_webp_quality $pcdn_rz_q;", "image_filter_buffer 20M;", "image_filter_interlace on;"]
+
+    def loc(head, body):
+        return [f"    location {head} {{"] + ["        " + x for x in body] + ["    }"]
+
+    srv = ["server {", f"    listen 127.0.0.1:{port};", "    server_name _;", "    access_log off;"]
+    srv += ["    " + x for x in common]
+    srv += loc("/", ['if ($http_x_pcdn_origin = "") { return 404; }',
+                     # the original is fetched without the resize / transform args ($uri, not a
+                     # capture: evaluating the regex map would overwrite $1)
+                     "rewrite ^ /__pcdn_rz/$pcdn_rz_mode$uri? last;"])
+    if filt:
+        srv += loc("^~ /__pcdn_rz/resize/", ["internal;", "rewrite ^/__pcdn_rz/resize(/.*)$ $1 break;"]
+                   + filt_lines("resize") + ["proxy_pass $http_x_pcdn_origin;"])
+        if not v2:
+            srv += loc("^~ /__pcdn_rz/crop/", ["internal;", "rewrite ^/__pcdn_rz/crop(/.*)$ $1 break;"]
+                       + filt_lines("crop") + ["proxy_pass $http_x_pcdn_origin;"])
+    # originals: the v2 mode without dimensions, and the transformer's own fetches (loopback only)
+    srv += loc("^~ /__pcdn_rz/src/", ["allow 127.0.0.1;", "allow ::1;", "deny all;",
+                                      'if ($http_x_pcdn_origin = "") { return 404; }',
+                                      "rewrite ^/__pcdn_rz/src(/.*)$ $1 break;", "proxy_pass $http_x_pcdn_origin;"])
+    if v2:
+        fb = "@pcdn_rz_fbr" if filt else "@pcdn_rz_fbs"
+        if filt:
+            out.append("map \"$http_x_pcdn_w|$pcdn_rz_h\" $pcdn_rz_fb {\n    default @pcdn_rz_fbr;\n"
+                       "    \"-|-\" @pcdn_rz_fbs;\n}")
+            fb = "$pcdn_rz_fb"
+        srv += loc("^~ /__pcdn_rz/v2/", [
+            "internal;", "rewrite ^/__pcdn_rz/v2(/.*)$ $1 break;",
+            "proxy_set_header Host $host;", "proxy_set_header X-Pcdn-Origin $http_x_pcdn_origin;",
+            "proxy_set_header X-Pcdn-W $http_x_pcdn_w;", "proxy_set_header X-Pcdn-H $http_x_pcdn_h;",
+            "proxy_set_header X-Pcdn-Q $http_x_pcdn_q;", "proxy_set_header X-Pcdn-Mtls $http_x_pcdn_mtls;",
+            'proxy_set_header Accept-Encoding "";', "proxy_connect_timeout 2s;", "proxy_read_timeout 60s;",
+            "proxy_intercept_errors on;", f"error_page 413 415 500 502 503 504 = {fb};",
+            f"proxy_pass http://127.0.0.1:{iport};"])
+        # fallbacks: short-lived in the site cache (X-Accel-Expires), so the real variant replaces
+        # them once the transformer is back
+        if filt:
+            srv += loc("@pcdn_rz_fbr", filt_lines("resize") + ["add_header X-Accel-Expires 60;",
+                                                               "proxy_pass $http_x_pcdn_origin;"])
+        srv += loc("@pcdn_rz_fbs", ["add_header X-Accel-Expires 60;", "proxy_pass $http_x_pcdn_origin;"])
+    srv.append("}")
+    return "\n".join(out + srv)
 
 
 def _legacy_sections(site: dict) -> tuple[dict, dict]:
@@ -743,6 +930,8 @@ def key_infos(config: dict) -> dict:
             continue
         if k["dev"] or k["cookies"] or k["qa"] or k["webp"]:
             out[sid] = k
+        if norm_video(s):   # SPEC §16.5: *.mp4 may be cached in 1 MB slices (";r=<range>" key field)
+            out[sid] = dict(out.get(sid) or k, slice=True)
     return out
 
 
@@ -1074,8 +1263,232 @@ def origin_client(sslo: dict) -> dict:
     return {"mode": "off"}
 
 
+# ----------------------------------------------------------------- wave 8: images v2, video, L4 (SPEC §16)
+
+SAFE_TRANSFORM_SECRET = re.compile(r"^[\x21-\x7e]{16,256}$")
+
+
+def norm_image_v2(site: dict) -> dict:
+    """SPEC §16.6 additions of the `image` section (falsy = absent / default, so a site that does not
+    use them renders exactly as before): avif, transform_secret (16-256 printable characters, no
+    spaces; anything else is treated as unset) and smart_crop."""
+    im = _sec(site, "image")
+    sec = im.get("transform_secret")
+    return {"avif": im.get("avif") is True,
+            "secret": sec if isinstance(sec, str) and SAFE_TRANSFORM_SECRET.match(sec) else "",
+            "smart": im.get("smart_crop") is True}
+
+
+def image_signature(secret: str, path: str, params: dict) -> str:
+    """Reference signer for image transform URLs (SPEC §16.6; pcdn.js imgParams verifies it):
+    hex HMAC-SHA256(transform_secret, "<path>?<k=v&...>") over w, h, fit, q, fmt, width, height in
+    that order (only the ones present), path and values exactly as they appear in the URL (raw,
+    percent-encoded). The URL then carries &sig=<hex>."""
+    import hmac as _hmac   # noqa: PLC0415
+    base = path + "?" + "&".join(f"{k}={params[k]}" for k in ("w", "h", "fit", "q", "fmt", "width", "height")
+                                 if k in params)
+    return _hmac.new(secret.encode(), base.encode(), hashlib.sha256).hexdigest()
+
+
+def norm_video(site: dict) -> dict | None:
+    """SPEC §16.5 `video` section {enabled, segment_ttl, manifest_ttl, prefetch_next}; None = off."""
+    v = _sec(site, "video")
+    if v.get("enabled") is not True:
+        return None
+    return {"segment_ttl": _int(v.get("segment_ttl"), 86400, 1, 31536000),
+            "manifest_ttl": _int(v.get("manifest_ttl"), 2, 1, 3600),
+            "prefetch": v.get("prefetch_next", True) is not False}
+
+
+L4_APPS_MAX = 2000           # apps rendered per node (every port of the default range fits)
+L4_ALLOW_MAX = 100           # ip_allow entries per app
+
+
+def l4_port_range(cfg: dict) -> tuple[int, int]:
+    """L4_PORT_RANGE ("20000-29999"); a malformed value falls back to the default."""
+    m = re.match(r"^\s*(\d{1,5})\s*-\s*(\d{1,5})\s*$", str(cfg.get("L4_PORT_RANGE") or ""))
+    lo, hi = (int(m.group(1)), int(m.group(2))) if m else (20000, 29999)
+    lo, hi = max(1024, lo), min(65535, hi)
+    return (lo, hi) if lo <= hi else (20000, 29999)
+
+
+def _l4_origin(o) -> tuple[str, bool] | None:
+    """origin {address, port} -> ("host:port", is_ip) or None."""
+    if not isinstance(o, dict):
+        return None
+    addr = str(o.get("address") or "").strip().lower()
+    port = o.get("port")
+    if isinstance(port, bool) or not isinstance(port, (int, str)) or not str(port).isdigit():
+        return None
+    port = int(port)
+    if not 1 <= port <= 65535:
+        return None
+    ip = _ip_literal(addr)
+    if ip:
+        return f"{ip}:{port}", True
+    if not SAFE_ORIGIN.match(addr) or addr.startswith("[") or len(addr) > 253:
+        return None
+    return f"{addr}:{port}", False
+
+
+def norm_l4(site: dict) -> list[dict]:
+    """Validated, enabled apps of a site's `l4` section (SPEC §16.4); edge_port is range-checked by
+    render_l4 (it needs the node settings). Invalid apps are skipped, never "fixed"."""
+    apps = _sec(site, "l4").get("apps")
+    out, seen = [], set()
+    for a in apps if isinstance(apps, list) else []:
+        if not isinstance(a, dict) or a.get("enabled") is False:
+            continue
+        aid = str(a.get("id") if a.get("id") is not None else "").lower()
+        proto = a.get("protocol")
+        port = a.get("edge_port")
+        origin = _l4_origin(a.get("origin"))
+        if (not SAFE_ID.match(aid) or aid in seen or proto not in ("tcp", "udp") or origin is None
+                or isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535):
+            continue
+        allow = []
+        for c in (a.get("ip_allow") if isinstance(a.get("ip_allow"), list) else [])[:L4_ALLOW_MAX]:
+            try:
+                allow.append(str(ipaddress.ip_network(str(c).strip(), strict=False)))
+            except ValueError:
+                continue
+        pp = a.get("proxy_protocol") if proto == "tcp" and a.get("proxy_protocol") in ("v1", "v2") else "off"
+        seen.add(aid)
+        out.append({"id": aid, "protocol": proto, "port": port, "target": origin[0], "ip": origin[1],
+                    "proxy_protocol": pp, "allow": list(dict.fromkeys(allow)),
+                    "idle": _int(a.get("idle_timeout"), 300, 10, 3600)})
+    return out
+
+
+def l4_sites(config: dict) -> list[dict]:
+    """The L4 apps of this node per site: [{"id", "domain", "edge_group", "status", "l4": {"apps"}}].
+    The controller sends them twice (SPEC §16.4): the node-wide `l4` list (own group only, active
+    sites, enabled apps; it also covers sites without any proxied HTTP host, which are not in
+    `sites`) and, per site, an `l4` block of the same apps. The node-wide list wins when present."""
+    node = config.get("l4") if isinstance(config, dict) else None
+    if isinstance(node, list):
+        by: dict = {}
+        for e in node:
+            if not isinstance(e, dict):
+                continue
+            try:
+                sid = int(e.get("site_id"))
+            except (TypeError, ValueError):
+                continue
+            s = by.setdefault(sid, {"id": sid, "domain": str(e.get("site") or ""), "l4": {"apps": []}})
+            s["l4"]["apps"].append({"id": e.get("app_id"), "protocol": e.get("protocol"), "edge_port": e.get("port"),
+                                    "origin": e.get("origin"), "proxy_protocol": e.get("proxy_protocol"),
+                                    "ip_allow": e.get("ip_allow"), "idle_timeout": e.get("idle_timeout")})
+        return [by[k] for k in sorted(by)]
+    return [s for s in config.get("sites", []) if isinstance(s, dict)
+            and s.get("status", "active") not in ("suspended", "over_quota")]
+
+
+def l4_busy_ports(cfg: dict, proc: str = "/proc/net") -> set:
+    """(protocol, port) pairs some OTHER process already listens on: listening TCP / bound UDP sockets
+    from /proc/net minus the ports of the L4 config nginx currently runs. An app on such a port is not
+    rendered, because nginx would fail to bind it on reload and every later config apply would be
+    rejected with it."""
+    busy = set()
+    for proto, files, state in (("tcp", ("tcp", "tcp6"), "0A"), ("udp", ("udp", "udp6"), "07")):
+        for name in files:
+            try:
+                with open(os.path.join(proc, name)) as f:
+                    next(f, None)
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) > 3 and parts[3] == state:
+                            busy.add((proto, int(parts[1].rsplit(":", 1)[1], 16)))
+            except (OSError, ValueError, IndexError):
+                continue
+    mine = set()
+    sdir = os.path.join(cfg["NGINX_DIR"], "l4", "sites")
+    try:
+        for name in os.listdir(sdir):
+            with open(os.path.join(sdir, name)) as f:
+                for m in re.finditer(r"^\s*listen (?:\[::\]:)?(\d+)( udp)?", f.read(), re.M):
+                    mine.add(("udp" if m.group(2) else "tcp", int(m.group(1))))
+    except OSError:
+        pass
+    return busy - mine
+
+
+def render_l4(config: dict, cfg: dict) -> dict:
+    """SPEC §16.4 stream config: {"l4/stream.conf": main stream {} block, "l4/sites/<id>.conf": one
+    server per app}; {} when no app is rendered (so nodes and sites without L4 keep their tree).
+    nginx.conf includes NGINX_DIR/l4/*.conf at the main context. Apps outside L4_PORT_RANGE, on a
+    port this node uses itself, or on a (protocol, port) already taken are skipped with a warning:
+    ports are unique per edge group, but every node gets every site, so on a clash the apps of this
+    node's own group (and of sites without a group) win over foreign ones, then the lower site id."""
+    sites = l4_sites(config)
+    if not l4_ready(cfg):
+        if any(norm_l4(s) for s in sites):
+            log.warning("L4 apps configured but this node has no stream module / nginx.conf include; skipped")
+        return {}
+    lo, hi = l4_port_range(cfg)
+    reserved = {_int(cfg.get(k), 0, 0, 65535) for k in ("HTTP_PORT", "HTTPS_PORT", "RESIZE_PORT", "IMAGE_PORT")}
+    reserved |= {int(x) for x in re.findall(r"\d{1,5}", str(cfg.get("GUARD_SSH_PORTS") or "22"))}
+    group = cfg.get("GROUP") or ""
+    busy = l4_busy_ports(cfg) if any(norm_l4(x) for x in sites) else set()
+    sites.sort(key=lambda s: (bool(group and s.get("edge_group") not in (None, "", group)), int(s["id"])))
+    v6 = _v6(cfg)
+    taken, files, count = set(), {}, 0
+    for site in sites:
+        domain = str(site.get("domain") or "").lower()
+        if not SAFE_NAME.match(domain) or "*" in domain:
+            continue
+        servers = []
+        for a in norm_l4(site):
+            key = (a["protocol"], a["port"])
+            if (not lo <= a["port"] <= hi or a["port"] in reserved or key in taken or key in busy
+                    or count >= L4_APPS_MAX):
+                log.warning("site %s: L4 app %s (%s/%d) skipped (outside %d-%d, reserved, taken or in use by "
+                            "another process)", site.get("id"), a["id"], a["protocol"], a["port"], lo, hi)
+                continue
+            taken.add(key)
+            count += 1
+            opt = " udp reuseport" if a["protocol"] == "udp" else " reuseport"
+            L = [f"listen {a['port']}{opt};"] + ([f"listen [::]:{a['port']}{opt};"] if v6 else [])
+            L.append(f'set $pcdn_l4_app "{domain}|{a["id"]}";')
+            if a["allow"]:
+                L += [f"allow {c};" for c in a["allow"]] + ["deny all;"]
+            L.append(f"proxy_timeout {a['idle']}s;")
+            if a["proxy_protocol"] != "off":
+                # nginx sends PROXY protocol v1 only; "v2" is sent as v1 (capability l4_proxy_protocol)
+                L.append("proxy_protocol on;")
+            if a["ip"]:
+                L.append(f"proxy_pass {a['target']};")
+            else:   # hostname: resolved at connect time through the stream resolver
+                L += [f'set $pcdn_l4_t "{a["target"]}";', "proxy_pass $pcdn_l4_t;"]
+            servers.append(f"# app {a['id']} ({a['protocol']})\nserver {{\n" + "".join(f"    {x}\n" for x in L) + "}")
+        if servers:
+            sid = int(site["id"])
+            files[f"l4/sites/{sid}.conf"] = (f"# {domain} (site {sid}) L4 apps — generated by pcdn-agent, do not edit\n"
+                                             + "\n".join(servers) + "\n")
+    if not files:
+        return {}
+    nd = cfg["NGINX_DIR"].rstrip("/")
+    logp = cfg.get("L4_ACCESS_LOG") or "/var/log/nginx/pcdn-l4.log"
+    if not SAFE_FSPATH.match(logp) or not SAFE_FSPATH.match(nd):
+        raise ValueError("unsafe L4_ACCESS_LOG / NGINX_DIR")
+    resolver = cfg["RESOLVER"] if SAFE_RESOLVER.match(cfg.get("RESOLVER") or "") else "1.1.1.1"
+    files["l4/stream.conf"] = (
+        "# L4 proxy (SPEC §16.4) — generated by pcdn-agent, do not edit. Included from nginx.conf at the\n"
+        "# main context. One JSON line per session; the agent bills bi/bo per app (usage `l4`).\n"
+        "stream {\n"
+        "    log_format pcdn_l4 escape=json '{\"t\":\"$time_iso8601\",\"a\":\"$pcdn_l4_app\",\"p\":\"$protocol\","
+        "\"ip\":\"$remote_addr\",\"bi\":$bytes_received,\"bo\":$bytes_sent,\"st\":$status,\"d\":$session_time}';\n"
+        f"    access_log {logp} pcdn_l4 buffer=16k flush=5s;\n"
+        f"    resolver {resolver} valid=300s ipv6=off;\n"
+        "    resolver_timeout 11s;\n"
+        f"    proxy_connect_timeout {_int(cfg.get('TUNNEL_CONNECT_TIMEOUT'), 10, 3, 30)}s;\n"
+        f"    include {nd}/l4/sites/*.conf;\n"
+        "}\n")
+    return files
+
+
 def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None,
-            tf_resp: list | None = None) -> dict:
+            tf_resp: list | None = None, video: dict | None = None) -> dict:
     """Per-site data for njs (sites.js). Only validated / typed values end up here."""
     fw = _sec(site, "firewall")
     rules = []
@@ -1130,6 +1543,8 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         extra["tf_resp"] = tf_resp
     if tunnel:   # SPEC §15.2 (tunnel sites only, so other sites keep a byte-identical entry)
         extra["tunnel_fair"] = bool(tunnel["fair_share"])
+    if video and video["prefetch"]:   # SPEC §16.5 (video sites only)
+        extra["video"] = {"prefetch": True}
     return dict({
         "domain": site["domain"],
         "secret": str(site.get("secret") or ""),
@@ -1152,8 +1567,9 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
                      "off_paths": [r["_re"] for r in page_rules(site) if r.get("waf") is False]},
                     **({"packs": packs} if packs else {})),
         "pools": pools,
-        "image": {"enabled": bool(im.get("enabled")), "quality": _int(im.get("quality"), 85, 1, 100),
-                  "max_width": _int(im.get("max_width"), 2000, 16, 10000)},
+        "image": dict({"enabled": bool(im.get("enabled")), "quality": _int(im.get("quality"), 85, 1, 100),
+                       "max_width": _int(im.get("max_width"), 2000, 16, 10000)},
+                      **{k: v for k, v in norm_image_v2(site).items() if v}),   # SPEC §16.6, only when used
         # prefixes where only firewall allow/block/log rules apply (tunnel mode)
         "tunnel_paths": [p["path"] for p in tunnel["paths"]] if tunnel else [],
     }, **extra)
@@ -1341,10 +1757,15 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                   + "".join(f";c.{n}={v}" for n, v in key_cookies)
                   + (";w=${pcdn_webp}" if webp_on else ""))
 
+    imv2 = norm_image_v2(site)
+
     def cache_key(iq, image=False):
         """-> (key text, needs quoting)."""
         if image:
-            uri = "$pcdn_path?w=$pcdn_img_w&h=$pcdn_img_h" if (iq or key_args) else "$request_uri"
+            # image.avif (SPEC §16.6): the output format depends on Accept, which pcdn.js folds into
+            # $pcdn_img_h, so such sites always key on the normalised transform spec
+            uri = ("$pcdn_path?w=$pcdn_img_w&h=$pcdn_img_h" if (iq or key_args or imv2["avif"])
+                   else "$request_uri")
         elif iq:
             uri = "$pcdn_path"
         elif key_args:   # cache.key_query_allow: only these parameters, in a fixed order
@@ -1605,7 +2026,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             err_pages[cls] = codes
 
     # the resizer needs the image_filter module and the njs imgW/imgH/imgQ parameters
-    image_on = bool(_sec(site, "image").get("enabled")) and "image_filter" in caps["modules"] and njs_ok
+    # (or, SPEC §16.6, the image transformer when this node has no image_filter module)
+    image_on = (bool(_sec(site, "image").get("enabled")) and njs_ok
+                and ("image_filter" in caps["modules"] or image_capabilities(cfg)["transform"]))
     resize_port = _int(cfg["RESIZE_PORT"], 8089, 1, 65535)
     prules = page_rules(site)
     valid_hosts = []
@@ -1616,6 +2039,12 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     image_on = image_on and fallback == "origin"  # decoy / 404 sites never fetch origin content
     webp_on = webp_on and fallback == "origin"
     decoy = decoy_page(cfg, domain) if fallback == "decoy" else None
+    # SPEC §16.5 video delivery: cached sites serving origin content only
+    video = norm_video(site) if (active and cache_on and fallback == "origin") else None
+    vslice = bool(video and caps.get("slice"))
+    # prefetch needs njs ($pcdn_vnext) and is skipped when rewrite_path rules could map the next
+    # segment's URI elsewhere than the prefetch would fetch
+    vprefetch = bool(video and video["prefetch"] and njs_ok and not rewrites)
     geo_ok = geoip_present(cfg)
     ka = _int(cfg.get("TUNNEL_KEEPALIVE"), 64, 1, 4096)
     h2_buf = cfg.get("TUNNEL_H2_BODY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_H2_BODY_BUFFER") or "") else "256k"
@@ -1829,6 +2258,61 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             L.append(f"proxy_pass {'https' if tls else 'http'}://{dest};")
         return [f"    location ^~ {_q(p['path'])} {{"] + ["        " + x for x in L] + ["    }"]
 
+    def video_locs():
+        """SPEC §16.5: manifests (*.m3u8|*.mpd: short TTL, stale-while-revalidate), segments
+        (*.ts|*.m4s|*.aac: long TTL, cache lock, optional next-segment prefetch) and *.mp4 (long TTL,
+        1 MB slices on slice-capable nodes so byte ranges of large files are cached piecewise). CORS
+        `*` on every media response. Same cache key shape as the site's other locations (plus
+        ";r=<range>" per slice); video locations always fetch from the origin (never the shield)."""
+        key, quote = cache_key(ignore_q)
+        cors = (["Access-Control-Allow-Origin", "Access-Control-Expose-Headers"],
+                ["add_header Access-Control-Allow-Origin * always;",
+                 'add_header Access-Control-Expose-Headers "Content-Length, Content-Range" always;',
+                 "add_header X-Cache $upstream_cache_status always;"])
+        stale_e = ["error", "timeout", "http_500", "http_502", "http_503", "http_504"] if stale_err else []
+        out_l = []
+
+        def block(match, manifest=False, sliced=False, mirror=False):
+            ttl = video["manifest_ttl"] if manifest else video["segment_ttl"]
+            k = key + (";r=$slice_range" if sliced else "")
+            L = loc_common(cors[0] + ([] if manifest else ["Set-Cookie"]), cors[1])
+            if sliced:
+                L += ["slice 1m;", "proxy_set_header Range $slice_range;"]
+            L += [f"proxy_cache {zone};", "proxy_cache_key " + (f'"{k}"' if (quote or sliced) else k) + ";"]
+            if manifest:
+                L += [f"proxy_cache_valid 200 {ttl}s;", "proxy_ignore_headers Cache-Control Expires Vary X-Accel-Expires;"]
+                if nocache_var:
+                    L.append(f"proxy_cache_bypass {nocache_var};")
+                L += ["proxy_no_cache " + " ".join(([nocache_var] if nocache_var else []) + ["$upstream_http_set_cookie"])
+                      + ";", f"proxy_cache_use_stale {' '.join(['updating'] + stale_e)};",
+                      "proxy_cache_background_update on;", "proxy_cache_lock on;", "proxy_cache_lock_timeout 3s;"]
+            else:
+                L += [f"proxy_cache_valid 200 206 {ttl}s;", "proxy_cache_valid 404 10s;",
+                      "proxy_ignore_headers Cache-Control Expires Set-Cookie Vary;",
+                      f"proxy_cache_use_stale {' '.join(stale_e) or 'off'};",
+                      "proxy_cache_lock on;", "proxy_cache_lock_timeout 10s;", "proxy_cache_lock_age 10s;"]
+            if mirror:
+                L += ["mirror /__pcdn/vpf;", "mirror_request_body off;"]
+            L += mtls_now + [f"proxy_pass $pcdn_proto://$pcdn_target{tf_uri};"]
+            return [f"    location {match} {{"] + ind(L) + ["    }"]
+
+        out_l += block("~* \\.(?:m3u8|mpd)$", manifest=True)
+        out_l += block("~* \\.(?:ts|m4s|aac)$", mirror=vprefetch)
+        out_l += block("~* \\.mp4$", sliced=vslice)
+        if vprefetch:
+            # mirror subrequest of a segment request (response discarded, never logged): pcdn.js
+            # videoNext names the next segment once per segment and bounded per node; it is fetched
+            # into the cache under exactly the key its own request will use (HIT when it arrives)
+            nkey = key.replace("$request_uri", "$pcdn_vnext$is_args$args").replace("$pcdn_path", "$pcdn_vnext")
+            L = ["internal;", 'if ($pcdn_vnext = "") { return 204; }'] + list(proxy_hdrs) + [
+                f"proxy_cache {zone};", f'proxy_cache_key "{nkey}";',
+                f"proxy_cache_valid 200 206 {video['segment_ttl']}s;", "proxy_cache_valid 404 10s;",
+                "proxy_ignore_headers Cache-Control Expires Set-Cookie Vary;", "proxy_cache_lock on;",
+                "proxy_cache_lock_timeout 10s;"] + mtls_now + [
+                "proxy_pass $pcdn_proto://$pcdn_target$pcdn_vnext$is_args$args;"]
+            out_l += ["    location = /__pcdn/vpf {"] + ind(L) + ["    }"]
+        return out_l
+
     for host in site["hosts"]:
         name = str(host["name"]).lower()
         res = resolve_origin(host, pools, origin_proto)
@@ -1919,6 +2403,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         if body_on:
             s.append("    if ($pcdn_bodychk) { rewrite ^ /__pcdn/body$uri last; }")
         if image_on:
+            if imv2["secret"]:   # SPEC §16.6 signed transform URLs: unsigned / wrong signature -> 403
+                s.append('    if ($pcdn_img_w = "!") { return 403; }')
             s.append("    if ($pcdn_img_w) { rewrite ^ /__pcdn/img$uri last; }")
         if rps > 0:
             s.append(f"    limit_req zone=pcdn_rlk_{sid} burst={rps * 2} nodelay;")
@@ -1965,6 +2451,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 adds.append("add_header X-Cache $upstream_cache_status always;")
             else:
                 adds.append("add_header X-Cache BYPASS always;")
+            if imv2["avif"] and not webp_on:   # the variant depends on Accept (webp_on adds its own Vary)
+                adds.append("add_header Vary Accept;")
             L = L + loc_common(["Set-Cookie"], adds) + [
                 "proxy_set_header X-Pcdn-Origin $pcdn_proto://$pcdn_target;",
                 "proxy_set_header X-Pcdn-W $pcdn_img_w;",
@@ -2018,6 +2506,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             iq = ignore_q if r.get("ignore_query") is None else bool(r["ignore_query"])
             s += proxy_loc(match, mode, ttl, bttl, iq)
 
+        if video:
+            s += video_locs()
         if cache_on:
             # static assets: cached at the edge even without origin headers
             s += proxy_loc(f"~* \\.(?:{STATIC_EXT})$", "static", edge_ttl, browser_ttl, ignore_q)
@@ -2031,7 +2521,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     if mtls_used and mtls_id != "platform":
         files[f"mtls/{sid}.crt"], files[f"mtls/{sid}.key"] = mtls_pair
     meta["mtls_platform"] = mtls_used and mtls_id == "platform"
-    js = site_js(site, valid_hosts, pools, sslo, tunnel, tf_resp) if active and valid_hosts else None
+    js = (site_js(site, valid_hosts, pools, sslo, tunnel, tf_resp, video if vprefetch else None)
+          if active and valid_hosts else None)
     return "\n\n".join(out) + "\n", files, js, meta
 
 
@@ -2092,6 +2583,7 @@ def render_all(config: dict, cfg: dict) -> dict:
             for p in js["pools"].values():
                 if p["health"]["enabled"]:
                     max_timeout = max(max_timeout, p["health"]["timeout"])
+    files.update(render_l4(config, cfg))   # SPEC §16.4 ({} without L4 apps)
     if platform_used:   # one 0600 pair per node, only while some site presents it
         files["mtls/platform.crt"], files["mtls/platform.key"] = platform_pair
     # verified crawler ranges: only while some site uses bot management (a daily range refresh
@@ -2146,7 +2638,7 @@ def _group_digests(files: dict, pattern: str) -> dict:
 
 def site_digests(files: dict) -> dict:
     """Per-site content digest (config + certs + error pages) for group-aware reload deferral (F21)."""
-    return _group_digests(files, r"^(?:sites|certs|errors|mtls)/(\d+)")
+    return _group_digests(files, r"^(?:sites|certs|errors|mtls|l4/sites)/(\d+)")
 
 
 def cert_digests(files: dict) -> dict:
@@ -2155,7 +2647,7 @@ def cert_digests(files: dict) -> dict:
 
 
 GLOBAL_FILES = ("http.conf", "js/pcdn.js", "shield.conf", "bots.conf", "mtls.conf", "mtls/platform.crt",
-                "mtls/platform.key")
+                "mtls/platform.key", "l4/stream.conf")
 
 
 def global_digest(files: dict) -> str:
@@ -2463,6 +2955,30 @@ def do_purge(item: dict, cfg: dict, kinfo: dict | None = None) -> int:
                         removed += 1
                     except FileNotFoundError:
                         pass
+    if kinfo and kinfo.get("slice"):
+        # SPEC §16.5: sliced *.mp4 entries carry one more trailing key field (";r=<range>") whose values
+        # cannot be enumerated: those URLs are found by scanning
+        slice_targets = set()
+        for url in urls:
+            m = re.match(r"^https?://([^/?#]+)([^#]*)", url)
+            if not m or not m.group(2).split("?", 1)[0].lower().endswith(".mp4"):
+                continue
+            host, path = m.group(1).lower(), m.group(2)
+            for scheme in ("http", "https"):
+                for p in url_key_bases(path, kinfo):
+                    for suf in (suffixes if suffixes is not None else [None]):
+                        slice_targets.add((f"{scheme}://{host}{p}" + (suf or ""), suf is None))
+        if slice_targets:
+            fields = int(bool(kinfo.get("dev"))) + len(kinfo.get("cookies") or []) + int(bool(kinfo.get("webp")))
+            exact = {t for t, var in slice_targets if not var}
+            n, overflow = purge_exact_scan(base, exact, 1, scan_max) if exact else (0, False)
+            if not overflow and any(var for _, var in slice_targets):
+                m2, overflow = purge_exact_scan(base, {t for t, var in slice_targets if var}, fields + 1, scan_max)
+                n += m2
+            if overflow:
+                log.warning("purge scan cap %d exceeded for site %s; falling back to full purge", scan_max, sid)
+                return wipe_cache(base)
+            removed += n
     if scan_targets:
         fields = int(bool(kinfo.get("dev"))) + len(kinfo.get("cookies") or []) + int(bool(kinfo.get("webp")))
         n, overflow = purge_exact_scan(base, scan_targets, fields, scan_max)
@@ -2792,10 +3308,34 @@ def _inc(d: dict, k: str, n: int = 1):
 
 
 _CC = re.compile(r"^[A-Z]{2}$")
+VIDEO_EXT = re.compile(r"\.(?:m3u8|mpd|ts|m4s|aac|mp4)$", re.I)
+
+
+def video_hosts(config: dict) -> dict:
+    """SPEC §16.5 usage `video`: the host names of active video-enabled sites ({"exact": [...],
+    "wild": [suffixes]}), kept in the agent state so access-log lines can be attributed without a
+    log-format change (requests whose path ends in a media extension, never tunnel requests)."""
+    exact, wild = set(), set()
+    for s in config.get("sites", []) if isinstance(config, dict) else []:
+        if not isinstance(s, dict) or s.get("status", "active") in ("suspended", "over_quota") or not norm_video(s):
+            continue
+        for h in s.get("hosts") or []:
+            n = str((h or {}).get("name") or "").lower() if isinstance(h, dict) else ""
+            if n.startswith("*.") and SAFE_NAME.match(n):
+                wild.add(n[1:])
+            elif SAFE_NAME.match(n):
+                exact.add(n)
+    return {"exact": sorted(exact), "wild": sorted(wild)} if exact or wild else {}
+
+
+def video_host(vh: dict, host: str) -> bool:
+    if host in vh.get("_set", ()) or host in (vh.get("exact") or ()):
+        return True
+    return any(host.endswith(w) for w in vh.get("wild") or ())
 
 
 def _account(e: dict, pending: dict, events: list, live: dict | None = None, cutoff: str = "",
-             ship=None, raw: bytes | None = None):
+             ship=None, raw: bytes | None = None, vhosts: dict | None = None):
     """Fold one access-log record into the host-hour (`pending`), the security `events`, the
     host-minute `live` buckets (SPEC §14.3.1; minutes before `cutoff` skipped) and, for sites with
     log export, the sampler `ship` (SPEC §14.3.2; `raw` is the log line, the sampling key)."""
@@ -2830,6 +3370,12 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
         _account_tunnel(a, e, tn, code, tcls)
         if e.get("tp"):
             live_tn = tcls or ""
+    if vhosts and not tn and VIDEO_EXT.search(path) and video_host(vhosts, host):
+        # SPEC §16.5: a media request of a video-enabled host (part of `bytes` too)
+        v = a.setdefault("video", {"bytes": 0, "requests": 0, "cache_hits": 0})
+        v["bytes"] += nbytes
+        v["requests"] += 1
+        v["cache_hits"] += int(hit)
     parts = str(e.get("v") or "ok").split(":", 2)
     if len(parts) == 3 and parts[0] in ("block", "challenge", "captcha", "log"):
         action, source, rule = parts
@@ -2909,6 +3455,8 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
     events = state.setdefault("events", [])
     live = state.setdefault("live", {})
     cutoff = live_cutoff() if cutoff is None else cutoff
+    vh = state.get("video_hosts") or None
+    vhosts = dict(vh, _set=frozenset(vh.get("exact") or ())) if isinstance(vh, dict) else None
     read = 0
     with open(path, "rb", buffering=1 << 20) as f:
         f.seek(pos)
@@ -2918,7 +3466,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
             pos += len(raw)
             read += len(raw)
             try:
-                _account(json.loads(raw), pending, events, live, cutoff, ship, raw)
+                _account(json.loads(raw), pending, events, live, cutoff, ship, raw, vhosts)
             except (ValueError, KeyError, TypeError, AttributeError):
                 pass
             if read >= max_bytes or (deadline is not None and time.monotonic() > deadline):
@@ -2977,6 +3525,71 @@ def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, ti
         del events[: len(events) - EVENT_BACKLOG]
 
 
+# ----------------------------------------------------------------- L4 usage (SPEC §16.4)
+
+L4_APPS_PER_ITEM = 100        # the controller keeps at most 100 app ids per item
+L4_READ_MAX = 32 * 1024 * 1024   # bytes of the stream access log consumed per usage tick
+
+
+def _account_l4(e: dict, pending: dict):
+    """One stream access-log line (one TCP connection / UDP session of an app) -> the `l4` counters of
+    the app's site host-hour: {app_id: {bytes_in, bytes_out, sessions}}. bytes_in = from the client
+    ($bytes_received), bytes_out = to the client ($bytes_sent)."""
+    host, _, app = str(e.get("a") or "").partition("|")
+    host = host.lower()
+    if not SAFE_NAME.match(host) or not SAFE_ID.match(app):
+        return
+    _, hour, _ = _times(e["t"])
+    a = _bucket(pending, f"{host}|{hour}")
+    l4 = a.setdefault("l4", {})
+    if app not in l4 and len(l4) >= L4_APPS_PER_ITEM:
+        return
+    c = l4.setdefault(app, {"bytes_in": 0, "bytes_out": 0, "sessions": 0})
+    c["bytes_in"] += max(0, int(e.get("bi") or 0))
+    c["bytes_out"] += max(0, int(e.get("bo") or 0))
+    c["sessions"] += 1
+
+
+def _consume_l4(path: str, pos: int, pending: dict, max_bytes: int) -> int:
+    read = 0
+    with open(path, "rb", buffering=1 << 20) as f:
+        f.seek(pos)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break
+            pos += len(raw)
+            read += len(raw)
+            try:
+                _account_l4(json.loads(raw), pending)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
+            if read >= max_bytes:
+                break
+    return pos
+
+
+def read_l4_usage(state: dict, path: str, max_bytes: int = L4_READ_MAX) -> None:
+    """Fold new stream access-log lines into state['pending'] (own offset / inode: l4_pos, l4_inode).
+    After a rotation the rest of the old file (<path>.1, same inode) is read first."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    pending = state.setdefault("pending", {})
+    pos, ino = int(state.get("l4_pos") or 0), state.get("l4_inode")
+    if ino is not None and ino != st.st_ino:
+        try:
+            if os.stat(path + ".1").st_ino == ino:
+                _consume_l4(path + ".1", pos, pending, max_bytes)
+        except OSError:
+            pass
+        pos = 0
+    elif st.st_size < pos:
+        pos = 0
+    state["l4_pos"] = _consume_l4(path, pos, pending, max_bytes)
+    state["l4_inode"] = st.st_ino
+
+
 def usage_item(key: str, a) -> dict:
     a = _bucket({key: a}, key)
     host, hour = key.split("|", 1)
@@ -2994,6 +3607,11 @@ def usage_item(key: str, a) -> dict:
             item["tunnel"]["paths"] = {pid: tpath_item(p) for pid, p in sorted(t["paths"].items())}
     if a["paths"]:
         item["paths"] = dict(sorted(a["paths"].items(), key=lambda kv: (-kv[1], kv[0]))[:PATHS_PER_ITEM])
+    if a.get("video"):   # SPEC §16.5 (optional): the video share of this host-hour (already in bytes)
+        item["video"] = {k: int(a["video"].get(k) or 0) for k in ("bytes", "requests", "cache_hits")}
+    if a.get("l4"):      # SPEC §16.4 (optional): per app; NOT included in bytes (billed by the controller)
+        item["l4"] = {app: {k: int(c.get(k) or 0) for k in ("bytes_in", "bytes_out", "sessions")}
+                      for app, c in sorted(a["l4"].items())}
     return item
 
 
@@ -3797,6 +4415,362 @@ def mem_pct(meminfo: str = "/proc/meminfo") -> float | None:
 
 # ----------------------------------------------------------------- controller
 
+# ----------------------------------------------------------------- image transformer (SPEC §16.6)
+#
+# `pcdn-agent imaged`: a loopback-only HTTP server (IMAGE_PORT) run as its own sandboxed systemd
+# service (pcdn-imaged, DynamicUser, no network beyond localhost). The resizer server of http.conf
+# proxies v2 requests here with the spec from pcdn.js; the original is fetched back through that
+# resizer (/__pcdn_rz/src/, which talks to the origin) and transformed with Pillow; AVIF is encoded
+# by Pillow when it has the plugin, else by avifenc (libavif-bin). Every failure answers 415 / 413 /
+# 502 / 503 and nginx falls back to image_filter / the original, so the transformer can never take
+# images down. Bounds: originals <= IMAGE_MAX_SOURCE_MB and <= IMAGE_MAX_PIXELS, output <= 4096 px a
+# side (pcdn.js already caps w/h at min(4096, max_width)), never enlarged, IMAGE_WORKERS at a time.
+
+IMAGE_MAX_DIM = 4096
+IMAGE_MAX_PIXELS = 50_000_000
+IMAGE_FMTS = ("keep", "webp", "avif", "jpeg")
+_SPEC_RE = re.compile(r"^(\d{1,5}|-):(contain|cover):(keep|webp|avif|jpeg):(\d{1,3}):([01])$")
+
+
+def parse_image_spec(w: str, h: str, q: str) -> dict | None:
+    """X-Pcdn-W / -H / -Q -> {w, h, fit, fmt, q, smart} (w/h None = free). Legacy ("N"/"-" in H) is a
+    contain resize in the source format with the site quality. None = not a valid spec."""
+    w, h, q = str(w or "").strip(), str(h or "").strip(), str(q or "").strip()
+    if not re.match(r"^(\d{1,5}|-)$", w):
+        return None
+    m = _SPEC_RE.match(h)
+    if m:
+        hh, fit, fmt, qq, smart = m.groups()
+    elif re.match(r"^(\d{1,5}|-)$", h):
+        hh, fit, fmt, qq, smart = h, "contain", "keep", (q if re.match(r"^\d{1,3}$", q) else "85"), "0"
+    else:
+        return None
+
+    def dim(v):
+        return None if v == "-" else max(1, min(IMAGE_MAX_DIM, int(v)))
+    return {"w": dim(w), "h": dim(hh), "fit": fit, "fmt": fmt, "q": max(1, min(100, int(qq))), "smart": smart == "1"}
+
+
+def _smart_offset(img, cw: int, ch: int) -> tuple[int, int]:
+    """Top-left corner of a cw x ch window inside img (already scaled to cover it) that maximises
+    image entropy, weighted toward the centre (SPEC §16.6 smart_crop). Scored on a small grayscale
+    copy at 17 positions along the free axis: deterministic and cheap."""
+    W, H = img.size
+    free_x, free_y = W - cw, H - ch
+    if free_x <= 0 and free_y <= 0:
+        return 0, 0
+    small = img.convert("L")
+    scale = min(1.0, 256.0 / max(W, H))
+    if scale < 1.0:
+        small = small.resize((max(1, int(W * scale)), max(1, int(H * scale))))
+    sw, sh = max(1, int(cw * scale)), max(1, int(ch * scale))
+    best, best_score, steps = 0.0, -1.0, 16
+    for i in range(steps + 1):
+        t = i / steps
+        if free_x > 0:
+            x0 = int(round(t * (small.size[0] - sw)))
+            box = (x0, 0, x0 + sw, min(small.size[1], sh))
+        else:
+            y0 = int(round(t * (small.size[1] - sh)))
+            box = (0, y0, min(small.size[0], sw), y0 + sh)
+        ent = small.crop(box).entropy()
+        score = ent * (1.0 - 0.35 * abs(t - 0.5) * 2)   # centre-weighted
+        if score > best_score + 1e-9:
+            best, best_score = t, score
+    return int(round(best * free_x)) if free_x > 0 else 0, int(round(best * free_y)) if free_y > 0 else 0
+
+
+def _avifenc(img, q: int, timeout: float = 30.0) -> bytes:
+    """AVIF through the avifenc CLI (libavif-bin): PNG in, AVIF out, in a private temp dir."""
+    import tempfile   # noqa: PLC0415
+    exe = shutil.which("avifenc")
+    if not exe:
+        raise RuntimeError("no avifenc")
+    with tempfile.TemporaryDirectory(prefix="pcdn-img-") as d:
+        src, dst = os.path.join(d, "in.png"), os.path.join(d, "out.avif")
+        img.save(src, "PNG", compress_level=1)
+        p = subprocess.run([exe, "-q", str(q), "-s", "8", "-j", "1", src, dst], capture_output=True, timeout=timeout)
+        if p.returncode != 0 or not os.path.isfile(dst):
+            raise RuntimeError("avifenc failed: " + p.stderr.decode("utf-8", "replace")[-300:])
+        with open(dst, "rb") as f:
+            return f.read()
+
+
+def transform_image(data: bytes, spec: dict, avif_mode: str = "auto") -> tuple[bytes, str]:
+    """Apply a parsed spec to an original image -> (bytes, content type). Raises ValueError for input
+    that cannot be transformed (not an image, animated, too many pixels): the caller answers 415.
+    avif_mode: auto (Pillow plugin, else avifenc), pillow, avifenc, none (AVIF not possible: the source
+    format is kept)."""
+    from PIL import Image, ImageOps   # noqa: PLC0415 - optional dependency (python3-pil)
+    import io   # noqa: PLC0415
+    Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
+    try:
+        img = Image.open(io.BytesIO(data))
+        src_fmt = (img.format or "").upper()
+        if src_fmt not in ("JPEG", "PNG", "WEBP", "GIF"):
+            raise ValueError(f"unsupported source format {src_fmt or '?'}")
+        if getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1:
+            raise ValueError("animated image")
+        if img.size[0] * img.size[1] > IMAGE_MAX_PIXELS:
+            raise ValueError("too many pixels")
+        img.load()
+    except (OSError, Image.DecompressionBombError) as e:
+        raise ValueError(str(e)) from e
+    img = ImageOps.exif_transpose(img)
+    W, H = img.size
+    tw, th = spec["w"], spec["h"]
+    if tw or th:
+        if spec["fit"] == "cover" and tw and th:
+            tw, th = min(tw, W), min(th, H)            # never enlarged
+            scale = max(tw / W, th / H)
+            sw, sh = max(tw, int(round(W * scale))), max(th, int(round(H * scale)))
+            if (sw, sh) != (W, H):
+                img = img.resize((sw, sh), Image.LANCZOS)
+            if spec["smart"]:
+                x0, y0 = _smart_offset(img, tw, th)
+            else:
+                x0, y0 = (img.size[0] - tw) // 2, (img.size[1] - th) // 2
+            img = img.crop((x0, y0, x0 + tw, y0 + th))
+        else:   # contain (or cover with one free side): proportional, inside the box
+            scale = min((tw or W) / W, (th or H) / H, 1.0)
+            if scale < 1.0:
+                img = img.resize((max(1, int(round(W * scale))), max(1, int(round(H * scale)))), Image.LANCZOS)
+    fmt = spec["fmt"]
+    if fmt == "avif" and avif_mode == "none":
+        fmt = "keep"
+    if fmt == "keep":
+        fmt = {"JPEG": "jpeg", "PNG": "png", "WEBP": "webp", "GIF": "png"}[src_fmt]
+    q = spec["q"]
+    out = io.BytesIO()
+    alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+    if fmt == "jpeg":
+        if alpha:
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        img.save(out, "JPEG", quality=q, optimize=True, progressive=True)
+        return out.getvalue(), "image/jpeg"
+    if fmt == "png":
+        img.save(out, "PNG", optimize=True)
+        return out.getvalue(), "image/png"
+    img = img.convert("RGBA" if alpha else "RGB")
+    if fmt == "webp":
+        img.save(out, "WEBP", quality=q, method=4)
+        return out.getvalue(), "image/webp"
+    # avif
+    if avif_mode in ("auto", "pillow"):
+        try:
+            img.save(out, "AVIF", quality=q, speed=8)
+            return out.getvalue(), "image/avif"
+        except (KeyError, OSError, ValueError):
+            if avif_mode == "pillow":
+                raise
+    return _avifenc(img, q), "image/avif"
+
+
+def imaged_server(cfg: dict):
+    """The transformer's ThreadingHTTPServer on 127.0.0.1:IMAGE_PORT (not started)."""
+    import http.server   # noqa: PLC0415
+    import threading     # noqa: PLC0415
+    port = _int(cfg.get("IMAGE_PORT"), 8090, 1, 65535)
+    rz_port = _int(cfg.get("RESIZE_PORT"), 8089, 1, 65535)
+    max_src = _int(cfg.get("IMAGE_MAX_SOURCE_MB"), 20, 1, 200) * 1024 * 1024
+    slots = threading.BoundedSemaphore(_int(cfg.get("IMAGE_WORKERS"), 2, 1, 64))
+    icaps = image_capabilities(dict(cfg, IMAGED="auto"))
+    avif_mode = "auto" if icaps["avif"] else "none"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "pcdn-imaged"
+
+        def log_message(self, *a):   # nginx logs the request; keep the journal quiet
+            pass
+
+        def _reply(self, code: int, body: bytes = b"", ctype: str = "text/plain"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self):
+            spec = parse_image_spec(self.headers.get("X-Pcdn-W"), self.headers.get("X-Pcdn-H"),
+                                    self.headers.get("X-Pcdn-Q"))
+            path = self.path.split("?", 1)[0]
+            if spec is None or not path.startswith("/") or not self.headers.get("X-Pcdn-Origin"):
+                return self._reply(400)
+            if not slots.acquire(timeout=5):
+                return self._reply(503)
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{rz_port}/__pcdn_rz/src{path}")
+                for h in ("Host", "X-Pcdn-Origin", "X-Pcdn-Mtls"):
+                    if self.headers.get(h):
+                        req.add_header(h, self.headers[h])
+                try:
+                    with opener.open(req, timeout=30) as r:
+                        data = r.read(max_src + 1)
+                except urllib.error.HTTPError as e:
+                    return self._reply(e.code if 400 <= e.code < 500 else 502)
+                except (OSError, ValueError):
+                    return self._reply(502)
+                if len(data) > max_src:
+                    return self._reply(413)
+                try:
+                    body, ctype = transform_image(data, spec, avif_mode)
+                except ValueError:
+                    return self._reply(415)
+                except Exception as e:  # noqa: BLE001 - encoder trouble: nginx falls back
+                    log.warning("image transform failed for %s: %s", path[:200], e)
+                    return self._reply(500)
+                self._reply(200, body, ctype)
+            finally:
+                slots.release()
+
+        do_HEAD = do_GET
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    log.info("image transformer on 127.0.0.1:%d (avif: %s)", port, avif_mode)
+    return srv
+
+
+def run_imaged(cfg: dict):
+    """The `pcdn-agent imaged` service loop (see above). Binds 127.0.0.1 only."""
+    import threading     # noqa: PLC0415
+    srv = imaged_server(cfg)
+
+    def stop(*_):
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+
+
+# ----------------------------------------------------------------- host network guard (SPEC §16.3)
+
+GUARD_TABLE = "pcdn_guard"
+
+
+def _guard_int(cfg: dict, key: str, default: int, lo: int, hi: int) -> int:
+    return _int(cfg.get(key), default, lo, hi)
+
+
+def guard_allow(cfg: dict, resolve=socket.getaddrinfo) -> tuple[list[str], list[str]]:
+    """Never-limited sources: the controller's addresses (resolved now from CONTROLLER_URL) and
+    GUARD_ALLOW. -> (ipv4 cidrs, ipv6 cidrs)."""
+    nets = []
+    host = urllib.parse.urlparse(cfg.get("CONTROLLER_URL") or "").hostname
+    if host:
+        try:
+            nets += [ai[4][0] for ai in resolve(host, None)]
+        except (OSError, UnicodeError):
+            log.warning("guard: cannot resolve the controller %s; only GUARD_ALLOW is allow-listed", host)
+    nets += re.split(r"[\s,]+", str(cfg.get("GUARD_ALLOW") or "").strip())
+    v4, v6 = [], []
+    for n in nets:
+        try:
+            net = ipaddress.ip_network(str(n).strip().split("%")[0], strict=False)
+        except ValueError:
+            continue
+        (v4 if net.version == 4 else v6).append(str(net))
+    return sorted(set(v4)), sorted(set(v6))
+
+
+def tcp_wscale(proc: str = "/proc/sys") -> int:
+    """The window-scale shift Linux advertises (tcp_select_initial_window over max(tcp_rmem[2],
+    rmem_max)): the SYN proxy must announce the same value the server socket uses."""
+    try:
+        with open(os.path.join(proc, "net/ipv4/tcp_rmem")) as f:
+            space = int(f.read().split()[2])
+        with open(os.path.join(proc, "net/core/rmem_max")) as f:
+            space = max(space, int(f.read().strip()))
+    except (OSError, ValueError, IndexError):
+        return 7
+    ws = 0
+    while space > 65535 and ws < 14:
+        space >>= 1
+        ws += 1
+    return ws
+
+
+def iface_mtu(iface: str | None, sys_net: str = "/sys/class/net") -> int:
+    try:
+        with open(os.path.join(sys_net, iface or "-", "mtu")) as f:
+            return max(576, min(65535, int(f.read().strip())))
+    except (OSError, ValueError):
+        return 1500
+
+
+def render_guard(cfg: dict, synproxy: bool = False, allow: tuple | None = None, wscale: int | None = None,
+                 mtu: int | None = None) -> str:
+    """nftables ruleset for install.sh --harden-net (SPEC §16.3), table inet pcdn_guard, loaded
+    atomically (the leading "table/delete" pair replaces a previous version in one transaction).
+    Policy accept everywhere: the guard only drops over-limit / invalid packets. Order: loopback,
+    SSH ports and the allow-list (controller + GUARD_ALLOW) are accepted FIRST, so they are never
+    limited; then optionally the SYN proxy for the HTTP(S) ports, invalid conntrack state, per-/24
+    (IPv6 /64) and global SYN limits, per-source UDP/<HTTPS_PORT> (QUIC) limit and an ICMP echo
+    limit. Complements, never replaces, datacenter scrubbing."""
+    v4, v6 = allow if allow is not None else guard_allow(cfg)
+    ssh = sorted({int(x) for x in re.findall(r"\d{1,5}", str(cfg.get("GUARD_SSH_PORTS") or "22"))
+                  if 0 < int(x) < 65536} or {22})
+    http_port = _int(cfg.get("HTTP_PORT"), 80, 1, 65535)
+    https_port = _int(cfg.get("HTTPS_PORT"), 443, 1, 65535)
+    syn = _guard_int(cfg, "GUARD_SYN_RATE", 1000, 1, 10_000_000)
+    burst = _guard_int(cfg, "GUARD_SYN_BURST", 2000, 1, 10_000_000)
+    glob = _guard_int(cfg, "GUARD_SYN_GLOBAL", 50000, 1, 100_000_000)
+    udp = _guard_int(cfg, "GUARD_UDP_RATE", 20000, 1, 100_000_000)
+    icmp = _guard_int(cfg, "GUARD_ICMP_RATE", 100, 1, 10_000_000)
+    ws = tcp_wscale() if wscale is None else wscale
+    mtu = iface_mtu(default_iface()) if mtu is None else mtu
+    web = f"{{ {http_port}, {https_port} }}"
+    synf = "tcp flags & (fin|syn|rst|ack) == syn"
+
+    def aset(name, typ, elems):
+        body = f"    set {name} {{\n        type {typ}\n        flags interval\n"
+        if elems:
+            body += "        elements = { " + ", ".join(elems) + " }\n"
+        return body + "    }"
+
+    def dset(name, typ):
+        return (f"    set {name} {{\n        type {typ}\n        flags dynamic, timeout\n        timeout 60s\n"
+                f"        size 65535\n    }}")
+
+    out = ["# pcdn host network guard (SPEC §16.3) — generated by `pcdn-agent guard`, do not edit.",
+           f"# Remove with: install.sh --no-harden-net (or: nft delete table inet {GUARD_TABLE})",
+           f"table inet {GUARD_TABLE} {{}}", f"delete table inet {GUARD_TABLE}", f"table inet {GUARD_TABLE} {{",
+           aset("allow4", "ipv4_addr", v4), aset("allow6", "ipv6_addr", v6),
+           dset("syn4", "ipv4_addr"), dset("syn6", "ipv6_addr"), dset("udp4", "ipv4_addr"), dset("udp6", "ipv6_addr")]
+    if synproxy:
+        out += ["    chain raw {", "        type filter hook prerouting priority raw; policy accept;",
+                f"        tcp dport {web} {synf} notrack", "    }"]
+    rules = ['iif "lo" accept',
+             f"tcp dport {{ {', '.join(str(p) for p in ssh)} }} accept",
+             "ip saddr @allow4 accept", "ip6 saddr @allow6 accept",
+             # per-source /24 (IPv6 /64) and host-wide new-connection rates
+             f"{synf} update @syn4 {{ ip saddr & 255.255.255.0 limit rate over {syn}/second burst {burst} packets }} drop",
+             f"{synf} update @syn6 {{ ip6 saddr & ffff:ffff:ffff:ffff:: limit rate over {syn}/second burst {burst} packets }} drop"]
+    if synproxy:
+        rules += [f"meta nfproto ipv4 tcp dport {web} ct state invalid,untracked synproxy mss {mtu - 40} wscale {ws} timestamp sack-perm",
+                  f"meta nfproto ipv6 tcp dport {web} ct state invalid,untracked synproxy mss {mtu - 60} wscale {ws} timestamp sack-perm"]
+    rules += ["ct state invalid drop",
+              f"{synf} limit rate over {glob}/second burst {glob * 2} packets drop",
+              f"udp dport {https_port} update @udp4 {{ ip saddr limit rate over {udp}/second burst {udp * 2} packets }} drop",
+              f"udp dport {https_port} update @udp6 {{ ip6 saddr limit rate over {udp}/second burst {udp * 2} packets }} drop",
+              f"icmp type echo-request limit rate over {icmp}/second burst {icmp * 2} packets drop",
+              f"icmpv6 type echo-request limit rate over {icmp}/second burst {icmp * 2} packets drop"]
+    out += ["    chain input {", "        type filter hook input priority filter - 10; policy accept;"]
+    out += ["        " + r for r in rules] + ["    }", "}"]
+    return "\n".join(out) + "\n"
+
+
 class Controller:
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/")
@@ -3956,6 +4930,11 @@ class Agent:
         try:   # SPEC §15.1/§15.2: agent-side only (abnormal-end attribution, fair-share hot flag)
             st["tunnel_map"] = tunnel_map(body)
             st["node"] = norm_node(body, cfg)
+            vh = video_hosts(body)   # SPEC §16.5 usage attribution (agent-side only, never rendered)
+            if vh:
+                st["video_hosts"] = vh
+            else:
+                st.pop("video_hosts", None)
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
         version = body["version"]
@@ -4065,6 +5044,10 @@ class Agent:
             read_usage(self.state, self.cfg["ACCESS_LOG"], ship=ls if ls.active else None)
         finally:
             ls.end_pass()   # the partial log-export batch of this read goes to the spool (never raises)
+        try:   # SPEC §16.4: L4 sessions from the stream access log (absent on nodes without L4 apps)
+            read_l4_usage(self.state, self.cfg.get("L4_ACCESS_LOG") or "/var/log/nginx/pcdn-l4.log")
+        except Exception as e:  # noqa: BLE001 - never let L4 accounting break HTTP usage
+            log.error("L4 usage read failed: %s", e)
         self._enqueue_usage()
         # F8: persist the outbox (with its batch_ids and the advanced log_pos) BEFORE the first POST,
         # so a crash or restart replays the SAME batch rather than a different one. A save failure is
@@ -4219,10 +5202,19 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # capture the agent's own WARN/ERROR lines so they ship with the nginx error log (SPEC §11.2)
     logging.getLogger("pcdn-agent").addHandler(AGENT_LOGS)
-    cfg = load_config(os.getenv("PCDN_CONFIG", "/etc/pcdn/agent.conf"))
+    try:
+        cfg = load_config(os.getenv("PCDN_CONFIG", "/etc/pcdn/agent.conf"))
+    except PermissionError:   # the sandboxed imaged cannot read a root-only file: defaults + env
+        cfg = load_config("/nonexistent")
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "bootstrap":
         bootstrap(cfg)
+        return
+    if cmd == "imaged":   # SPEC §16.6 image transformer (service pcdn-imaged)
+        run_imaged(cfg)
+        return
+    if cmd == "guard":    # SPEC §16.3: print the nftables ruleset (install.sh --harden-net)
+        sys.stdout.write(render_guard(cfg, synproxy="--synproxy" in sys.argv[2:]))
         return
     if not cfg["CONTROLLER_URL"] or not cfg["EDGE_TOKEN"]:
         log.error("CONTROLLER_URL and EDGE_TOKEN must be set in /etc/pcdn/agent.conf")

@@ -25,6 +25,18 @@
 #                      (flags still override); LOGSHIP_*, CAPACITY_MBPS, FAIR_SHARE_PCT,
 #                      NODE_NAME and SPEED_FILE set there are kept
 #   --distro-nginx     same as --no-http3 (the default)
+#   --harden-net       opt-in host network guard (SPEC §16.3): nftables table pcdn_guard (SYN rate limits
+#                      per /24 and global, SYN proxy for the HTTP(S) ports when the kernel supports it,
+#                      invalid-conntrack drop, per-source UDP/<https-port> limit, ICMP echo limit; SSH
+#                      ports and the controller are allow-listed first). Values: GUARD_* in agent.conf.
+#                      A complement to datacenter scrubbing, never a replacement.
+#   --no-harden-net    remove the guard (table, service, sysctls); --upgrade keeps the installed state
+#   --no-avif          do not install libavif-bin (AVIF output then needs Pillow's own AVIF plugin);
+#                      default: installed when the distribution has it (SPEC §16.6)
+# L4 proxy (SPEC §16.4): the stream module is installed (libnginx-mod-stream / built into nginx.org) and
+# nginx.conf includes /etc/nginx/pcdn/l4/*.conf at the main context. Open L4_PORT_RANGE (default
+# 20000-29999, TCP and UDP) in the host / provider firewall. Images v2: python3-pil + service
+# pcdn-imaged (loopback image transformer, sandboxed).
 set -euo pipefail
 
 CONTROLLER=""
@@ -43,6 +55,8 @@ KEEP_CONF="" # operator-tuned agent.conf lines carried over by --upgrade (log ex
 # F6: worker_shutdown_timeout — bounds how many draining worker generations pile up after reloads.
 # 1h matches the default tunnel idle_timeout; use 20-30m on <=4GB nodes. Never seconds (a hard cut).
 SHUTDOWN_TIMEOUT=1h
+HARDEN_NET=""  # yes | no ("" = not given: no, or the installed GUARD value on --upgrade)
+AVIF=""        # yes | no ("" = not given: yes, or the installed value on --upgrade)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 while [ $# -gt 0 ]; do
@@ -61,6 +75,10 @@ while [ $# -gt 0 ]; do
     --shutdown-timeout) SHUTDOWN_TIMEOUT="$2"; shift 2 ;;
     --no-geoip) GEOIP=no; shift ;;
     --upgrade) UPGRADE=yes; shift ;;
+    --harden-net) HARDEN_NET=yes; shift ;;
+    --no-harden-net) HARDEN_NET=no; shift ;;
+    --avif) AVIF=yes; shift ;;
+    --no-avif) AVIF=no; shift ;;
     *) echo "unknown option: $1"; exit 1 ;;
   esac
 done
@@ -84,13 +102,19 @@ if [ "$UPGRADE" = yes ]; then
   v="$(conf HTTPS_PORT)"; [ -n "$v" ] && HTTPS_PORT="$v"
   if [ -z "$TCP_CC" ]; then v="$(conf TCP_CC)"; case "$v" in bbr|cubic) TCP_CC="$v" ;; esac; fi
   if [ -z "$HTTP3" ]; then v="$(conf HTTP3)"; case "$v" in yes|no) HTTP3="$v" ;; esac; fi
+  # wave 8: the host guard (SPEC §16.3) and AVIF tooling (§16.6) stay as installed unless a flag says
+  if [ -z "${HARDEN_NET:-}" ]; then v="$(conf GUARD)"; case "$v" in yes|no) HARDEN_NET="$v" ;; esac; fi
+  if [ -z "${AVIF:-}" ]; then v="$(conf AVIF)"; case "$v" in yes|no) AVIF="$v" ;; esac; fi
   # kept across --upgrade: log-export tunables (SPEC §14.3.2) and the wave-7 node settings an operator
   # may have added (SPEC §15.2 fair-share capacity / share, §15.6 speed-test node name / file)
-  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE)=' \
+  # and the wave-8 settings (SPEC §16.3 GUARD_* values, §16.4 L4_*, §16.6 IMAGE*/IMAGED)
+  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY))=' \
     /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
 HTTP3="${HTTP3:-no}"
+HARDEN_NET="${HARDEN_NET:-no}"
+AVIF="${AVIF:-yes}"
 [ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || { echo "usage: $0 --controller URL --token TOKEN"; exit 1; }
 [ -f /etc/debian_version ] || { echo "only Ubuntu 24.04 (or a Debian derivative with njs >= 0.8.1) is supported"; exit 1; }
 case "$HTTP_PORT$HTTPS_PORT" in *[!0-9]*) echo "ports must be numeric"; exit 1 ;; esac
@@ -173,8 +197,19 @@ else
   apt-get install -y -q curl ca-certificates python3 logrotate gzip
   # shellcheck disable=SC2086
   apt-get install -y -q $NGINX_APT_OPTS \
-    nginx libnginx-mod-http-js libnginx-mod-http-geoip2 libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter
+    nginx libnginx-mod-http-js libnginx-mod-http-geoip2 libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter \
+    libnginx-mod-stream
   NJS_PKG=libnginx-mod-http-js
+fi
+# SPEC §16.6 images v2 (best effort: without them the node reports image_transform / avif false and
+# keeps serving image_filter resizes / originals)
+apt-get install -y -q python3-pil || echo "warning: python3-pil not installed: no image transformer (images v2)"
+if [ "$AVIF" = yes ]; then
+  if apt-cache show libavif-bin >/dev/null 2>&1; then
+    apt-get install -y -q libavif-bin || echo "warning: libavif-bin not installed: no AVIF output"
+  else
+    echo "warning: libavif-bin is not available here (enable 'universe'?): no AVIF output unless Pillow has AVIF"
+  fi
 fi
 if [ -f /etc/nginx/00-pcdn.conf.parked ]; then mv -f /etc/nginx/00-pcdn.conf.parked /etc/nginx/conf.d/00-pcdn.conf; fi
 
@@ -202,6 +237,7 @@ install -m 644 "$HERE/systemd/pcdn-geoip.timer" /etc/systemd/system/pcdn-geoip.t
 install -m 644 "$HERE/systemd/pcdn-geoip-retry.service" /etc/systemd/system/pcdn-geoip-retry.service
 install -m 644 "$HERE/systemd/pcdn-geoip-retry.timer" /etc/systemd/system/pcdn-geoip-retry.timer
 install -m 755 "$HERE/pcdn-geoip-update.sh" /usr/local/sbin/pcdn-geoip-update
+install -m 644 "$HERE/systemd/pcdn-imaged.service" /etc/systemd/system/pcdn-imaged.service
 # the agent renders /etc/nginx/pcdn/http.conf (base config) + sites; conf.d only includes it
 echo 'include /etc/nginx/pcdn/http.conf;' > /etc/nginx/conf.d/00-pcdn.conf
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
@@ -218,6 +254,12 @@ if grep -q '^[[:space:]]*#*[[:space:]]*multi_accept' /etc/nginx/nginx.conf; then
   sed -i 's/^\([[:space:]]*\)#*[[:space:]]*multi_accept.*/\1multi_accept off;/' /etc/nginx/nginx.conf
 else
   sed -i 's/^\([[:space:]]*\)\(worker_connections.*\)$/\1\2\n\1multi_accept off;/' /etc/nginx/nginx.conf
+fi
+# SPEC §16.4: the agent's L4 proxy (stream {}) lives in /etc/nginx/pcdn/l4/*.conf, main context (the
+# glob matches nothing until a site has an L4 app; the agent renders it only when this line exists)
+if ! grep -q '^include /etc/nginx/pcdn/l4/\*\.conf;' /etc/nginx/nginx.conf; then
+  printf '\n# pcdn L4 proxy (SPEC §16.4): stream {} rendered by pcdn-agent\ninclude /etc/nginx/pcdn/l4/*.conf;\n' \
+    >> /etc/nginx/nginx.conf
 fi
 if grep -q '^worker_rlimit_nofile' /etc/nginx/nginx.conf; then
   sed -i 's/^worker_rlimit_nofile.*/worker_rlimit_nofile 524288;/' /etc/nginx/nginx.conf
@@ -295,10 +337,19 @@ fi
 # LOGSHIP_TIMEOUT=30 s per POST; values an operator added to agent.conf survive --upgrade
 if [ -n "$KEEP_CONF" ]; then printf '%s\n' "$KEEP_CONF" >> /etc/pcdn/agent.conf; fi
 # <<< pcdn keep logship
+# >>> pcdn wave8 conf (edge/tests/test_agent.py runs this)
+# SPEC §16.3 / §16.6 install choices (read back by --upgrade) and the SSH ports the guard never limits
+# (detected from sshd unless the operator set GUARD_SSH_PORTS)
+printf 'GUARD=%s\nAVIF=%s\n' "$HARDEN_NET" "$AVIF" >> /etc/pcdn/agent.conf
+if ! grep -q '^GUARD_SSH_PORTS=' /etc/pcdn/agent.conf; then
+  SSH_PORTS="$( (sshd -T 2>/dev/null || true) | awk '$1 == "port" {print $2}' | sort -un | tr '\n' ' ' | sed 's/ *$//')"
+  echo "GUARD_SSH_PORTS=${SSH_PORTS:-22}" >> /etc/pcdn/agent.conf
+fi
+# <<< pcdn wave8 conf
 umask 022
 
 cat > /etc/logrotate.d/pcdn <<'EOF'
-/var/log/nginx/pcdn-access.log {
+/var/log/nginx/pcdn-access.log /var/log/nginx/pcdn-l4.log {
     daily
     rotate 6
     maxsize 1G
@@ -402,6 +453,53 @@ if [ -n "$IF" ]; then
   fi
 fi
 
+# >>> pcdn guard (SPEC §16.3; opt-in, removable)
+GUARD_UNIT=/etc/systemd/system/pcdn-guard.service
+if [ "$HARDEN_NET" = yes ]; then
+  echo "==> host network guard (nftables table pcdn_guard)"
+  command -v nft >/dev/null 2>&1 || apt-get install -y -q nftables
+  install -m 644 "$HERE/systemd/pcdn-guard.service" "$GUARD_UNIT"
+  guard() { PCDN_CONFIG=/etc/pcdn/agent.conf /usr/bin/python3 /usr/local/bin/pcdn-agent guard "$@"; }
+  SYNPROXY=""
+  # SYN proxy for the HTTP(S) ports only when the kernel accepts the ruleset (GUARD_SYNPROXY=no: never)
+  if [ "$(sed -n 's/^GUARD_SYNPROXY=//p' /etc/pcdn/agent.conf | tail -1)" != no ] \
+     && guard --synproxy > /etc/pcdn/guard.nft.new && nft -c -f /etc/pcdn/guard.nft.new >/dev/null 2>&1; then
+    SYNPROXY=--synproxy
+  fi
+  guard $SYNPROXY > /etc/pcdn/guard.nft.new
+  if nft -c -f /etc/pcdn/guard.nft.new; then
+    mv -f /etc/pcdn/guard.nft.new /etc/pcdn/guard.nft
+    chmod 644 /etc/pcdn/guard.nft
+    if [ -n "$SYNPROXY" ]; then
+      # the SYN proxy needs syncookies + timestamps and strict TCP tracking (the third ACK of a proxied
+      # handshake must be INVALID so synproxy completes it). Untracked mid-stream connections from
+      # before the guard are dropped once.
+      printf 'net.ipv4.tcp_syncookies = 1\nnet.ipv4.tcp_timestamps = 1\nnet.netfilter.nf_conntrack_tcp_loose = 0\n' \
+        > /etc/sysctl.d/999-pcdn-guard.conf
+      sysctl -p /etc/sysctl.d/999-pcdn-guard.conf >/dev/null 2>&1 || true
+    else
+      rm -f /etc/sysctl.d/999-pcdn-guard.conf
+      sysctl -w net.netfilter.nf_conntrack_tcp_loose=1 >/dev/null 2>&1 || true
+    fi
+    systemctl daemon-reload
+    systemctl enable pcdn-guard >/dev/null
+    systemctl restart pcdn-guard
+    echo "    guard active${SYNPROXY:+ (with SYN proxy)}; remove with --no-harden-net"
+  else
+    rm -f /etc/pcdn/guard.nft.new
+    sed -i 's/^GUARD=yes$/GUARD=no/' /etc/pcdn/agent.conf
+    echo "warning: nft rejected the guard ruleset; the guard is NOT installed"
+  fi
+elif [ -f "$GUARD_UNIT" ] || [ -f /etc/pcdn/guard.nft ]; then
+  echo "==> removing the host network guard"
+  systemctl disable --now pcdn-guard >/dev/null 2>&1 || true
+  nft delete table inet pcdn_guard 2>/dev/null || true
+  rm -f "$GUARD_UNIT" /etc/pcdn/guard.nft /etc/pcdn/guard.nft.new /etc/sysctl.d/999-pcdn-guard.conf
+  sysctl -w net.netfilter.nf_conntrack_tcp_loose=1 >/dev/null 2>&1 || true
+  systemctl daemon-reload
+fi
+# <<< pcdn guard
+
 echo "==> GeoIP (DB-IP IP to Country Lite, CC BY 4.0)"
 systemctl daemon-reload
 if [ "$GEOIP" = yes ]; then
@@ -421,6 +519,21 @@ PCDN_CONFIG=/etc/pcdn/agent.conf /usr/bin/python3 /usr/local/bin/pcdn-agent once
 # `enable --now` would NOT restart an already-running service, leaving the old code in memory.
 systemctl enable pcdn-agent
 systemctl restart pcdn-agent
+# >>> pcdn imaged (SPEC §16.6): the loopback image transformer, sandboxed (DynamicUser); its settings
+# live in a world-readable file because it cannot read the root-only agent.conf
+aval() { v="$(sed -n "s/^$1=//p" /etc/pcdn/agent.conf | tail -1)"; echo "${v:-$2}"; }
+umask 022
+printf 'IMAGE_PORT=%s\nRESIZE_PORT=%s\nIMAGE_WORKERS=%s\nIMAGE_MAX_SOURCE_MB=%s\n' \
+  "$(aval IMAGE_PORT 8090)" "$(aval RESIZE_PORT 8089)" "$(aval IMAGE_WORKERS 2)" "$(aval IMAGE_MAX_SOURCE_MB 20)" \
+  > /etc/pcdn/imaged.conf
+chmod 644 /etc/pcdn/imaged.conf
+if [ "$(aval IMAGED auto)" != no ] && /usr/bin/python3 -c 'import PIL' 2>/dev/null; then
+  systemctl enable pcdn-imaged >/dev/null
+  systemctl restart pcdn-imaged
+else
+  systemctl disable --now pcdn-imaged >/dev/null 2>&1 || true
+fi
+# <<< pcdn imaged
 
 echo
 echo "Edge installed. Check: systemctl status pcdn-agent ; journalctl -u pcdn-agent -f"
@@ -430,3 +543,8 @@ if [ "$HTTP3" = yes ]; then
   echo "HTTP/3: allow UDP/$HTTPS_PORT (QUIC) in the host firewall and any provider security group,"
   echo "        e.g. 'ufw allow $HTTPS_PORT/udp' — TCP/$HTTPS_PORT alone keeps clients on HTTP/2."
 fi
+L4R="$(sed -n 's/^L4_PORT_RANGE=//p' /etc/pcdn/agent.conf | tail -1)"
+L4R="${L4R:-20000-29999}"
+echo
+echo "L4 proxy: allow TCP and UDP $L4R in the host firewall / provider security group (only ports of"
+echo "          configured apps listen), e.g. 'ufw allow ${L4R/-/:}/tcp' and 'ufw allow ${L4R/-/:}/udp'."

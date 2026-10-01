@@ -21,6 +21,8 @@
 #   --no-http3           back to the distro nginx (default)
 #   --cc bbr|cubic       TCP congestion control (default bbr)
 #   --upgrade            update an installed edge in place
+#   --harden-net         opt-in nftables host guard (SPEC §16.3); --no-harden-net removes it
+#   --no-avif            do not install libavif-bin (AVIF image output)
 set -euo pipefail
 
 CONTROLLER=""
@@ -33,7 +35,7 @@ while [ $# -gt 0 ]; do
     --token) TOKEN="${2:-}"; shift 2 ;;
     --region|--role|--cache-size|--http-port|--https-port|--cc)
       PASS+=("$1" "${2:-}"); shift 2 ;;
-    --no-ipv6|--no-geoip|--upgrade|--http3|--no-http3)
+    --no-ipv6|--no-geoip|--upgrade|--http3|--no-http3|--harden-net|--no-harden-net|--avif|--no-avif)
       PASS+=("$1"); shift ;;
     *) echo "bootstrap: unknown option: $1" >&2; exit 1 ;;
   esac
