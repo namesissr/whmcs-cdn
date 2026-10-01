@@ -69,7 +69,9 @@
   var NAV = [
     { title: 'شروع', items: ['overview', 'help'] },
     { title: 'DNS', items: ['dns', 'dnssec'] },
-    { title: 'تونل', items: ['tunnel'] },
+    // Wave 7 (SPEC §15.7): quality / usage / speed test appear once the controller answers tunnel/health
+    // (tunnelq.js P.w7.probe); the browser-only config checker needs no endpoint.
+    { title: 'تونل', items: ['tunnel', 'tquality', 'tusage', 'tconfig', 'speedtest'] },
     { title: 'عملکرد', items: ['cache', 'pagerules', 'image', 'pools'] },
     // Wave 6B (SPEC §14.2): shown only when the controller returns the section (see available()).
     { title: 'قوانین', items: ['redirects', 'transform'] },
@@ -89,6 +91,18 @@
   function readHash() {
     var m = /^#pcdn=([a-z]+)(?:\/([a-z0-9_-]+))?$/.exec(window.location.hash || '');
     return m && available(m[1]) ? { page: m[1], sub: m[2] || '' } : null;
+  }
+  /** A deep link to a registered page that is still hidden (feature probe pending), else null. */
+  function pendingHash() {
+    var m = /^#pcdn=([a-z]+)(?:\/([a-z0-9_-]+))?$/.exec(window.location.hash || '');
+    return m && pages[m[1]] && !available(m[1]) ? { page: m[1], sub: m[2] || '' } : null;
+  }
+  /** Rebuilds the side navigation in place (after a feature probe changed which pages are available). */
+  function refreshNav() {
+    var nav = root.querySelector('.pcdn-side .pcdn-nav');
+    if (!nav || !S.site) return;
+    clear(nav);
+    append(nav, navTree());
   }
   function writeHash(replace) {
     var hs = '#pcdn=' + S.page + (S.sub ? '/' + S.sub : '');
@@ -928,7 +942,9 @@
       h('dl', { className: 'pcdn-dl' },
         h('div', { 'data-w': 'credit' }, h('dt', { text: 'اعتبار کیف پول' }), h('dd', { className: Number(w.credit) > 0 ? '' : 'pcdn-text-danger', text: money(w.credit) })),
         h('div', null, h('dt', { text: 'ترافیک پلن' }), h('dd', { text: num(w.plan_gb) + ' گیگابایت' })),
-        h('div', { 'data-w': 'bought' }, h('dt', { text: 'خریداری‌شده این ماه' }), h('dd', { text: num(w.bought_gb) + ' گیگابایت' })),
+        h('div', { 'data-w': 'bought' }, h('dt', { text: 'خریداری‌شده این ماه' }), h('dd', { text: num(Math.max(0, Number(w.bought_gb) - (Number(w.addon_gb) || 0))) + ' گیگابایت' })),
+        // §15.7 «بسته‌ی ترافیک افزوده» add-ons paid this month (part of the cap, not of the wallet blocks)
+        Number(w.addon_gb) > 0 ? h('div', { 'data-w': 'addon' }, h('dt', { text: 'بسته‌ی ترافیک افزوده' }), h('dd', { text: num(w.addon_gb) + ' گیگابایت' })) : null,
         h('div', null, h('dt', { text: 'مصرف / سقف فعلی' }), h('dd', { text: P.num1(usedGb) + ' از ' + num(w.cap_gb) + ' گیگابایت' })),
         h('div', null, h('dt', { text: 'بسته ترافیک' }), h('dd', { text: num(w.block_gb) + ' گیگابایت' + (w.block_price != null ? ' — ' + money(w.block_price) : '') }))),
       h('div', { 'data-w': 'projection' }, proj),
@@ -1490,12 +1506,22 @@
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
     reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
-    readonly: READONLY, onLeave: onLeave
+    readonly: READONLY, onLeave: onLeave, refreshNav: refreshNav
   };
 
   // ------------------------------------------------------------------ boot
 
-  var r0 = readHash();
+  var r0 = readHash(), later = r0 ? null : pendingHash();
   if (r0) { S.page = r0.page; S.sub = r0.sub; }
   renderAll();
+  // Wave 7 (SPEC §15): one background GET tunnel/health decides whether the tunnel quality / usage /
+  // speed-test pages exist on this controller (an older one 404s and they stay hidden).
+  if (S.site && P.w7 && P.w7.probe) {
+    P.w7.probe().then(function (ok) {
+      if (!ok) return;
+      refreshNav();
+      var w = later && available(later.page) ? later : null;
+      if (w && S.page === 'overview' && /^#pcdn=/.test(window.location.hash || '')) go(w.page, w.sub, { fromHistory: true, fromBoot: true });
+    });
+  }
 })();

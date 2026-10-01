@@ -318,7 +318,8 @@ function pasargadcdn_UsageUpdate(array $params)
         }
         $limitMb = (int) ($site['bandwidth_limit_gb'] ?? 0) * 1024;
         if (isset($packageOf[$serviceId], $included[(int) $packageOf[$serviceId]])) {
-            $limitMb = $included[(int) $packageOf[$serviceId]];
+            // included traffic + this month's «بسته‌ی ترافیک افزوده» add-ons (SPEC §15.7) are not overage
+            $limitMb = $included[(int) $packageOf[$serviceId]] + pasargadcdn_addon_gb($serviceId) * 1024;
         }
         Capsule::table('tblhosting')
             ->where('id', $serviceId)
@@ -519,6 +520,21 @@ function pasargadcdn_topup_gb(int $serviceId, ?string $month = null): int
     }
 }
 
+/**
+ * GB of «بسته‌ی ترافیک افزوده» add-ons paid for a service in $month (SPEC §15.7). They are stored
+ * in mod_pasargadcdn_topups like prepaid purchases but with blocks = 0, so they raise the cap
+ * without counting toward the monthly auto-purchase limit.
+ */
+function pasargadcdn_addon_gb(int $serviceId, ?string $month = null): int
+{
+    try {
+        return (int) Capsule::table('mod_pasargadcdn_topups')->where('service_id', $serviceId)
+            ->where('month', $month ?: pasargadcdn_month())->where('status', 'paid')->where('blocks', 0)->sum('gb');
+    } catch (\Throwable $e) {
+        return 0;
+    }
+}
+
 /** Product row for the prepaid decision of a service (by pid), or []. */
 function pasargadcdn_product_row(int $pid): array
 {
@@ -568,6 +584,8 @@ function pasargadcdn_wallet(array $params): ?array
         return [
             'plan_gb' => $pp['plan_gb'],
             'bought_gb' => $bought,
+            // §15.7: the part of bought_gb that came from «بسته‌ی ترافیک افزوده» add-ons (not wallet blocks)
+            'addon_gb' => pasargadcdn_addon_gb($sid),
             'cap_gb' => $pp['plan_gb'] + $bought,
             'block_gb' => $pp['block_gb'],
             'block_price' => $blockPrice,
@@ -656,6 +674,8 @@ function pasargadcdn_statement(array $params): ?array
                 'amount' => round((float) $t->amount, 2),
                 'invoice_id' => $t->invoice_id ? (int) $t->invoice_id : 0,
                 'status' => (string) $t->status,
+                // §15.7 add-on traffic rows have no wallet blocks
+                'kind' => (int) $t->blocks === 0 ? 'addon' : 'auto',
             ];
             if ($t->status === 'paid') {
                 $byMonth[$m]['bought_gb'] += (int) $t->gb;
@@ -675,6 +695,7 @@ function pasargadcdn_statement(array $params): ?array
             'prepaid' => $pp !== null,
             'current_month' => pasargadcdn_month(),
             'months' => array_values($byMonth),
+        'addon_gb' => pasargadcdn_addon_gb($sid),
             'total_bought_gb' => $totalGb,
             'total_spent' => round($totalSpent, 2),
             'invoice_url' => 'viewinvoice.php?id=',
@@ -725,6 +746,9 @@ function pasargadcdn_cap_plan(array $params): array
         $row = pasargadcdn_product_row((int) ($params['pid'] ?? $params['packageid'] ?? 0));
         if ($row && pasargadcdn_prepaid($row, (array) ($params['configoptions'] ?? [])) !== null) {
             $plan['bandwidth_limit_gb'] += pasargadcdn_topup_gb((int) $params['serviceid']);
+        } else {
+            // §15.7 add-on traffic also raises the cap of non-prepaid services for the month it was paid in
+            $plan['bandwidth_limit_gb'] += pasargadcdn_addon_gb((int) $params['serviceid']);
         }
     }
     return $plan;
@@ -939,7 +963,7 @@ function pasargadcdn_assets(string $base): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, ['ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'tutorials.js', 'tunnel.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
+        }, ['ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js']),
     ];
 }
 

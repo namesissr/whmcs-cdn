@@ -44,6 +44,8 @@
       h('dl', { className: 'pcdn-dl' },
         drow('ترافیک پلن (این ماه)', num(plan) + ' گیگابایت', 'plan'),
         drow('ترافیک خریداری‌شده', num(boughtGb) + ' گیگابایت', 'bought'),
+        // §15.7: add-on traffic bought as «بسته‌ی ترافیک افزوده» (included in the line above when prepaid)
+        st && Number(st.addon_gb) > 0 ? drow('از آن، بسته‌ی ترافیک افزوده', num(st.addon_gb) + ' گیگابایت', 'addon') : null,
         drow('مجموع ترافیک قابل‌استفاده', included > 0 ? num(included) + ' گیگابایت' : 'نامحدود', 'included'),
         drow('مصرف‌شده این ماه', num1(usedGb) + ' گیگابایت', 'used'),
         remaining != null ? drow('باقی‌مانده', num1(remaining) + ' گیگابایت', 'remaining') : null,
@@ -70,7 +72,8 @@
         : h('span', { className: 'pcdn-muted', text: '—' });
       tbody.appendChild(h('tr', { 'data-topup': '1' },
         h('td', { className: 'pcdn-nowrap', text: P.date(t.ts, { dateStyle: 'medium' }) }),
-        h('td', { className: 'pcdn-num', text: num(t.gb) + ' گیگابایت' }),
+        h('td', { className: 'pcdn-num' }, h('span', { text: num(t.gb) + ' گیگابایت' }),
+          t.kind === 'addon' ? h('span', { className: 'pcdn-stmt-kind', 'data-kind': 'addon', text: ' بسته‌ی ترافیک افزوده' }) : null),
         h('td', { className: 'pcdn-num', text: money(Aa, t.amount) }),
         h('td', null, inv),
         h('td', null, P.badge(stt[0], stt[1]))));

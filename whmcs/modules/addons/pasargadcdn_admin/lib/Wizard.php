@@ -26,6 +26,12 @@ final class Wizard
     const EMAIL_EXHAUSTED = 'Pasargad CDN Traffic Exhausted';
     const EMAIL_WARNING = 'Pasargad CDN Traffic Warning';
     const EMAIL_FORECAST = 'Pasargad CDN Traffic Forecast';
+    /** Wave 7 (SPEC §15.7): origin-down / back-up e-mails of tunnel services (sent by TunnelAlerts). */
+    const EMAIL_TUNNEL_DOWN = 'Pasargad CDN Tunnel Origin Down';
+    const EMAIL_TUNNEL_UP = 'Pasargad CDN Tunnel Origin Up';
+    /** Wave 7: «بسته‌ی ترافیک افزوده» product add-ons, one per size (WHMCS add-ons carry no configurable options). */
+    const ADDON_NAME = 'بسته‌ی ترافیک افزوده';
+    const ADDON_SIZES = [10, 50, 100];
     const BILLING = [
         'prepaid' => 'پیش‌پرداخت از کیف پول (پیشنهادی)',
         'overage' => 'فاکتور ترافیک اضافه در پایان ماه',
@@ -198,6 +204,7 @@ final class Wizard
             'billing' => self::currentBilling(), 'overage' => self::currentBilling() === 'overage',
             'overage_price' => (float) self::BASE_OVERAGE[$kind], 'overage_allow' => 100,
             'email' => true, 'email_update' => false, 'update' => false, 'plans' => [],
+            'addon' => true, 'addon_sizes' => self::ADDON_SIZES,
         ];
         $existing = self::existingServerGroup();
         if ($existing) {
@@ -253,7 +260,33 @@ final class Wizard
             'email_update' => !empty($post['email_update']),
             'update' => !empty($post['update']),
             'plans' => [],
+            'addon' => !empty($post['addon']),
+            'addon_sizes' => self::ADDON_SIZES,
         ];
+        // Wave 7: add-on traffic sizes, e.g. "10, 50, 100" (GB, 1..100000, at most 6)
+        $rawSizes = trim(str_replace(['،', '-', '/'], ',', (string) Env::input($post['addon_sizes'] ?? '')));
+        if ($rawSizes !== '') {
+            $sizes = [];
+            foreach (explode(',', $rawSizes) as $v) {
+                $v = $numv($v);
+                if ($v === '') {
+                    continue;
+                }
+                if (!ctype_digit($v) || (int) $v < 1 || (int) $v > 100000) {
+                    $sizes = null;
+                    break;
+                }
+                $sizes[(int) $v] = (int) $v;
+            }
+            if ($sizes === null || !$sizes || count($sizes) > 6) {
+                if ($in['addon']) {
+                    $e[] = 'اندازه‌های بسته‌ی ترافیک افزوده باید ۱ تا ۶ عدد صحیح (گیگابایت) با کاما جدا باشند؛ مثلاً 10,50,100.';
+                }
+            } else {
+                ksort($sizes);
+                $in['addon_sizes'] = array_values($sizes);
+            }
+        }
         if ($in['group_name'] === '') {
             $e[] = 'نام گروه محصولات را وارد کنید.';
         }
@@ -550,6 +583,26 @@ final class Wizard
                 . "<p>برای جلوگیری از قطعی، می‌توانید اعتبار کیف پول را شارژ کنید تا پس از اتمام ترافیک پلن، بسته‌های ترافیک خودکار خریده شوند، "
                 . "یا برای صرفه‌جویی در بلندمدت، پلن را به یک پلن با ترافیک بیشتر ارتقا دهید.</p>\n"
                 . $btn . $manage, '#1d5fd6')],
+            // Wave 7 (SPEC §15.7): tunnel origin down / up (TunnelAlerts, from GET /api/v1/events?type=tunnel)
+            self::EMAIL_TUNNEL_DOWN => ['قطعی سرور پشت تونل — {$service_domain}', $wrap(
+                "<p>{\$client_name} عزیز، سلام</p>\n"
+                . "<p>از <strong>{\$cdn_tunnel_since}</strong> نودهای CDN نمی‌توانند به سرور پشت تونل دامنه <strong dir=\"ltr\">{\$service_domain}</strong> وصل شوند "
+                . "(<strong>{\$cdn_tunnel_origin_errors} از {\$cdn_tunnel_attempts}</strong> تلاش اتصال در چند دقیقه‌ی گذشته ناموفق بود). "
+                . "در این مدت کاربران VPN شما احتمالاً وصل نمی‌شوند.</p>\n"
+                . "{if \$cdn_tunnel_paths}<p>مسیرهای درگیر: <span dir=\"ltr\">{\$cdn_tunnel_paths}</span></p>\n{/if}"
+                . "<p><strong>چه چیزهایی را بررسی کنم؟</strong></p>\n<ul>"
+                . "<li>سرور خاموش نشده یا ترافیک/اعتبار آن تمام نشده باشد.</li>"
+                . "<li>سرویس Xray یا sing-box روشن باشد (مثلاً <span dir=\"ltr\">systemctl status xray</span>).</li>"
+                . "<li>پورت سرویس با پورت مسیر در صفحه‌ی تونل یکی باشد و فایروال سرور آی‌پی‌های CDN را نبسته باشد.</li></ul>\n"
+                . '<p style="margin:14px 0"><a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}#pcdn=tquality" style="display:inline-block;background:#1d5fd6;'
+                . 'color:#fff;padding:9px 20px;border-radius:8px;text-decoration:none;font-weight:bold">مشاهده‌ی کیفیت تونل</a></p>'
+                . "<p style=\"font-size:13px;color:#52606d\">وقتی اتصال دوباره برقرار شود، ایمیل دیگری برایتان می‌فرستیم.</p>", '#d64545')],
+            self::EMAIL_TUNNEL_UP => ['اتصال دوباره برقرار شد — سرور پشت تونل {$service_domain}', $wrap(
+                "<p>{\$client_name} عزیز، سلام</p>\n"
+                . "<p>اتصال نودهای CDN به سرور پشت تونل دامنه <strong dir=\"ltr\">{\$service_domain}</strong> از <strong>{\$cdn_tunnel_since}</strong> دوباره برقرار شده است"
+                . "{if \$cdn_tunnel_down_for} (مدت قطعی: حدود <strong>{\$cdn_tunnel_down_for}</strong>){/if}. کاربران VPN شما می‌توانند دوباره وصل شوند.</p>\n"
+                . "<p style=\"font-size:13px;color:#52606d\">اگر قطعی تکرار می‌شود، گزارش «کیفیت تونل» در ناحیه کاربری مشکل اصلی هر مسیر و راه‌حل آن را نشان می‌دهد.</p>"
+                . '<p style="margin:10px 0"><a href="{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}#pcdn=tquality">مشاهده‌ی کیفیت تونل</a></p>', '#13733a')],
         ];
     }
 
@@ -610,7 +663,9 @@ final class Wizard
             $what = [self::EMAIL_NAME => 'قالب خوش‌آمدگویی فارسی با نیم‌سرورها: ' . implode('، ', self::nameservers()),
                 self::EMAIL_EXHAUSTED => 'اطلاع‌رسانی قطع سرویس به‌دلیل اتمام ترافیک و کافی نبودن اعتبار (حداکثر یک بار در ماه)',
                 self::EMAIL_WARNING => 'هشدار ۹۰٪ ترافیک وقتی اعتبار برای بسته بعدی کافی نیست',
-                self::EMAIL_FORECAST => 'پیش‌بینی اتمام زودهنگام ترافیک پلن بر اساس روند مصرف (حداکثر یک بار در ماه)'];
+                self::EMAIL_FORECAST => 'پیش‌بینی اتمام زودهنگام ترافیک پلن بر اساس روند مصرف (حداکثر یک بار در ماه)',
+                self::EMAIL_TUNNEL_DOWN => '«قطعی سرور پشت تونل»: وقتی نودها به سرور تونل مشتری وصل نمی‌شوند (هر رویداد یک بار)',
+                self::EMAIL_TUNNEL_UP => '«اتصال دوباره برقرار شد»: پس از رفع قطعی سرور پشت تونل'];
             foreach ($what as $name => $desc) {
                 $tpl = self::findEmail($name);
                 $steps[] = ['op' => $tpl ? ($in['email_update'] ? 'update' : 'skip') : 'create', 'kind' => 'قالب ایمیل',
@@ -622,6 +677,14 @@ final class Wizard
                 ? 'پس از اتمام ترافیک پلن، بسته‌های ' . View::n((int) Env::setting('block_gb', '10') ?: 10) . ' گیگابایتی از کیف پول مشتری خریده می‌شود؛ اعتبار ناکافی = قطع تا شارژ مجدد. Overage WHMCS برای این محصولات خاموش است.'
                 : ($in['billing'] === 'overage' ? 'WHMCS در پایان ماه ترافیک مازاد را فاکتور می‌کند.' : 'سرویس در پایان ترافیک پلن قطع می‌شود؛ هزینه اضافه‌ای گرفته نمی‌شود.')];
 
+        if (!empty($in['addon'])) {
+            foreach ($in['addon_sizes'] as $gb) {
+                $ex = self::findAddon($gb);
+                $steps[] = ['op' => $ex ? ($in['update'] ? 'update' : 'skip') : 'create', 'kind' => 'افزونه', 'label' => self::addonName($gb),
+                    'detail' => $ex ? 'افزونه‌ی موجود #' . (int) $ex->id . ($in['update'] ? ' به‌روزرسانی می‌شود' : ' دست نمی‌خورد')
+                        : 'یک‌بار پرداخت، پنهان تا قیمت‌گذاری؛ پس از پرداخت فاکتور، سقف ترافیک این ماه سرویس ' . View::n($gb) . ' گیگابایت بالا می‌رود'];
+            }
+        }
         $perMb = self::perMb($in['overage_price']);
         $found = [];
         foreach ($in['plans'] as $key => $p) {
@@ -711,6 +774,10 @@ final class Wizard
         }
         if (Env::setting('billing', '') !== $in['billing']) {
             Env::saveSetting('billing', $in['billing']);
+        }
+        // Wave 7: lets the cron's add-on pass (cap retries / month rollover) run only where add-ons exist
+        if (!empty($in['addon']) && Env::setting('traffic_addon_on', '') !== 'on') {
+            Env::saveSetting('traffic_addon_on', 'on');
         }
         return $summary;
     }
@@ -867,6 +934,73 @@ final class Wizard
                 $out[] = ['op' => $added ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => View::n($added) . ' مسیر جدید — ' . self::FAMILIES[$fam], 'link' => ''];
             }
         }
+        if (!empty($in['addon'])) {
+            foreach (self::applyAddons($in, $now) as $row) {
+                $out[] = $row;
+            }
+        }
+        return $out;
+    }
+
+    // ------------------------------------------------------------------ Wave 7: add-on traffic (SPEC §15.7)
+
+    public static function addonName(int $gb): string
+    {
+        return self::ADDON_NAME . ' — ' . View::n($gb) . ' گیگابایت';
+    }
+
+    /** The wizard's add-on of this size: through the remembered id → GB map first, then by its name. */
+    public static function findAddon(int $gb)
+    {
+        if (!Env::hasTable('tbladdons')) {
+            return null;
+        }
+        foreach ((array) Env::kvGet('traffic_addons', []) as $id => $size) {
+            if ((int) $size === $gb) {
+                $row = Capsule::table('tbladdons')->where('id', (int) $id)->first();
+                if ($row) {
+                    return $row;
+                }
+            }
+        }
+        return Capsule::table('tbladdons')->where('name', self::addonName($gb))->first();
+    }
+
+    /**
+     * Creates (or, in update mode, refreshes) one «بسته‌ی ترافیک افزوده» add-on per size: one-time,
+     * linked to every CDN product, hidden from the order form until the admin prices it (no pricing
+     * rows are written: prices are the admin's). Remembers id → GB in mod_pasargadcdn_settings.
+     */
+    private static function applyAddons(array $in, string $now): array
+    {
+        if (!Env::hasTable('tbladdons')) {
+            return [['op' => 'skip', 'kind' => 'افزونه', 'label' => self::ADDON_NAME, 'link' => '']];
+        }
+        $out = [];
+        $map = (array) Env::kvGet('traffic_addons', []);
+        $packages = implode(',', array_map('intval', Capsule::table('tblproducts')->where('servertype', 'pasargadcdn')->orderBy('id')->pluck('id')->all()));
+        foreach ($in['addon_sizes'] as $gb) {
+            $gb = (int) $gb;
+            $cols = ['packages' => $packages, 'name' => self::addonName($gb),
+                'description' => View::n($gb) . ' گیگابایت ترافیک اضافه برای همین ماه سرویس CDN / تونل؛ بلافاصله پس از پرداخت به سقف ترافیک این ماه اضافه می‌شود و به ماه بعد منتقل نمی‌شود.',
+                'billingcycle' => 'onetime', 'allowqty' => 0, 'tax' => 1, 'autoactivate' => 'on', 'suspendproduct' => 0,
+                'welcomeemail' => 0, 'type' => '', 'module' => '', 'weight' => 0, 'updated_at' => $now];
+            $ex = self::findAddon($gb);
+            if ($ex) {
+                $id = (int) $ex->id;
+                if ($in['update']) {
+                    Capsule::table('tbladdons')->where('id', $id)->update(Env::onlyColumns('tbladdons', ['packages' => $packages, 'description' => $cols['description'], 'updated_at' => $now]));
+                }
+                $op = $in['update'] ? 'update' : 'skip';
+            } else {
+                $id = (int) Capsule::table('tbladdons')->insertGetId(Env::onlyColumns('tbladdons', $cols + ['showorder' => 0, 'hidden' => 1, 'retired' => 0,
+                    'downloads' => '', 'autolinkby' => '', 'server_group_id' => 0, 'created_at' => $now]));
+                $op = 'create';
+            }
+            $map[(string) $id] = $gb;
+            $out[] = ['op' => $op, 'kind' => 'افزونه', 'label' => self::addonName($gb), 'link' => 'configaddons.php?action=manage&id=' . $id];
+        }
+        Env::kvSet('traffic_addons', $map);
         return $out;
     }
 

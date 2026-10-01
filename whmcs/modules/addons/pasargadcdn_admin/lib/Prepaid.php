@@ -86,13 +86,20 @@ final class Prepaid
             return;
         }
         try {
-            $items = Capsule::table('tblinvoiceitems')->where('invoiceid', $invoiceId)->get(['type', 'userid'])->all();
+            $items = Capsule::table('tblinvoiceitems')->where('invoiceid', $invoiceId)->get(['id', 'type', 'userid', 'relid', 'amount'])->all();
             $types = array_map(function ($i) {
                 return (string) $i->type;
             }, $items);
             $topup = in_array(self::ITEM_TYPE, $types, true);
             $rtopup = in_array(self::RESELLER_ITEM_TYPE, $types, true);
             $funds = in_array('AddFunds', $types, true);
+            // Wave 7 (SPEC §15.7): «بسته‌ی ترافیک افزوده» add-on lines raise the cap in every billing mode
+            $addons = array_values(array_filter($items, function ($i) {
+                return (string) $i->type === 'Addon';
+            }));
+            if ($addons && class_exists(__NAMESPACE__ . '\\AddonTraffic')) {
+                AddonTraffic::applyItems($invoiceId, $addons);
+            }
             if (!$topup && !$rtopup && !$funds) {
                 return; // ordinary invoice: one query, nothing else
             }

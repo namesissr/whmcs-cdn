@@ -28,6 +28,10 @@ final class Env
     const RESELLERS = 'mod_pasargadcdn_resellers';
     const RESELLER_SITES = 'mod_pasargadcdn_reseller_sites';
     const RESELLER_TOPUPS = 'mod_pasargadcdn_reseller_topups';
+    /** Wave 7 (SPEC §15.7): tunnel origin-down / origin-up events already handled (dedupe per event id). */
+    const TUNNEL_EVENTS = 'mod_pasargadcdn_tunnel_events';
+    /** Wave 7 (SPEC §15.7): «بسته‌ی ترافیک افزوده» invoice items already applied (idempotency per item). */
+    const ADDON_ITEMS = 'mod_pasargadcdn_addon_items';
     const DEAD_STATUSES = ['Terminated', 'Cancelled', 'Fraud'];
     const DEFAULT_NS = ['ns1.pasargadmizban.com', 'ns2.pasargadmizban.com'];
 
@@ -266,6 +270,39 @@ final class Env
         self::$memo['tbl:' . self::RESELLERS] = true;
         self::$memo['tbl:' . self::RESELLER_SITES] = true;
         self::$memo['tbl:' . self::RESELLER_TOPUPS] = true;
+        // ---- Wave 7 (SPEC §15.7) -----------------------------------------------
+        if (!$schema->hasTable(self::TUNNEL_EVENTS)) {
+            $schema->create(self::TUNNEL_EVENTS, function ($t) {
+                $t->increments('id');
+                $t->integer('server_id');
+                $t->string('event_id', 64);              // controller id ("evt_…"), unique per controller
+                $t->string('type', 32);
+                $t->string('domain', 253)->default('');
+                $t->integer('service_id')->nullable();
+                $t->dateTime('event_at')->nullable();     // the event's created_at (UTC)
+                $t->string('status', 16)->default('new'); // sent | failed | skipped | stale | nomatch
+                $t->dateTime('created_at')->nullable();
+                $t->unique(['server_id', 'event_id'], 'mod_pcdn_tevents_once');
+                $t->index(['service_id', 'type'], 'mod_pcdn_tevents_service');
+            });
+        }
+        if (!$schema->hasTable(self::ADDON_ITEMS)) {
+            $schema->create(self::ADDON_ITEMS, function ($t) {
+                $t->integer('invoice_item_id')->primary(); // one application per paid invoice line
+                $t->integer('invoice_id');
+                $t->integer('service_id');
+                $t->integer('hostingaddon_id')->default(0);
+                $t->integer('gb')->default(0);
+                $t->char('month', 7);
+                $t->integer('topup_id')->nullable();
+                $t->string('status', 16)->default('pending'); // applied | skipped
+                $t->tinyInteger('cap_ok')->default(0);
+                $t->dateTime('created_at')->nullable();
+                $t->index('service_id', 'mod_pcdn_addon_service');
+            });
+        }
+        self::$memo['tbl:' . self::TUNNEL_EVENTS] = true;
+        self::$memo['tbl:' . self::ADDON_ITEMS] = true;
     }
 
     // ------------------------------------------------------------------ servers / controller

@@ -7,6 +7,57 @@
  *   ['code', text, label] ['note', text, 'info'|'warn'|'danger']
  *   ['go', sectionId, label] (button to a panel section) ['tut', tutorialId, label]
  */
+/*
+ * Wave 7 (SPEC §15.7) — client apps for the tunnel: short Persian steps per app, shown next to the
+ * share link / QR in «پیکربندی آماده» (tunnel.js) and as the «tunnelapps» tutorial below.
+ * support: protocol → 'yes' | 'maybe' (depends on the app version / core) | 'no'.
+ */
+window.PCDN_TUNNEL_APPS = [
+  { id: 'v2rayng', name: 'v2rayNG', os: 'اندروید', core: 'Xray', link: true,
+    support: { grpc: 'yes', xhttp: 'yes', ws: 'yes', httpupgrade: 'yes', h2: 'yes' },
+    steps: ['لینک اشتراک را کپی کنید (یا QR همین صفحه را آماده نگه دارید).',
+      'v2rayNG را باز کنید و دکمه + بالای صفحه را بزنید.',
+      'گزینه «Import config from clipboard» را بزنید؛ یا «Scan QR code» و QR را اسکن کنید.',
+      'کانفیگ تازه را در فهرست انتخاب کنید و دکمه‌ی گرد پایین صفحه را بزنید؛ اجازه‌ی ساخت VPN را تأیید کنید.',
+      'برای اطمینان، از منوی ⋮ گزینه‌ی «Real delay» را بزنید؛ عدد میلی‌ثانیه یعنی اتصال کار می‌کند.'] },
+  { id: 'nekobox', name: 'NekoBox', os: 'اندروید', core: 'sing-box', link: true,
+    support: { grpc: 'yes', xhttp: 'no', ws: 'yes', httpupgrade: 'yes', h2: 'no' },
+    steps: ['لینک اشتراک را کپی کنید.',
+      'NekoBox را باز کنید، آیکن + (Add) بالای صفحه را بزنید و «Import from clipboard» یا «Scan QR code» را انتخاب کنید.',
+      'روی کانفیگ تازه بزنید تا انتخاب شود و دکمه‌ی اتصال (▶) پایین صفحه را بزنید.',
+      'اجازه‌ی VPN را تأیید کنید؛ با «URL Test» از منو می‌توانید تأخیر را ببینید.'] },
+  { id: 'hiddify', name: 'Hiddify', os: 'اندروید، iOS، ویندوز، مک', core: 'sing-box', link: true,
+    support: { grpc: 'yes', xhttp: 'maybe', ws: 'yes', httpupgrade: 'yes', h2: 'maybe' },
+    steps: ['لینک اشتراک را کپی کنید.',
+      'در Hiddify دکمه‌ی «+ پروفایل جدید» را بزنید و «افزودن از کلیپ‌بورد» (Add from clipboard) یا «اسکن QR» را انتخاب کنید.',
+      'پروفایل تازه را فعال کنید و دکمه‌ی بزرگ اتصال وسط صفحه را بزنید.',
+      'اگر وصل نشد، در تنظیمات Hiddify گزینه‌ی «Fragment» را خاموش بگذارید و دوباره امتحان کنید.'] },
+  { id: 'streisand', name: 'Streisand', os: 'iOS (آیفون و آیپد)', core: 'Xray', link: true,
+    support: { grpc: 'yes', xhttp: 'yes', ws: 'yes', httpupgrade: 'yes', h2: 'yes' },
+    steps: ['لینک اشتراک را کپی کنید.',
+      'Streisand را باز کنید، دکمه + بالای صفحه را بزنید و «Import from clipboard» (یا «Scan QR code») را انتخاب کنید.',
+      'کانفیگ تازه را انتخاب کنید و کلید اتصال بالای صفحه را روشن کنید.',
+      'بار اول، iOS برای افزودن پیکربندی VPN اجازه می‌خواهد؛ «Allow» را بزنید.'] },
+  { id: 'v2rayn', name: 'v2rayN', os: 'ویندوز', core: 'Xray', link: true,
+    support: { grpc: 'yes', xhttp: 'yes', ws: 'yes', httpupgrade: 'yes', h2: 'yes' },
+    steps: ['لینک اشتراک را کپی کنید.',
+      'v2rayN را باز کنید و در پنجره‌ی اصلی Ctrl+V بزنید (یا از منوی Servers گزینه‌ی «Import bulk URLs from clipboard»).',
+      'سرور تازه را انتخاب کنید و Enter بزنید تا سرور فعال شود.',
+      'پایین پنجره (یا آیکن کنار ساعت) «System proxy» را روی «Set system proxy» بگذارید؛ برای همه‌ی برنامه‌ها حالت TUN را روشن کنید.'] },
+  { id: 'singbox', name: 'sing-box', os: 'اندروید، iOS، مک (SFA / SFI / SFM)', core: 'sing-box', link: false,
+    support: { grpc: 'yes', xhttp: 'no', ws: 'yes', httpupgrade: 'yes', h2: 'no' },
+    steps: ['برنامه‌ی رسمی sing-box لینک vless:// را مستقیم وارد نمی‌کند؛ از بخش «کلاینت sing-box» همین صفحه، outbound آماده را کپی کنید.',
+      'در sing-box به Profiles بروید، «New Profile» را بزنید، نوع را Local و «Create New» را انتخاب کنید.',
+      'در ویرایشگر پروفایل، outbound کپی‌شده را در بخش "outbounds" بگذارید (همراه با یک inbound از نوع tun) و ذخیره کنید.',
+      'پروفایل را انتخاب و در Dashboard دکمه‌ی Start را بزنید.'] },
+  { id: 'shadowrocket', name: 'Shadowrocket', os: 'iOS (آیفون و آیپد)', core: 'Shadowrocket', link: true,
+    support: { grpc: 'yes', xhttp: 'maybe', ws: 'yes', httpupgrade: 'maybe', h2: 'maybe' },
+    steps: ['لینک اشتراک را کپی کنید و Shadowrocket را باز کنید؛ برنامه لینک کپی‌شده را تشخیص می‌دهد و برای افزودن آن سؤال می‌کند — «Add» را بزنید.',
+      'یا آیکن اسکن (بالای صفحه) را بزنید و QR همین صفحه را اسکن کنید.',
+      'سرور تازه را در فهرست انتخاب کنید و کلید «Not Connected» بالای صفحه را روشن کنید.',
+      'بار اول، اجازه‌ی افزودن پیکربندی VPN را در iOS تأیید کنید.'] }
+];
+
 window.PCDN_TUTORIALS = function (ctx) {
   'use strict';
   var d = ctx.domain || 'example.com';
@@ -443,6 +494,35 @@ window.PCDN_TUTORIALS = function (ctx) {
         ['note', 'سقف سرعت هر اتصال روی جریان‌های تونل اعمال نمی‌شود؛ سرعت هر کاربر تا حد پهنای باند نود و سرور شما آزاد است. مصرف تونل (آپلود و دانلود) جزو ترافیک ماهانه سرویس حساب می‌شود، پس برای کاربران پرمصرف پلن با ترافیک بیشتر بگیرید.', 'info'],
         ['tut', 'tunnel', 'راه‌اندازی VPN پشت CDN']
       ]
-    }
+    },
+    tunnelAppsTutorial()
   ];
+
+  /** «اتصال با برنامه‌ها» — built from PCDN_TUNNEL_APPS so the drawer and the tutorial never disagree. */
+  function tunnelAppsTutorial() {
+    var apps = window.PCDN_TUNNEL_APPS || [];
+    var P2 = { grpc: 'gRPC', xhttp: 'XHTTP', ws: 'WebSocket', httpupgrade: 'HTTPUpgrade', h2: 'h2' };
+    var blocks = [
+      ['p', 'برای هر کاربر، در صفحه‌ی «تونل / VPN» روی «پیکربندی آماده»ی یک مسیر بزنید، نام میزبان پروکسی‌شده را انتخاب کنید و لینک اشتراک یا QR را به کاربر بدهید. مراحل زیر برای برنامه‌های رایج است.'],
+      ['note', 'XHTTP فقط در برنامه‌های با هسته‌ی Xray (v2rayNG، v2rayN، Streisand) قطعی کار می‌کند. اگر کاربران برنامه‌های مختلف دارند، کنار XHTTP یک مسیر gRPC یا WebSocket هم بسازید.', 'info']
+    ];
+    apps.forEach(function (a) {
+      var no = Object.keys(a.support).filter(function (k) { return a.support[k] === 'no'; }).map(function (k) { return P2[k]; });
+      var maybe = Object.keys(a.support).filter(function (k) { return a.support[k] === 'maybe'; }).map(function (k) { return P2[k]; });
+      blocks.push(['h', a.name + ' — ' + a.os]);
+      blocks.push(['steps', a.steps]);
+      if (no.length || maybe.length) {
+        blocks.push(['note', (no.length ? 'پشتیبانی نمی‌کند: ' + no.join('، ') + '. ' : '') + (maybe.length ? 'بسته به نسخه‌ی برنامه: ' + maybe.join('، ') + '.' : ''), no.length ? 'warn' : 'info']);
+      }
+    });
+    blocks.push(['p', 'اگر برنامه وصل شد ولی سایتی باز نمی‌شود، «کیفیت تونل» و «بررسی کانفیگ سرور» را ببینید؛ اگر اصلاً وصل نمی‌شود، «تست اتصال» صفحه‌ی تونل را بزنید.']);
+    blocks.push(['go', 'tunnel', 'رفتن به تونل / VPN']);
+    blocks.push(['tut', 'tunnel', 'راه‌اندازی VPN پشت CDN']);
+    return {
+      id: 'tunnelapps', cat: 'تونل / VPN', title: 'اتصال کاربران با برنامه‌های VPN',
+      summary: 'گام‌های کوتاه برای v2rayNG، NekoBox، Hiddify، Streisand، v2rayN، sing-box و Shadowrocket با لینک اشتراک یا QR.',
+      keywords: 'v2rayng nekobox hiddify streisand v2rayn sing-box singbox shadowrocket کلاینت برنامه اندروید آیفون ios ویندوز لینک qr وارد کردن import',
+      blocks: blocks
+    };
+  }
 };

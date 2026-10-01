@@ -335,6 +335,9 @@
     return { link: link, xray: JSON.stringify(xray, null, 2), singbox: sb ? JSON.stringify(sb, null, 2) : null, serviceName: svc, alpn: alpn };
   }
   P.tunnelConfig = tunnelConfig;
+  // Wave 7: the config checker (tunnelq.js) compares a pasted server config with these.
+  P.tunnelListen = listenOf;
+  P.tunnelHosts = hosts;
 
   // ------------------------------------------------------------------ small pieces
 
@@ -423,6 +426,36 @@
     d.focusFirst();
   }
 
+  // ------------------------------------------------------------------ client apps: short steps next to the link / QR (Wave 7, §15.7)
+
+  /** App picker + Persian steps for v2rayNG, NekoBox, Hiddify, Streisand, v2rayN, sing-box, Shadowrocket (data: tutorials.js). */
+  function appGuide(p, st) {
+    var apps = Array.isArray(window.PCDN_TUNNEL_APPS) ? window.PCDN_TUNNEL_APPS : [];
+    if (!apps.length) return null;
+    st = st || {};
+    var cur = apps.some(function (a) { return a.id === st.app; }) ? st.app : apps[0].id;
+    var body = h('div', { className: 'pcdn-tn-app-body', 'aria-live': 'polite' });
+    var seg = P.segmented(apps.map(function (a) { return [a.id, a.name]; }), cur, function (v) { cur = st.app = v; draw(); }, 'برنامه‌ی کلاینت');
+    seg.classList.add('pcdn-tn-app-seg');
+    seg.setAttribute('data-seg', 'tn-app');
+    function draw() {
+      Array.prototype.forEach.call(seg.querySelectorAll('.pcdn-seg-btn'), function (b) {
+        var on = b.getAttribute('data-value') === cur;
+        b.classList.toggle('is-active', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      clear(body);
+      var a = apps.filter(function (x) { return x.id === cur; })[0] || apps[0];
+      var sup = (a.support || {})[p.protocol] || 'yes', label = PROTO[p.protocol] ? PROTO[p.protocol].label : p.protocol;
+      append(body, [
+        h('p', { className: 'pcdn-muted pcdn-small', text: a.name + ' — ' + a.os + ' — هسته ' + a.core }),
+        sup === 'no' ? P.alertBox('danger', a.name + ' پروتکل ' + label + ' را پشتیبانی نمی‌کند؛ برای کاربران این برنامه یک مسیر gRPC یا WebSocket بسازید.')
+          : sup === 'maybe' ? P.alertBox('warning', 'پشتیبانی ' + a.name + ' از ' + label + ' به نسخه‌ی برنامه بستگی دارد؛ اگر وصل نشد برنامه را به‌روز کنید یا از مسیر gRPC / WebSocket استفاده کنید.') : null,
+        h('ol', { className: 'pcdn-ol pcdn-steps-ol pcdn-tn-app-steps', 'data-app': a.id }, (a.steps || []).map(function (x) { return h('li', { text: x }); }))]);
+    }
+    draw();
+    return h('div', { className: 'pcdn-tn-apps', 'data-apps': '1' }, h('h5', { className: 'pcdn-tn-apps-title', text: 'گام‌به‌گام در برنامه‌ی کاربر' }), seg, body);
+  }
+
   // ------------------------------------------------------------------ ready-to-use configs (drawer)
 
   function configDrawer(p) {
@@ -448,7 +481,8 @@
             h('p', { className: 'pcdn-muted', text: 'در v2rayNG، v2rayN، Hiddify، Streisand یا NekoBox: لینک را کپی و «Import from clipboard» را بزنید یا QR را اسکن کنید.' }),
             h('div', { className: 'pcdn-tn-link' }, h('code', { dir: 'ltr', className: 'pcdn-tn-link-text', text: c.link }),
               P.copyBtn(c.link, 'کپی لینک اشتراک', { text: 'کپی لینک', cls: 'pcdn-copy-link', done: 'لینک کپی شد' })),
-            p.protocol === 'xhttp' || p.protocol === 'h2' ? P.alertBox('info', 'XHTTP فقط در کلاینت‌های با هسته Xray (v2rayNG و v2rayN نسخه‌های جدید، Hiddify با هسته Xray، Streisand) کار می‌کند.') : null),
+            p.protocol === 'xhttp' || p.protocol === 'h2' ? P.alertBox('info', 'XHTTP فقط در کلاینت‌های با هسته Xray (v2rayNG و v2rayN نسخه‌های جدید، Hiddify با هسته Xray، Streisand) کار می‌کند.') : null,
+            appGuide(p, st)),
           q ? h('div', { className: 'pcdn-tn-qr', 'data-qr': '1' }, q) : h('p', { className: 'pcdn-muted', text: 'لینک برای QR بیش از حد طولانی است.' })),
         h('section', { 'data-server': '1' },
           h('h4', { text: '۲. تنظیم سرور شما (Xray)' }),

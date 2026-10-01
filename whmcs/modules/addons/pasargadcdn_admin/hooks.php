@@ -13,10 +13,15 @@
  *  - AdminHomeWidgets: registers the widget (data cached 5 minutes).
  *  - InvoicePaid: one query on the paid invoice's items; only an Add Funds or a
  *    CDN traffic top-up invoice does more (prepaid mode: buy traffic / reconnect
- *    this client's CDN services, pay its CDN-only invoices from credit).
+ *    this client's CDN services, pay its CDN-only invoices from credit). A paid
+ *    «بسته‌ی ترافیک افزوده» add-on line (Wave 7, any billing mode) raises the
+ *    service's cap for the month, once per invoice item (AddonTraffic).
  *  - AfterCronJob: prepaid mode only; no CDN products → 2 small queries. Otherwise
  *    one controller /api/v1/usage call per CDN server and work only for services
- *    at/near their cap. Errors are logged, never thrown into WHMCS's cron.
+ *    at/near their cap. Wave 7: one GET /api/v1/events?type=tunnel per CDN server
+ *    for the origin-down / back-up e-mails (TunnelAlerts) and the add-on traffic
+ *    cap retries / month rollover (AddonTraffic). Errors are logged, never thrown
+ *    into WHMCS's cron.
  */
 
 if (!defined('WHMCS')) {
@@ -87,6 +92,9 @@ add_hook('InvoicePaid', 1, function ($vars) {
         require_once __DIR__ . '/lib/Env.php';
         require_once __DIR__ . '/lib/View.php';
         require_once __DIR__ . '/lib/Prepaid.php';
+        require_once __DIR__ . '/lib/Wizard.php';
+        require_once __DIR__ . '/lib/AddonTraffic.php';
+        // Prepaid reads the invoice lines once; Wave 7 «Addon» lines go to AddonTraffic (any billing mode)
         \PasargadCdn\Admin\Prepaid::onInvoicePaid($id);
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
@@ -104,6 +112,20 @@ add_hook('AfterCronJob', 1, function ($vars) {
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: cron hook error: ' . $e->getMessage());
+        }
+    }
+    // Wave 7 (SPEC §15.7): independent passes — a failure in one never stops the others.
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Wizard.php';
+        require_once __DIR__ . '/lib/TunnelAlerts.php';
+        require_once __DIR__ . '/lib/AddonTraffic.php';
+        \PasargadCdn\Admin\TunnelAlerts::onCron();
+        \PasargadCdn\Admin\AddonTraffic::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: tunnel/add-on cron hook error: ' . $e->getMessage());
         }
     }
 });

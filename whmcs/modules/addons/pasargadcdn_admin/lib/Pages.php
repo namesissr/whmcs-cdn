@@ -1824,7 +1824,16 @@ final class Pages
         $h .= '<fieldset class="pcdna-fieldset"><legend>قالب‌های ایمیل</legend><div class="pcdna-checks-row">'
             . self::check('email', $in['email'], 'قالب‌های «' . Wizard::EMAIL_NAME . '» (به محصولات وصل می‌شود)، «' . Wizard::EMAIL_EXHAUSTED . '» و «' . Wizard::EMAIL_WARNING . '» ساخته شوند')
             . self::check('email_update', $in['email_update'], 'به‌روزرسانی: اگر قالبی با این نام‌ها وجود دارد متن آن بازنویسی شود')
-            . '</div></fieldset>';
+            . '</div><small class="pcdna-muted">قالب‌های «' . Wizard::EMAIL_TUNNEL_DOWN . '» (قطعی سرور پشت تونل) و «' . Wizard::EMAIL_TUNNEL_UP
+            . '» (اتصال دوباره برقرار شد) هم ساخته می‌شوند؛ کران WHMCS آن‌ها را از رویدادهای تونل کنترلر برای صاحب سرویس می‌فرستد.</small></fieldset>';
+
+        // Wave 7 (SPEC §15.7): «بسته‌ی ترافیک افزوده» product add-ons
+        $h .= '<fieldset class="pcdna-fieldset" data-addon-fs="1"><legend>' . View::e(Wizard::ADDON_NAME) . '</legend><div class="pcdna-checks-row">'
+            . self::check('addon', !empty($in['addon']), 'افزونه‌های «' . Wizard::ADDON_NAME . '» ساخته شوند (یک افزونه‌ی یک‌بار پرداخت برای هر اندازه، متصل به همه‌ی محصولات CDN)')
+            . '</div><div class="pcdna-form-grid"><label><span>اندازه‌ها (گیگابایت، با کاما جدا)</span><input class="pcdna-input" name="addon_sizes" dir="ltr" inputmode="numeric" value="'
+            . View::e(implode(', ', array_map('intval', (array) ($in['addon_sizes'] ?? Wizard::ADDON_SIZES)))) . '">'
+            . '<small>افزونه‌ها پنهان ساخته می‌شوند و قیمتی برایشان ثبت نمی‌شود: در Setup ← Products/Services ← Product Addons قیمت را تعیین و «Show on Order» را روشن کنید. '
+            . 'پس از پرداخت فاکتور، سقف ترافیک همان ماه سرویس به اندازه‌ی بسته بالا می‌رود (یک بار برای هر قلم فاکتور).</small></label></div></fieldset>';
 
         // feature matrix, one table per plan family (a single «CDN» family now — tunnel is included in every plan)
         $h .= '<fieldset class="pcdna-fieldset"><legend>امکانات پلن‌ها</legend>';

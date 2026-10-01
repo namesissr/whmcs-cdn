@@ -45,6 +45,8 @@ class ClientApi
             'analytics', 'events', 'usage', 'tunnel/stats', 'apikeys', 'origin-pull-ca',
             // Wave 6D (SPEC §14.3.1–§14.3.4)
             'analytics/live', 'logs/status', 'webhooks/deliveries', 'sla',
+            // Wave 7 (SPEC §15.3/§15.4): tunnel quality, tunnel usage and origin health — read-only
+            'tunnel/quality', 'tunnel/usage', 'tunnel/health',
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)'],
@@ -70,6 +72,9 @@ class ClientApi
         'analytics/live' => ['minutes' => '/^([1-9][0-9]{0,2}|1[0-3][0-9]{2}|14[0-3][0-9]|1440)$/D'],
         'webhooks/deliveries' => ['limit' => '/^([1-9][0-9]?|1[0-9]{2}|200)$/D'],
         'sla' => ['month' => '/^[0-9]{4}-(0[1-9]|1[0-2])$/D'],
+        // Wave 7: quality hours 1..744 (the app uses 24/168/720), tunnel usage days 1..90 (the app uses 30).
+        'tunnel/quality' => ['hours' => '/^([1-9]|[1-9][0-9]|[1-6][0-9]{2}|7[0-3][0-9]|74[0-4])$/D'],
+        'tunnel/usage' => ['days' => '/^([1-9]|[1-8][0-9]|90)$/D'],
     ];
 
     /** Answer for a write by a read-only team member (SPEC §14.3.7). */

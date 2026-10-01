@@ -35,7 +35,7 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.1.0',
+        'version' => '1.2.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',
@@ -108,6 +108,12 @@ function pasargadcdn_admin_config()
                 'Size' => '6',
                 'Default' => '1.5',
                 'Description' => 'اگر مصرف ماه از این نسبت برابرِ ترافیک پلن بیشتر شود، پیشنهاد ارتقا نمایش داده می‌شود (مثلاً ۱.۵ یعنی ۱۵۰٪ ترافیک پلن)',
+            ],
+            'tunnel_email' => [
+                'FriendlyName' => 'ایمیل قطعی سرور پشت تونل',
+                'Type' => 'yesno',
+                'Default' => 'yes',
+                'Description' => 'کران WHMCS رویدادهای تونل کنترلر را می‌خواند و برای قطع و وصل دوباره‌ی سرور پشت تونل به صاحب سرویس ایمیل «قطعی سرور پشت تونل» / «اتصال دوباره برقرار شد» می‌فرستد (هر رویداد یک بار)',
             ],
             'widget' => [
                 'FriendlyName' => 'ویجت صفحه اصلی',
