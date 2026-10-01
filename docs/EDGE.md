@@ -480,3 +480,26 @@ an address.
 New agent.conf keys (kept by `--upgrade`): `CAPACITY_MBPS` (0), `FAIR_SHARE_PCT` (25), `NODE_NAME`
 (hostname), `SPEED_FILE` (`speed.bin` next to the state file).
 
+
+## Wave 8 (SPEC §16)
+
+- **L4 proxy:** `l4/stream.conf` (stream block, JSON log `L4_ACCESS_LOG`) + `l4/sites/<sid>.conf`, rendered
+  from the node-wide `l4` list; needs `libnginx-mod-stream` and `include /etc/nginx/pcdn/l4/*.conf;` in the
+  main context of nginx.conf (install.sh adds both). Apps outside `L4_PORT_RANGE`, on node ports or on busy
+  ports are skipped with a warning. Usage `l4: {app: {bytes_in, bytes_out, sessions}}` (not in `bytes`).
+- **Video:** manifest/segment cache rules, `slice 1m` for mp4, media CORS `*`, bounded mirror prefetch.
+- **Images v2:** signed `w,h,fit,q,fmt` transforms (403 on bad signature), AVIF via `avifenc`/Pillow,
+  smart crop; transformer `pcdn-imaged` (systemd sandbox, loopback `IMAGE_PORT`).
+- **Net guard:** `pcdn-agent guard` renders nftables `inet pcdn_guard`; `install.sh --harden-net` applies it
+  (`GUARD_*` keys, SSH/allow-list first, optional SYN proxy).
+- **Storage origins:** `origin.storage` hosts proxied with SNI + verification, bucket Host, Referer token
+  (0600 `storage/<sid>.conf`), GET/HEAD only, no visitor credentials, loopback `STORAGE_FETCH_PORT` (8091)
+  for the image paths.
+- **Edge Functions:** `pcdn-fn` (edge/pcdn-fn.py, runtime edge/fn/runtime.js, unit edge/systemd/pcdn-fn.service)
+  runs one QuickJS process per invocation under Landlock + seccomp + no_new_privs + MDWE + rlimits; nginx
+  routes bound paths to it over a unix socket; `fetch()` goes back through `/run/pcdn-fnfetch/fetch.sock`
+  to the site's own origin only. Capability `edge_functions` only after the self-test passes. Usage
+  `functions: {invocations, cpu_ms, errors, timeouts}`.
+- New agent.conf keys: `L4_PORT_RANGE`, `L4_ACCESS_LOG`, `NGINX_CONF`, `IMAGED`, `IMAGE_PORT`,
+  `IMAGE_WORKERS`, `IMAGE_MAX_SOURCE_MB`, `GUARD*`, `AVIF`, `STORAGE_FETCH_PORT`, `FUNCTIONS`, `FN_*`
+  (all kept by `--upgrade`).
