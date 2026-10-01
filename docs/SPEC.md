@@ -795,3 +795,83 @@ anti-filtering scope. Controller code English; operator/UI text Persian.
 - An «حسابرسی» (audit) page surfacing `GET /api/v1/audit` with filters (action/actor/time), Persian UI.
 - A health panel summarising `GET /healthz/deep` and the key `/metrics` numbers (edges online, ssl
   expiring, dns sync, backup age) with clear OK/warn colouring.
+
+## 14. Wave 6: performance, rules & security, analytics & platform
+
+General CDN capabilities for website customers. Defaults keep today's behaviour unless stated.
+
+### 14.1 Edge performance & cache (6A)
+- **HTTP/3 (opt-in per node, capability-detected).** The agent detects `--with-http_v3_module` in
+  `nginx -V` (and the nginx version) and reports `capabilities: {http3, early_hints}` in the heartbeat.
+  Only on capable nodes it renders `listen <https_port> quic reuseport` once on the default server,
+  `listen <https_port> quic` on site servers, `http3 on;` and
+  `add_header Alt-Svc 'h3=":<https_port>"; ma=86400' always;`. Site toggle `ssl.http3` (default true).
+  `install.sh --http3` installs nginx from the nginx.org mainline repository plus the nginx.org
+  dynamic modules that exist there (njs, image-filter); modules not available for that build
+  (e.g. geoip2, brotli) are detected by the agent (module file present) and their directives are
+  only rendered when loaded. The default install path (distro nginx 1.24, no HTTP/3) is unchanged.
+  Operators must allow UDP/<https_port>.
+- **Origin shield (tiered cache).** Edge flag `shield` (admin-set). Site setting `cache.shield`
+  (default false). When on and the site's edge group has ≥1 enabled, online shield edge, non-shield
+  edges send cache misses to the shield edges (consistent hash on the cache key), which fetch from
+  the origin. Shield hops carry `X-Pcdn-Shield: <hmac>` (per-node secret derived by the controller);
+  a shield only accepts shield-mode requests carrying a valid value, never re-shields, and if all
+  shields are unreachable edges fall back to the origin directly. Shield edges still serve their own
+  visitors normally.
+- **Stale content.** `cache.stale_while_revalidate` (bool, default true) and
+  `cache.stale_if_error` (seconds 0..604800, default 86400) map onto `proxy_cache_use_stale` /
+  `proxy_cache_background_update`; origin `Cache-Control: stale-while-revalidate / stale-if-error`
+  extensions are honoured.
+- **Cache key options.** `cache.key_device` (bool: separate desktop/mobile variants),
+  `cache.key_cookies` (≤10 cookie names whose values join the key), `cache.key_query_allow`
+  (≤50 parameter names; when set, only these query params are part of the key; conflicts with
+  `ignore_query=true` → 422).
+- **WebP.** `image.auto_webp` (bool, default false): when the client sends `Accept: image/webp`,
+  serve WebP for JPEG/PNG images — via conversion if the edge's nginx can produce WebP from those
+  inputs, otherwise by keying the cache on WebP capability (`Vary: Accept` semantics) so origins
+  that negotiate formats are cached correctly. The agent documents which mode a node uses.
+- **Preload / Early Hints.** Page-rule field `preload` (≤10 entries `{url, as}`; `as` in
+  script|style|image|font|fetch) renders `Link: <url>; rel=preload; as=<as>` headers; on nodes
+  reporting `early_hints` capability the same links are sent as a 103 response.
+- **TCP congestion control.** Node tunable `TCP_CC` (bbr|cubic, default bbr), applied by install.sh.
+
+### 14.2 Rules & security (6B)
+- **Transform rules** — section `transform`: list of `{id, enabled, match:{path (pattern),
+  methods[], countries[]}, actions:[{type: set_request_header|remove_request_header|
+  set_response_header|remove_response_header|rewrite_path, name?, value?, regex?, replacement?}]}`.
+  Plan limit `features.max_transform_rules` (default 10). Reserved/hop-by-hop headers rejected (422).
+- **Redirect rules** — section `redirects`: list of `{id, enabled, source, match: exact|prefix|regex,
+  target (may use $1..$9 for regex), status: 301|302|307|308, preserve_query}`. Plan limit
+  `features.max_redirects` (default 100). Bulk CSV import in the client app.
+- **Managed WAF packs** — `waf.packs`: subset of `generic, wordpress, joomla, drupal, laravel, api`;
+  each pack is a versioned rule set with stable rule ids, honouring existing `waf.exclusions` and
+  `waf.mode` (log|block).
+- **Bot management** — section `bots`: `{mode: off|log|challenge|block, allow_verified: true,
+  block_empty_ua: true}`. Verified bots = published IP ranges of major search engines (fetched and
+  cached by the agent, refreshed daily) AND a matching User-Agent; unverified automation signals
+  (empty/library UAs, headless markers) get `mode`. Bot decisions appear in security events.
+- **Authenticated origin pulls (mTLS)** — `ssl.origin_client_auth`: `off | platform | custom`.
+  `platform` presents a platform client certificate (CA cert downloadable from the client app so
+  origins can verify requests come from the CDN); `custom` uses a customer-uploaded cert+key
+  (encrypted at rest like custom SSL keys).
+- **HSTS presets** — client-app presets (basic / strict / preload-ready) filling existing `ssl.hsts`.
+
+### 14.3 Analytics & platform (6D)
+- **Near-real-time analytics** — edges send 1-minute aggregates per site (requests, bytes, cache hits,
+  status classes, top paths, top countries); the controller keeps minute buckets for 24 h and serves
+  `GET /api/v1/sites/{domain}/analytics/live?minutes=1..1440`; client app shows an auto-refreshing chart.
+- **Log export** — section `logs`: `{enabled, s3_endpoint, bucket, prefix, access_key, secret_key
+  (encrypted, write-only), anonymize_ip: true, sample_rate: 0.01..1}`; edges ship that site's access
+  log records to the controller which uploads gzip JSON-lines objects hourly to the customer's
+  S3-compatible bucket. Per-site hourly cap; failures retried and surfaced in the client app.
+- **Webhooks** — section `webhooks`: ≤10 `{id, url (https), events[], enabled}` with a
+  controller-generated signing secret (shown once). Events: purge.completed, ssl.issued, ssl.failed,
+  quota.warning, quota.exceeded, site.suspended, site.unsuspended, attack.detected. Body JSON,
+  header `X-Pcdn-Signature: sha256=<hmac>`, retries with backoff (≤24 h), recent deliveries visible.
+- **Team access** — the WHMCS client app honours WHMCS user permissions: users without the product
+  management permission get a read-only view; all writes require it.
+- **SLA report** — per-site monthly availability (edge-side success ratio excluding origin errors +
+  platform edge uptime), shown in the client app with CSV export and a printable page.
+- **OpenAPI + Terraform** — `GET /capi/v1/openapi.json` (customer API only); a Terraform provider
+  (`terraform-provider-pcdn/`, Go, terraform-plugin-framework) with resources `pcdn_record`,
+  `pcdn_config_section`, `pcdn_purge` and data source `pcdn_site`, authenticated with a customer API key.
