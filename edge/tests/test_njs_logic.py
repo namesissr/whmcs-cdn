@@ -5,6 +5,7 @@ The real njs runtime is covered by test_nginx_e2e.py; this file checks the pure 
 """
 
 import json
+import re
 import pathlib
 import shutil
 import subprocess
@@ -26,8 +27,10 @@ function req(site, uri, args, extra) {
   extra = extra || {};
   const vars = Object.assign({ pcdn_site: site, remote_addr: '127.0.0.1', request_uri: uri + (args ? '?' + args : ''),
     args: args, host: 'x.test', pcdn_country: 'IR', ssl_protocol: '' }, extra.vars || {});
-  return { uri: uri, method: extra.method || 'GET', variables: vars, headersIn: Object.assign({ 'User-Agent': 'Mozilla/5.0' }, extra.headers || {}),
-    args: {}, error: () => {} };
+  const hin = Object.assign({ 'User-Agent': 'Mozilla/5.0' }, extra.headers || {});
+  Object.keys(hin).forEach(k => { if (hin[k] === null) delete hin[k]; });
+  return { uri: uri, method: extra.method || 'GET', variables: vars, headersIn: hin, headersOut: {},
+    args: {}, error: () => {}, log: () => {} };
 }
 const cases = JSON.parse(process.argv[2]);
 const out = cases.map(c => {
@@ -49,6 +52,43 @@ const out = cases.map(c => {
     return seen;
   }
   if (c.kind === 'hc') { store[c.key] = c.value; return null; }
+  if (c.kind === 'bodyneed') return m.bodyNeed(req(c.site, c.uri, c.args || '', c.extra));
+  if (c.kind === 'inspect') {
+    const r = req(c.site, '/__pcdn/body' + c.uri, '', c.extra), res = {};
+    r.requestText = c.body;
+    r.return = (code, body) => { res.code = code; res.body = String(body).slice(0, 0); };
+    r.internalRedirect = u => { res.redirect = u; };
+    m.bodyInspect(r);
+    res.v = r.variables.pcdn_verdict || null;
+    return res;
+  }
+  if (c.kind === 'tfh') {
+    const r = req(c.site, c.uri, '', c.extra);
+    r.headersOut = Object.assign({}, c.out);
+    m.tfHeaders(r);
+    return r.headersOut;
+  }
+  if (c.kind === 'botclass') return T.botClass(c.ua, c.vbot, c.blockEmpty !== false);
+  if (c.kind === 'prep') {
+    const P = T.prepSite('x', c.site);
+    return { rules: P.waf.rules.map(r => r.id), fn: P.waf.fn.map(r => r.id), body: P.waf.body };
+  }
+  if (c.kind === 'catalog') return {
+    rules: T.WAF_RULES.filter(r => r.k).map(r => [r.id, r.k, r.pl, r.t, r.re.source]),
+    fn: T.WAF_PACK_FN.map(r => [r.id, r.k, r.pl]), body: T.WAF_BODY_XMLRPC.map(r => [r.id, r.pl, r.re.source]),
+    versions: T.WAF_PACK_VERSION };
+  if (c.kind === 'redos') {
+    // worst case time of every pack / bot / body regex over adversarial inputs (backtracking engine)
+    const res = T.WAF_RULES.filter(r => r.k).map(r => r.re).concat(T.WAF_BODY_XMLRPC.map(r => r.re),
+      [T.BOT_GOOGLE, T.BOT_BING, T.BOT_HEADLESS, T.BOT_LIBRARY, T.JSON_CT, T.CT_SYNTAX, T.CT_EXPECTED, T.MONGO_OPS]);
+    let worst = 0, which = '';
+    const inputs = c.inputs.map(x => x[0] + x[1].repeat(x[2]) + x[3]);
+    res.forEach(re => inputs.forEach(s => {
+      const t0 = process.hrtime.bigint(); re.test(s); const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      if (ms > worst) { worst = ms; which = re.source + ' / ' + s.slice(0, 20); }
+    }));
+    return { worst: worst, which: which };
+  }
 });
 console.log(JSON.stringify(out));
 """
@@ -57,7 +97,9 @@ console.log(JSON.stringify(out));
 def build(tmp_path, sites):
     src = (HERE.parent / "njs/pcdn.js").read_text()
     src = src.replace("from 'sites.js'", "from './sites.mjs'")
-    src += "\nexport const T = { parseIP, cidr, inCidr, fnv };\n"
+    src += ("\nexport const T = { parseIP, cidr, inCidr, fnv, prepSite, botClass, WAF_RULES, WAF_PACK_FN, WAF_BODY_XMLRPC,"
+            " WAF_PACK_VERSION, BOT_GOOGLE, BOT_BING, BOT_HEADLESS, BOT_LIBRARY, JSON_CT, CT_SYNTAX, CT_EXPECTED,"
+            " MONGO_OPS };\n")
     (tmp_path / "pcdn.mjs").write_text(src)
     (tmp_path / "sites.mjs").write_text("export default " + json.dumps(sites) + ";\n")
     (tmp_path / "h.mjs").write_text(HARNESS)
@@ -239,3 +281,229 @@ def test_tunnel_paths_only_see_firewall_block_allow_log(tmp_path):
     ])
     assert res == ["ok", "ok", "ok", "log:firewall:watch", "block:firewall:bad", "challenge:firewall:chal",
                    "challenge:firewall:chal", "block:firewall:default", "block:firewall:blocked_ips"]
+
+
+# ----------------------------------------------------------------- SPEC §14.2 managed WAF packs
+
+PACK_RANGES = {"generic": 990000, "wordpress": 991000, "joomla": 992000, "drupal": 993000, "laravel": 994000,
+               "api": 995000}
+# the published, stable rule ids per pack (a removed or renumbered id breaks customers' exclusions)
+PACK_IDS = {
+    "generic": {990100, 990110, 990120, 990130, 990140, 990150, 990160, 990170, 990180, 990190},
+    "wordpress": {991100, 991105, 991110, 991120, 991130, 991140, 991150, 991160, 991165, 991170, 991180},
+    "joomla": {992100, 992110, 992120, 992130, 992140, 992150},
+    "drupal": {993100, 993110, 993120, 993130, 993135, 993140},
+    "laravel": {994100, 994110, 994115, 994120, 994125, 994130, 994140, 994150},
+    "api": {995100, 995110, 995120, 995130, 995140, 995150, 995160, 995165, 995170, 995175},
+}
+
+
+def test_waf_pack_catalog_ids_ranges_and_versions(tmp_path):
+    build(tmp_path, {})
+    cat = run(tmp_path, [{"kind": "catalog"}])[0]
+    ids = {}
+    for rid, pack, pl, *_ in cat["rules"] + [r + ["", ""] for r in cat["fn"]]:
+        ids.setdefault(pack, set()).add(rid)
+        assert 1 <= pl <= 3
+    for rid, pl, _ in cat["body"]:
+        ids["wordpress"].add(rid)
+    assert ids == PACK_IDS
+    for pack, rids in ids.items():
+        assert all(PACK_RANGES[pack] <= r < PACK_RANGES[pack] + 1000 for r in rids), pack
+    all_ids = [r[0] for r in cat["rules"]] + [r[0] for r in cat["fn"]] + [r[0] for r in cat["body"]]
+    assert len(all_ids) == len(set(all_ids))                       # never two checks under one id
+    assert cat["versions"] == {p: 1 for p in PACK_RANGES}
+    # linear-time patterns: no quantified group (nested / overlapping repetition)
+    for rid, _, _, _, src in cat["rules"]:
+        assert not re.search(r"\)[*+{]", src), (rid, src)
+
+
+def test_waf_packs_enabled_only_when_listed(tmp_path):
+    base = {"mode": "block", "paranoia": 3, "groups": ["sqli"], "exclusions": [], "off_paths": []}
+    build(tmp_path, {})
+    res = run(tmp_path, [{"kind": "prep", "site": site(waf=dict(base))},
+                         {"kind": "prep", "site": site(waf=dict(base, packs=["wordpress", "nope"]))},
+                         {"kind": "prep", "site": site(waf=dict(base, packs=["api"], paranoia=1))}])
+    none, wp, api = res
+    assert not [r for r in none["rules"] if r >= 990000] and none["fn"] == [] and none["body"] is None
+    assert {r for r in wp["rules"] if r >= 990000} | set(wp["fn"]) == PACK_IDS["wordpress"] - {991100, 991110}
+    assert all(r < 990000 or 991000 <= r < 992000 for r in wp["rules"])
+    assert wp["body"] == {"xmlrpc": True, "json": False}
+    assert set(api["fn"]) == {995110, 995170} and api["body"] == {"xmlrpc": False, "json": True}   # paranoia 1
+
+
+def test_waf_pack_rules_hit_and_spare_benign(tmp_path):
+    waf = {"mode": "block", "paranoia": 1, "groups": [], "exclusions": [{"rule_id": 994100, "path_re": "^/ok/.*$"}],
+           "off_paths": [], "packs": list(PACK_RANGES)}
+    build(tmp_path, {"1": site(waf=waf)})
+    hits = [("/.env", "", 994100), ("/a/.env.local", "", 994100), ("/_ignition/execute-solution", "", 994110),
+            ("/_debugbar/open", "", 994120), ("/storage/logs/laravel.log", "", 994130),
+            ("/vendor/x/y.php", "", 994150), ("/", "author=2", 991130), ("/wp-config.php~", "", 991120),
+            ("/wp-content/uploads/2024/shell.php", "", 991150), ("/wp-content/debug.log", "", 991160),
+            ("/wp-content/plugins/x/dl.php", "file=../../wp-config.php", 991140),
+            ("/configuration.php.bak", "", 992100), ("/", "option=com_x&view=..%2F..%2Fetc", 992130),
+            ("/api/index.php/v1/config/application", "public=true", 992110),
+            ("/user/register", "element_parents=account/mail/%23value", 993100),
+            ("/", "name%5B%23post_render%5D%5B%5D=passthru", 993100),
+            ("/sites/default/settings.php", "", 993120), ("/c99.php", "", 990100), ("/backup.tar.gz", "", 990110),
+            ("/.DS_Store", "", 990120), ("/phpinfo.php", "", 990130),
+            ("/", "url=http%3A%2F%2F169.254.169.254%2Flatest", 990140), ("/actuator/env", "", 990170),
+            ("/a/..;/admin", "", 990180), ("/", "a%5B__proto__%5D%5Bx%5D=1", 995150),
+            ("/", "q%5B%24where%5D=1", 995160)]
+    benign = [("/ok/.env", ""), ("/environment", ""), ("/", "author_name=x"), ("/wp-content/uploads/a.jpg", ""),
+              ("/blog/configuration-guide", ""), ("/", "filters%5Bprice%5D%5B%24gt%5D=5"), ("/", "q=169.254.1.1"),
+              ("/vendor/app.js", ""), ("/wp-login.php", ""), ("/api/items", "sort=-price")]
+    res = run(tmp_path, [{"kind": "verdict", "site": "1", "uri": u, "args": a} for u, a, _ in hits])
+    assert res == [f"block:waf:{rid}" for *_, rid in hits], list(zip(hits, res))
+    res = run(tmp_path, [{"kind": "verdict", "site": "1", "uri": u, "args": a} for u, a in benign])
+    assert res == ["ok"] * len(benign), list(zip(benign, res))
+    # header / size checks
+    xml = {"Content-Type": "text/xml"}
+    res = run(tmp_path, [
+        {"kind": "verdict", "site": "1", "uri": "/xmlrpc.php", "extra": {"method": "POST", "headers": dict(xml, **{"Content-Length": "200000"})}},
+        {"kind": "verdict", "site": "1", "uri": "/xmlrpc.php", "extra": {"method": "POST", "headers": dict(xml, **{"Transfer-Encoding": "chunked"})}},
+        {"kind": "verdict", "site": "1", "uri": "/xmlrpc.php", "extra": {"method": "POST", "headers": dict(xml, **{"Content-Length": "300"})}},
+        {"kind": "verdict", "site": "1", "uri": "/api", "extra": {"method": "POST", "headers": {"Content-Type": "json", "Content-Length": "2"}}},
+        {"kind": "verdict", "site": "1", "uri": "/api", "extra": {"method": "POST", "headers": {"Content-Type": "application/json; charset=utf-8", "Content-Length": "2"}}},
+        {"kind": "verdict", "site": "1", "uri": "/api", "extra": {"headers": {"X-HTTP-Method-Override": "TRACE"}}},
+        {"kind": "verdict", "site": "1", "uri": "/api", "extra": {"headers": {"X-HTTP-Method-Override": "DELETE"}}},
+    ])
+    assert res == ["block:waf:991105", "block:waf:991105", "ok", "block:waf:995110", "ok", "block:waf:995170", "ok"]
+
+
+def test_waf_pack_regexes_are_linear(tmp_path):
+    build(tmp_path, {})
+    n = 50000   # [prefix, repeated unit, count, suffix], expanded in node
+    inputs = [["", u, n, ""] for u in ("a", "/", "/a", ".", "%", "[$", "a.", "-", "\\", " ", "a/", "x;", "a=b; ")] + [
+        ["<methodname>", " ", n, "x"], ["/wp-content/uploads/", "a/", n, ""], ["/sites/", "a", n, ""],
+        ["application/json", "; a=b", n // 8, "\""], ["}__", "a", n, ""], ["name[", "a", n, ""],
+        ["/_ignition/", "a", n, ""], ["/storage/logs/", "a", n, ".lo"], ["/vendor/", "a", n, ".ph"],
+        ["/wp-content/uploads/", "a", n, ".ph"], ["text/", "a", 60, "/" + "b" * n]]
+    res = run(tmp_path, [{"kind": "redos", "inputs": inputs}])[0]
+    assert res["worst"] < 50, res
+
+
+# ----------------------------------------------------------------- request bodies (xmlrpc / JSON)
+
+def test_body_inspection_routing_and_verdicts(tmp_path):
+    waf = {"mode": "block", "paranoia": 1, "groups": ["sqli", "xss"], "packs": ["wordpress", "api"],
+           "exclusions": [{"rule_id": 995220, "path_re": "^/free/.*$"}, {"rule_id": 995150, "path_re": "^/free/.*$"}],
+           "off_paths": ["^/nowaf/.*$"]}
+    build(tmp_path, {"1": site(waf=waf), "2": site(waf=dict(waf, mode="detect")),
+                     "3": site(waf=dict(waf, packs=["generic"]))})
+    j = {"Content-Type": "application/json", "Content-Length": "20"}
+    x = {"Content-Type": "text/xml", "Content-Length": "20"}
+    need = run(tmp_path, [
+        {"kind": "bodyneed", "site": "1", "uri": "/xmlrpc.php", "extra": {"method": "POST", "headers": x}},
+        {"kind": "bodyneed", "site": "1", "uri": "/api/x", "extra": {"method": "PUT", "headers": j}},
+        {"kind": "bodyneed", "site": "1", "uri": "/api/x", "extra": {"method": "GET", "headers": j}},
+        {"kind": "bodyneed", "site": "1", "uri": "/api/x", "extra": {"method": "POST", "headers": dict(j, **{"Content-Length": "999999"})}},
+        {"kind": "bodyneed", "site": "1", "uri": "/api/x", "extra": {"method": "POST", "headers": {"Content-Type": "text/plain", "Content-Length": "5"}}},
+        {"kind": "bodyneed", "site": "1", "uri": "/nowaf/x", "extra": {"method": "POST", "headers": j}},
+        {"kind": "bodyneed", "site": "1", "uri": "/api/x", "extra": {"method": "POST", "headers": j, "vars": {"pcdn_wafskip": "1"}}},
+        {"kind": "bodyneed", "site": "3", "uri": "/xmlrpc.php", "extra": {"method": "POST", "headers": x}},
+    ])
+    assert need == ["1", "1", "", "", "", "", "", ""]
+    multicall = "<methodCall><methodName> system.multicall </methodName></methodCall>"
+    res = run(tmp_path, [
+        {"kind": "inspect", "site": "1", "uri": "/xmlrpc.php", "body": multicall},
+        {"kind": "inspect", "site": "1", "uri": "/xmlrpc.php", "body": "<methodCall><methodName>pingback.ping</methodName>"},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '{"a": "1\' or \'1\'=\'1"}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '{"__proto__": {"x": 1}}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/free/x", "body": '{"__proto__": {"x": 1}}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '{"constructor": {"prototype": {"x": 1}}}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '{"f": {"$where": "1"}}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '{"f": {"$gt": 1}}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": "[" * 33 + "]" * 33, "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '["[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["]', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": "[" + "1," * 10001 + "1]", "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": "{broken", "extra": {"headers": j}},
+        {"kind": "inspect", "site": "1", "uri": "/api", "body": '{"name": "O\'Reilly", "n": [1, 2]}', "extra": {"headers": j}},
+        {"kind": "inspect", "site": "2", "uri": "/xmlrpc.php", "body": multicall},
+    ])
+    blocked = {"code": 403, "body": ""}
+    assert res[0] == dict(blocked, v="block:waf:991100")
+    assert res[1] == {"redirect": "@pcdn_body", "v": None}                    # pingback: paranoia 2
+    assert res[2] == dict(blocked, v="block:waf:942100")                      # signatures on JSON strings
+    assert res[3] == dict(blocked, v="block:waf:995220")
+    assert res[4] == {"redirect": "@pcdn_body", "v": None}                    # exclusion by path
+    assert res[5] == dict(blocked, v="block:waf:995220")
+    assert res[6] == dict(blocked, v="block:waf:995230")
+    assert res[7] == {"redirect": "@pcdn_body", "v": None}                    # $gt: paranoia 2
+    assert res[8] == dict(blocked, v="block:waf:995210")                      # depth 33 > 32
+    assert res[9] == {"redirect": "@pcdn_body", "v": None}                    # brackets inside a string
+    assert res[10] == dict(blocked, v="block:waf:995210")                     # > 10000 values
+    assert res[11] == {"redirect": "@pcdn_body", "v": None}                   # invalid JSON: paranoia 2
+    assert res[12] == {"redirect": "@pcdn_body", "v": None}
+    assert res[13] == {"redirect": "@pcdn_body", "v": "log:waf:991100"}      # detect: logged, proxied
+
+
+# ----------------------------------------------------------------- bot management
+
+def test_bot_classification_matrix(tmp_path):
+    build(tmp_path, {})
+    gb, bb = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "Mozilla/5.0 (compatible; bingbot/2.0)"
+    chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
+    cases = [
+        (gb, "1gb", True, None), (gb, "0gb", False, "spoofed"), (gb, "2gb", False, "spoofed"),
+        (bb, "2gb", True, None), (bb, "1gb", False, "spoofed"),
+        (gb, "", False, None), (bb, "", False, None),                 # no ranges at all: fail open
+        (bb, "0g", False, None), (gb, "0b", False, None),             # no ranges for that engine: fail open
+        (gb, "0g", False, "spoofed"),
+        ("", "1gb", False, "empty_ua"), ("curl/8.5.0", "0gb", False, "library"), ("Wget/1.21", "", False, "library"),
+        ("python-requests/2.31", "", False, "library"), ("Go-http-client/1.1", "", False, "library"),
+        ("Scrapy/2.11 (+https://scrapy.org)", "", False, "library"), ("okhttp/4.12", "", False, "library"),
+        ("Mozilla/5.0 HeadlessChrome/120.0", "", False, "headless"), ("Mozilla/5.0 PhantomJS/2.1", "", False, "headless"),
+        (chrome, "0gb", False, None), ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Mobile/15E148 Safari/604.1", "", False, None),
+        ("Mozilla/5.0 (compatible; AdsBot-Google; +http://www.google.com/adsbot.html)", "0gb", False, None),
+    ]
+    res = run(tmp_path, [{"kind": "botclass", "ua": ua, "vbot": vb} for ua, vb, *_ in cases])
+    assert res == [{"verified": v, "rule": rule} for *_, v, rule in cases], list(zip(cases, res))
+    assert run(tmp_path, [{"kind": "botclass", "ua": "", "vbot": "", "blockEmpty": False}]) == [{"verified": False, "rule": None}]
+
+
+def test_bot_modes_in_verdict(tmp_path):
+    gb = "Mozilla/5.0 (compatible; Googlebot/2.1)"
+    bots = lambda mode, **k: dict({"mode": mode, "allow_verified": True, "block_empty_ua": True}, **k)  # noqa: E731
+    build(tmp_path, {"1": site(bots=bots("block")), "2": site(bots=bots("challenge")), "3": site(bots=bots("log")),
+                     "4": site(bots=bots("log"), ddos={"mode": "js"}),
+                     "5": site(bots=bots("log", allow_verified=False), ddos={"mode": "js"}),
+                     "6": site(ddos={"mode": "js"}),
+                     "8": site(bots=bots("log"), ratelimit=[
+                         {"id": "c", "path_re": "^/c$", "methods": [], "requests": 1, "period": 60, "action": "challenge"},
+                         {"id": "b", "path_re": "^/b$", "methods": [], "requests": 1, "period": 60, "action": "block"}]),
+                     "7": site(bots=bots("block"), firewall={"default_action": "allow", "rules": [
+                         {"id": "ok", "action": "allow", "conditions": [{"field": "path", "op": "starts_with", "value": "/api"}]}]})})
+
+    def v(sid, ua, vb="0gb", uri="/"):
+        return {"kind": "verdict", "site": sid, "uri": uri, "extra": {"headers": {"User-Agent": ua}, "vars": {"pcdn_vbot": vb}}}
+    res = run(tmp_path, [v("1", "curl/8"), v("2", "curl/8"), v("3", "curl/8"), v("1", gb), v("1", gb, "1gb"),
+                         v("4", gb, "1gb"), v("4", "Mozilla/5.0"), v("5", gb, "1gb"), v("6", gb, "1gb"),
+                         v("7", "curl/8", uri="/api/x"), v("1", None),
+                         v("8", gb, "1gb", "/c"), v("8", gb, "1gb", "/c"), v("8", gb, "1gb", "/b"), v("8", gb, "1gb", "/b"),
+                         v("8", "Mozilla/5.0", "1gb", "/c"), v("8", "Mozilla/5.0", "1gb", "/c")])
+    assert res == ["block:bots:library", "challenge:bots:library", "log:bots:library", "block:bots:spoofed", "ok",
+                   "ok",                       # verified crawler: no DDoS challenge (allow_verified)
+                   "challenge:ddos:js", "challenge:ddos:js", "challenge:ddos:js",
+                   "ok",                       # firewall allow skips bot rules
+                   "block:bots:empty_ua",
+                   "ok", "ok",                 # verified crawler: no rate-limit challenge ...
+                   "ok", "block:ratelimit:b",  # ... but rate-limit blocks (429) still apply
+                   "ok", "challenge:ratelimit:c"]
+
+
+# ----------------------------------------------------------------- transform response headers
+
+def test_transform_header_filter(tmp_path):
+    ops = [{"f": "", "op": "set", "n": "X-Base", "v": "b"}, {"f": "pcdn_tf_1_0", "op": "del", "n": "Set-Cookie"},
+           {"f": "pcdn_tf_1_0", "op": "set", "n": "X-Base", "v": "c"}, {"f": "pcdn_tf_1_1", "op": "set", "n": "X-B", "v": "1"}]
+    build(tmp_path, {"1": site(tf_resp=ops), "2": site()})
+    out = {"Set-Cookie": ["a=1", "b=2"], "X-Base": "origin", "X-Other": "o"}
+    res = run(tmp_path, [{"kind": "tfh", "site": "1", "uri": "/", "out": out,
+                          "extra": {"vars": {"pcdn_tf_1_0": "1", "pcdn_tf_1_1": "0"}}},
+                         {"kind": "tfh", "site": "1", "uri": "/", "out": out,
+                          "extra": {"vars": {"pcdn_tf_1_0": "0", "pcdn_tf_1_1": "1"}}},
+                         {"kind": "tfh", "site": "2", "uri": "/", "out": out}])
+    assert res[0] == {"X-Base": "c", "X-Other": "o"}
+    assert res[1] == {"Set-Cookie": ["a=1", "b=2"], "X-Base": "b", "X-Other": "o", "X-B": "1"}
+    assert res[2] == out

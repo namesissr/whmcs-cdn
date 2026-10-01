@@ -322,7 +322,8 @@ def heartbeat_capabilities(cfg: dict) -> dict:
     c = nginx_capabilities(cfg)
     return {"http3": bool(c["http3"]), "early_hints": bool(c["early_hints"]),
             "webp_convert": bool(c["webp_convert"]), "webp_mode": c["webp_mode"],
-            "modules": list(c["modules"]), "nginx": c["nginx"]}
+            "modules": list(c["modules"]), "nginx": c["nginx"],
+            "waf_packs": dict(WAF_PACK_VERSIONS)}   # SPEC §14.2 managed rule-set versions
 
 
 _GUARD = re.compile(r"^# @if (\w+)\n(.*?)(?:^# @else \1\n(.*?))?^# @endif \1\n", re.S | re.M)
@@ -421,10 +422,12 @@ def render_shield(shield: dict | None, cfg: dict) -> str | None:
 
 # ----------------------------------------------------------------- rendering
 
-def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None) -> str:
+def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bots: bool = False,
+                mtls: bool = False) -> str:
     """The base http-context config (from the template), see nginx/pcdn-base.conf.
     hc_interval: js_periodic tick for pool health checks (> the largest check timeout).
-    shield: the node's normalised shield section (norm_shield) or None."""
+    shield: the node's normalised shield section (norm_shield) or None.
+    bots / mtls: bots.conf / mtls.conf were rendered and are included (SPEC §14.2)."""
     with open(asset(cfg, "BASE_TEMPLATE", "nginx/pcdn-base.conf")) as f:
         text = f.read()
     caps = nginx_capabilities(cfg)
@@ -453,6 +456,11 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None) -> 
         shield_conf = f"include {cfg['NGINX_DIR'].rstrip('/')}/shield.conf;"
     else:
         shield_conf = "map $uri $pcdn_shield_ok {\n    default 0;\n}"
+    # no verified crawler ranges (or no site using bot management): "" = crawler UAs fail open
+    bots_conf = (f"include {cfg['NGINX_DIR'].rstrip('/')}/bots.conf;" if bots
+                 else "geo $pcdn_vbot {\n    default \"\";\n}")
+    mtls_conf = (f"include {cfg['NGINX_DIR'].rstrip('/')}/mtls.conf;" if mtls
+                 else "map $uri $pcdn_mtls_crt {\n    default \"\";\n}\nmap $uri $pcdn_mtls_key {\n    default \"\";\n}")
     subst = {
         "NGINX_DIR": cfg["NGINX_DIR"].rstrip("/"),
         "HTTP_PORT": str(_int(cfg["HTTP_PORT"], 80, 1, 65535)),
@@ -465,6 +473,8 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None) -> 
         "CONNECT_TIMEOUT": str(_int(cfg.get("TUNNEL_CONNECT_TIMEOUT"), 10, 3, 30)),
         "SSL_BUFFER_SIZE": cfg["SSL_BUFFER_SIZE"] if SAFE_SIZE.match(cfg.get("SSL_BUFFER_SIZE") or "") else "4k",
         "SHIELD": shield_conf,
+        "BOTS": bots_conf,
+        "MTLS": mtls_conf,
         "EARLY_HINTS": eh_conf,
         "LISTEN_H2": "" if caps["http2_directive"] else " http2",
         "HTTPS_DEFAULT_EXTRA": "\n".join(extra),
@@ -669,7 +679,336 @@ def key_infos(config: dict) -> dict:
     return out
 
 
-def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None) -> dict:
+# ----------------------------------------------------------------- rules & security (SPEC §14.2)
+# Everything below is validated again on the edge (the controller already did): a value that does
+# not pass is dropped, never "fixed", and a rule whose condition cannot be understood is skipped as
+# a whole (a broken condition must never widen what a rule applies to).
+
+WAF_PACKS = ("generic", "wordpress", "joomla", "drupal", "laravel", "api")
+# rule-set versions of the managed packs shipped in njs/pcdn.js (WAF_PACK_VERSION there; a unit
+# test keeps both in sync), reported in the heartbeat capabilities
+WAF_PACK_VERSIONS = {"generic": 1, "wordpress": 1, "joomla": 1, "drupal": 1, "laravel": 1, "api": 1}
+BOT_MODES = ("log", "challenge", "block")
+BODY_CAP = 131072   # request bodies inspected by the WAF packs (njs BODY_CAP)
+BOT_ENGINES = (("google", "1", "g"), ("bing", "2", "b"))   # name, $pcdn_vbot value, "known" flag
+BOT_MIN_PREFIX = {4: 16, 6: 32}   # anything broader is not a crawler range (tampered / bogus list)
+BOT_MAX_PREFIXES = 2000
+REDIRECT_CODES = (301, 302, 307, 308)
+TF_MAX_RULES, TF_MAX_ACTIONS, REDIRECT_MAX = 1000, 10, 10000
+# header names a transform rule may never touch (mirrors the controller's TRANSFORM_RESERVED):
+# hop-by-hop / framing, the visitor-address chain the edge sets, and every internal X-Pcdn-* header
+TF_RESERVED = HOP_HEADERS | {"x-real-ip", "forwarded", "trailers"}
+TF_RESERVED_PREFIX = ("x-pcdn-", "x-forwarded-", "proxy-")
+TF_REMOVE_ONLY = {"cookie", "set-cookie"}
+SAFE_TF_VALUE = re.compile(r"^[\x20-\x7e]{1,1024}$")
+# redirect source (exact / prefix): a raw request path as the controller normalises it (percent-encoded)
+SAFE_REDIRECT_SOURCE = re.compile(r"^/[A-Za-z0-9\-._~!&'()*+,;=:@/%]{0,1023}$")
+# redirect target / rewrite replacement characters: RFC 3986 unreserved + reserved + "%" and "$"
+# (only as $1..$9). Double quotes, backslashes, whitespace, CR/LF, <> and backticks never pass.
+URL_CHARS = re.compile(r"^[A-Za-z0-9\-._~!&'()*+,;=:@/?#\[\]%$]*$")
+REDIRECT_ABS = re.compile(r"^https?://[A-Za-z0-9.-]{1,253}(?::\d{1,5})?(?=[/?#]|$)")
+SAFE_REWRITE = re.compile(r"^/(?!/)[A-Za-z0-9\-._~!$&'()*+,;=:@/?%]{0,1023}$")
+# map_hash_bucket_size is 128: longer exact redirect sources are matched by an anchored regex instead
+REDIRECT_HASH_MAX_KEY = 96
+
+
+def _qre(s: str) -> str:
+    """A regex (or other text without `$` interpolation concerns) as a double-quoted nginx token:
+    nginx un-escapes \\\\ and \\" inside quotes, so both are escaped."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _hvar(name: str) -> str:
+    """nginx variable of a request header ($http_x_foo for X-Foo)."""
+    return "$http_" + name.lower().replace("-", "_")
+
+
+def pcre_regex(src, max_len: int = 512):
+    """A customer regex that PCRE (nginx) will run: printable ASCII, compiles in Python, and none of
+    the Python-only syntax PCRE rejects (\\N \\u \\U \\l \\L escapes, inline flags other than imsx).
+    Returns the compiled Python pattern (for its group count) or None."""
+    if not isinstance(src, str) or not 0 < len(src) <= max_len or not re.match(r"^[\x20-\x7e]+$", src):
+        return None
+    if re.search(r"\\[NuUlL]", src):
+        return None
+    for m in re.finditer(r"\(\?([A-Za-z-]+)[:)]", src):
+        if set(m.group(1)) - set("imsx-"):
+            return None
+    try:
+        return re.compile(src)
+    except (re.error, RecursionError, OverflowError, ValueError):
+        return None
+
+
+def _refs_ok(text: str, groups: int | None) -> bool:
+    """`$` only as $1..$9 naming an existing group (groups None: no `$` at all)."""
+    for m in re.finditer(r"\$(\d?)(\d?)", text):
+        if groups is None or not m.group(1) or m.group(1) == "0" or m.group(2) or int(m.group(1)) > groups:
+            return False
+    return True
+
+
+def _under(path: str, prefixes) -> bool:
+    return any(path.startswith(p) for p in prefixes)
+
+
+def norm_redirects(site: dict, tunnel_prefixes=()) -> list[dict]:
+    """Validated `redirects.rules` in order: {id, match, source, target, status, preserve_query,
+    groups (regex only), re (compiled, regex only)}. Exact / prefix sources inside /__pcdn/ or a
+    tunnel path are dropped (those paths are never redirected)."""
+    out = []
+    for r in (_sec(site, "redirects").get("rules") or [])[:REDIRECT_MAX]:
+        if not isinstance(r, dict) or r.get("enabled") is False:
+            continue
+        rid, match, status = str(r.get("id") or "").lower(), r.get("match") or "exact", r.get("status")
+        src, target = r.get("source"), r.get("target")
+        if (not SAFE_ID.match(rid) or match not in ("exact", "prefix", "regex") or status not in REDIRECT_CODES
+                or isinstance(status, bool) or not isinstance(src, str) or not isinstance(target, str)):
+            continue
+        groups, rx = None, None
+        if match == "regex":
+            rx = pcre_regex(src)
+            if rx is None:
+                continue
+            groups = rx.groups
+        elif (not SAFE_REDIRECT_SOURCE.match(src) or src.lower().startswith("/__pcdn")
+              or _under(src, tunnel_prefixes)):
+            continue
+        if (not target or len(target) > 2048 or not URL_CHARS.match(target) or not _refs_ok(target, groups)
+                or not (REDIRECT_ABS.match(target) or (target.startswith("/") and not target.startswith("//")))):
+            continue
+        out.append({"id": rid, "match": match, "source": src, "target": target, "status": status,
+                    "preserve_query": r.get("preserve_query") is True, "groups": groups, "re": rx})
+    return out
+
+
+def _rd_matches(rule: dict, path: str) -> bool:
+    if rule["match"] == "prefix":
+        return path.startswith(rule["source"])
+    if rule["match"] == "regex":
+        return rule["re"].search(path) is not None
+    return path == rule["source"]
+
+
+def redirect_maps(sid: int, rules: list[dict], tunnel_prefixes=()) -> tuple[list[str], str | None, list[int]]:
+    """http-level maps of a site's redirect rules -> (maps, variable, status codes used). The
+    variable is "<status><Location>" of the first enabled rule (in order) matching the RAW request
+    path ($pcdn_path: percent-encoded like the controller's sources; regex captures can never carry a
+    decoded CR/LF into the Location header), or "".
+     * exact sources: one hash lookup ($pcdn_rdh_*). nginx lower-cases map hash keys, so the hit is
+       confirmed case-sensitively by a backreference ($pcdn_rde_*: the path must repeat the source).
+       An exact rule shadowed by an EARLIER prefix / regex rule matching that same path is dropped
+       (unreachable), so the hash may take precedence over the ordered map.
+     * prefix / regex rules (and exact sources too long for the hash or differing from a hashed one
+       only by case): one ordered regex map ($pcdn_rdc_*), first match wins; /__pcdn/ and tunnel
+       prefixes are guarded first (never redirected).
+    The value carries $1..$9 (regex rules) and, with preserve_query, the query string."""
+    def value(r):
+        t = r["target"]
+        if r["preserve_query"]:
+            base, mark, frag = t.partition("#")
+            t = base + ("$pcdn_args_amp" if "?" in base else "$is_args$args") + mark + frag
+        return f"{r['status']}{t}"
+
+    hashed, ordered, before, seen, seen_low, codes = [], [], [], set(), set(), set()
+    for r in rules:
+        if r["match"] == "exact":
+            src = r["source"]
+            if src in seen or any(_rd_matches(p, src) for p in before):
+                continue
+            seen.add(src)
+            if src.lower() not in seen_low and len(src) <= REDIRECT_HASH_MAX_KEY:
+                seen_low.add(src.lower())
+                hashed.append((src, value(r)))
+                codes.add(r["status"])
+                continue
+            ordered.append(("~^" + re.escape(src) + "$", value(r)))
+        elif r["match"] == "prefix":
+            ordered.append(("~^" + re.escape(r["source"]), value(r)))
+        else:
+            ordered.append(("~" + r["source"], value(r)))
+        before.append(r)
+        codes.add(r["status"])
+    maps, rde, rdc = [], None, None
+    if hashed:
+        maps.append(f"map $pcdn_path $pcdn_rdh_{sid} {{\n    default \"\";\n"
+                    + "".join(f'    {_qre(src)} "{src} {val}";\n' for src, val in hashed) + "}")
+        maps.append(f'map "$pcdn_path $pcdn_rdh_{sid}" $pcdn_rde_{sid} {{\n    default "";\n'
+                    f'    "~^(\\\\S+) \\\\1 (.+)$" $2;\n}}')
+        rde = f"$pcdn_rde_{sid}"
+    if ordered:
+        guards = ['    "~^/__pcdn/" "";\n']
+        if tunnel_prefixes:
+            guards.append(f"    {_qre('~^(?:' + '|'.join(re.escape(p) for p in tunnel_prefixes) + ')')} \"\";\n")
+        maps.append(f"map $pcdn_path $pcdn_rdc_{sid} {{\n    default \"\";\n" + "".join(guards)
+                    + "".join(f'    {_qre(k)} "{val}";\n' for k, val in ordered) + "}")
+        rdc = f"$pcdn_rdc_{sid}"
+    if rde and rdc:
+        maps.append(f'map {rde} $pcdn_rd_{sid} {{\n    "~." {rde};\n    default {rdc};\n}}')
+        return maps, f"$pcdn_rd_{sid}", sorted(codes)
+    return maps, rde or rdc, sorted(codes)
+
+
+def _tf_header_ok(name, remove: bool) -> bool:
+    if not isinstance(name, str) or not SAFE_HEADER.match(name):
+        return False
+    low = name.lower()
+    if low in TF_RESERVED or low.startswith(TF_RESERVED_PREFIX):
+        return False
+    return remove or low not in TF_REMOVE_ONLY
+
+
+def norm_transform(site: dict) -> list[dict]:
+    """Validated `transform.rules` in order: {"cond": None (always) | {methods, countries, path_re},
+    "actions": [...]}. Actions: {type, name, value} for headers, {type, re, regex, groups,
+    replacement} for rewrite_path."""
+    out = []
+    for r in (_sec(site, "transform").get("rules") or [])[:TF_MAX_RULES]:
+        if not isinstance(r, dict) or r.get("enabled") is False:
+            continue
+        m = r.get("match") if isinstance(r.get("match"), dict) else {}
+        pat = m.get("path", m.get("pattern"))
+        methods, countries = m.get("methods") or [], m.get("countries") or []
+        if pat not in (None, "", "/*", "*") and not (isinstance(pat, str) and SAFE_PATTERN.match(pat)):
+            continue
+        if not isinstance(methods, list) or not all(isinstance(x, str) and re.match(r"^[A-Za-z]{1,16}$", x)
+                                                    for x in methods):
+            continue
+        if not isinstance(countries, list) or not all(isinstance(x, str) and re.match(r"^[A-Za-z]{2}$", x)
+                                                      for x in countries):
+            continue
+        cond = {"methods": sorted({x.upper() for x in methods}), "countries": sorted({x.upper() for x in countries}),
+                "path_re": wildcard_re(pat) if pat not in (None, "", "/*", "*") else None}
+        if not cond["methods"] and not cond["countries"] and cond["path_re"] is None:
+            cond = None
+        actions = []
+        for a in (r.get("actions") if isinstance(r.get("actions"), list) else [])[:TF_MAX_ACTIONS]:
+            if not isinstance(a, dict):
+                continue
+            t = a.get("type")
+            if t == "rewrite_path":
+                rx, rep = pcre_regex(a.get("regex")), a.get("replacement")
+                if (rx is None or not isinstance(rep, str) or not SAFE_REWRITE.match(rep)
+                        or rep.lower().startswith("/__pcdn") or not _refs_ok(rep, rx.groups)):
+                    continue
+                actions.append({"type": t, "regex": a["regex"], "groups": rx.groups, "replacement": rep})
+            elif t in ("set_request_header", "set_response_header"):
+                v = a.get("value")
+                if _tf_header_ok(a.get("name"), False) and isinstance(v, str) and SAFE_TF_VALUE.match(v):
+                    actions.append({"type": t, "name": a["name"], "value": v})
+            elif t in ("remove_request_header", "remove_response_header"):
+                if _tf_header_ok(a.get("name"), True):
+                    actions.append({"type": t, "name": a["name"]})
+        if actions:
+            out.append({"cond": cond, "actions": actions})
+    return out
+
+
+def norm_bots(site: dict) -> dict | None:
+    """Per-site `bots` section; None when absent or mode off (today's behaviour)."""
+    b = _sec(site, "bots")
+    if b.get("mode") not in BOT_MODES:
+        return None
+    return {"mode": b["mode"], "allow_verified": b.get("allow_verified") is not False,
+            "block_empty_ua": b.get("block_empty_ua") is not False}
+
+
+def norm_bot_ranges(config: dict) -> dict:
+    """Node-wide verified crawler ranges {engine: [cidr]} (only engines with at least one valid
+    network). Broad or malformed networks are dropped; duplicates (also across engines) are kept
+    once, for the first engine."""
+    b = config.get("bots") if isinstance(config, dict) else None
+    ver = b.get("verified") if isinstance(b, dict) else None
+    out, seen = {}, set()
+    if not isinstance(ver, dict):
+        return out
+    for name, _, _ in BOT_ENGINES:
+        nets = []
+        for c in (ver.get(name) if isinstance(ver.get(name), list) else [])[:BOT_MAX_PREFIXES * 2]:
+            if not isinstance(c, str) or not SAFE_CIDR.match(c.strip()):
+                continue
+            try:
+                n = ipaddress.ip_network(c.strip(), strict=False)
+            except ValueError:
+                continue
+            if n.prefixlen < BOT_MIN_PREFIX[n.version] or n in seen:
+                continue
+            seen.add(n)
+            nets.append(n)
+        if nets:
+            out[name] = [str(n) for n in sorted(nets, key=lambda n: (n.version, n))][:BOT_MAX_PREFIXES]
+    return out
+
+
+def with_cached_bot_ranges(body: dict, state: dict) -> dict:
+    """The agent's cache of verified crawler ranges (SPEC §14.2): every engine's last non-empty list
+    is kept in the state file and used while the controller sends none for it (e.g. a controller
+    restored from an old backup). Nothing received ever -> nothing cached -> crawler UAs fail open."""
+    if not isinstance(body, dict):
+        return body
+    got = norm_bot_ranges(body)
+    cache = state.get("bot_ranges") if isinstance(state.get("bot_ranges"), dict) else {}
+    cache = {k: v for k, v in cache.items() if isinstance(v, list) and v}
+    cache.update(got)
+    if cache:
+        state["bot_ranges"] = cache
+    if cache == got:
+        return body
+    b = body.get("bots") if isinstance(body.get("bots"), dict) else {}
+    return dict(body, bots=dict(b, verified=dict(cache)))
+
+
+def render_bots(ranges: dict) -> str | None:
+    """bots.conf (0644, CIDRs only): `geo $pcdn_vbot` = "<engine><known>" where engine is 1 (google)
+    / 2 (bing) / 0 (neither) and <known> lists the engines this node has ranges for, so njs can fail
+    open for an engine without ranges. None when no engine has ranges ($pcdn_vbot is then "")."""
+    if not ranges:
+        return None
+    known = "".join(flag for name, _, flag in BOT_ENGINES if ranges.get(name))
+    out = ["# verified crawler ranges (SPEC §14.2) — generated by pcdn-agent, do not edit",
+           "geo $pcdn_vbot {", f'    default "0{known}";']
+    for name, val, _ in BOT_ENGINES:
+        out += [f'    {c} "{val}{known}";' for c in ranges.get(name) or []]
+    return "\n".join(out) + "\n}\n"
+
+
+SAFE_PEM = re.compile(r"^[A-Za-z0-9+/=\-\s:,._()]+$")
+
+
+def _pem_ok(cert, key) -> bool:
+    """A PEM certificate (chain) + unencrypted private key, shape-checked so a malformed upload
+    cannot make `nginx -t` reject the whole tree."""
+    return (isinstance(cert, str) and isinstance(key, str) and 0 < len(cert) <= 65536 and 0 < len(key) <= 16384
+            and SAFE_PEM.match(cert) is not None and SAFE_PEM.match(key) is not None
+            and "-----BEGIN CERTIFICATE-----" in cert and "-----END CERTIFICATE-----" in cert
+            and re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", key) is not None and "ENCRYPTED" not in key)
+
+
+def norm_origin_pull(config: dict) -> dict | None:
+    """Node-wide platform client certificate {cert, key}, or None."""
+    op = config.get("origin_pull") if isinstance(config, dict) else None
+    if isinstance(op, dict) and _pem_ok(op.get("cert"), op.get("key")):
+        return {"cert": op["cert"], "key": op["key"]}
+    return None
+
+
+def origin_client(sslo: dict) -> dict:
+    """ssl_options.origin_client of a site: {"mode": off|platform|custom, cert?, key?}; the bare
+    `origin_client_auth` string is understood too. A custom mode without a usable pair is off."""
+    oc = sslo.get("origin_client")
+    if isinstance(oc, dict):
+        mode, cert, key = oc.get("mode"), oc.get("cert"), oc.get("key")
+    else:
+        mode, cert, key = sslo.get("origin_client_auth"), None, None
+    if mode == "platform":
+        return {"mode": "platform"}
+    if mode == "custom" and _pem_ok(cert, key):
+        return {"mode": "custom", "cert": cert, "key": key}
+    return {"mode": "off"}
+
+
+def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None,
+            tf_resp: list | None = None) -> dict:
     """Per-site data for njs (sites.js). Only validated / typed values end up here."""
     fw = _sec(site, "firewall")
     rules = []
@@ -713,7 +1052,16 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         excl.append({"rule_id": _int(e.get("rule_id"), 0, 0, 99999999), "path_re": wildcard_re(path) if path else None})
 
     hl, dd, im = _sec(site, "hotlink"), _sec(site, "ddos"), _sec(site, "image")
-    return {
+    # SPEC §14.2 additions appear only when used, so sites without them keep a byte-identical entry
+    packs = list(dict.fromkeys(p for p in (waf.get("packs") if isinstance(waf.get("packs"), list) else [])
+                               if p in WAF_PACKS))
+    extra = {}
+    bots = norm_bots(site)
+    if bots:
+        extra["bots"] = bots
+    if tf_resp:
+        extra["tf_resp"] = tf_resp
+    return dict({
         "domain": site["domain"],
         "secret": str(site.get("secret") or ""),
         "hosts": hosts,
@@ -728,26 +1076,30 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         "ddos": {"mode": dd.get("mode") if dd.get("mode") in ("auto", "js", "captcha") else "off",
                  "threshold_rps": _int(dd.get("threshold_rps"), 200, 1, 10000000),
                  "clearance_ttl": _int(dd.get("clearance_ttl"), 3600, 60, 30 * 86400)},
-        "waf": {"mode": waf.get("mode") if waf.get("mode") in ("detect", "block") else "off",
-                "paranoia": _int(waf.get("paranoia"), 1, 1, 3),
-                "groups": [g for g in (waf.get("groups") or []) if g in WAF_GROUPS],
-                "exclusions": excl,
-                "off_paths": [r["_re"] for r in page_rules(site) if r.get("waf") is False]},
+        "waf": dict({"mode": waf.get("mode") if waf.get("mode") in ("detect", "block") else "off",
+                     "paranoia": _int(waf.get("paranoia"), 1, 1, 3),
+                     "groups": [g for g in (waf.get("groups") or []) if g in WAF_GROUPS],
+                     "exclusions": excl,
+                     "off_paths": [r["_re"] for r in page_rules(site) if r.get("waf") is False]},
+                    **({"packs": packs} if packs else {})),
         "pools": pools,
         "image": {"enabled": bool(im.get("enabled")), "quality": _int(im.get("quality"), 85, 1, 100),
                   "max_width": _int(im.get("max_width"), 2000, 16, 10000)},
         # prefixes where only firewall allow/block/log rules apply (tunnel mode)
         "tunnel_paths": [p["path"] for p in tunnel["paths"]] if tunnel else [],
-    }
+    }, **extra)
 
 
-def render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str, dict]:
+def render_site(site: dict, cfg: dict, shield: dict | None = None, platform_pull: tuple | None = None) -> tuple[str, dict]:
     """Return (nginx config text, {relative_path: content}) for one site."""
-    text, files, _ = _render_site(site, cfg, shield)
+    text, files, _, _ = _render_site(site, cfg, shield, platform_pull)
     return text, files
 
 
-def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str, dict, dict | None]:
+def _render_site(site: dict, cfg: dict, shield: dict | None = None,
+                 platform_pull: tuple | None = None) -> tuple[str, dict, dict | None, dict]:
+    """-> (config text, extra files, sites.js entry or None, meta). platform_pull: the node's
+    (cert, key) platform client certificate for authenticated origin pulls (SPEC §14.2), or None."""
     sid = int(site["id"])
     domain = site["domain"]
     files = {}
@@ -885,15 +1237,79 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         if SAFE_HEADER.match(n) and n.lower() not in HOP_HEADERS and v is not None and SAFE_VALUE.match(str(v)):
             req_headers[n.lower()] = (n, _qv(str(v)))
     resp_add, resp_hide = [], []
+    resp_static = {}   # lower name -> (name, value | None): the last headers.response entry
     for h in hdr.get("response") or []:
         n, v = str(h.get("name") or ""), h.get("value")
         if not SAFE_HEADER.match(n) or n.lower() in HOP_HEADERS:
             continue
         if v is None:
             resp_hide.append(n)
+            resp_static[n.lower()] = (n, None)
         elif SAFE_VALUE.match(str(v)):
             resp_hide.append(n)  # replace the origin's value instead of sending both
-            resp_add.append(f"add_header {n} {_qv(str(v))} always;")
+            resp_add.append((n, f"add_header {n} {_qv(str(v))} always;"))
+            resp_static[n.lower()] = (n, str(v))
+
+    # --- transform rules (SPEC §14.2), web locations only (tunnel paths keep today's headers).
+    # Conditions (methods / countries / path pattern) become one flag map per rule over
+    # "$request_method|$pcdn_country|$pcdn_shield_ok|$pcdn_ouri" ($pcdn_ouri = the request's $uri
+    # pinned at server level, before any internal rewrite; (?s): a "*" also spans a decoded
+    # newline). A valid shield hop never matches, so a shield does not transform again what the
+    # visitor-facing edge already did. Rules run in order; a later matching rule wins for a header.
+    #  * request headers: proxy_set_header with a chain of maps (flag 1 -> this rule's value, "" for a
+    #    removal; otherwise the previous value, at the bottom the visitor's own $http_<name>);
+    #  * response headers: unconditional -> proxy_hide_header + add_header; conditional -> the njs
+    #    header filter pcdn.tfHeaders (exact set / delete of every value, also multi-value Set-Cookie,
+    #    which a "$upstream_http_<name>" pass-through would join into one broken line);
+    #  * rewrite_path: the regex runs on the RAW request path ($pcdn_path, percent-encoded, so a
+    #    capture can never put a decoded CR/LF into the request line) and the result is passed as the
+    #    URI of proxy_pass; the cache key stays on the visitor's original URI.
+    active = status not in ("suspended", "over_quota")
+    tf_rules = norm_transform(site) if active else []
+    tf_flag, tf_req, tf_resp, tf_hide, tf_add, tf_done, rewrites = {}, {}, [], [], [], set(), []
+    req_ops, resp_ops = {}, {}
+    for i, rule in enumerate(tf_rules):
+        c = rule["cond"]
+        if c is not None:
+            meth = "(?:" + "|".join(c["methods"]) + ")" if c["methods"] else "[^|]*"
+            ccs = "(?:" + "|".join(c["countries"]) + ")" if c["countries"] else "[^|]*"
+            path = c["path_re"][1:] if c["path_re"] else ".*"
+            tf_flag[i] = f"pcdn_tf_{sid}_{i}"
+            out.append(f'map "$request_method|$pcdn_country|$pcdn_shield_ok|$pcdn_ouri" ${tf_flag[i]} {{\n'
+                       f"    {_qre('~(?s)^' + meth + '[|]' + ccs + '[|]0[|]' + path)} 1;\n    default 0;\n}}")
+        f = tf_flag.get(i)
+        for a in rule["actions"]:
+            t = a["type"]
+            if t == "rewrite_path":
+                rewrites.append((f, a))
+            elif t.endswith("_request_header"):
+                req_ops.setdefault(a["name"].lower(), []).append(
+                    (f, _qv(a["value"]) if t.startswith("set_") else '""', a["name"]))
+            else:
+                resp_ops.setdefault(a["name"].lower(), []).append(
+                    (f, "set" if t.startswith("set_") else "del", a.get("value"), a["name"]))
+    for low, ops in resp_ops.items():
+        name, base = ops[0][3], resp_static.get(low)
+        if all(o[0] is None for o in ops):
+            state = ops[-1][1:3]
+            tf_hide.append(name)
+            if state[0] == "set":
+                tf_add.append(f"add_header {name} {_qv(state[1])} always;")
+            tf_done.add(low)
+        elif njs_ok:
+            if base:
+                tf_resp.append({"f": "", "op": "set", "n": name, "v": base[1]} if base[1] is not None
+                               else {"f": "", "op": "del", "n": name})
+            for f, op, v, _ in ops:
+                tf_resp.append({"f": f or "", "op": op, "n": name, "v": v} if op == "set"
+                               else {"f": f or "", "op": op, "n": name})
+            tf_done.add(low)
+        else:
+            log.warning("site %s: conditional response-header transforms need njs; skipped for %s", sid, name)
+    if tf_done:   # these names are handled by the transform rules (their headers.response entry is the base)
+        resp_hide = [n for n in resp_hide if n.lower() not in tf_done]
+        resp_add = [x for x in resp_add if x[0].lower() not in tf_done]
+    resp_add = [line for _, line in resp_add] + tf_add
     if shield_self:
         # a shield keeps the visitor's address / scheme / country forwarded by a valid shield hop
         base_req = [("Host", "$host"), ("X-Real-IP", "$pcdn_client_ip"), ("X-Forwarded-For", "$pcdn_xff"),
@@ -905,17 +1321,50 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
     # send it hops (config propagation lag)
     base_req.append(("X-Pcdn-Shield", '""'))
 
-    def req_hdrs(directive, conn=(("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))):
-        pairs = [(n, v) for n, v in base_req if n.lower() not in req_headers] + list(req_headers.values()) + list(conn)
+    # transform request headers: start from the static headers.request value (or the edge's own
+    # value for a base header, or the visitor's header) and apply the rules in order
+    base_vals = {n.lower(): v for n, v in base_req}
+    for k, (low, ops) in enumerate(req_ops.items()):
+        cur = req_headers[low][1] if low in req_headers else base_vals.get(low) or _hvar(ops[0][2])
+        for j, (f, expr, _) in enumerate(ops):
+            if f is None:
+                cur = expr
+            else:
+                var = f"pcdn_tq_{sid}_{k}_{j}"
+                out.append(f"map ${f} ${var} {{\n    1 {expr};\n    default {cur};\n}}")
+                cur = "$" + var
+        tf_req[low] = (ops[0][2], cur)
+
+    def req_hdrs(directive, conn=(("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade")), tf=False):
+        over = tf_req if tf else {}
+        pairs = ([(n, v) for n, v in base_req if n.lower() not in req_headers and n.lower() not in over]
+                 + [hv for low, hv in req_headers.items() if low not in over] + list(over.values()) + list(conn))
         return [f"{directive} {n} {v};" for n, v in pairs]
 
     # nginx drops inherited proxy_set_header / add_header / proxy_hide_header as soon as
     # a location sets one of them, so every proxying location gets the complete set.
-    proxy_hdrs = req_hdrs("proxy_set_header")
+    proxy_hdrs = req_hdrs("proxy_set_header", tf=True)
+
+    # rewrite_path: per rule, $pcdn_tfu_* is the rewritten URI when the rule's condition holds
+    # ($pcdn_tfr_*: its regex on the raw path) and otherwise the next rule's, so the first rule whose
+    # condition and regex both match wins ("" = none: proxy_pass keeps the request URI). Unconditional
+    # rules are skipped on a valid shield hop too (the edge already sent the rewritten path).
+    tf_uri = ""
+    if rewrites:
+        nxt = '""'
+        for j, (f, a) in reversed(list(enumerate(rewrites))):
+            rep = a["replacement"] + ("$pcdn_args_amp" if "?" in a["replacement"] else "$is_args$args")
+            out.append(f"map $pcdn_path $pcdn_tfr_{sid}_{j} {{\n    default {nxt};\n"
+                       f"    {_qre('~' + a['regex'])} \"{rep}\";\n}}")
+            src, hit = (f"${f}", "1") if f else ("$pcdn_shield_ok", "0")
+            out.append(f"map {src} $pcdn_tfu_{sid}_{j} {{\n    {hit} $pcdn_tfr_{sid}_{j};\n    default {nxt};\n}}")
+            nxt = f"$pcdn_tfu_{sid}_{j}"
+        tf_uri = nxt
+    mtls_now = []   # proxy_ssl_certificate lines of the host being rendered (origin-bound HTTPS only)
 
     def loc_common(hides=(), extra_add=(), hdrs=None):
         lines = list(proxy_hdrs if hdrs is None else hdrs)
-        for n in dict.fromkeys(list(hides) + resp_hide):
+        for n in dict.fromkeys(list(hides) + resp_hide + tf_hide):
             lines.append(f"proxy_hide_header {n};")
         lines += list(extra_add)
         lines.append("add_header X-Served-By $hostname always;")
@@ -929,6 +1378,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
             lines.append("add_header Vary $pcdn_webp_vary;")
         if eh_on:
             lines.append("early_hints $pcdn_early_hints;")
+        if tf_resp:
+            lines.append("js_header_filter pcdn.tfHeaders;")
         return lines + resp_add
 
     def ind(lines):
@@ -936,8 +1387,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
 
     named = [0]
 
-    def proxy_loc(match, mode, ttl, bttl, iq):
-        """mode: bypass | dynamic (honour origin; ttl>0 = default TTL) | aggressive | everything | static."""
+    def proxy_loc(match, mode, ttl, bttl, iq, uri=""):
+        """mode: bypass | dynamic (honour origin; ttl>0 = default TTL) | aggressive | everything | static.
+        uri: explicit URI variable for proxy_pass (default: the rewrite_path result, "" = unchanged)."""
         L, hides, adds = [], [], []
         cacheable = mode != "bypass" and cache_on
         key = None
@@ -973,7 +1425,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         if bttl > 0:
             hides += ["Cache-Control", "Expires"]
             adds.append(f"add_header Cache-Control \"public, max-age={bttl}\" always;")
-        origin = loc_common(hides, adds) + L + ["proxy_pass $pcdn_proto://$pcdn_target;"]
+        origin = loc_common(hides, adds) + L + mtls_now + [f"proxy_pass $pcdn_proto://$pcdn_target{uri or tf_uri};"]
         if not (shielded and cacheable):
             return [f"    location {match} {{"] + ind(origin) + ["    }"]
         # SPEC §14.1 origin shield: GET/HEAD cache misses go to the shield peers (consistent hash on
@@ -997,10 +1449,13 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         S += [f"error_page 418 502 504 = {fb};", "proxy_intercept_errors off;",
               f"proxy_connect_timeout {min(5, _int(cfg.get('TUNNEL_CONNECT_TIMEOUT'), 10, 3, 30))}s;",
               f"proxy_next_upstream_tries {len(shield_peers)};"]
-        # always TLS, verified against $host (the shield serves the site's certificate)
+        # always TLS, verified against $host (the shield serves the site's certificate). The upstream
+        # is shared by every shielded site, so a TLS session saved for one site must not be resumed
+        # for another (a resumed session keeps the first site's certificate, the name check fails and
+        # the hop silently falls back to the origin); idle keepalive connections are still reused.
         S += ["proxy_ssl_server_name on;", "proxy_ssl_name $host;", "proxy_ssl_verify on;",
               f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};", "proxy_ssl_verify_depth 4;",
-              "proxy_pass https://pcdn_shield_https;"]
+              "proxy_ssl_session_reuse off;", f"proxy_pass https://pcdn_shield_https{tf_uri};"]
         return ([f"    location {match} {{"] + ind(S) + ["    }"]
                 + [f"    location {fb} {{"] + ind(origin) + ["    }"])
 
@@ -1052,6 +1507,44 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         out.append(f"map $uri $pcdn_tnp_{sid} {{\n    volatile;\n    default 0;\n    \"~^(?:{alt})\" 1;\n}}")
         out.append(f"map \"$scheme$pcdn_tnp_{sid}\" $pcdn_httpredir_{sid} {{\n    volatile;\n"
                    f"    \"http0\" 1;\n    default 0;\n}}")
+
+    # --- redirect rules (SPEC §14.2): server level, after the security verdict and force_https and
+    # before the request-body check, image resizing, page rules, cache and origin
+    tn_prefixes = [p["path"] for p in tunnel["paths"]] if tunnel else []
+    rd_var, rd_codes = None, []
+    if active:
+        rd_maps, rd_var, rd_codes = redirect_maps(sid, norm_redirects(site, tn_prefixes), tn_prefixes)
+        out += rd_maps
+
+    # --- WAF packs (SPEC §14.2): xmlrpc.php / JSON request bodies are read and inspected by njs
+    # (/__pcdn/body/ -> pcdn.bodyInspect) before they are proxied through @pcdn_body
+    waf_sec = _sec(site, "waf")
+    body_packs = {"wordpress", "api"} & set(p for p in (waf_sec.get("packs") if isinstance(waf_sec.get("packs"), list)
+                                                        else []) if isinstance(p, str))
+    body_on = bool(active and njs_ok and fallback == "origin" and body_packs
+                   and waf_sec.get("mode") in ("detect", "block"))
+
+    # --- authenticated origin pulls (SPEC §14.2): client certificate on origin-bound HTTPS hops only
+    # (never on the edge -> shield hop, which carries the shield's own TLS; the shield itself presents
+    # it to the origin). Origins over plain HTTP get nothing.
+    oc = origin_client(sslo) if active else {"mode": "off"}
+    mtls_id, mtls_pair, mtls_used = None, None, False
+    if oc["mode"] == "platform":
+        if platform_pull:
+            mtls_id, mtls_pair = "platform", platform_pull
+        else:
+            log.warning("site %s: origin_client platform but no origin_pull certificate in the config", sid)
+    elif oc["mode"] == "custom":
+        mtls_id, mtls_pair = str(sid), (oc["cert"], oc["key"])
+    mtls_lines = [f"proxy_ssl_certificate {cfg['NGINX_DIR']}/mtls/{mtls_id}.crt;",
+                  f"proxy_ssl_certificate_key {cfg['NGINX_DIR']}/mtls/{mtls_id}.key;"] if mtls_id else []
+    meta = {"mtls_resizer": None}
+    # @pcdn_body proxies the visitor's original URI (or its rewrite_path result) explicitly: the
+    # request URI there is the internal /__pcdn/body/... one
+    body_uri = "$request_uri"
+    if body_on and tf_uri:
+        out.append(f'map {tf_uri} $pcdn_bu_{sid} {{\n    "~." {tf_uri};\n    default $request_uri;\n}}')
+        body_uri = f"$pcdn_bu_{sid}"
 
     def _upstream_block(name, hp, h2):
         # one server: never marked down (max_fails=0). A warm pool of idle keepalive connections to
@@ -1226,6 +1719,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         s.append(f"    access_log {cfg['ACCESS_LOG']} pcdn buffer=64k flush=1s"
                  + (" if=$pcdn_log_ok;" if shield_self else ";"))
         s.append(f"    set $pcdn_site {sid};")
+        if tf_flag:   # transform conditions see the visitor's path, also after an internal rewrite
+            s.append("    set $pcdn_ouri $uri;")
         s.append("    location = /__pcdn/health { access_log off; return 200 \"ok\\n\"; }")
         if tunnel and status not in ("suspended", "over_quota"):
             # F27/N2: raise the client-facing HTTP/2 connection timers for tunnel hosts so idle
@@ -1256,6 +1751,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
             continue
 
         s.append(f"    set $pcdn_proto {proto};")
+        # client certificate towards this host's origin (only when it is reached over HTTPS)
+        mtls_now[:] = mtls_lines if proto == "https" else []
+        mtls_used = mtls_used or bool(mtls_now)
         if pool:
             s.append(f"    set $pcdn_pool {_q(pool)};")
             s.append("    set $pcdn_target $pcdn_upstream;")
@@ -1269,6 +1767,10 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
                 s.append(f"    if ($pcdn_httpredir_{sid}) {{ return 301 https://$host$request_uri; }}")
             else:
                 s.append("    if ($scheme = http) { return 301 https://$host$request_uri; }")
+        for code in rd_codes:   # SPEC §14.2 redirect rules (first matching rule, see redirect_maps)
+            s.append(f"    if ({rd_var} ~ \"^{code}(.*)$\") {{ return {code} $1; }}")
+        if body_on:
+            s.append("    if ($pcdn_bodychk) { rewrite ^ /__pcdn/body$uri last; }")
         if image_on:
             s.append("    if ($pcdn_img_w) { rewrite ^ /__pcdn/img$uri last; }")
         if rps > 0:
@@ -1296,6 +1798,13 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         for cls in err_pages:
             s.append(f"    location = /__pcdn/err/{cls}.html {{ internal; default_type text/html; "
                      f"alias {cfg['NGINX_DIR']}/errors/{sid}-{cls}.html; add_header Cache-Control no-store always; }}")
+        if body_on:
+            # the body is read here (in memory: bodyNeed only routes requests whose declared length
+            # fits), inspected, then proxied as is (never cached) with the original request URI
+            s.append(f"    location ^~ /__pcdn/body/ {{ internal; client_max_body_size {BODY_CAP}; "
+                     f"client_body_buffer_size {BODY_CAP}; client_body_in_single_buffer on; "
+                     "js_content pcdn.bodyInspect; }")
+            s += proxy_loc("@pcdn_body", "bypass", 0, 0, False, uri=body_uri)
 
         if image_on:
             L = ["internal;", "rewrite ^/__pcdn/img(/.*)$ $1 break;"]
@@ -1312,8 +1821,14 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
                 "proxy_set_header X-Pcdn-Origin $pcdn_proto://$pcdn_target;",
                 "proxy_set_header X-Pcdn-W $pcdn_img_w;",
                 "proxy_set_header X-Pcdn-H $pcdn_img_h;",
-                "proxy_set_header X-Pcdn-Q $pcdn_img_q;",
-                f"proxy_pass http://127.0.0.1:{resize_port};"]
+                "proxy_set_header X-Pcdn-Q $pcdn_img_q;"]
+            if mtls_now:   # the resizer presents this site's client certificate (mtls.conf)
+                tok = mtls_token(mtls_id, mtls_pair)
+                L.append(f"proxy_set_header X-Pcdn-Mtls {tok};")
+                meta["mtls_resizer"] = (tok, mtls_pair)
+            else:          # never let a visitor's own X-Pcdn-Mtls header reach the resizer
+                L.append('proxy_set_header X-Pcdn-Mtls "";')
+            L.append(f"proxy_pass http://127.0.0.1:{resize_port}{tf_uri};")
             s += ["    location ^~ /__pcdn/img/ {"] + ["        " + x for x in L] + ["    }"]
 
         # tunnel paths: "^~" prefix locations, so no page rule / static regex location can take them
@@ -1365,8 +1880,43 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None) -> tuple[str
         s.append("}")
         out.append("\n".join(s))
 
-    js = site_js(site, valid_hosts, pools, sslo, tunnel) if status not in ("suspended", "over_quota") and valid_hosts else None
-    return "\n\n".join(out) + "\n", files, js
+    if mtls_used and mtls_id != "platform":
+        files[f"mtls/{sid}.crt"], files[f"mtls/{sid}.key"] = mtls_pair
+    meta["mtls_platform"] = mtls_used and mtls_id == "platform"
+    js = site_js(site, valid_hosts, pools, sslo, tunnel, tf_resp) if active and valid_hosts else None
+    return "\n\n".join(out) + "\n", files, js, meta
+
+
+MTLS_CHUNK = 3000   # nginx limits one config token to its 4 KiB read buffer
+
+
+def mtls_token(ident: str, pair: tuple) -> str:
+    """The X-Pcdn-Mtls value naming a client certificate for the image resizer: "<id>-<hash of the
+    key>", so a visitor cannot pick a certificate by sending the header itself (client headers pass
+    through an image location that does not set it). Deterministic: the tree digest stays stable."""
+    return f"{ident}-" + hashlib.sha256(b"pcdn-mtls|" + pair[1].encode()).hexdigest()[:32]
+
+
+def render_mtls_resizer(pairs: dict) -> str | None:
+    """mtls.conf (0600): the client certificates the local image resizer presents to origins
+    (SPEC §14.2), selected by the X-Pcdn-Mtls header the calling site sets (mtls_token). The
+    resizer runs in unprivileged workers, so the PEM travels in variables ("data:...",
+    nginx >= 1.21) instead of root-only files; long PEMs are split over several variables."""
+    if not pairs:
+        return None
+    out = ["# client certificates for the image resizer (SPEC §14.2) — generated by pcdn-agent, do not edit"]
+    sel = {"c": [], "k": []}
+    for ident in sorted(pairs):
+        for kind, pem in zip("ck", pairs[ident]):
+            names = []
+            for i in range(0, len(pem), MTLS_CHUNK):
+                var = f"pcdn_m{kind}_{ident.split('-')[0]}_{i // MTLS_CHUNK}"
+                out.append(f'map $uri ${var} {{\n    default "{pem[i:i + MTLS_CHUNK]}";\n}}')
+                names.append("$" + var)
+            sel[kind].append(f'    "{ident}" "data:{"".join(names)}";\n')
+    for kind, var in (("c", "$pcdn_mtls_crt"), ("k", "$pcdn_mtls_key")):
+        out.append(f"map $http_x_pcdn_mtls {var} {{\n    default \"\";\n" + "".join(sel[kind]) + "}")
+    return "\n".join(out) + "\n"
 
 
 def render_all(config: dict, cfg: dict) -> dict:
@@ -1378,16 +1928,33 @@ def render_all(config: dict, cfg: dict) -> dict:
     sh_conf = render_shield(shield, cfg)
     if sh_conf:
         files["shield.conf"] = sh_conf
+    platform = norm_origin_pull(config)   # node-wide platform client certificate (SPEC §14.2)
+    platform_pair = (platform["cert"], platform["key"]) if platform else None
+    resizer_pairs, platform_used = {}, False
     for site in config.get("sites", []):
-        text, extra, js = _render_site(site, cfg, shield)
+        text, extra, js, meta = _render_site(site, cfg, shield, platform_pair)
         files[f"sites/{int(site['id'])}.conf"] = text
         files.update(extra)
+        platform_used = platform_used or meta.get("mtls_platform")
+        if meta.get("mtls_resizer"):
+            ident, pair = meta["mtls_resizer"]
+            resizer_pairs[ident] = pair
         if js:
             js_sites[str(int(site["id"]))] = js
             for p in js["pools"].values():
                 if p["health"]["enabled"]:
                     max_timeout = max(max_timeout, p["health"]["timeout"])
-    files["http.conf"] = render_http(cfg, max_timeout + 1, shield)
+    if platform_used:   # one 0600 pair per node, only while some site presents it
+        files["mtls/platform.crt"], files["mtls/platform.key"] = platform_pair
+    # verified crawler ranges: only while some site uses bot management (a daily range refresh
+    # must not reload nodes where nobody needs them)
+    bots_conf = render_bots(norm_bot_ranges(config)) if any("bots" in j for j in js_sites.values()) else None
+    if bots_conf:
+        files["bots.conf"] = bots_conf
+    mtls_conf = render_mtls_resizer(resizer_pairs)
+    if mtls_conf:
+        files["mtls.conf"] = mtls_conf
+    files["http.conf"] = render_http(cfg, max_timeout + 1, shield, bool(bots_conf), bool(mtls_conf))
     # JSON is valid JS; ensure_ascii keeps U+2028 & co. out of the source
     files["js/sites.js"] = ("// generated by pcdn-agent, do not edit\nexport default "
                             + json.dumps(js_sites, ensure_ascii=True, sort_keys=True) + ";\n")
@@ -1430,7 +1997,7 @@ def _group_digests(files: dict, pattern: str) -> dict:
 
 def site_digests(files: dict) -> dict:
     """Per-site content digest (config + certs + error pages) for group-aware reload deferral (F21)."""
-    return _group_digests(files, r"^(?:sites|certs|errors)/(\d+)")
+    return _group_digests(files, r"^(?:sites|certs|errors|mtls)/(\d+)")
 
 
 def cert_digests(files: dict) -> dict:
@@ -1438,10 +2005,14 @@ def cert_digests(files: dict) -> dict:
     return _group_digests(files, r"^certs/(\d+)\.")
 
 
+GLOBAL_FILES = ("http.conf", "js/pcdn.js", "shield.conf", "bots.conf", "mtls.conf", "mtls/platform.crt",
+                "mtls/platform.key")
+
+
 def global_digest(files: dict) -> str:
     """Digest of the node-global rendered files (base http.conf + njs module + shield.conf): any
     change here affects every site and must not be deferred (F21)."""
-    return tree_digest({k: files[k] for k in ("http.conf", "js/pcdn.js", "shield.conf") if k in files})
+    return tree_digest({k: files[k] for k in GLOBAL_FILES if k in files})
 
 
 def verify_reload(cfg: dict, digest: str) -> bool:
@@ -1473,11 +2044,15 @@ def run(cmd: str) -> tuple[int, str]:
 def write_tree(root: str, files: dict):
     os.makedirs(os.path.join(root, "sites"), exist_ok=True)
     os.makedirs(os.path.join(root, "certs"), mode=0o700, exist_ok=True)
+    if any(rel.startswith("mtls/") for rel in files):
+        os.makedirs(os.path.join(root, "mtls"), mode=0o700, exist_ok=True)
     for rel, content in files.items():
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # keys and the HMAC / shield secrets are only read by the nginx master (root) at load time
-        mode = 0o600 if rel.endswith(".key") or rel in ("js/sites.js", "shield.conf") else 0o644
+        # keys and the HMAC / shield secrets are only read by the nginx master (root) at load time;
+        # so are the origin-pull client certificates (mtls/, mtls.conf; SPEC §14.2)
+        mode = 0o600 if (rel.endswith(".key") or rel in ("js/sites.js", "shield.conf", "mtls.conf")
+                         or rel.startswith("mtls/")) else 0o644
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as f:
             f.write(content)
@@ -2371,6 +2946,7 @@ class Agent:
             return
         version = body["version"]
         etag = hdrs.get("ETag") or hdrs.get("etag")
+        body = with_cached_bot_ranges(body, st)   # SPEC §14.2: keep the last good crawler ranges
         files, digest = render_tree(body, cfg)
         now = time.monotonic()
 

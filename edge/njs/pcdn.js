@@ -9,6 +9,9 @@
 //   upstream js_set $pcdn_upstream — "host:port" chosen from a load-balancer pool
 //   tunnelUpstream js_set $pcdn_tn_upstream — same for the pool of a tunnel path ($pcdn_tn_pool)
 //   imgW/imgH/imgQ js_set          — image resize parameters ("" = no resize)
+//   bodyNeed js_set $pcdn_bodychk  — "1" when a WAF pack inspects this request's body (SPEC §14.2)
+//   bodyInspect                    — js_content for /__pcdn/body/*: inspects the body, then proxies
+//   tfHeaders js_header_filter     — conditional transform-rule response headers (SPEC §14.2)
 //   deny / verify / captcha        — js_content handlers for /__pcdn/*
 //   health                         — js_periodic origin health checker
 //
@@ -180,7 +183,146 @@ const WAF_RULES = [
     { id: 913120, g: 'scanner', pl: 1, t: 'p', re: /\/\.(?:git|svn|hg|env)(?:\/|$)/ },
     { id: 913130, g: 'scanner', pl: 2, t: 'p', re: /\.(?:sql|bak|old|swp|orig)$|\/wp-config\.php./ },
     { id: 913110, g: 'scanner', pl: 3, t: 'u', re: /python-requests|go-http-client|libwww-perl|^curl\/|^wget\// },
+
+    // ---- managed rule packs (SPEC §14.2): enabled per site by waf.packs (k = pack), independent of
+    // waf.groups, honouring waf.mode / paranoia / exclusions like every other rule. Stable ids in a
+    // reserved range per pack (see WAF_PACK_VERSION). Targets as above plus a: the whole query string.
+    // Patterns are linear-time: no nested or overlapping quantifiers (checked by the unit tests).
+    // generic 990xxx
+    { id: 990100, k: 'generic', pl: 1, t: 'p', re: /\/(?:c99|c100|r57|wso\d{0,2}|b374k|alfa(?:shell)?|indoxploit|webshell|leafmailer|priv8)\.ph(?:p\d?|tml|ar)$/ },
+    { id: 990110, k: 'generic', pl: 1, t: 'p', re: /\/(?:backups?|bak|db|database|dump|sql|site|www|wwwroot|htdocs|public_html|web|html|archive|old)\.(?:zip|rar|7z|tar|tgz|tar\.gz|tar\.bz2|gz|bz2|sql|sql\.gz|bak)$/ },
+    { id: 990120, k: 'generic', pl: 1, t: 'p', re: /\/(?:\.ds_store|thumbs\.db|web\.config|\.user\.ini|php\.ini|\.npmrc|\.dockerenv|docker-compose\.ya?ml|dockerfile|id_[rd]sa|\.pgpass|\.my\.cnf|sftp-config\.json|\.ftpconfig|\.git-credentials|\.netrc)$/ },
+    { id: 990130, k: 'generic', pl: 1, t: 'p', re: /\/(?:phpinfo\.php|server-status|server-info)\/?$/ },
+    { id: 990140, k: 'generic', pl: 1, t: 'q', re: /169\.254\.169\.254|\bmetadata\.google\.internal\b|100\.100\.100\.200|fd00:ec2::254/ },
+    { id: 990150, k: 'generic', pl: 2, t: 'p', re: /\/(?:phpmyadmin\d{0,2}|pma|myadmin|mysqladmin|sqladmin|dbadmin)(?:\/|$)|\/adminer[^\/]{0,32}\.php$/ },
+    { id: 990160, k: 'generic', pl: 1, t: 'p', re: /\/eval-stdin\.php$/ },
+    { id: 990170, k: 'generic', pl: 1, t: 'p', re: /\/actuator\/(?:env|heapdump|jolokia|gateway|threaddump|configprops|mappings)(?:\/|$)|\/(?:jmx-console|web-console|invoker\/jmxinvokerservlet)(?:\/|$)/ },
+    { id: 990180, k: 'generic', pl: 1, t: 'p', re: /\/\.\.;/ },
+    { id: 990190, k: 'generic', pl: 2, t: 'p', re: /\/cgi-bin\/(?:[^\/]{1,64}\.(?:sh|pl|cgi)|php\d?|test-cgi|printenv)$/ },
+    // wordpress 991xxx (xmlrpc bodies: WAF_BODY_XMLRPC; 991105 / 991170 are WAF_PACK_FN checks)
+    { id: 991120, k: 'wordpress', pl: 1, t: 'p', re: /\/\.?wp-config(?:\.php)?[^\/]{0,64}$/ },
+    { id: 991130, k: 'wordpress', pl: 1, t: 'a', re: /(?:^|&)author=\d/ },
+    { id: 991150, k: 'wordpress', pl: 1, t: 'p', re: /^\/wp-content\/uploads\/.{0,1024}\.(?:ph(?:p\d?|tml|ar|ps))(?:\/|$)/ },
+    { id: 991160, k: 'wordpress', pl: 1, t: 'p', re: /^\/wp-content\/debug\.log$/ },
+    { id: 991165, k: 'wordpress', pl: 2, t: 'p', re: /^\/wp-admin\/(?:install|setup-config)\.php$/ },
+    { id: 991180, k: 'wordpress', pl: 3, t: 'p', re: /^\/(?:readme\.html|license\.txt|wp-includes\/version\.php)$/ },
+    // joomla 992xxx
+    { id: 992100, k: 'joomla', pl: 1, t: 'p', re: /\/configuration\.php(?:[~#]|\.\w{1,8}|-dist)?$/ },
+    { id: 992120, k: 'joomla', pl: 1, t: 'uq', re: /\}__[a-z0-9_]{1,64}\|o:\d{1,6}:"|jdatabasedrivermysqli/ },
+    { id: 992140, k: 'joomla', pl: 2, t: 'p', re: /^\/administrator\/(?:manifests\/files\/joomla\.xml|logs\/|cache\/)/ },
+    { id: 992150, k: 'joomla', pl: 2, t: 'p', re: /^\/installation\// },
+    // drupal 993xxx
+    { id: 993100, k: 'drupal', pl: 1, t: 'q', re: /\[#(?:post_render|pre_render|access_callback|lazy_builder|markup|submit|validate)\]|(?:^|\/)#(?:value|markup|post_render|pre_render|lazy_builder|access_callback)(?:$|\/|\[)/ },
+    { id: 993110, k: 'drupal', pl: 1, t: 'q', re: /^name\[[^\]]{0,64}[;'"(]/ },
+    { id: 993120, k: 'drupal', pl: 1, t: 'p', re: /^\/sites\/[^\/]{1,128}\/(?:settings(?:\.local)?\.php|services\.yml)(?:[~#]|\.\w{1,8})?$/ },
+    { id: 993130, k: 'drupal', pl: 2, t: 'p', re: /^\/(?:core\/)?install\.php$/ },
+    { id: 993135, k: 'drupal', pl: 3, t: 'p', re: /^\/(?:core\/)?(?:update|cron|authorize)\.php$/ },
+    { id: 993140, k: 'drupal', pl: 3, t: 'p', re: /^\/(?:core\/)?changelog\.txt$/ },
+    // laravel 994xxx
+    { id: 994100, k: 'laravel', pl: 1, t: 'p', re: /\/\.env(?:$|[.\-_~])/ },
+    { id: 994110, k: 'laravel', pl: 1, t: 'p', re: /^\/_ignition\/(?:execute-solution|share-report|update-config)(?:\/|$)/ },
+    { id: 994115, k: 'laravel', pl: 2, t: 'p', re: /^\/_ignition\// },
+    { id: 994120, k: 'laravel', pl: 1, t: 'p', re: /^\/(?:_debugbar|__clockwork|_clockwork)(?:\/|$)/ },
+    { id: 994125, k: 'laravel', pl: 2, t: 'p', re: /^\/(?:telescope|horizon)(?:\/|$)/ },
+    { id: 994130, k: 'laravel', pl: 1, t: 'p', re: /\/storage\/logs\/[^\/]{1,128}\.log$|\/storage\/framework\/sessions\// },
+    { id: 994140, k: 'laravel', pl: 2, t: 'p', re: /^\/(?:composer\.(?:json|lock)|artisan|server\.php|phpunit\.xml(?:\.dist)?)$/ },
+    { id: 994150, k: 'laravel', pl: 1, t: 'p', re: /^\/vendor\/.{1,1024}\.php$/ },
+    // api 995xxx (JSON bodies: inspectJson; header / size checks: WAF_PACK_FN)
+    { id: 995150, k: 'api', pl: 1, t: 'q', re: /__proto__|constructor\[prototype\]|constructor\.prototype/ },
+    { id: 995160, k: 'api', pl: 1, t: 'q', re: /\[\$(?:where|function|accumulator|expr)\]|^\$(?:where|function|accumulator)$/ },
+    { id: 995165, k: 'api', pl: 2, t: 'q', re: /\[\$(?:ne|eq|gt|gte|lt|lte|in|nin|regex|exists|or|and|not|nor|elemmatch|size|type|all)\]/ },
 ];
+
+// rule-pack versions (SPEC §14.2 "versioned rule sets"): bumped when a pack's rules change; ids are
+// never reused for a different check. Reserved id ranges: generic 990000-990999, wordpress
+// 991000-991999, joomla 992000-992999, drupal 993000-993999, laravel 994000-994999, api 995000-995999.
+const WAF_PACK_VERSION = { generic: 1, wordpress: 1, joomla: 1, drupal: 1, laravel: 1, api: 1 };
+
+// request bodies are inspected (wordpress xmlrpc.php, api JSON) only when their declared length is
+// at most BODY_CAP: the body is read into memory by bodyInspect before it is proxied
+const BODY_CAP = 131072;
+const JSON_CT = /^application\/(?:[a-z0-9.+-]{0,64}\+)?json\s*(?:;|$)/i;
+const CT_SYNTAX = /^[a-z0-9!#$&^_.+-]{1,64}\/[a-z0-9!#$&^_.+-]{1,64}(?:\s*;\s*[a-z0-9!#$&^_.+-]{1,64}=(?:[^;",\s]{0,256}|"[^"]{0,256}"))*\s*$/i;
+const CT_EXPECTED = /^(?:application\/(?:[a-z0-9.+-]{0,64}\+)?(?:json|xml)|application\/(?:x-www-form-urlencoded|octet-stream|graphql|x-ndjson)|multipart\/form-data|text\/(?:plain|xml))\s*(?:;|$)/i;
+const STD_METHODS = { GET: 1, HEAD: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, OPTIONS: 1 };
+
+function bodyLen(r) {
+    const v = String(r.headersIn['Content-Length'] || '');
+    return /^\d{1,12}$/.test(v) ? +v : -1;
+}
+function hasBody(c) {
+    return bodyLen(c.r) > 0 || /chunked/i.test(String(c.r.headersIn['Transfer-Encoding'] || ''));
+}
+function bodyMethod(c) { return c.method === 'POST' || c.method === 'PUT' || c.method === 'PATCH'; }
+function methodOverride(c) {
+    const h = c.r.headersIn;
+    return String(h['X-HTTP-Method-Override'] || h['X-HTTP-Method'] || h['X-Method-Override'] || '');
+}
+
+// pack checks that need more than one regex on one target
+const WAF_PACK_FN = [
+    // xmlrpc.php POST whose body cannot be inspected (no length / larger than BODY_CAP): padding a
+    // system.multicall past the inspection limit must not be a bypass
+    { id: 991105, k: 'wordpress', pl: 1, f: function (c) {
+        if (c.method !== 'POST' || c.pathL !== '/xmlrpc.php') return false;
+        const n = bodyLen(c.r);
+        return n > BODY_CAP || (n < 0 && hasBody(c));
+    } },
+    // plugin / theme endpoint used for path traversal or wp-config disclosure
+    { id: 991140, k: 'wordpress', pl: 1, f: function (c) {
+        return /^\/wp-content\/(?:plugins|themes)\//.test(c.pathL)
+            && /\.\.[\/\\]|wp-config|etc\/passwd/.test(c.query().toLowerCase() + ' ' + c.pathL);
+    } },
+    // REST / ?rest_route user enumeration by visitors who are not logged in
+    { id: 991170, k: 'wordpress', pl: 2, f: function (c) {
+        return (/^\/wp-json\/wp\/v2\/users/.test(c.pathL) || /(?:^|&)rest_route=\/wp\/v2\/users/.test(c.query().toLowerCase()))
+            && !/(?:^|;)\s*wordpress_logged_in_/.test(String(c.r.headersIn.Cookie || ''));
+    } },
+    // CVE-2023-23752: unauthenticated configuration / user disclosure through the Joomla API
+    { id: 992110, k: 'joomla', pl: 1, f: function (c) {
+        return /^\/api\/index\.php\/v1\/(?:config\/application|users)/.test(c.pathL) && /(?:^|&)public=(?:true|1)\b/i.test(c.args);
+    } },
+    // component parameter carrying a traversal
+    { id: 992130, k: 'joomla', pl: 1, f: function (c) {
+        const q = c.query().toLowerCase();
+        return /(?:^|&)option=com_/.test(q) && /\.\.[\/\\]/.test(q);
+    } },
+    // body-carrying request without a Content-Type
+    { id: 995100, k: 'api', pl: 2, f: function (c) {
+        return bodyMethod(c) && hasBody(c) && !c.r.headersIn['Content-Type'];
+    } },
+    // syntactically invalid Content-Type
+    { id: 995110, k: 'api', pl: 1, f: function (c) {
+        const ct = c.r.headersIn['Content-Type'];
+        return ct !== undefined && !CT_SYNTAX.test(String(ct));
+    } },
+    // body of an unexpected media type
+    { id: 995120, k: 'api', pl: 2, f: function (c) {
+        const ct = c.r.headersIn['Content-Type'];
+        return bodyMethod(c) && hasBody(c) && ct !== undefined && !CT_EXPECTED.test(String(ct));
+    } },
+    // overlong request target
+    { id: 995130, k: 'api', pl: 2, f: function (c) { return c.rawUri.length > 4096; } },
+    // JSON body too large (or of unknown length) to be inspected
+    { id: 995140, k: 'api', pl: 3, f: function (c) {
+        if (!bodyMethod(c) || !JSON_CT.test(String(c.r.headersIn['Content-Type'] || ''))) return false;
+        const n = bodyLen(c.r);
+        return n > BODY_CAP || (n < 0 && hasBody(c));
+    } },
+    // method override to a non-standard method; any override at paranoia 3
+    { id: 995170, k: 'api', pl: 1, f: function (c) { const m = methodOverride(c); return m !== '' && !STD_METHODS[m.toUpperCase()]; } },
+    { id: 995175, k: 'api', pl: 3, f: function (c) { return methodOverride(c) !== ''; } },
+];
+
+// xmlrpc.php request bodies (lower-cased)
+const WAF_BODY_XMLRPC = [
+    { id: 991100, pl: 1, re: /<methodname>\s*system\.multicall\s*<\/methodname>/ },
+    { id: 991110, pl: 2, re: /<methodname>\s*pingback\.(?:ping|extensions\.getpingbacks)\s*<\/methodname>/ },
+];
+// JSON body limits (api pack)
+const JSON_MAX_DEPTH = 32, JSON_MAX_NODES = 10000, JSON_MAX_STRINGS = 2000;
+const MONGO_EXEC = /^\$(?:where|function|accumulator|expr)$/;   // a regex: an object lookup would hit '__proto__'
+const MONGO_OPS = /^\$(?:ne|eq|gt|gte|lt|lte|in|nin|regex|exists|or|and|not|nor|elemmatch|size|type|all|text|jsonschema|mod)$/i;
 
 const ALLOWED_METHODS = { GET: 1, HEAD: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, OPTIONS: 1 };
 const RESTRICTED_EXT = /\.(?:asa|asax|backup|bat|cdx|cer|cfg|cmd|com|config|conf|cs|csproj|csr|dat|db|dbf|dll|dos|htr|htw|ida|idc|idq|inc|ini|key|licx|lnk|log|mdb|pass|pdb|pol|printer|pwd|rdb|resources|resx|sys|vb|vbs|vbproj|vsdisco|webinfo|xsd|xsx)$/;
@@ -286,16 +428,34 @@ function prepSite(id, s) {
     P.ddos = { mode: dd.mode || 'off', threshold: Math.max(1, +dd.threshold_rps || 200), ttl: Math.max(60, +dd.clearance_ttl || 3600) };
 
     const w = s.waf || {};
-    const groups = {};
+    const groups = {}, packs = {};
     (w.groups || []).forEach(function (g) { groups[g] = 1; });
+    (w.packs || []).forEach(function (k) { if (WAF_PACK_VERSION[k]) packs[k] = 1; });
     const pl = Math.min(3, Math.max(1, +w.paranoia || 1));
     P.waf = {
         mode: w.mode || 'off',
-        rules: WAF_RULES.filter(function (r) { return groups[r.g] && r.pl <= pl; }),
+        pl: pl,
+        rules: WAF_RULES.filter(function (r) { return (r.k ? packs[r.k] : groups[r.g]) && r.pl <= pl; }),
         proto: groups.protocol ? WAF_PROTOCOL.filter(function (r) { return r.pl <= pl; }) : [],
+        fn: WAF_PACK_FN.filter(function (r) { return packs[r.k] && r.pl <= pl; }),
+        // request bodies read by bodyInspect: xmlrpc.php (wordpress), JSON (api)
+        body: packs.wordpress || packs.api ? { xmlrpc: !!packs.wordpress, json: !!packs.api } : null,
         excl: (w.exclusions || []).map(function (e) { return { id: +e.rule_id || 0, re: reOrNull(e.path_re, '') }; }),
         off: (w.off_paths || []).map(function (p) { return reOrNull(p, ''); }).filter(Boolean),
     };
+    // JSON body string values are checked with the site's query-string signatures
+    P.waf.jsonRules = P.waf.rules.filter(function (r) { return r.t.indexOf('q') >= 0; });
+
+    // bot management (SPEC §14.2); absent / mode off -> no bot checks
+    const b = s.bots;
+    P.bots = b && (b.mode === 'log' || b.mode === 'challenge' || b.mode === 'block')
+        ? { mode: b.mode, allowVerified: b.allow_verified !== false, blockEmpty: b.block_empty_ua !== false } : null;
+
+    // conditional transform-rule response headers, applied in order by tfHeaders (SPEC §14.2):
+    // {f: flag variable ("" = always), op: set|del, n: header name, v: value}
+    P.tfResp = Array.isArray(s.tf_resp) && s.tf_resp.length ? s.tf_resp.filter(function (o) {
+        return o && typeof o.n === 'string' && (o.op === 'del' || (o.op === 'set' && typeof o.v === 'string'));
+    }) : null;
 
     P.pools = {};
     Object.keys(s.pools || {}).forEach(function (name) {
@@ -399,7 +559,11 @@ function evaluate(r) {
         if (!rule.conds.every(function (c) { return c(ctx); })) continue;
         if (rule.action === 'log') { if (!logged) logged = 'log:firewall:' + rule.id; continue; }
         matched = true;
-        if (rule.action === 'allow') return logged || 'ok';
+        if (rule.action === 'allow') {
+            // the request-body inspection (bodyNeed) is part of the WAF that `allow` skips
+            if (site.waf.body) { try { r.variables.pcdn_wafskip = '1'; } catch (e) { /* no js_var */ } }
+            return logged || 'ok';
+        }
         if (rule.action === 'block') return 'block:firewall:' + rule.id;
         if (rule.action === 'challenge' || rule.action === 'captcha') {
             v = challengeOr(ctx, rule.action, 'firewall', rule.id);
@@ -410,10 +574,19 @@ function evaluate(r) {
 
     if (site.hotlink && site.hotlink.ext && site.hotlink.ext.test(ctx.path) && !hotlinkOk(ctx, site)) return 'block:hotlink:referer';
 
+    v = bots(ctx, site);
+    if (v) {
+        if (v.indexOf('log:') !== 0) return v;
+        if (!logged) logged = v;
+    }
+
     v = rateLimit(ctx, site);
     if (v) return v;
-    v = ddos(ctx, site);
-    if (v) return v;
+    // a verified search-engine crawler (allow_verified) is never sent a DDoS challenge it cannot solve
+    if (!(ctx.verifiedBot && site.bots && site.bots.allowVerified)) {
+        v = ddos(ctx, site);
+        if (v) return v;
+    }
     v = waf(ctx, site);
     if (v) {
         if (v.indexOf('log:') !== 0) return v;
@@ -448,13 +621,54 @@ function hotlinkOk(ctx, site) {
     return h === ctx.host || site.hosts.some(ok) || site.hotlink.allowed.some(ok);
 }
 
+// ------------------------------------------------------------------ bot management (SPEC §14.2)
+// Verified crawler = the client IP is in that engine's published ranges ($pcdn_vbot, a geo rendered
+// from the node-wide bots.verified block: "<engine><known>" where engine is 1 google / 2 bing /
+// 0 neither and <known> lists the engines whose ranges this node has, e.g. "1gb") AND the
+// User-Agent claims that engine. A crawler User-Agent from outside the engine's ranges is
+// "spoofed" — but only when this node has ranges for that engine: with none ($pcdn_vbot "" or the
+// engine missing from <known>) crawler UAs fail open and are never treated as spoofed.
+const BOT_GOOGLE = /googlebot|storebot-google|google-inspectiontool|googleother/i;   // googlebot.json crawlers
+const BOT_BING = /bingbot/i;
+const BOT_HEADLESS = /headlesschrome|phantomjs|slimerjs|puppeteer|playwright|selenium|webdriver|htmlunit|nightmare/i;
+const BOT_LIBRARY = /^(?:curl|wget|libcurl|python-requests|python-urllib|python-httpx|python\/|aiohttp|httpx|go-http-client|okhttp|java\/|apache-httpclient|libwww-perl|lwp-|php\/|guzzlehttp|node-fetch|axios\/|undici|got |ruby|faraday|mechanize|scrapy|httpie|powershell|pycurl|http_request2|colly|winhttp|reqwest|hackney|zgrab|masscan)|\b(?:scrapy|httrack|python-requests|go-http-client|libwww-perl|curl\/)/i;
+
+// -> {verified, rule} where rule is null or empty_ua | spoofed | headless | library
+function botClass(ua, vbot, blockEmpty) {
+    vbot = String(vbot || '');
+    const engine = vbot.charAt(0), known = vbot.substring(1);
+    const g = BOT_GOOGLE.test(ua), b = BOT_BING.test(ua);
+    if ((g && engine === '1') || (b && engine === '2')) return { verified: true, rule: null };
+    let rule = null;
+    if (!ua) rule = blockEmpty ? 'empty_ua' : null;
+    else if ((g && known.indexOf('g') >= 0) || (b && known.indexOf('b') >= 0)) rule = 'spoofed';
+    else if (BOT_HEADLESS.test(ua)) rule = 'headless';
+    else if (BOT_LIBRARY.test(ua)) rule = 'library';
+    return { verified: false, rule: rule };
+}
+
+function bots(ctx, site) {
+    const b = site.bots;
+    if (!b) return null;
+    const c = botClass(ctx.ua, ctx.r.variables.pcdn_vbot, b.blockEmpty);
+    ctx.verifiedBot = c.verified;
+    if (!c.rule) return null;
+    if (b.mode === 'log') return 'log:bots:' + c.rule;
+    if (b.mode === 'challenge') return challengeOr(ctx, 'challenge', 'bots', c.rule);
+    return 'block:bots:' + c.rule;
+}
+
 function rateLimit(ctx, site) {
     if (!site.rl.length) return null;
     const cnt = ngx.shared.pcdn_cnt, blk = ngx.shared.pcdn_blk, t = now();
+    // a verified crawler (bots.allow_verified) is never sent a challenge / captcha it cannot solve;
+    // rate-limit blocks (429, which crawlers honour) still apply to it
+    const crawler = ctx.verifiedBot && site.bots && site.bots.allowVerified;
     for (let i = 0; i < site.rl.length; i++) {
         const rule = site.rl[i];
         if (!rule.re || !rule.re.test(ctx.path)) continue;
         if (rule.methods.length && rule.methods.indexOf(ctx.method) < 0) continue;
+        if (crawler && rule.action !== 'block') continue;
         const bkey = 'b:' + site.id + ':' + rule.id + ':' + ctx.ipStr;
         if (rule.action === 'block' && (blk.get(bkey) || 0) > t) return 'block:ratelimit:' + rule.id;
         const n = cnt.incr('r:' + site.id + ':' + rule.id + ':' + ctx.ipStr + ':' + Math.floor(t / rule.period), 1, 0);
@@ -490,7 +704,8 @@ function normalize(s) {
 }
 
 function wafTargets(ctx) {
-    const t = { p: [normalize(ctx.path)], q: [], c: [], u: [normalize(ctx.ua)], r: [] };
+    const t = { p: [normalize(ctx.path)], q: [], c: [], u: [normalize(ctx.ua)], r: [],
+        a: ctx.args ? [normalize(ctx.args.replace(/\+/g, ' '))] : [] };
     if (ctx.args) {
         ctx.args.split('&').forEach(function (kv) {
             if (!kv) return;
@@ -524,6 +739,10 @@ function waf(ctx, site) {
         const pr = w.proto[i];
         if (!wafExcluded(w, pr.id, ctx.path) && pr.f(ctx)) hit = pr.id;
     }
+    for (let i = 0; i < w.fn.length && !hit; i++) {
+        const fr = w.fn[i];
+        if (!wafExcluded(w, fr.id, ctx.path) && fr.f(ctx)) hit = fr.id;
+    }
     if (!hit && w.rules.length) {
         const T = wafTargets(ctx);
         for (let i = 0; i < w.rules.length && !hit; i++) {
@@ -537,6 +756,128 @@ function waf(ctx, site) {
     }
     if (!hit) return null;
     return (w.mode === 'block' ? 'block' : 'log') + ':waf:' + hit;
+}
+
+// ------------------------------------------------------------------ request-body inspection (WAF packs)
+// js_set $pcdn_bodychk: evaluated at server level right after the verdict, so only requests the
+// verdict let through get here. "1" routes the request to the internal /__pcdn/body/ location
+// (bodyInspect), which reads the (size-capped) body, checks it and then proxies it unchanged
+// through the named location @pcdn_body.
+function bodyNeed(r) {
+    try {
+        const site = siteOf(r);
+        if (!site || !site.waf.body) return '';
+        const w = site.waf, m = r.method;
+        if ((w.mode !== 'block' && w.mode !== 'detect') || r.variables.pcdn_wafskip) return '';
+        if (m !== 'POST' && m !== 'PUT' && m !== 'PATCH') return '';
+        const uri = String(r.uri);
+        if (uri.indexOf('/__pcdn/') === 0 || inTunnel(site, uri) || w.off.some(function (re) { return re.test(uri); })) return '';
+        const n = bodyLen(r);
+        if (n < 1 || n > BODY_CAP) return '';
+        if (w.body.xmlrpc && m === 'POST' && uri === '/xmlrpc.php') return '1';
+        if (w.body.json && JSON_CT.test(String(r.headersIn['Content-Type'] || ''))) return '1';
+    } catch (e) { r.error('pcdn bodyNeed: ' + e); }
+    return '';
+}
+
+// nesting depth of a JSON text, scanned linearly (before JSON.parse, so a deeply nested document
+// never reaches the parser)
+function jsonDepth(s) {
+    let depth = 0, max = 0, str = false;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s.charCodeAt(i);
+        if (str) {
+            if (ch === 92) i++;                 // backslash: skip the escaped character
+            else if (ch === 34) str = false;
+        } else if (ch === 34) str = true;
+        else if (ch === 123 || ch === 91) { if (++depth > max) max = depth; }
+        else if (ch === 125 || ch === 93) depth--;
+    }
+    return max;
+}
+
+// -> rule id (0 = clean). Keys and string values are collected iteratively (no recursion).
+function inspectJson(w, text, path) {
+    const ok = function (id, pl) { return pl <= w.pl && !wafExcluded(w, id, path); };
+    if (jsonDepth(text) > JSON_MAX_DEPTH) return ok(995210, 1) ? 995210 : 0;
+    let doc;
+    try { doc = JSON.parse(text); } catch (e) { return ok(995200, 2) ? 995200 : 0; }
+    const stack = [doc], strs = [];
+    let nodes = 0, proto = false, exec = false, ops = false;
+    while (stack.length) {
+        const x = stack.pop();
+        if (++nodes > JSON_MAX_NODES) return ok(995210, 1) ? 995210 : 0;
+        if (typeof x === 'string') { if (strs.length < JSON_MAX_STRINGS) strs.push(x); continue; }
+        if (x === null || typeof x !== 'object') continue;
+        if (Array.isArray(x)) { for (let i = 0; i < x.length; i++) stack.push(x[i]); continue; }
+        const keys = Object.keys(x);
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            if (k === '__proto__' || (k === 'constructor' && x[k] && typeof x[k] === 'object' && 'prototype' in x[k])) proto = true;
+            if (MONGO_EXEC.test(k)) exec = true; else if (MONGO_OPS.test(k)) ops = true;
+            if (strs.length < JSON_MAX_STRINGS) strs.push(k);
+            stack.push(x[k]);
+        }
+    }
+    if (proto && ok(995220, 1)) return 995220;
+    if (exec && ok(995230, 1)) return 995230;
+    if (ops && ok(995235, 2)) return 995235;
+    // injection signatures of the site's enabled groups / packs, as for query-string values
+    for (let i = 0; i < w.jsonRules.length; i++) {
+        const rule = w.jsonRules[i];
+        if (wafExcluded(w, rule.id, path)) continue;
+        for (let j = 0; j < strs.length; j++) if (rule.re.test(normalize(strs[j]))) return rule.id;
+    }
+    return 0;
+}
+
+function inspectBody(r, site, path) {
+    const w = site.waf;
+    const text = r.requestText;
+    if (typeof text !== 'string' || !text) return 0;
+    if (w.body.xmlrpc && path === '/xmlrpc.php') {
+        const lb = text.toLowerCase();
+        for (let i = 0; i < WAF_BODY_XMLRPC.length; i++) {
+            const rule = WAF_BODY_XMLRPC[i];
+            if (rule.pl <= w.pl && !wafExcluded(w, rule.id, path) && rule.re.test(lb)) return rule.id;
+        }
+    }
+    if (w.body.json && JSON_CT.test(String(r.headersIn['Content-Type'] || ''))) return inspectJson(w, text, path);
+    return 0;
+}
+
+function bodyInspect(r) {
+    const site = siteOf(r);
+    const path = String(r.uri).replace(/^\/__pcdn\/body(?=\/)/, '');
+    let hit = 0;
+    try { if (site) hit = inspectBody(r, site, path); } catch (e) { r.error('pcdn body: ' + e); hit = 0; }
+    if (hit) {
+        const v = (site.waf.mode === 'block' ? 'block' : 'log') + ':waf:' + hit;
+        const cur = String(r.variables.pcdn_vmemo || 'ok');
+        if (v.indexOf('block:') === 0 || cur === 'ok') {
+            // the access log reports this verdict ($pcdn_verdict was cached as "ok" before the body
+            // was read, so it is overwritten as well as the memo)
+            try { r.variables.pcdn_vmemo = v; r.variables.pcdn_verdict = v; } catch (e) { r.error('pcdn body verdict: ' + e); }
+        }
+        if (v.indexOf('block:') === 0) return blockPage(r, v);
+    }
+    r.internalRedirect('@pcdn_body');
+}
+
+// ------------------------------------------------------------------ transform rules (SPEC §14.2)
+// js_header_filter of sites whose response-header transform rules have conditions: each op runs
+// when its flag variable (a per-rule nginx map over method / country / path) is "1", in rule order,
+// so a later matching rule wins; a removal deletes every value of a multi-value header (Set-Cookie).
+function tfHeaders(r) {
+    const site = siteOf(r);
+    if (!site || !site.tfResp) return;
+    const ops = site.tfResp;
+    for (let i = 0; i < ops.length; i++) {
+        const o = ops[i];
+        if (o.f && r.variables[o.f] !== '1') continue;
+        if (o.op === 'del') delete r.headersOut[o.n];
+        else r.headersOut[o.n] = o.v;
+    }
 }
 
 // ------------------------------------------------------------------ load balancing
@@ -717,6 +1058,10 @@ function deny(r) {
         return send(r, 429, page('درخواست‌های بیش از حد', 'تعداد درخواست‌های شما از حد مجاز بیشتر شده است. لطفاً کمی بعد دوباره تلاش کنید.',
             'Too many requests. Please try again later.', '', metaLine(r, v)), { 'Retry-After': String(retry) });
     }
+    return blockPage(r, v);
+}
+
+function blockPage(r, v) {
     return send(r, 403, page('دسترسی مسدود شد', 'درخواست شما توسط سامانه امنیتی CDN مسدود شد. اگر فکر می‌کنید اشتباهی رخ داده، با مدیر وب‌سایت تماس بگیرید.',
         'Access denied by the website\'s security settings.', '', metaLine(r, v)));
 }
@@ -866,4 +1211,5 @@ function captcha(r) {
     grant(r, site, 'cap', back);
 }
 
-export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health };
+export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
+    bodyNeed, bodyInspect, tfHeaders };

@@ -212,15 +212,32 @@ def env(tmp_path_factory):
     op = origin.port
     crt, key = self_signed(tmp, "shs.test")
     tls = {"cert": crt.read_text(), "key": key.read_text()}
+    crt2, key2 = self_signed(tmp, "shtf.test")
+    tls2 = {"cert": crt2.read_text(), "key": key2.read_text()}
+    bundle = tmp / "bundle.pem"       # the edge verifies both shielded sites' certificates on the hop
+    bundle.write_text(tls["cert"] + tls2["cert"])
 
     def shield_sites(hop):
         req = {"request": [{"name": "X-Hop", "value": hop}]}
         fw = {"default_action": "allow", "rules": [{"id": "blk", "enabled": True, "action": "block",
                                                     "conditions": [{"field": "path", "op": "starts_with",
                                                                     "value": "/blocked"}]}]}
+        # SPEC §14.2 transform rules on a shielded site: an unconditional rewrite_path plus
+        # conditional header rules whose values differ per node, to show the shield never re-applies
+        # what the visitor-facing edge did (no double rewrite, hop headers passed through)
+        tfm = {"rules": [
+            {"id": "rw", "enabled": True, "match": {"path": "/*", "methods": [], "countries": []},
+             "actions": [{"type": "rewrite_path", "name": None, "value": None, "regex": "^/rw/(.*)$",
+                          "replacement": "/echo/pre/$1"}]},
+            {"id": "hdr", "enabled": True, "match": {"path": "/rw/*", "methods": [], "countries": []},
+             "actions": [{"type": "set_request_header", "name": "X-Tf", "value": hop, "regex": None, "replacement": None},
+                         {"type": "set_response_header", "name": "X-Tf-Resp", "value": hop, "regex": None,
+                          "replacement": None}]}]}
         # sh.test has no certificate (never shielded); shs.test hops edge -> shield over TLS
         return [site(306, "sh.test", op, cache={"shield": True}, headers=req, firewall=fw),
                 site(307, "shs.test", op, cache={"shield": True}, headers=req, ssl=tls, firewall=fw,
+                     ssl_options={"force_https": False, "origin_protocol": "http"}),
+                site(309, "shtf.test", op, cache={"shield": True}, headers=req, ssl=tls2, transform=tfm,
                      ssl_options={"force_https": False, "origin_protocol": "http"})]
 
     edge_sites = [
@@ -241,7 +258,7 @@ def env(tmp_path_factory):
     shield_tmp.mkdir()
     edge_tmp.mkdir()
     s_cfg, s_conf = node_cfg(shield_tmp)
-    e_cfg, e_conf = node_cfg(edge_tmp, SHIELD_HTTPS_PORT=s_cfg["HTTPS_PORT"], CA_BUNDLE=str(crt))
+    e_cfg, e_conf = node_cfg(edge_tmp, SHIELD_HTTPS_PORT=s_cfg["HTTPS_PORT"], CA_BUNDLE=str(bundle))
     shield = Node(s_cfg, s_conf, shield_tmp)
     edge = Node(e_cfg, e_conf, edge_tmp)
     edge.config = {"sites": edge_sites, "shield": {"self": False, "peers": ["127.0.0.1"], "secret": SHIELD_SECRET}}
@@ -346,6 +363,26 @@ def test_shield_https_hop_verifies_certificate(env):
     plain = env.req("shs.test", "/echo?tls=0")
     h = hdrs(plain)
     assert h["x-hop"] == "shield" and h["x-forwarded-proto"] == "http"
+
+
+def test_shield_with_transform_rules_applies_them_once(env):
+    """SPEC §14.2 + §14.1: the edge rewrites the path and sets the headers; the shield (a valid hop
+    never matches a transform condition and skips rewrite_path) passes them through unchanged."""
+    r = env.req("shtf.test", "/rw/x?q=1")
+    assert r.status == 200, r.body
+    h = hdrs(r)
+    assert r.json["path"] == "/echo/pre/x?q=1"                      # rewritten once, not twice
+    assert h["x-hop"] == "shield" and h["x-tf"] == "edge"            # fetched by the shield, edge's value
+    assert r.all("X-Tf-Resp") == ["edge"]
+    # a visitor of the shield itself gets the shield's own transforms
+    d = env.shield.req("shtf.test", "/rw/y")
+    assert d.json["path"] == "/echo/pre/y" and hdrs(d)["x-tf"] == "shield" and d.all("X-Tf-Resp") == ["shield"]
+    # POST is never shielded: the origin fallback rewrites exactly once as well
+    p = env.req("shtf.test", "/rw/p", "POST", {"Content-Type": "application/json"}, b"{}")
+    assert p.json["path"] == "/echo/pre/p" and hdrs(p)["x-hop"] == "edge" and hdrs(p)["x-tf"] == "edge"
+    # cached on the edge under the visitor's URL
+    assert xcache(env.req("shtf.test", "/rw/t.css")) == "MISS"
+    assert xcache(env.req("shtf.test", "/rw/t.css")) == "HIT" and env.origin.hits["/echo/pre/t.css"] == 1
 
 
 # ----------------------------------------------------------------- cache key variants + purge

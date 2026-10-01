@@ -966,7 +966,8 @@ def test_heartbeat_reports_capabilities(tmp_path):
     a.cfg = caps_cfg(tmp_path, modules=ORG_MODULES, **H3)
     body = a._hb(applied_version="v1")
     assert body["capabilities"] == {"http3": True, "early_hints": True, "webp_convert": False,
-                                    "webp_mode": "accept_key", "modules": ORG_MODULES, "nginx": "1.29.1"}
+                                    "webp_mode": "accept_key", "modules": ORG_MODULES, "nginx": "1.29.1",
+                                    "waf_packs": agent.WAF_PACK_VERSIONS}
     json.dumps(body)
 
 
@@ -1122,6 +1123,7 @@ def test_shield_render_edge_node(tmp_path):
     assert "proxy_hide_header X-Cache;" in static and "proxy_hide_header X-Served-By;" in static
     assert "proxy_hide_header Strict-Transport-Security;" in static
     assert "proxy_pass https://pcdn_shield_https;" in static and "proxy_ssl_verify on;" in static
+    assert "proxy_ssl_session_reuse off;" in static      # never resume another site's TLS session
     assert f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};" in static and "proxy_ssl_name $host;" in static
     assert "proxy_cache pcdn_9;" in static and "proxy_cache_key $scheme://$host$request_uri;" in static
     name = re.search(r"error_page 418 502 504 = (@pcdn_origin_\d+);", static).group(1)
@@ -1407,3 +1409,377 @@ def test_install_http3_load_module_block(tmp_path):
     assert 'allow UDP/$HTTPS_PORT' in install
     boot = (HERE.parent / "bootstrap.sh").read_text()
     assert "--http3|--no-http3" in boot and "|--cc)" in boot
+
+
+# ----------------------------------------------------------------- SPEC §14.2 rules & security
+
+def rd(rid, source, match, target, status=301, preserve_query=False, enabled=True):
+    return {"id": rid, "enabled": enabled, "source": source, "match": match, "target": target, "status": status,
+            "preserve_query": preserve_query}
+
+
+def site_6b(**over):
+    s = dict(SITE, hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}}])
+    s.update(over)
+    return s
+
+
+def test_redirect_rules_render(tmp_path):
+    rules = [rd("a", "/old", "exact", "https://new.example/p"),
+             rd("b", "/About", "exact", "/about", 308),
+             rd("c", "/about", "exact", "/x", 302),                         # case collision -> ordered regex
+             rd("d", "/blog/", "prefix", "https://b.example/?s=1#top", 302, True),
+             rd("e", r"^/p/(\d+)/(.*)$", "regex", "/post/$2?id=$1", 307, True),
+             rd("f", "/p/1/x", "exact", "/never", 301),                     # shadowed by the earlier regex
+             rd("g", "/k", "exact", "/kept", 301, True),
+             rd("h", "/" + "a" * 120, "exact", "/long", 301),               # too long for the hash
+             rd("off", "/off", "exact", "/x", 301, enabled=False)]
+    text, _ = agent.render_site(site_6b(redirects={"rules": rules}), make_cfg(tmp_path))
+    h = text.split("map $pcdn_path $pcdn_rdh_7 {", 1)[1].split("}", 1)[0]
+    assert '"/old" "/old 301https://new.example/p";' in h
+    assert '"/About" "/About 308/about";' in h and '"/k" "/k 301/kept$is_args$args";' in h
+    assert "/about\" " not in h and "/never" not in text and "/off" not in text and "/p/1/x" not in h
+    assert 'map "$pcdn_path $pcdn_rdh_7" $pcdn_rde_7 {\n    default "";\n    "~^(\\\\S+) \\\\1 (.+)$" $2;\n}' in text
+    c = text.split("map $pcdn_path $pcdn_rdc_7 {", 1)[1].split("\n}", 1)[0]
+    lines = [x.strip() for x in c.strip().splitlines()]
+    assert lines == ['default "";', '"~^/__pcdn/" "";', '"~^/about$" "302/x";',
+                     '"~^/blog/" "302https://b.example/?s=1$pcdn_args_amp#top";',
+                     '"~^/p/(\\\\d+)/(.*)$" "307/post/$2?id=$1$pcdn_args_amp";', '"~^/' + "a" * 120 + '$" "301/long";']
+    assert "map $pcdn_rde_7 $pcdn_rd_7 {\n    \"~.\" $pcdn_rde_7;\n    default $pcdn_rdc_7;\n}" in text
+    # one return per status in use, after the security verdict, before any location
+    srv = text.split("server_name example.com;", 1)[1]
+    for code in (301, 302, 307, 308):
+        assert f'    if ($pcdn_rd_7 ~ "^{code}(.*)$") {{ return {code} $1; }}' in srv
+    assert srv.index("$pcdn_verdict !~") < srv.index("$pcdn_rd_7 ~ \"^301") < srv.index("    location ^~ /__pcdn/ {")
+    # only exact rules -> the confirmed hash alone; only regex rules -> the ordered map alone
+    t2, _ = agent.render_site(site_6b(redirects={"rules": [rd("a", "/x", "exact", "/y")]}), make_cfg(tmp_path))
+    assert "$pcdn_rdc_7" not in t2 and 'if ($pcdn_rde_7 ~ "^301(.*)$") { return 301 $1; }' in t2
+    t3, _ = agent.render_site(site_6b(redirects={"rules": [rd("a", "^/x", "regex", "/y", 302)]}), make_cfg(tmp_path))
+    assert "$pcdn_rdh_7" not in t3 and 'if ($pcdn_rdc_7 ~ "^302(.*)$") { return 302 $1; }' in t3
+
+
+def test_redirect_rules_revalidated(tmp_path):
+    bad = [rd("a", "/a", "exact", 'https://e.example/"; return 200 x'),     # quote
+           rd("b", "/b", "exact", "https://e.example/\r\nSet-Cookie: x=1"),  # CR/LF
+           rd("c", "/c", "exact", "/x/$1"),                                  # $1 without a regex
+           rd("d", r"^/d/(\d+)$", "regex", "/x/$2"),                        # group that does not exist
+           rd("e", "/e", "exact", "//evil.example/"),                       # protocol-relative
+           rd("f", "/f", "exact", "javascript:alert(1)"),
+           rd("g", "/g", "exact", "/x", 303),                               # status not allowed
+           rd("h", "/__pcdn/verify", "exact", "/x"),                        # internal endpoint
+           rd("i", "/tun/x", "prefix", "/x"),                               # under a tunnel path
+           rd("j", "/j\"", "exact", "/x"), rd("k", "no-slash", "exact", "/x"),
+           rd("l", r"(?a)^/l", "regex", "/x"), rd("m", r"^/m\N{DIGIT ONE}", "regex", "/x"),
+           rd("n", "^/n(", "regex", "/x"), rd("o", "/o", "exact", "/x\\y"), rd("BAD ID", "/p", "exact", "/x"),
+           rd("q", "/q", "exact", "/x", True)]                             # bool is not a status
+    tunnel = dict(TUNNEL, paths=[{"id": "t", "path": "/tun", "protocol": "ws"}])
+    assert agent.norm_redirects(site_6b(redirects={"rules": bad}), ["/tun"]) == []
+    text, _ = agent.render_site(site_6b(redirects={"rules": bad + [rd("ok", "^/(.*)$", "regex", "/n/$1")]},
+                                        tunnel=tunnel), make_cfg(tmp_path))
+    assert "$pcdn_rdh_7" not in text and "evil" not in text and "Set-Cookie: x" not in text
+    assert '    "~^(?:/tun)" "";\n' in text               # tunnel prefixes are never redirected
+
+
+def tfr(actions, path="/*", methods=(), countries=(), enabled=True):
+    return {"id": "r", "enabled": enabled, "match": {"path": path, "methods": list(methods), "countries": list(countries)},
+            "actions": [dict({"name": None, "value": None, "regex": None, "replacement": None}, **a) for a in actions]}
+
+
+def test_transform_rules_render(tmp_path):
+    cfg = make_cfg(tmp_path)
+    rules = [tfr([{"type": "set_request_header", "name": "X-All", "value": 'a$b"c'},
+                  {"type": "remove_request_header", "name": "X-Drop"},
+                  {"type": "set_response_header", "name": "X-Frame-Options", "value": "DENY"},
+                  {"type": "remove_response_header", "name": "Server"}]),
+             tfr([{"type": "set_request_header", "name": "X-Static", "value": "t"},
+                  {"type": "remove_request_header", "name": "Cookie"},
+                  {"type": "remove_response_header", "name": "Set-Cookie"},
+                  {"type": "rewrite_path", "regex": r"^/api/(.*)$", "replacement": "/v2/$1"}],
+                 path="/api/*", methods=["post", "PUT"], countries=["ir"]),
+             tfr([{"type": "rewrite_path", "regex": r"^/q/(\d+)$", "replacement": "/item?id=$1"}])]
+    site = site_6b(transform={"rules": rules}, headers={"request": [{"name": "X-Static", "value": "s"}],
+                                                        "response": [{"name": "X-Frame-Options", "value": "SAMEORIGIN"}]})
+    files = agent.render_all({"sites": [site]}, cfg)
+    text = files["sites/7.conf"]
+    assert ('map "$request_method|$pcdn_country|$pcdn_shield_ok|$pcdn_ouri" $pcdn_tf_7_1 {\n'
+            '    "~(?s)^(?:POST|PUT)[|](?:IR)[|]0[|]/api/.*$" 1;\n    default 0;\n}') in text
+    assert "$pcdn_tf_7_0" not in text and "$pcdn_tf_7_2" not in text          # unconditional rules: no flag
+    assert "map $pcdn_tf_7_1 $pcdn_tq_7_2_0 {\n    1 \"t\";\n    default \"s\";\n}" in text   # static value as base
+    assert "map $pcdn_tf_7_1 $pcdn_tq_7_3_0 {\n    1 \"\";\n    default $http_cookie;\n}" in text
+    # rewrite_path: regex on the raw path, first matching rule wins, never on a shield hop
+    assert ('map $pcdn_path $pcdn_tfr_7_0 {\n    default $pcdn_tfu_7_1;\n    "~^/api/(.*)$" "/v2/$1$is_args$args";\n}'
+            in text)
+    assert 'map $pcdn_path $pcdn_tfr_7_1 {\n    default "";\n    "~^/q/(\\\\d+)$" "/item?id=$1$pcdn_args_amp";\n}' in text
+    assert "map $pcdn_tf_7_1 $pcdn_tfu_7_0 {\n    1 $pcdn_tfr_7_0;\n    default $pcdn_tfu_7_1;\n}" in text
+    assert "map $pcdn_shield_ok $pcdn_tfu_7_1 {\n    0 $pcdn_tfr_7_1;\n    default \"\";\n}" in text
+    srv = text.split("server {", 1)[1]
+    assert "    set $pcdn_ouri $uri;\n" in srv
+    n_proxy = srv.count("proxy_pass ")
+    assert n_proxy == srv.count("$pcdn_tfu_7_0;") and n_proxy >= 2       # every web location
+    for loc in srv.split("    location ")[1:]:
+        if "proxy_pass" not in loc:
+            continue
+        assert 'proxy_set_header X-All "a${pcdn_dollar}b\\"c";' in loc and 'proxy_set_header X-Drop "";' in loc
+        assert "proxy_set_header X-Static $pcdn_tq_7_2_0;" in loc and "proxy_set_header Cookie $pcdn_tq_7_3_0;" in loc
+        assert loc.count("X-Static") == 1                                 # the static entry is replaced
+        assert "proxy_hide_header X-Frame-Options;" in loc and 'add_header X-Frame-Options "DENY" always;' in loc
+        assert "SAMEORIGIN" not in loc and "proxy_hide_header Server;" in loc
+        assert "js_header_filter pcdn.tfHeaders;" in loc
+    js = json.loads(files["js/sites.js"].split("export default ", 1)[1].rstrip().rstrip(";"))["7"]
+    assert js["tf_resp"] == [{"f": "pcdn_tf_7_1", "op": "del", "n": "Set-Cookie"}]
+
+
+def test_transform_tunnel_paths_untouched(tmp_path):
+    site = site_6b(transform={"rules": [tfr([{"type": "set_request_header", "name": "X-T", "value": "1"},
+                                             {"type": "rewrite_path", "regex": "^/(.*)$", "replacement": "/x/$1"}])]},
+                   tunnel=dict(TUNNEL, paths=[{"id": "t", "path": "/tun", "protocol": "ws"},
+                                              {"id": "g", "path": "/grpc.S", "protocol": "grpc"}]))
+    text, _ = agent.render_site(site, make_cfg(tmp_path))
+    for loc in text.split("    location ^~ ")[1:]:
+        if loc.startswith(('"/tun"', '"/grpc.S"')):
+            body = loc.split("\n    }", 1)[0]
+            assert "X-T" not in body and "pcdn_tfu" not in body
+
+
+def test_transform_rules_revalidated(tmp_path):
+    bad = [{"type": "set_request_header", "name": n, "value": "x"}
+           for n in ("Host", "Connection", "X-Pcdn-Shield", "X-Forwarded-For", "X-Real-IP", "Proxy-Authorization",
+                     "Cookie", "Content-Length", "Bad Name", "Transfer-Encoding")]
+    bad += [{"type": "set_response_header", "name": "Set-Cookie", "value": "a=1"},
+            {"type": "set_request_header", "name": "X-Nl", "value": "a\r\nb: c"},
+            {"type": "set_request_header", "name": "X-Long", "value": "x" * 1025},
+            {"type": "rewrite_path", "regex": "^/(.*)$", "replacement": "/__pcdn/img/$1"},
+            {"type": "rewrite_path", "regex": "^/(.*)$", "replacement": "//evil/$1"},
+            {"type": "rewrite_path", "regex": "^/(.*)$", "replacement": "/x/$2"},
+            {"type": "rewrite_path", "regex": "^/(.*)$", "replacement": "/x/\"y"},
+            {"type": "rewrite_path", "regex": "(?u)^/x", "replacement": "/y"},
+            {"type": "unknown", "name": "X-A", "value": "1"}]
+    assert agent.norm_transform(site_6b(transform={"rules": [tfr(bad)]})) == []
+    ok = [{"type": "remove_request_header", "name": "Cookie"}, {"type": "remove_response_header", "name": "Set-Cookie"}]
+    assert len(agent.norm_transform(site_6b(transform={"rules": [tfr(ok)]}))[0]["actions"]) == 2
+    # a condition the edge cannot understand skips the whole rule (never widens it)
+    for m in ({"path": "no-slash"}, {"methods": ["GET;"]}, {"countries": ["IRN"]}, {"methods": "GET"}):
+        r = tfr(ok)
+        r["match"] = m
+        assert agent.norm_transform(site_6b(transform={"rules": [r]})) == []
+    assert agent.norm_transform(site_6b(transform={"rules": [tfr(ok, enabled=False)]})) == []
+    text, _ = agent.render_site(site_6b(transform={"rules": [tfr(bad)]}), make_cfg(tmp_path))
+    assert "evil" not in text and "__pcdn/img/$1" not in text and "X-Nl" not in text and "pcdn_tf" not in text
+
+
+def test_waf_packs_and_body_inspection_render(tmp_path):
+    cfg = make_cfg(tmp_path)
+    waf = {"mode": "block", "paranoia": 1, "groups": ["sqli"], "packs": ["wordpress", "bogus", "laravel", "wordpress"]}
+    files = agent.render_all({"sites": [site_6b(waf=waf)]}, cfg)
+    js = json.loads(files["js/sites.js"].split("export default ", 1)[1].rstrip().rstrip(";"))["7"]
+    assert js["waf"]["packs"] == ["wordpress", "laravel"]
+    text = files["sites/7.conf"]
+    assert "    if ($pcdn_bodychk) { rewrite ^ /__pcdn/body$uri last; }" in text
+    assert ("location ^~ /__pcdn/body/ { internal; client_max_body_size 131072; client_body_buffer_size 131072; "
+            "client_body_in_single_buffer on; js_content pcdn.bodyInspect; }") in text
+    body = text.split("    location @pcdn_body {", 1)[1].split("\n    }", 1)[0]
+    assert "proxy_pass $pcdn_proto://$pcdn_target$request_uri;" in body and "proxy_cache " not in body
+    assert "js_set $pcdn_bodychk pcdn.bodyNeed;" in files["http.conf"] and "js_var $pcdn_wafskip;" in files["http.conf"]
+    # no body packs, WAF off, or no njs -> no body routing at all
+    for w in (dict(waf, packs=["laravel"]), dict(waf, mode="off"), dict(waf, packs=[])):
+        t, _ = agent.render_site(site_6b(waf=w), cfg)
+        assert "pcdn_bodychk" not in t and "@pcdn_body" not in t
+    t, _ = agent.render_site(site_6b(waf=waf), make_cfg(tmp_path, NGINX_CAPS=dict(agent.LEGACY_CAPS, modules=["geoip2"])))
+    assert "pcdn_bodychk" not in t
+    # the agent's pack catalog mirrors njs/pcdn.js
+    src = (HERE.parent / "njs/pcdn.js").read_text()
+    m = re.search(r"const WAF_PACK_VERSION = (\{[^}]*\});", src)
+    assert json.loads(re.sub(r"(\w+):", r'"\1":', m.group(1))) == agent.WAF_PACK_VERSIONS
+    assert tuple(agent.WAF_PACK_VERSIONS) == agent.WAF_PACKS
+    assert f"const BODY_CAP = {agent.BODY_CAP};" in src
+
+
+def test_bot_ranges_render(tmp_path):
+    cfg = make_cfg(tmp_path)
+    ranges = {"verified": {"google": ["66.249.66.0/27", "66.249.66.1/27", "2001:4860:4801:10::/64", "10.0.0.0/8",
+                                      "bad", "1.2.3.4/33", '1.1.1.1/32"; }'],
+                           "bing": ["157.55.39.0/24", "66.249.66.0/27"], "yandex": ["5.255.0.0/16"]},
+              "fetched_at": "2026-10-01T00:00:00Z"}
+    assert agent.norm_bot_ranges({"bots": ranges}) == {"google": ["66.249.66.0/27", "2001:4860:4801:10::/64"],
+                                                     "bing": ["157.55.39.0/24"]}
+    bsite = site_6b(bots={"mode": "challenge", "allow_verified": True, "block_empty_ua": False})
+    files = agent.render_all({"sites": [bsite], "bots": ranges}, cfg)
+    assert files["bots.conf"] == ('# verified crawler ranges (SPEC §14.2) — generated by pcdn-agent, do not edit\n'
+                                  'geo $pcdn_vbot {\n    default "0gb";\n    66.249.66.0/27 "1gb";\n'
+                                  '    2001:4860:4801:10::/64 "1gb";\n    157.55.39.0/24 "2gb";\n}\n')
+    assert f"include {cfg['NGINX_DIR']}/bots.conf;" in files["http.conf"]
+    js = json.loads(files["js/sites.js"].split("export default ", 1)[1].rstrip().rstrip(";"))["7"]
+    assert js["bots"] == {"mode": "challenge", "allow_verified": True, "block_empty_ua": False}
+    agent.write_tree(str(tmp_path / "t"), files)
+    assert oct((tmp_path / "t/bots.conf").stat().st_mode & 0o777) == "0o644"
+    # only google ranges: bing crawlers fail open ("0g" lists the known engines)
+    one = agent.render_all({"sites": [bsite], "bots": {"verified": {"google": ["66.249.66.0/27"]}}}, cfg)
+    assert '    default "0g";\n    66.249.66.0/27 "1g";' in one["bots.conf"]
+    # nothing received, or no site using bot management: no bots.conf, $pcdn_vbot is "" (fail open)
+    for config in ({"sites": [bsite], "bots": {"verified": {}, "fetched_at": None}},
+                   {"sites": [site_6b()], "bots": ranges}, {"sites": [site_6b(bots={"mode": "off"})], "bots": ranges}):
+        f = agent.render_all(config, cfg)
+        assert "bots.conf" not in f and 'geo $pcdn_vbot {\n    default "";\n}' in f["http.conf"]
+    assert agent.global_digest(files) != agent.global_digest(one)    # a range change is never deferred
+
+
+def test_bot_ranges_cached_by_the_agent(tmp_path):
+    ranges = {"google": ["66.249.66.0/27"], "bing": ["157.55.39.0/24"]}
+    st = {}
+    body = {"version": "v1", "sites": [], "bots": {"verified": ranges, "fetched_at": "x"}}
+    assert agent.with_cached_bot_ranges(body, st) is body and st["bot_ranges"] == ranges
+    # the controller sends none (or only one engine): the last good lists are used
+    b2 = agent.with_cached_bot_ranges({"version": "v2", "sites": [], "bots": {"verified": {}, "fetched_at": None}}, st)
+    assert b2["bots"]["verified"] == ranges
+    b3 = agent.with_cached_bot_ranges({"version": "v3", "sites": [], "bots": {"verified": {"google": ["66.249.70.0/27"]}}}, st)
+    assert b3["bots"]["verified"] == {"google": ["66.249.70.0/27"], "bing": ["157.55.39.0/24"]}
+    # never received anything: nothing invented (fail open)
+    st2 = {}
+    b4 = {"version": "v", "sites": []}
+    assert agent.with_cached_bot_ranges(b4, st2) is b4 and "bot_ranges" not in st2
+
+
+def test_bot_ranges_dropped_by_controller_do_not_reload(tmp_path):
+    """F20 diff-skip keeps working: a config whose ranges vanished renders identically from the cache."""
+    counter = tmp_path / "reloads"
+    cfg = make_cfg(tmp_path, NGINX_RELOAD_CMD=f"sh -c 'echo x >> {counter}'")
+    bsite = dict(MINSITE, bots={"mode": "block"})
+    bodies = [{"version": "v1", "sites": [bsite], "bots": {"verified": {"google": ["66.249.66.0/27"]}}},
+              {"version": "v2", "sites": [bsite], "bots": {"verified": {}, "fetched_at": None}}]
+
+    class C:
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            if path == "/edge/v1/config":
+                b = bodies.pop(0)
+                return 200, {"ETag": b["version"]}, b
+            return 200, {}, None
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg, a.state, a.ctl = cfg, {}, C()
+    a.sync_config()
+    a.sync_config()
+    assert counter.read_text().count("x") == 1 and a.state["version"] == "v2"
+    assert "66.249.66.0/27" in (pathlib.Path(cfg["NGINX_DIR"]) / "bots.conf").read_text()
+
+
+def test_origin_pull_render(tmp_path):
+    cfg = make_cfg(tmp_path)
+    crt, key = self_signed(tmp_path)
+    https = {"origin_protocol": "https", "force_https": False}
+    plat = site_6b(ssl_options=dict(https, origin_client={"mode": "platform"}), image={"enabled": True})
+    cust = site_6b(id=8, domain="b.com", hosts=[{"name": "b.com", "origin": {"address": "10.0.0.2", "port": 443}}],
+                   ssl_options=dict(https, origin_client={"mode": "custom", "cert": crt, "key": key}))
+    http = site_6b(id=9, domain="c.com", hosts=[{"name": "c.com", "origin": {"address": "10.0.0.3", "port": 80}}],
+                   ssl_options={"origin_protocol": "http", "origin_client_auth": "platform"})
+    off = site_6b(id=10, domain="d.com", hosts=[{"name": "d.com", "origin": {"address": "10.0.0.4", "port": 443}}],
+                  ssl_options=dict(https, origin_client={"mode": "custom", "cert": "junk", "key": key}))
+    config = {"sites": [plat, cust, http, off], "origin_pull": {"cert": crt, "key": key}}
+    files = agent.render_all(config, cfg)
+    d = cfg["NGINX_DIR"]
+    assert files["mtls/platform.crt"] == crt and files["mtls/platform.key"] == key
+    assert files["mtls/8.crt"] == crt and files["mtls/8.key"] == key and "mtls/10.crt" not in files
+    p7 = files["sites/7.conf"]
+    for loc in p7.split("    location ")[1:]:
+        if "proxy_pass $pcdn_proto://" in loc:
+            assert f"proxy_ssl_certificate {d}/mtls/platform.crt;" in loc
+            assert f"proxy_ssl_certificate_key {d}/mtls/platform.key;" in loc
+    tok = agent.mtls_token("platform", (crt, key))
+    assert re.fullmatch(r"platform-[0-9a-f]{32}", tok) and f"proxy_set_header X-Pcdn-Mtls {tok};" in p7   # resizer hop
+    assert f"proxy_ssl_certificate {d}/mtls/8.crt;" in files["sites/8.conf"]
+    assert "proxy_ssl_certificate" not in files["sites/9.conf"]              # plain-HTTP origin: nothing
+    assert "proxy_ssl_certificate" not in files["sites/10.conf"]             # unusable custom pair: off
+    mt = files["mtls.conf"]
+    assert f'    "{tok}" "data:$pcdn_mc_platform_0";' in mt and '"data:$pcdn_mk_platform_0"' in mt
+    assert '"platform" ' not in mt                                        # never selectable by a bare name
+    assert f"include {d}/mtls.conf;" in files["http.conf"]
+    assert "proxy_ssl_certificate $pcdn_mtls_crt;" in files["http.conf"]    # resizer
+    agent.write_tree(str(tmp_path / "t"), files)
+    for rel in ("mtls/platform.crt", "mtls/platform.key", "mtls/8.crt", "mtls/8.key", "mtls.conf"):
+        assert oct((tmp_path / "t" / rel).stat().st_mode & 0o777) == "0o600", rel
+    assert oct((tmp_path / "t/mtls").stat().st_mode & 0o777) == "0o700"
+    assert "8" in agent.site_digests(files) and agent.site_digests(files)["8"] != agent.site_digests(
+        agent.render_all(dict(config, sites=[plat, dict(cust, ssl_options=dict(https))]), cfg)).get("8")
+    # platform mode without the node's pair renders nothing (nginx would not start otherwise); a
+    # pair nobody uses is not written
+    f2 = agent.render_all({"sites": [plat]}, cfg)
+    assert "mtls/platform.crt" not in f2 and "proxy_ssl_certificate " not in f2["sites/7.conf"]
+    f3 = agent.render_all({"sites": [http], "origin_pull": {"cert": crt, "key": key}}, cfg)
+    assert not [k for k in f3 if k.startswith("mtls")] and 'map $uri $pcdn_mtls_crt {\n    default "";\n}' in f3["http.conf"]
+    # long PEMs are split over several variables (nginx caps one config token at 4 KiB)
+    big = agent.render_mtls_resizer({"7": (crt * 8, key)})
+    assert "$pcdn_mc_7_0$pcdn_mc_7_1" in big and all(len(t) < 4000 for t in re.findall(r'"([^"]*)"', big))
+
+
+def test_origin_pull_never_on_the_shield_hop(tmp_path):
+    cfg = make_cfg(tmp_path)
+    crt, key = self_signed(tmp_path)
+    site = dict(shield_site(), ssl={"cert": crt, "key": key},
+                ssl_options={"origin_protocol": "https", "origin_client": {"mode": "platform"}})
+    config = {"sites": [site], "shield": {"self": False, "peers": ["10.0.0.1"], "secret": SHIELD_SECRET},
+              "origin_pull": {"cert": crt, "key": key}}
+    text = agent.render_all(config, cfg)["sites/7.conf"]
+    for loc in text.split("    location ")[1:]:
+        if "proxy_pass https://pcdn_shield_https" in loc:
+            assert "proxy_ssl_certificate " not in loc                      # the edge -> shield hop
+        elif "proxy_pass $pcdn_proto://" in loc:
+            assert "proxy_ssl_certificate " in loc                          # origin fallback / bypass
+
+
+def test_6b_fields_absent_or_default_keep_rendering(tmp_path):
+    """SPEC §14.2 fields missing or at their defaults leave a site's config and sites.js entry
+    byte-identical, so a controller upgrade alone never triggers a reload."""
+    cfg = make_cfg(tmp_path)
+    cert, key = self_signed(tmp_path)
+    base = dict(SITE, ssl={"cert": cert, "key": key}, image={"enabled": True},
+                waf={"mode": "block", "paranoia": 1, "groups": ["sqli"]},
+                pagerules={"rules": [{"id": "p", "pattern": "/a/*", "cache": "everything"}]})
+    explicit = dict(base, waf=dict(base["waf"], packs=[]), transform={"rules": []}, redirects={"rules": []},
+                    bots={"mode": "off", "allow_verified": True, "block_empty_ua": True},
+                    ssl_options=dict(SITE["ssl_options"], origin_client_auth="off", origin_client={"mode": "off"}))
+    assert agent.render_site(base, cfg) == agent.render_site(explicit, cfg)
+    f1 = agent.render_all({"sites": [base]}, cfg)
+    f2 = agent.render_all({"sites": [explicit], "bots": {"verified": {}, "fetched_at": None}, "origin_pull": None}, cfg)
+    assert agent.tree_digest(f1) == agent.tree_digest(f2)
+    # node-wide blocks nobody uses do not change the tree either
+    f3 = agent.render_all({"sites": [explicit], "bots": {"verified": {"google": ["66.249.66.0/27"]}},
+                           "origin_pull": {"cert": cert, "key": key}}, cfg)
+    assert agent.tree_digest(f1) == agent.tree_digest(f3)
+
+
+@pytest.mark.skipif(shutil.which("nginx") is None, reason="nginx not installed")
+def test_nginx_accepts_6b_config(tmp_path):
+    from conftest import nginx_conf, modules_available
+    if not modules_available():
+        pytest.skip("nginx dynamic modules (njs, geoip2, image_filter, brotli) not installed")
+    cert, key = self_signed(tmp_path)
+    cfg = make_cfg(tmp_path, LISTEN_IPV6="no", HTTP_PORT="18680", HTTPS_PORT="18643")
+    site = dict(SITE, ssl={"cert": cert, "key": key}, image={"enabled": True},
+                hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 443}},
+                       {"name": "lb.example.com", "origin": {"pool": "main"}}],
+                pools={"pools": [{"name": "main", "protocol": "https", "origins": [{"address": "10.0.0.1", "port": 443}]}]},
+                ssl_options={"origin_protocol": "https", "origin_client": {"mode": "platform"}},
+                waf={"mode": "detect", "paranoia": 3, "groups": ["sqli"], "packs": list(agent.WAF_PACKS)},
+                bots={"mode": "challenge"}, tunnel=dict(TUNNEL, paths=[{"id": "t", "path": "/tun", "protocol": "ws"}]),
+                transform={"rules": [tfr([{"type": "set_request_header", "name": "X-A", "value": "1"},
+                                          {"type": "remove_response_header", "name": "Set-Cookie"},
+                                          {"type": "rewrite_path", "regex": r"^/a/(\d+)", "replacement": "/b?x=$1"}],
+                                         path="/a/*", methods=["GET"], countries=["IR"])]},
+                redirects={"rules": [rd("a", "/x", "exact", "/y", 301, True), rd("b", "/p/", "prefix", "https://e.example/", 302),
+                                     rd("c", r"^/r/(\w+)$", "regex", "/s/$1", 307, True),
+                                     rd("d", "/%D8%B3%D9%84%D8%A7%D9%85", "exact", "/fa", 308)]})
+    config = {"sites": [site], "bots": {"verified": {"google": ["66.249.66.0/27", "2001:4860:4801:10::/64"]}},
+              "origin_pull": {"cert": cert, "key": key}}
+    assert agent.apply_config(config, cfg) is None
+    p = subprocess.run(["nginx", "-t", "-c", str(nginx_conf(tmp_path, cfg))], capture_output=True, text=True)
+    assert p.returncode == 0 and "[warn]" not in p.stderr, p.stderr
+
+
+def test_bot_and_pack_verdicts_become_security_events():
+    pending, events = {}, []
+    for v in ("block:bots:spoofed", "challenge:bots:library", "log:bots:empty_ua", "block:waf:991100"):
+        agent._account({"t": "2026-10-01T10:00:00+00:00", "h": "a.com", "b": 10, "s": 403, "u": "/x", "v": v,
+                        "ip": "1.2.3.4", "m": "GET", "ua": "curl/8"}, pending, events)
+    a = pending["a.com|2026-10-01T10:00:00Z"]
+    assert a["security"] == {"bots": 3, "challenge": 1, "waf": 1}
+    assert [(e["action"], e["source"], e["rule"]) for e in events] == [
+        ("block", "bots", "spoofed"), ("challenge", "bots", "library"), ("log", "bots", "empty_ua"),
+        ("block", "waf", "991100")]
