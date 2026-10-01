@@ -1110,3 +1110,96 @@ Per host-hour, per tunnel **path id**, the edge adds to the usage item's `tunnel
   `Cache-Control: no-store, no-transform`, `X-Pcdn-Node` = first 8 hex of sha256(node name).
 - `tunnel_attempts` in live items = every tunnel request with a path id that minute.
 - Add-on traffic is one WHMCS add-on per size (WHMCS add-ons take no configurable options).
+
+## 16. Wave 8: production readiness & new products
+
+Not code (operator's responsibility, documented only): third-party penetration test, network-level
+(L3/L4) DDoS scrubbing from the datacenter, more PoPs, 24/7 on-call, pricing and the SLA commitment.
+This wave ships the tooling and products that code CAN deliver. Same boundary as always: nothing whose
+purpose is evading filtering or hiding/rotating node addresses.
+
+### 16.1 Load-test kit (`tools/loadtest/`)
+Self-contained Python 3 (asyncio, stdlib + `aiohttp` optional) tool `pcdn-loadtest` with scenarios:
+`http` (cache hit/miss mix, configurable RPS/concurrency/duration), `ws`, `httpupgrade`, `grpc`
+(h2 streams), `xhttp` (long-lived tunnel sessions with bidirectional traffic at a target Mbps each),
+`ramp` (step up connections until error rate or p99 latency crosses a threshold). Output: JSON + a
+Persian summary (max sustainable connections, Mbps, p50/p95/p99, error breakdown). Runs from a
+separate client machine against ONE node the operator owns (target IP + Host header), never against
+third parties; refuses targets not given explicitly. A tiny echo origin (`tools/loadtest/origin.py`)
+for ws/grpc/xhttp sinks. Runbook `docs/LOADTEST.md` (Persian): how to size `capacity_mbps`.
+
+### 16.2 CLI (`cli/pcdn`, Go) + provider release
+`pcdn` command for the customer API: `site`, `records list|add|update|delete`, `config get|set
+<section> [file]`, `purge --url/--prefix/--everything`, `analytics`, `tunnel quality|usage`,
+`--endpoint/--api-key` flags or env (same as Terraform), JSON or table output. GoReleaser config for
+both the CLI and `terraform-provider-pcdn` (signed checksums, registry manifest) and a GitHub Actions
+`release.yml` triggered by tags `cli/v*` / `provider/v*` (the GPG key comes from repository secrets,
+never committed). CI job builds and tests `cli/`.
+
+### 16.3 Edge host hardening (opt-in, L3/L4 first line)
+`install.sh --harden-net`: nftables table `pcdn_guard` — SYN rate limit per source /24 and global,
+SYN-proxy for 80/443 when the kernel supports it, drop invalid conntrack, UDP/443 rate limit per
+source (QUIC), ICMP rate limit; values in agent.conf (`GUARD_*`). Never blocks the controller or SSH
+(allow-list first). `--no-harden-net` removes it. Documented as a complement to — not a replacement
+for — datacenter scrubbing.
+
+### 16.4 TCP/UDP proxy product ("Spectrum")
+- Plan feature `l4_proxy` (bool, default false), `max_l4_apps` (default 0). Section `l4`: `{apps:
+  [{id, protocol: "tcp"|"udp", edge_port (1024..65535, not 80/443/controller ports, unique per
+  edge group), origin: {address, port}, proxy_protocol: "off"|"v1"|"v2" (tcp only), ip_allow: [cidr],
+  idle_timeout: 10..3600, enabled}]}`. The controller allocates `edge_port` uniqueness across all
+  sites of the same edge group (409 on conflict) and returns `hostname` (= the site's proxied host or
+  an `l4-<id>.<domain>` record it creates).
+- Edge: nginx `stream {}` block rendered into its own file, one `server { listen <port> [udp]
+  reuseport; proxy_pass <origin>; proxy_timeout; proxy_protocol; allow/deny }` per app; stream access
+  log (JSON) → usage `l4: {app_id: {bytes_in, bytes_out, sessions}}` billed like HTTP bytes.
+  install.sh enables the stream module (`libnginx-mod-stream` or nginx.org built-in).
+- Firewall note: the operator must open the allocated port range (`L4_PORT_RANGE`, default
+  20000-29999) on edges; edge_port must fall inside it.
+
+### 16.5 Video delivery (HLS/DASH)
+Section `video`: `{enabled, segment_ttl (s, default 86400), manifest_ttl (default 2), prefetch_next:
+true}`. Edge: separate cache rules for `*.m3u8|*.mpd` (short TTL, stale-while-revalidate) and
+segments `*.ts|*.m4s|*.mp4|*.aac` (long TTL, `slice` module 1 MB for byte-range on large mp4, cache
+lock), CORS `*` for media, and optional prefetch: on a segment MISS the agent-side njs triggers a
+subrequest for the next segment number when the name ends in a number (bounded, once). Analytics:
+video bytes counted under `video` in usage details.
+
+### 16.6 Images v2
+Section `image` gains `avif: false` (convert to AVIF when the client accepts it and the node has
+`avifenc`/libavif — capability `avif`), URL transform params `?w=&h=&fit=cover|contain&q=&fmt=webp|avif|jpeg`
+(bounded: w,h ≤ 4096, q 1..100; signed-URL option `transform_secret` so third parties cannot generate
+unlimited variants), and `smart_crop: false` (center-weighted entropy crop via the resizer).
+Unsupported features degrade gracefully (serve original).
+
+### 16.7 DNS: secondary + weighted/failover records
+- Record fields: `weight` (0..100, A/AAAA/CNAME non-proxied only), `health_check` reused for
+  non-proxied records too (HTTP/HTTPS/TCP probe from the controller every 60 s; unhealthy members are
+  withdrawn, never all — fail-open).
+- Secondary DNS: section `dns_secondary`: `{mode: "off"|"primary_elsewhere", primaries: [ip], tsig?:
+  {name, algorithm, secret(write-only)}}` → PowerDNS slave zone (AXFR from the customer's primary);
+  and `allow_axfr: [ip]` to let the customer's own secondary transfer from us (with TSIG).
+
+### 16.8 Object storage
+`deploy/storage/`: docker-compose for MinIO (single node or 4-disk erasure), Caddy TLS, behind the
+CDN as an origin type. Controller: plan feature `storage_gb` (0 = none); `POST /api/v1/sites/{d}/
+storage/buckets {name}` creates a bucket + scoped access key via the MinIO admin API (secret shown
+once, stored encrypted), `GET` lists buckets with usage, `DELETE` (only empty). Usage collected
+hourly and billed via WHMCS (GB-month). A record/origin shortcut `origin: {storage: "<bucket>"}`
+makes a bucket a CDN origin. Customer app page «فضای ذخیره‌سازی».
+
+### 16.9 Edge Functions (isolated)
+Customer JavaScript at the edge is untrusted multi-tenant code; it must NOT run inside nginx/njs.
+Design: separate service `pcdn-fn` on each node — a pool of sandboxed workers (QuickJS or another
+embeddable engine runnable on Ubuntu 24.04 without internet at runtime), each invocation with a
+memory cap, CPU-time cap (50 ms default), no filesystem, no network except a `fetch()` restricted to
+the site's own origin, run under systemd sandboxing (DynamicUser, ProtectSystem=strict,
+PrivateNetwork except a unix socket, MemoryMax, SystemCallFilter). nginx reaches it over a unix
+socket only for routes the customer bound (`functions: [{id, route, code, enabled}]`, code ≤ 256 KB,
+plan feature `edge_functions`). API: request in → `{status, headers, body}` out or `pass` to continue
+to the origin. If a safe sandbox is not achievable with available packages, ship the feature disabled
+with a precise report rather than a weaker isolation.
+
+### 16.10 English client app
+The WHMCS client app gains full English (LTR) alongside Persian, selected from the WHMCS client
+language (fallback Persian), all strings through one dictionary; numbers/dates localized.
