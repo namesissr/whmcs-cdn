@@ -84,8 +84,8 @@ def test_03_dns_answers_point_at_the_edges(edges, site):
 
 
 def test_04_http_through_every_edge_reaches_the_origin(edges, site):
-    def ok(ip):
-        r = edge_request(ip, DOMAIN, "/hello?nocache=1")
+    def ok(ip, host=DOMAIN, path="/hello?nocache=1"):
+        r = edge_request(ip, host, path)
         return r if r.status == 200 and r.headers.get("x-origin") == "pcdn-staging" else None
 
     for name, ip in edges.items():
@@ -94,8 +94,10 @@ def test_04_http_through_every_edge_reaches_the_origin(edges, site):
         assert body["host"] == DOMAIN          # Host is preserved towards the origin
         assert body["path"] == "/hello"
         assert body["headers"].get("x-forwarded-for")
-        r = edge_request(ip, f"api.{DOMAIN}", "/v1/ping?nocache=1")
-        assert r.status == 200 and r.json()["host"] == f"api.{DOMAIN}"
+        # waited for like the apex: right after the edge applies the site, a connection can still land
+        # on an nginx worker of the previous config (graceful reload) and get the 421 of an unknown host
+        r = wait_until(lambda: ok(ip, f"api.{DOMAIN}", "/v1/ping?nocache=1"), f"api.{DOMAIN} served by {name}")
+        assert r.json()["host"] == f"api.{DOMAIN}"
     r = edge_request(edges["edge-1"], "unknown.staging.test", "/")
     assert r.headers.get("x-origin") != "pcdn-staging"  # unknown hosts never reach an origin
 
