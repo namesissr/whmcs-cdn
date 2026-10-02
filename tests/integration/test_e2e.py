@@ -38,9 +38,20 @@ def site(api, edges):
             pass
 
 
+SETTLED_CHECKS = 3
+
+
 def _all_edges(edges, fn, desc, timeout=None):
+    """Wait until fn(ip) holds on every edge for SETTLED_CHECKS consecutive fresh connections: right
+    after an agent applies a config, nginx reloads gracefully and a new connection can still be
+    accepted by a worker of the previous config for a moment, so one success is not "settled"."""
     for name, ip in edges.items():
-        wait_until(lambda: fn(ip), f"{desc} on {name} ({ip})", timeout=timeout)
+        def settled(ip=ip):
+            for _ in range(SETTLED_CHECKS):
+                if not fn(ip):
+                    return False
+            return True
+        wait_until(settled, f"{desc} on {name} ({ip})", timeout=timeout)
 
 
 def test_01_edges_installed_from_the_controller_bundle(api, edges):
