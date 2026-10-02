@@ -62,7 +62,10 @@ def test_install_block_fresh_and_upgrade(tmp_path):
     p = launcher(root, "once")   # no controller configured: the loop refuses to start
     assert p.returncode == 1 and "CONTROLLER_URL and EDGE_TOKEN must be set" in p.stderr
     p = launcher(root, "bootstrap", PCDN_NGINX_DIR=str(tmp_path / "ngx"), PCDN_CACHE_DIR=str(tmp_path / "cache"),
-                 PCDN_STATE_FILE=str(tmp_path / "state.json"), PCDN_NGINX_TEST_CMD="true", PCDN_NGINX_RELOAD_CMD="true")
+                 PCDN_STATE_FILE=str(tmp_path / "state.json"), PCDN_NGINX_TEST_CMD="true", PCDN_NGINX_RELOAD_CMD="true",
+                 # the assets install.sh puts in /usr/share/pcdn (absent on a CI runner)
+                 PCDN_NJS_FILE=str(EDGE / "njs/pcdn.js"), PCDN_BASE_TEMPLATE=str(EDGE / "nginx/pcdn-base.conf"),
+                 PCDN_PAGES_DIR=str(EDGE / "pages"))
     assert p.returncode == 0, p.stderr
     assert (tmp_path / "ngx/http.conf").is_file()
 
