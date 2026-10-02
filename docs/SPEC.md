@@ -1478,3 +1478,56 @@ by their reseller tooling only (422 here, clear message).
 - Old owner's WHMCS team members lose access automatically (the service is no longer theirs); the
   client app shows the new owner a one-time banner: «این دامنه به حساب شما منتقل شد — کلید API،
   وب‌هوک‌ها و ارسال لاگ را دوباره تنظیم کنید».
+
+## 20. Domain sharing (collaborators from other accounts)
+The owner of a CDN service (or the operator, for operator sites) can share one domain with another
+WHMCS client account so that person manages the domain's settings from their own client area — like
+Arvan's domain members. Billing and ownership never move (that is §19 transfer).
+
+### 20.1 Roles
+| role | can | cannot |
+|---|---|---|
+| `viewer` | see every page, analytics, logs, download statements | change anything |
+| `dns` | viewer + DNS records (incl. secondary DNS settings, DNSSEC view) | anything else |
+| `editor` | every configuration page (DNS, SSL, cache, rules, WAF/firewall/bots, rate limit, access, waiting room, tunnel, functions, storage objects, L4, video/images, purge, webhooks/log export with their own secrets) | billing/upgrade/addon purchase, cancel/terminate, transfer, sharing management, customer API keys, team access, deleting the site, storage bucket key rotation |
+Plan gating still applies (a shared user never gets a feature the plan lacks). A suspended service is
+read-only for collaborators exactly as for the owner.
+
+### 20.2 Invitations
+- Owner (client area page «اشتراک دامنه», owner and owner-side team members with manage rights only)
+  invites by e-mail + role; ≤ 20 active members per domain (setting), ≤ 50 pending invites per owner.
+- If a WHMCS client with that e-mail exists, the invite shows on their client-area home (card «دعوت به
+  مدیریت دامنه») and an e-mail with an accept link is sent; otherwise the e-mail invites them to
+  register — the invite is bound to the e-mail and can only be accepted by a logged-in client whose
+  primary e-mail matches (case-insensitive). Token: 32 random bytes, stored hashed, expires in 7 days,
+  single use; accept/decline both need the client session + CSRF.
+- The owner cannot invite themselves (same client id); inviting a member of their own team is refused
+  with a hint to use WHMCS team access.
+- Owner can change a member's role, revoke a member or a pending invite at any time (effective
+  immediately — every proxied request re-checks the membership). A member can leave.
+- Transfers (§19) revoke all shares and pending invites of the moved site by default (wizard option to
+  keep); terminating/deleting the service or site removes them. Operator sites can be shared by the
+  admin from the operator page (same roles).
+
+### 20.3 Access path
+- Members see «دامنه‌های اشتراکی» in the client area (addon client-area route
+  `index.php?m=pasargadcdn_admin&page=shared`): list of domains shared with them (domain, role, owner's
+  display name — company or first name only, never the owner's e-mail/contact data), and «مدیریت» opens
+  the module's client app bound to that one domain in a `shared` context: same ClientApi whitelist,
+  plus a per-role allow-list of operations (deny by default; an op not in the role's list → 403 with a
+  Persian message). The app hides controls the role cannot use and shows a role badge.
+- No billing data of the owner is exposed (invoices, credit, prices, prepaid wallet, upgrade links,
+  addon purchases): those boot fields are omitted in the shared context.
+- Every write by a member is audited: WHMCS module log + addon activity with
+  `share:<member client id>:<role>`, and forwarded to the controller as header
+  `X-PCDN-Actor: share:<id>:<role>` (controller records it in the audit detail as `on_behalf_of`;
+  validated ≤ 64 chars, `[a-z0-9:_-]`, ignored when malformed). The owner's «گزارش تغییرات» shows who did it.
+- Owner gets an e-mail when an invite is accepted (setting, default on).
+- Data: table `mod_pasargadcdn_shares` (id, service_id nullable, operator_domain nullable, domain,
+  owner_client_id nullable, member_client_id nullable until accepted, email, role, status
+  pending|active|revoked|declined|expired|left, token_hash, expires_at, created_by, created_at,
+  accepted_at, revoked_at) with indexes; a daily cron expires old invites.
+
+### 20.4 Admin
+- Addon page «اشتراک‌ها»: all shares with filters, revoke, and the audit trail; service tab shows the
+  service's members.
