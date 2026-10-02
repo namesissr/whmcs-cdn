@@ -162,3 +162,26 @@ jobs:
       - name: Tear down
         if: always()
         run: deploy/staging/staging.sh down
+
+  ops-tooling:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install promtool + amtool
+        run: |
+          curl -fsSL https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin prometheus-3.5.0.linux-amd64/promtool
+          curl -fsSL https://github.com/prometheus/alertmanager/releases/download/v0.28.1/alertmanager-0.28.1.linux-amd64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin alertmanager-0.28.1.linux-amd64/amtool
+      - run: python3 deploy/monitoring/tools/check_monitoring.py
+      - name: Alertmanager config renders and validates
+        run: |
+          mkdir -p /tmp/sec && printf x > /tmp/sec/telegram_bot_token
+          RENDER_ONLY=1 RENDER_DIR=/tmp/am SECRETS_DIR=/tmp/sec TELEGRAM_CHAT_ID=-1 ALERT_EMAIL_TO=a@b.c SMTP_SMARTHOST=s:587 SMTP_FROM=a@b.c sh deploy/monitoring/render-config.sh alertmanager
+          sed -i "s#/etc/alertmanager/templates#$PWD/deploy/monitoring/alertmanager/templates#" /tmp/am/alertmanager.yml
+          amtool check-config /tmp/am/alertmanager.yml
+      - run: sh -n deploy/monitoring/render-config.sh && sh -n deploy/status/mirror.sh
+      - run: docker compose -f deploy/monitoring/docker-compose.yml --env-file deploy/monitoring/.env.example config -q
+      - run: docker compose -f deploy/status/docker-compose.yml --env-file deploy/status/.env.example config -q
+      - run: pip install -r docs-site/requirements.txt && mkdocs build --strict
