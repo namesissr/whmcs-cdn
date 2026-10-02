@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import access, errortrack, sections, statements, waiting_room
-from .audit import record_audit
+from .audit import record_audit, with_actor
 from .auth import require_admin
 from .db import get_db
 from .models import AuditLog, Site, utcnow
@@ -29,7 +29,7 @@ AUDIT_DEFAULT_DAYS = 30
 
 
 def _admin_audit(db: Session, request: Request, action: str, target: str | None, detail: dict | None = None):
-    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target, detail=detail,
+    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target, detail=with_actor(detail, request),
                  ip=request.client.host if request.client else None)
 
 

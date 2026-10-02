@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from . import live, logexport, sections, sla, webhooks
-from .audit import record_audit
+from .audit import record_audit, with_actor
 from .auth import require_admin
 from .config import settings
 from .db import get_db
@@ -39,7 +39,7 @@ def rate_limit_test(kind: str, site: Site) -> None:
 
 def _audit(db: Session, request: Request, action: str, target: str, detail: dict | None = None) -> None:
     ip = request.client.host if request.client else None
-    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target, detail=detail, ip=ip)
+    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target, detail=with_actor(detail, request), ip=ip)
 
 
 # ------------------------------------------------------------------ live analytics (SPEC §14.3.1)

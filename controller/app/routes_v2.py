@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from . import (access, dns_secondary, edge_functions, images, l4, logexport, origin_pull, pdns, sections, ssl,
                tunnel, waf_learning, waiting_room, webhooks)
-from .audit import record_audit
+from .audit import record_audit, with_actor
 from .auth import require_admin
 from .config import settings
 from .db import get_db
@@ -43,7 +43,7 @@ def _audit(db: Session, request: Request, action: str, target: str | None = None
     """Record an admin mutation on the v2 surface (SPEC §13.2)."""
     ip = request.client.host if request.client else None
     record_audit(db, actor="admin", actor_kind="admin", action=action, target=target,
-                 detail=detail, ip=ip)
+                 detail=with_actor(detail, request), ip=ip)
 
 
 # ------------------------------------------------------------------ sections

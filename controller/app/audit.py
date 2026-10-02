@@ -8,6 +8,7 @@ password can never end up in the log even if a caller passes one in.
 
 import json
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
@@ -15,9 +16,32 @@ from .models import AuditLog
 
 log = logging.getLogger("pcdn.audit")
 
+# SPEC §20.3: WHMCS names the person behind an admin-key write made for a domain collaborator
+# ("share:<member client id>:<role>"); anything else in the header is ignored
+_ACTOR_RE = re.compile(r"^[a-z0-9:_-]{1,64}$")
+
+
+def on_behalf_of(request) -> str | None:
+    """The validated X-PCDN-Actor header of an admin request, or None."""
+    try:
+        v = (request.headers.get("x-pcdn-actor") or "").strip() if request is not None else ""
+    except Exception:  # noqa: BLE001 - a request stub without headers
+        return None
+    return v if _ACTOR_RE.match(v) else None
+
+
+def with_actor(detail: dict | None, request) -> dict | None:
+    """`detail` plus {"on_behalf_of": ...} when the request names one."""
+    who = on_behalf_of(request)
+    if who is None:
+        return detail
+    return {**(detail or {}), "on_behalf_of": who}
+
 # Only these keys may appear in a detail document. Anything else (and anything that looks like a
 # secret — see _SECRET_HINTS) is dropped. Keep this list small and non-sensitive.
 DETAIL_WHITELIST = {
+    # SPEC §20.3: the domain collaborator WHMCS acted for (validated X-PCDN-Actor)
+    "on_behalf_of",
     # sites / plan
     "domain", "external_id", "origin_ip", "plan", "bandwidth_limit_gb", "max_records",
     "ssl_allowed", "rate_limit_rps", "features", "ssl_source", "dnssec",

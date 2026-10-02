@@ -185,3 +185,20 @@ def test_capi_write_audited_with_key_actor(client):
     rows = _audit(client, actor="ci-key")
     assert len(rows) == 1 and rows[0]["action"] == "purge" and rows[0]["actor_kind"] == "capi"
     assert rows[0]["target"] == "example.com"
+
+
+def test_audit_records_collaborator_from_x_pcdn_actor(client):
+    """SPEC §20.3: a write WHMCS makes for a domain collaborator carries X-PCDN-Actor; the audit
+    entry keeps it as on_behalf_of. Malformed values are ignored, never stored."""
+    client.post("/api/v1/sites", json={"domain": "example.com"})
+    client.post("/api/v1/sites/example.com/records", json={"name": "a", "type": "A", "content": "93.184.216.34"},
+                headers={"X-PCDN-Actor": "share:42:dns"})
+    client.put("/api/v1/sites/example.com/config/firewall", json={"default_action": "allow", "rules": []},
+               headers={"X-PCDN-Actor": "share:42:editor"})
+    client.post("/api/v1/sites/example.com/records", json={"name": "b", "type": "A", "content": "93.184.216.34"},
+                headers={"X-PCDN-Actor": "<script>alert(1)</script>"})
+    client.post("/api/v1/sites/example.com/records", json={"name": "c", "type": "A", "content": "93.184.216.34"})
+    rows = [r for r in _audit(client) if r["target"] == "example.com" and r["action"] != "site.create"]
+    who = sorted(r["detail"].get("on_behalf_of") or "" for r in rows)
+    assert who == ["", "", "share:42:dns", "share:42:editor"], rows
+    assert all(r["actor"] == "admin" for r in rows)

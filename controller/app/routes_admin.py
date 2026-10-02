@@ -11,7 +11,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import bundle, dnsbuild, l4, nscheck, origin_guard, pdns, sections, tenancy, transfer, webhooks
-from .audit import record_audit
+from .audit import record_audit, with_actor
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
@@ -55,7 +55,7 @@ def _audit(db: Session, request: Request | None, action: str, target: str | None
     """Record an admin mutation (SPEC §13.2). The admin surface has a single key, so the actor
     label is simply "admin"; secrets are stripped by record_audit."""
     record_audit(db, actor="admin", actor_kind="admin", action=action, target=target,
-                 detail=detail, ip=_client_ip(request))
+                 detail=with_actor(detail, request), ip=_client_ip(request))
 
 
 def get_site(db: Session, domain: str) -> Site:
@@ -897,18 +897,27 @@ def list_records(domain: str, db: Session = Depends(get_db)):
 
 
 @router.post("/sites/{domain}/records", status_code=201)
-def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
-    return add_record_of(db, get_site(db, domain), body)
+def add_record(domain: str, body: RecordIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = add_record_of(db, site, body)
+    _audit(db, request, "record.create", site.domain, {"type": body.type, "name": body.name})
+    return result
 
 
 @router.put("/sites/{domain}/records/{record_id}")
-def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Depends(get_db)):
-    return update_record_of(db, get_site(db, domain), record_id, body)
+def update_record(domain: str, record_id: int, body: RecordIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = update_record_of(db, site, record_id, body)
+    _audit(db, request, "record.update", site.domain, {"record_id": record_id, "type": body.type, "name": body.name})
+    return result
 
 
 @router.delete("/sites/{domain}/records/{record_id}")
-def delete_record(domain: str, record_id: int, db: Session = Depends(get_db)):
-    return delete_record_of(db, get_site(db, domain), record_id)
+def delete_record(domain: str, record_id: int, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = delete_record_of(db, site, record_id)
+    _audit(db, request, "record.delete", site.domain, {"record_id": record_id})
+    return result
 
 
 @router.post("/sites/{domain}/dns-sync")
