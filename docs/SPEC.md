@@ -1224,3 +1224,37 @@ language (fallback Persian), all strings through one dictionary; numbers/dates l
   config/functions.
 - English client app: Persian source strings are the dictionary keys; English sent only to English
   viewers; admin addon stays Persian.
+
+## 17. Wave 9: WAF learning mode (auto-tuning)
+
+Goal: fewer false positives and sensible rate limits without manual tuning. Learning never blocks;
+it only observes and proposes; the customer applies proposals explicitly.
+
+### 17.1 Edge
+- Section `waf` gains `learning: {enabled: false, until: ISO|null}` (controller-managed end time,
+  default 7 days after enabling). While learning, the edge evaluates WAF/packs exactly as in `log`
+  mode for that site (never blocks/challenges on WAF verdicts; firewall/ratelimit/DDoS unchanged).
+- Per host-hour usage item adds optional `waf_learn`: `{rules: {rule_id: {hits, paths: {path_prefix: n}
+  (top 10, first two segments), methods: {M: n}}} (≤100 rules), paths: {path_prefix: {req, p95_rps_min,
+  methods: {...}}} (top 50 prefixes; p95 of per-minute request counts per client IP /24 bucket… keep it
+  simple: max per-minute requests from a single client IP seen for that prefix, and total), clients:
+  {max_rpm: n, p95_rpm: n}}`. Bounded memory; only for sites in learning.
+
+### 17.2 Controller
+- `waf.learning` validated; enabling sets `until` = now + `days` (1..30, default 7) and records
+  `started_at`; ends automatically (job) → state `learned`.
+- `GET /api/v1/sites/{d}/waf/learning` (+ capi, scope stats) → `{state: off|learning|learned, started_at,
+  until, requests_observed, proposals: [{id, kind: "waf_exclusion"|"rate_limit"|"pack_off", summary
+  (Persian), detail (en), confidence: 0..1, change: <exact section patch>}]}`.
+  - waf_exclusion: a rule hit on ≥ 0.5% of requests to a path prefix, by ≥ 20 distinct clients, with
+    no other attack signals on those requests → propose a WAF exclusion for (rule, path prefix).
+  - rate_limit: per path prefix with ≥ 1000 requests: propose a limit at max(3 × p95 per-client rpm,
+    observed max × 1.5) with action challenge; never below 30 rpm.
+  - pack_off: a pack whose rules never matched attack-like traffic but produced only proposals above.
+- `POST /api/v1/sites/{d}/waf/learning/apply {ids: [...]}` applies chosen proposals via the normal
+  section validation (audit-logged), returns the updated sections; idempotent.
+- No proposal is ever applied automatically.
+
+### 17.3 WHMCS
+- WAF page: «حالت یادگیری» card (start with days, progress, stop), proposals list with Persian
+  explanation, confidence, preview of the exact change, apply selected; bilingual.
