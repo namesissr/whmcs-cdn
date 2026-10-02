@@ -1567,3 +1567,29 @@ read-only for collaborators exactly as for the owner.
 - §19 as built: controller head `0021`; transfers with `revoke_credentials` also rotate the image
   signing key, the secondary-DNS TSIG secret and storage bucket keys (after commit, retried by a
   scheduler job, deep-health warning while pending).
+
+## 21. Per-domain feature overrides (admin)
+Every feature is normally decided by the product plan (`pasargadcdn_plan()` → `plan.features`). The
+operator can override any of them for one domain without changing the product.
+- Scope: one CDN service (keyed by service id) or one operator site (keyed by domain). Stored in
+  `mod_pasargadcdn_feature_overrides` (key, overrides JSON, admin id, updated_at), created idempotently.
+- Editor «امکانات اختصاصی» (admin addon; reachable from the Sites row menu, the operator domains
+  list, the admin service tab and the «انتقال دامنه»-style search of a new «امکانات اختصاصی» tab):
+  every plan field of the controller's plan model — the top-level ones (bandwidth_limit_gb,
+  max_records, ssl_allowed, rate_limit_rps) and every key of `features` (booleans, numeric limits,
+  edge_group, sla_target; the list comes from the controller's DEFAULT_FEATURES via the site's plan, so
+  new features appear automatically) — each with «طبق پلن» (inherit) or an explicit value; shows the
+  plan value next to it and the effective value. Quick actions: «همه امکانات روشن» (every boolean on;
+  limits untouched), «بازگشت به پلن» (clear all). Numeric inputs validated against the controller's
+  ranges (422 messages shown).
+- Effect: saving stores the overrides and immediately pushes the merged plan with
+  `PATCH /api/v1/sites/{d}/plan`; every module path that sends a plan (Create, ChangePackage, renew /
+  unsuspend resync, wizard re-runs, upgrades) merges overrides on top of the product plan, so an
+  override survives plan changes until it is cleared. Turning a feature off keeps the site's saved
+  section settings (the controller already ignores sections the plan lacks).
+- Visibility: the client app shows overridden features as normal (no upsell lock); the admin service
+  tab and Sites list show a badge «امکانات اختصاصی (n)». Audited: activity log with admin username +
+  controller `site.plan` audit.
+- Transfers (§19): overrides move with the domain (service id re-keyed / operator domain key moved);
+  the transfer wizard shows them in the preview with an option to drop them.
+- Billing: overrides never create invoices; storage_gb / addon traffic billing keep their own rules.
