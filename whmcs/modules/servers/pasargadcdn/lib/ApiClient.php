@@ -253,6 +253,46 @@ class ApiClient
     }
 
     /**
+     * SPEC §18.3: a binary/text download from the controller (statement PDF/CSV, audit CSV), sent WITH the
+     * admin key. The transfer is aborted past $max bytes. Returns [http status, body|null (null = larger than
+     * $max), content type]. The module log gets the size and type only, never the document.
+     */
+    public function download(string $path, int $max, string $accept = 'application/pdf, text/csv, application/json;q=0.5'): array
+    {
+        $ch = curl_init($this->baseUrl . $path);
+        $opts = $this->curlOptions('GET', null);
+        $opts[CURLOPT_HTTPHEADER] = ['Authorization: Bearer ' . $this->apiKey, 'Accept: ' . $accept];
+        $buf = '';
+        $over = false;
+        $opts[CURLOPT_RETURNTRANSFER] = false;
+        $opts[CURLOPT_WRITEFUNCTION] = function ($h, $chunk) use (&$buf, &$over, $max) {
+            if (strlen($buf) + strlen($chunk) > $max) {
+                $over = true;
+                return 0;   // aborts the transfer
+            }
+            $buf .= $chunk;
+            return strlen($chunk);
+        };
+        curl_setopt_array($ch, $opts);
+        $ok = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $type = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        if (function_exists('logModuleCall')) {
+            logModuleCall('pasargadcdn', 'GET ' . $path, null, $over ? 'download larger than ' . $max . ' bytes (aborted)'
+                : 'HTTP ' . $code . ', ' . $type . ', ' . strlen($buf) . ' bytes', null, [$this->apiKey]);
+        }
+        if ($over) {
+            return [$code ?: 200, null, $type];
+        }
+        if ($ok === false) {
+            throw new ApiException(I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err));
+        }
+        return [$code, $buf, $type];
+    }
+
+    /**
      * Secrets never reach the WHMCS module log: edge tokens (shown to the admin
      * once), private keys of custom certificates, and (SPEC §14.3) the log-export
      * S3 keys in `logs` bodies plus webhook signing secrets — `new_secrets` of a
@@ -266,7 +306,8 @@ class ApiClient
         if (!is_string($text) || $text === '') {
             return $text;
         }
-        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key|transform_secret|tsig_secret)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        // SPEC §18.1/§18.2: the per-site waiting-room / access secrets never leave the controller, masked anyway
+        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key|transform_secret|tsig_secret|access_secret|wr_secret)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
         $text = (string) preg_replace('/"new_secrets"\s*:\s*\{[^{}]*\}/', '"new_secrets":"***"', $text);
         // possessive: linear on megabytes of escaped JavaScript; a PCRE failure logs nothing rather than the code
         $text = preg_replace('/"code"\s*:\s*"(?:[^"\\\\]++|\\\\.)*+"/', '"code":"***"', $text);

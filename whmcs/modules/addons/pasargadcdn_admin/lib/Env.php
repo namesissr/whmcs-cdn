@@ -36,6 +36,8 @@ final class Env
     const STORAGE_BILLS = 'mod_pasargadcdn_storage_bills';
     /** Growth: one scheduled e-mail report per service and period (Reports cron dedupe / retry ledger). */
     const REPORTS = 'mod_pasargadcdn_reports';
+    /** Wave 10 (SPEC §18.5): referral ledger — one row per referred client (Referrals). */
+    const REFERRALS = 'mod_pasargadcdn_referrals';
     const DEAD_STATUSES = ['Terminated', 'Cancelled', 'Fraud'];
     const DEFAULT_NS = ['ns1.pasargadmizban.com', 'ns2.pasargadmizban.com'];
 
@@ -363,11 +365,69 @@ final class Env
             });
         }
         self::$memo['tbl:' . self::REPORTS] = true;
+        self::ensureReferrals();
         if (self::loadServerModule()) {
             \PasargadCdn\ServiceState::ensure();
             \PasargadCdn\Trial::ensure();
             \PasargadCdn\Reseller::ensureExtras();
         }
+    }
+
+    /**
+     * Wave 10 (SPEC §18.5): creates / migrates mod_pasargadcdn_referrals idempotently (missing columns of an
+     * earlier build are added; nothing is dropped). Safe to call on every activation / upgrade.
+     */
+    public static function ensureReferrals(): void
+    {
+        $schema = Capsule::schema();
+        if (!$schema->hasTable(self::REFERRALS)) {
+            $schema->create(self::REFERRALS, function ($t) {
+                $t->increments('id');
+                $t->integer('referrer_id');
+                $t->integer('referred_id');
+                $t->string('code', 32)->default('');
+                // pending (order placed, waiting for the first CDN invoice) | qualified (paid, waiting X days)
+                // | paying (payout claimed) | paid | cancelled
+                $t->string('status', 16)->default('pending');
+                $t->string('reason', 191)->nullable();
+                $t->integer('order_id')->default(0);
+                $t->integer('invoice_id')->default(0);
+                $t->string('signup_ip', 45)->default('');
+                $t->decimal('amount_referrer', 16, 2)->default(0);
+                $t->decimal('amount_referred', 16, 2)->default(0);
+                $t->boolean('credited_referrer')->default(0);
+                $t->boolean('credited_referred')->default(0);
+                $t->integer('cancelled_by')->default(0);
+                $t->dateTime('qualified_at')->nullable();
+                $t->dateTime('paid_at')->nullable();
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+                // once per referred client, whatever runs in parallel
+                $t->unique('referred_id', 'mod_pcdn_ref_once');
+                $t->index(['referrer_id', 'status'], 'mod_pcdn_ref_referrer');
+                $t->index(['status', 'qualified_at'], 'mod_pcdn_ref_due');
+            });
+        } else {
+            $cols = ['code' => function ($t) { $t->string('code', 32)->default(''); },
+                'reason' => function ($t) { $t->string('reason', 191)->nullable(); },
+                'order_id' => function ($t) { $t->integer('order_id')->default(0); },
+                'invoice_id' => function ($t) { $t->integer('invoice_id')->default(0); },
+                'signup_ip' => function ($t) { $t->string('signup_ip', 45)->default(''); },
+                'amount_referrer' => function ($t) { $t->decimal('amount_referrer', 16, 2)->default(0); },
+                'amount_referred' => function ($t) { $t->decimal('amount_referred', 16, 2)->default(0); },
+                'credited_referrer' => function ($t) { $t->boolean('credited_referrer')->default(0); },
+                'credited_referred' => function ($t) { $t->boolean('credited_referred')->default(0); },
+                'cancelled_by' => function ($t) { $t->integer('cancelled_by')->default(0); },
+                'qualified_at' => function ($t) { $t->dateTime('qualified_at')->nullable(); },
+                'paid_at' => function ($t) { $t->dateTime('paid_at')->nullable(); },
+                'updated_at' => function ($t) { $t->dateTime('updated_at')->nullable(); }];
+            foreach ($cols as $col => $def) {
+                if (!$schema->hasColumn(self::REFERRALS, $col)) {
+                    $schema->table(self::REFERRALS, $def);
+                }
+            }
+        }
+        self::$memo['tbl:' . self::REFERRALS] = true;
     }
 
     // ------------------------------------------------------------------ servers / controller

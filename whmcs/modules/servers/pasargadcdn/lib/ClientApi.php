@@ -6,6 +6,34 @@ use WHMCS\Database\Capsule;
 
 require_once __DIR__ . '/I18n.php';
 
+if (!class_exists(__NAMESPACE__ . '\\Download', false)) {
+    /**
+     * SPEC §18.3: a file the controller produced (statement PDF/CSV, audit CSV) that the proxy streams to
+     * the browser as is: api.php / the admin addon send it with this type and an attachment filename
+     * instead of JSON. Only ClientApi::download() makes one, after checking type, size and signature.
+     */
+    final class Download
+    {
+        public $body;
+        public $type;
+        public $filename;
+
+        public function __construct(string $body, string $type, string $filename)
+        {
+            $this->body = $body;
+            $this->type = $type;
+            $this->filename = $filename;
+        }
+
+        /** Response headers (api.php / Admin::emit add Cache-Control: no-store and nosniff). */
+        public function headers(): array
+        {
+            return ['Content-Type: ' . $this->type, 'Content-Length: ' . strlen($this->body),
+                'Content-Disposition: attachment; filename="' . $this->filename . '"'];
+        }
+    }
+}
+
 if (class_exists(__NAMESPACE__ . '\\ClientApi', false)) {
     return;
 }
@@ -46,7 +74,8 @@ class ClientApi
 
     // Wave 6B (SPEC §14.2) added transform, redirects and bots; Wave 6D (§14.3) logs and webhooks;
     // Wave 8 (§16.4/§16.5/§16.7) l4 (TCP/UDP apps), video and dns_secondary; §16.9 functions (edge functions).
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary|functions';
+    // Wave 10 (SPEC §18.1/§18.2): waiting_room and access (bodies re-checked by sectionBody()).
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary|functions|waiting_room|access';
 
     /** Webhook ids are assigned by the controller: "wh_" + 8 hex (SPEC §14.3.3). */
     const WEBHOOK_ID = 'wh_[0-9a-f]{8}';
@@ -83,6 +112,9 @@ class ClientApi
             // SPEC §17.3 WAF learning mode: state, progress and proposals (read-only; starting / stopping
             // is a PUT config/waf with `learning`)
             'waf/learning',
+            // SPEC §18.1–§18.3 (wave 10): waiting-room live stats, access sign-in log, monthly statement
+            // (format=json here; pdf/csv are streamed by download()) and the site's audit entries (json/csv)
+            self::W10_WAITING_ROOM, self::W10_ACCESS_LOG, self::W10_STATEMENT, self::W10_AUDIT,
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
@@ -91,7 +123,9 @@ class ClientApi
             // SPEC §16.8: new bucket / new access key — secret_key returned once, never logged (ApiClient::redact)
             'storage/buckets', 'storage/buckets/' . self::BUCKET . '/rotate-key',
             // SPEC §17.3: apply the chosen learning-mode proposals — body re-checked by applyBody()
-            'waf/learning/apply'],
+            'waf/learning/apply',
+            // SPEC §18.2: new access secret (all sign-in sessions end) — body must be empty, see sectionBody()
+            self::W10_ACCESS_ROTATE],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
         'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client',
             // Wave 8 (SPEC §16.6): forget the image transform secret (unsigned transforms allowed again)
@@ -123,7 +157,43 @@ class ClientApi
         'tunnel/usage' => ['days' => '/^([1-9]|[1-8][0-9]|90)$/D'],
         // SPEC §16.9: functions stats hours 1..744 (the app uses 24 and 168)
         'functions/stats' => ['hours' => '/^([1-9]|[1-9][0-9]|[1-6][0-9]{2}|7[0-3][0-9]|74[0-4])$/D'],
+        // SPEC §18.3: statement month YYYY-MM, format pdf|csv|json, lang fa|en; audit from/to (date or ISO-8601 UTC), json|csv
+        self::W10_STATEMENT => ['month' => '/^[0-9]{4}-(0[1-9]|1[0-2])$/D', 'format' => '/^(pdf|csv|json)$/D', 'lang' => '/^(fa|en)$/D'],
+        self::W10_AUDIT => ['from' => self::W10_TIME, 'to' => self::W10_TIME, 'format' => '/^(json|csv)$/D'],
+        self::W10_ACCESS_LOG => ['limit' => '/^([1-9][0-9]?|1[0-9]{2}|200)$/D'],
+        self::W10_WAITING_ROOM => ['hours' => '/^([1-9]|[1-9][0-9]|1[0-5][0-9]|16[0-8])$/D'],
     ];
+
+    // ------------------------------------------------------------------ wave 10 (SPEC §18) — the controller contract in one place
+    /** GET → {enabled, active_estimate, queued_estimate, last_hour: {...}, hourly: [...]} (§18.1) */
+    const W10_WAITING_ROOM = 'waiting-room';
+    /** GET → last ≤200 sign-ins / failures: [{t, app, email_hash, ok}] or {events: [...]} (§18.2) */
+    const W10_ACCESS_LOG = 'access/log';
+    /** POST {} → new access_secret, every access session invalid (§18.2) */
+    const W10_ACCESS_ROTATE = 'access/rotate';
+    /** GET ?month&format=pdf|csv|json&lang (§18.3) */
+    const W10_STATEMENT = 'statement';
+    /** GET ?from&to&format=json|csv (§18.3) */
+    const W10_AUDIT = 'audit';
+    /** Controller path of the client error forwarder (§18.4), admin key. */
+    const W10_CLIENT_ERRORS = '/api/v1/client-errors';
+    /** Audit range bounds: YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS]Z. */
+    const W10_TIME = '/^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])(T([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?Z)?$/D';
+
+    /**
+     * SPEC §18.3 downloads streamed as files: sub-path => format => [expected content type, extension, max bytes].
+     * The statement PDF is ≤ 2 MB by contract (4 MB accepted); the audit CSV is ≤ 10 000 rows.
+     */
+    const DOWNLOADS = [
+        self::W10_STATEMENT => ['pdf' => ['application/pdf', 'pdf', 4194304], 'csv' => ['text/csv; charset=utf-8', 'csv', 8388608]],
+        self::W10_AUDIT => ['csv' => ['text/csv; charset=utf-8', 'csv', 8388608]],
+    ];
+
+    /** SPEC §18.4 client error reports: ≤ 10 per minute per session, body ≤ 16 KB. */
+    const CLIENT_ERROR_RATE = 10;
+    const CLIENT_ERROR_WINDOW = 60;
+    const CLIENT_ERROR_MAX_BODY = 16384;
+    const CLIENT_ERROR_STACK = 4096;
 
     /** Answer for a write by a read-only team member (SPEC §14.3.7). */
     const READONLY_DETAIL = 'دسترسی شما به این سرویس فقط‌خواندنی است؛ برای تغییر تنظیمات از مالک حساب بخواهید دسترسی «مدیریت محصولات» را به شما بدهد.';
@@ -252,6 +322,16 @@ class ClientApi
                     return self::fail(400, 'پارامتر نامعتبر است.');
                 }
             }
+            // Wave 10 (SPEC §18.1/§18.2): the new sections and the rotate call carry exactly the contract's shape
+            if ($method === 'POST' && $path === self::W10_ACCESS_ROTATE && $data !== []) {
+                return self::fail(400, 'پارامتر نامعتبر است.');
+            }
+            if ($method === 'PUT' && ($path === 'config/waiting_room' || $path === 'config/access')) {
+                $bad = $path === 'config/access' ? self::accessProblems($data) : self::waitingRoomProblems($data);
+                if ($bad) {
+                    return [422, ['detail' => $bad]];
+                }
+            }
             // Re-encoded, so only well-formed JSON ever reaches the controller.
             $body = json_encode($data === [] ? new \stdClass() : $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
@@ -259,6 +339,14 @@ class ClientApi
         $query = self::query($path, (array) ($req['query'] ?? []));
         if ($query === null) {
             return self::fail(400, 'پارامتر نامعتبر است.');
+        }
+        if ($method === 'GET' && $path === self::W10_STATEMENT) {
+            // SPEC §18.3: the controller knows neither the plan name nor the prepaid block size — WHMCS adds them
+            // from the service's product and the addon settings (never from the request)
+            $extra = self::statementExtras($svc);
+            if ($extra) {
+                $query .= ($query === '' ? '?' : '&') . http_build_query($extra);
+            }
         }
 
         // Defence in depth: the domain is admin/order data, keep it a plain hostname.
@@ -284,6 +372,10 @@ class ClientApi
             $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params, $admin ? 10 : 20);
             if (isset(self::PUBLIC_FILES[$path])) {
                 return self::pemFile($api, self::PUBLIC_FILES[$path]);
+            }
+            $fmt = $method === 'GET' ? self::downloadFormat($path, (array) ($req['query'] ?? [])) : null;
+            if ($fmt !== null) {
+                return self::download($api, $target, $path, $fmt, $domain, (array) ($req['query'] ?? []));
             }
             [$code, $data] = $api->raw($method, $target, $body);
         } catch (\Throwable $e) {
@@ -531,6 +623,436 @@ class ClientApi
             }
         }
         return ['ids' => array_values(array_unique($ids))];
+    }
+
+    // ------------------------------------------------------------------ wave 10 (SPEC §18)
+
+    /**
+     * SPEC §18.3: the format a GET of a download sub-path asks for when it is a file (pdf / csv), else null
+     * (json or no format: the normal JSON proxy). The format has already passed QUERY.
+     */
+    public static function downloadFormat(string $path, array $query): ?string
+    {
+        $fmt = is_string($query['format'] ?? null) ? $query['format'] : '';
+        return isset(self::DOWNLOADS[$path][$fmt]) ? $fmt : null;
+    }
+
+    /**
+     * Streams a controller file through the proxy: only a 200 whose type and signature match the format and
+     * whose size is within DOWNLOADS' cap becomes a Download; a controller 4xx keeps its JSON detail (404 =
+     * older controller, the app hides the page), anything else is a generic 502.
+     */
+    private static function download($api, string $target, string $path, string $fmt, string $domain, array $query): array
+    {
+        [$type, $ext, $max] = self::DOWNLOADS[$path][$fmt];
+        if (!method_exists($api, 'download')) {
+            return self::fail(502, 'دریافت فایل از سرور CDN ممکن نشد.');
+        }
+        [$code, $body, $ctype] = $api->download($target, $max, $fmt === 'pdf' ? 'application/pdf, application/json;q=0.5' : 'text/csv, application/json;q=0.5');
+        if ($body === null) {
+            self::log('GET ' . $target, 'download over ' . $max . ' bytes');
+            return self::fail(502, 'فایل دریافتی از سرور CDN بیش از حد بزرگ است.');
+        }
+        if ($code >= 400 && $code < 500) {
+            $data = json_decode((string) $body, true);
+            if (is_array($data) && isset($data['detail'])) {
+                if (is_string($data['detail'])) {
+                    $data['detail'] = I18n::controller($data['detail']);
+                }
+                return [$code, ['detail' => $data['detail']]];
+            }
+            return self::fail($code, I18n::tr('درخواست توسط سرور CDN رد شد (HTTP %s)', $code));
+        }
+        if ($code !== 200) {
+            self::log('GET ' . $target, 'HTTP ' . $code);
+            return self::fail(502, I18n::tr('خطای سرور CDN (HTTP %s)', $code));
+        }
+        $ct = strtolower(trim(explode(';', $ctype)[0]));
+        $ok = $fmt === 'pdf' ? ($ct === 'application/pdf' && strncmp((string) $body, '%PDF-', 5) === 0)
+            : (in_array($ct, ['text/csv', 'application/csv', 'text/plain'], true) && !preg_match('/^(\xEF\xBB\xBF)?\s*</', (string) $body));
+        if (!$ok) {
+            self::log('GET ' . $target, 'unexpected download ' . $ct);
+            return self::fail(502, 'فایل دریافتی از سرور CDN معتبر نبود.');
+        }
+        $safe = (string) preg_replace('/[^a-z0-9.-]/', '', strtolower($domain));
+        if ($path === self::W10_STATEMENT) {
+            $month = is_string($query['month'] ?? null) ? $query['month'] : gmdate('Y-m');
+            $name = 'pasargadcdn-statement-' . $safe . '-' . $month;
+        } else {
+            $from = is_string($query['from'] ?? null) ? substr($query['from'], 0, 10) : '';
+            $to = is_string($query['to'] ?? null) ? substr($query['to'], 0, 10) : '';
+            $name = 'pasargadcdn-audit-' . $safe . ($from !== '' ? '-' . $from : '') . ($to !== '' ? '-' . $to : '');
+        }
+        return [200, new Download((string) $body, $type, $name . '.' . $ext)];
+    }
+
+    /**
+     * `plan` (the service's WHMCS product name, ≤ 100 characters) and `block_gb` (the prepaid traffic block size,
+     * prepaid billing only) for GET statement. Reseller sub-sites have no WHMCS product: nothing is added.
+     */
+    public static function statementExtras($svc): array
+    {
+        $out = [];
+        try {
+            if ($svc && isset($svc->packageid)) {
+                $prod = Capsule::table('tblproducts')->where('id', (int) $svc->packageid)->first(['name']);
+                $name = trim((string) ($prod->name ?? ''));
+                if ($name !== '') {
+                    $out['plan'] = function_exists('mb_substr') ? mb_substr($name, 0, 100, 'UTF-8') : substr($name, 0, 100);
+                }
+                if (function_exists('pasargadcdn_billing_mode') && \pasargadcdn_billing_mode() === 'prepaid') {
+                    $gb = (int) (\pasargadcdn_addon_settings()['block_gb'] ?? 10);
+                    $out['block_gb'] = $gb > 0 ? $gb : 10;
+                }
+            }
+        } catch (\Throwable $e) {
+            return $out;
+        }
+        return $out;
+    }
+
+    /** A loc-tagged validation item in the controller's 422 list shape (the app places it next to the field). */
+    private static function bad(array $loc, string $msg, ...$args): array
+    {
+        return ['loc' => array_merge(['body'], $loc), 'msg' => I18n::tr($msg, ...$args)];
+    }
+
+    private static function isInt($v, int $lo, int $hi): bool
+    {
+        return is_int($v) && $v >= $lo && $v <= $hi;
+    }
+
+    /** A JSON list (0..n-1 keys). */
+    private static function isList($v): bool
+    {
+        return is_array($v) && ($v === [] || array_keys($v) === range(0, count($v) - 1));
+    }
+
+    /** URL path prefix as sections._prefixes accepts it: /…, PATH_PATTERN_RE characters, no * or ?, never /__pcdn. */
+    public static function pathPrefix($p): bool
+    {
+        if (!is_string($p) || strlen($p) > 256 || !preg_match('#^/[A-Za-z0-9\-._~%!$&\'()+,;=:@/]*$#D', $p)) {
+            return false;
+        }
+        return !($p === '/__pcdn' || strncmp($p, '/__pcdn/', 8) === 0 || strncmp($p, '/__pcdn_', 8) === 0);
+    }
+
+    /** IP or CIDR as sections._cidrs_list accepts it (networks no wider than /8 for IPv4, /16 for IPv6). */
+    public static function cidr($v): bool
+    {
+        if (!is_string($v) || strlen($v) > 50 || !preg_match('#^([0-9A-Fa-f:.]+)(?:/([0-9]{1,3}))?$#D', trim($v), $m)) {
+            return false;
+        }
+        $v4 = filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+        $v6 = !$v4 && filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+        if (!$v4 && !$v6) {
+            return false;
+        }
+        if (!isset($m[2]) || $m[2] === '') {
+            return true;
+        }
+        $len = (int) $m[2];
+        return $v4 ? $len >= 8 && $len <= 32 : $len >= 16 && $len <= 128;
+    }
+
+    /** Plain text of an edge page: ≤ $max characters, no control characters except newline / tab. */
+    private static function plainText($v, int $max): bool
+    {
+        if (!is_string($v)) {
+            return false;
+        }
+        $len = function_exists('mb_strlen') ? mb_strlen($v, 'UTF-8') : strlen($v);
+        return $len <= $max && preg_match('//u', $v) && !preg_match('/[\x00-\x08\x0B-\x1F\x7F]/', $v);
+    }
+
+    /** Checks a list of $what (prefix | cidr) under $loc with at most $max items; appends problems. */
+    private static function listOf(array &$out, array $loc, $v, int $max, string $what, int $min = 0): void
+    {
+        if (!self::isList($v)) {
+            $out[] = self::bad($loc, 'باید فهرست باشد.');
+            return;
+        }
+        if (count($v) > $max) {
+            $out[] = self::bad($loc, 'حداکثر %s مورد مجاز است.', $max);
+            return;
+        }
+        if (count($v) < $min) {
+            $out[] = self::bad($loc, 'دست‌کم یک مسیر لازم است.');
+            return;
+        }
+        foreach ($v as $i => $x) {
+            if ($what === 'prefix' && !self::pathPrefix($x)) {
+                $out[] = self::bad(array_merge($loc, [$i]), 'پیشوند مسیر باید با / شروع شود، بدون * و ? باشد و حداکثر ۲۵۶ نویسه؛ مسیرهای /__pcdn/ رزرو شده‌اند.');
+            } elseif ($what === 'cidr' && !self::cidr($x)) {
+                $out[] = self::bad(array_merge($loc, [$i]), 'آدرس IP یا شبکهٔ نامعتبر است (شبکه حداکثر /8 برای IPv4 و /16 برای IPv6).');
+            } elseif ($what === 'email' && !(is_string($x) && strlen($x) <= 254
+                    && preg_match('/^([a-z0-9.!#$%&\'*+\/=?^_`{|}~-]{1,64})?@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/iD', $x))) {
+                $out[] = self::bad(array_merge($loc, [$i]), 'ایمیل یا @دامنهٔ نامعتبر است (مثل a@b.com یا @company.com).');
+            }
+        }
+    }
+
+    /** Unknown keys of an object under $loc. */
+    private static function keys(array &$out, array $loc, array $v, array $allowed): void
+    {
+        foreach (array_keys($v) as $k) {
+            if (!in_array($k, $allowed, true)) {
+                $out[] = self::bad(array_merge($loc, [(string) $k]), 'فیلد ناشناخته است.');
+            }
+        }
+    }
+
+    /**
+     * SPEC §18.1 section `waiting_room` as WHMCS forwards it: exactly the contract's keys and types (the
+     * controller re-validates everything). Returns the 422 items ([] = fine).
+     */
+    public static function waitingRoomProblems(array $d): array
+    {
+        $out = [];
+        self::keys($out, [], $d, ['enabled', 'mode', 'paths', 'max_active', 'session_minutes', 'queue_page', 'bypass']);
+        if (array_key_exists('enabled', $d) && !is_bool($d['enabled'])) {
+            $out[] = self::bad(['enabled'], 'باید روشن یا خاموش باشد.');
+        }
+        if (array_key_exists('mode', $d) && !in_array($d['mode'], ['queue', 'off'], true)) {
+            $out[] = self::bad(['mode'], 'مقدار نامعتبر است.');
+        }
+        if (array_key_exists('paths', $d)) {
+            self::listOf($out, ['paths'], $d['paths'], 20, 'prefix', 1);
+        }
+        if (array_key_exists('max_active', $d) && !self::isInt($d['max_active'], 1, 1000000)) {
+            $out[] = self::bad(['max_active'], 'باید عدد صحیح بین %s و %s باشد.', 1, 1000000);
+        }
+        if (array_key_exists('session_minutes', $d) && !self::isInt($d['session_minutes'], 1, 120)) {
+            $out[] = self::bad(['session_minutes'], 'باید عدد صحیح بین %s و %s باشد.', 1, 120);
+        }
+        if (array_key_exists('queue_page', $d)) {
+            $q = $d['queue_page'];
+            if (!is_array($q) || (self::isList($q) && $q !== [])) {
+                $out[] = self::bad(['queue_page'], 'مقدار نامعتبر است.');
+            } else {
+                self::keys($out, ['queue_page'], $q, ['title_fa', 'title_en', 'message_fa', 'message_en']);
+                foreach (['title_fa', 'title_en', 'message_fa', 'message_en'] as $k) {
+                    if (array_key_exists($k, $q) && !self::plainText($q[$k], 500)) {
+                        $out[] = self::bad(['queue_page', $k], 'متن حداکثر ۵۰۰ نویسه و بدون نویسهٔ کنترلی باشد.');
+                    }
+                }
+            }
+        }
+        if (array_key_exists('bypass', $d)) {
+            $b = $d['bypass'];
+            if (!is_array($b) || (self::isList($b) && $b !== [])) {
+                $out[] = self::bad(['bypass'], 'مقدار نامعتبر است.');
+            } else {
+                self::keys($out, ['bypass'], $b, ['verified_bots', 'paths', 'ips']);
+                if (array_key_exists('verified_bots', $b) && !is_bool($b['verified_bots'])) {
+                    $out[] = self::bad(['bypass', 'verified_bots'], 'باید روشن یا خاموش باشد.');
+                }
+                if (array_key_exists('paths', $b)) {
+                    self::listOf($out, ['bypass', 'paths'], $b['paths'], 20, 'prefix');
+                }
+                if (array_key_exists('ips', $b)) {
+                    self::listOf($out, ['bypass', 'ips'], $b['ips'], 50, 'cidr');
+                }
+            }
+        }
+        return $out;
+    }
+
+    /** SPEC §18.2 section `access` as WHMCS forwards it (≤ 20 apps; keys, types and limits of the contract). */
+    public static function accessProblems(array $d): array
+    {
+        $out = [];
+        self::keys($out, [], $d, ['enabled', 'apps']);
+        if (array_key_exists('enabled', $d) && !is_bool($d['enabled'])) {
+            $out[] = self::bad(['enabled'], 'باید روشن یا خاموش باشد.');
+        }
+        if (!array_key_exists('apps', $d)) {
+            return $out;
+        }
+        if (!self::isList($d['apps'])) {
+            return array_merge($out, [self::bad(['apps'], 'باید فهرست باشد.')]);
+        }
+        if (count($d['apps']) > 20) {
+            return array_merge($out, [self::bad(['apps'], 'حداکثر %s مورد مجاز است.', 20)]);
+        }
+        $ids = [];
+        foreach ($d['apps'] as $i => $a) {
+            $loc = ['apps', $i];
+            if (!is_array($a) || (self::isList($a) && $a !== [])) {
+                $out[] = self::bad($loc, 'مقدار نامعتبر است.');
+                continue;
+            }
+            self::keys($out, $loc, $a, ['id', 'name', 'paths', 'methods', 'emails', 'ips', 'session_hours']);
+            $id = $a['id'] ?? null;
+            if (!is_string($id) || !preg_match('/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/D', $id)) {
+                $out[] = self::bad(array_merge($loc, ['id']), 'شناسهٔ برنامه فقط حروف کوچک انگلیسی، عدد و - باشد (حداکثر ۳۲ نویسه).');
+            } elseif (isset($ids[$id])) {
+                $out[] = self::bad(array_merge($loc, ['id']), 'شناسهٔ برنامه‌ها باید یکتا باشد.');
+            } else {
+                $ids[$id] = true;
+            }
+            $name = $a['name'] ?? null;
+            if (!self::plainText($name, 100) || trim((string) $name) === '' || strpos((string) $name, "\n") !== false) {
+                $out[] = self::bad(array_merge($loc, ['name']), 'نام برنامه لازم است (حداکثر ۱۰۰ نویسه، یک خط).');
+            }
+            self::listOf($out, array_merge($loc, ['paths']), $a['paths'] ?? null, 20, 'prefix', 1);
+            if (array_key_exists('methods', $a) && !in_array($a['methods'], ['otp', 'ip', 'otp_or_ip'], true)) {
+                $out[] = self::bad(array_merge($loc, ['methods']), 'مقدار نامعتبر است.');
+            }
+            if (array_key_exists('emails', $a)) {
+                self::listOf($out, array_merge($loc, ['emails']), $a['emails'], 200, 'email');
+            }
+            if (array_key_exists('ips', $a)) {
+                self::listOf($out, array_merge($loc, ['ips']), $a['ips'], 100, 'cidr');
+            }
+            if (array_key_exists('session_hours', $a) && !self::isInt($a['session_hours'], 1, 720)) {
+                $out[] = self::bad(array_merge($loc, ['session_hours']), 'باید عدد صحیح بین %s و %s باشد.', 1, 720);
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * SPEC §18.4: a JavaScript error report of the client app (api.php `action=client-error`, POST, CSRF-checked).
+     * At most CLIENT_ERROR_RATE per CLIENT_ERROR_WINDOW seconds per session ($session is the PHP session, by
+     * reference), payload sanitized (sanitizeClientError), written to the WHMCS module log and forwarded to the
+     * controller's POST /api/v1/client-errors with the service's server key (best effort, 3 s). The customer
+     * always gets 202 unless refused (401 / 403 / 405 / 400 / 429).
+     */
+    public static function clientError(array $req, array &$session, ?callable $clientFactory = null): array
+    {
+        $adminId = (int) ($req['admin_id'] ?? 0);
+        I18n::$current = $adminId <= 0 && ($req['lang'] ?? '') === 'en' ? 'en' : 'fa';
+        if (strtoupper((string) ($req['method'] ?? 'GET')) !== 'POST') {
+            return self::fail(405, 'متد مجاز نیست.');
+        }
+        if ($adminId <= 0 && (int) ($req['client_id'] ?? 0) <= 0) {
+            return self::fail(401, 'لطفاً دوباره وارد حساب کاربری شوید.');
+        }
+        $tok = (string) ($req['session_csrf'] ?? '');
+        if ($tok === '' || !hash_equals($tok, (string) ($req['csrf'] ?? ''))) {
+            return self::fail(403, 'درخواست نامعتبر است، صفحه را دوباره بارگذاری کنید.');
+        }
+        $now = (int) ($req['now'] ?? time());
+        $times = array_values(array_filter(is_array($session['pasargadcdn_client_errors'] ?? null) ? $session['pasargadcdn_client_errors'] : [],
+            function ($t) use ($now) {
+                return is_int($t) && $t > $now - self::CLIENT_ERROR_WINDOW && $t <= $now;
+            }));
+        if (count($times) >= self::CLIENT_ERROR_RATE) {
+            $session['pasargadcdn_client_errors'] = $times;
+            return self::fail(429, 'گزارش خطا بیش از حد مجاز است؛ کمی بعد دوباره تلاش کنید.');
+        }
+        $times[] = $now;
+        $session['pasargadcdn_client_errors'] = $times;
+        $raw = (string) ($req['body'] ?? '');
+        $data = strlen($raw) > self::CLIENT_ERROR_MAX_BODY ? null : json_decode($raw, true, 8);
+        if (!is_array($data)) {
+            return self::fail(400, 'بدنه درخواست باید JSON معتبر باشد.');
+        }
+        $report = self::sanitizeClientError($data);
+        if (function_exists('logModuleCall')) {
+            logModuleCall('pasargadcdn', 'client-error', json_encode($report, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), '');
+        }
+        $forwarded = false;
+        $server = self::errorServer($req, $adminId > 0);
+        if ($server) {
+            try {
+                $params = ['serverhostname' => $server->hostname, 'serverip' => $server->ipaddress, 'serversecure' => $server->secure,
+                    'serverport' => $server->port, 'serveraccesshash' => $server->accesshash,
+                    'serverpassword' => (trim((string) $server->accesshash) === '' && function_exists('decrypt')) ? decrypt($server->password) : ''];
+                $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params, 3);
+                [$code] = $api->raw('POST', self::W10_CLIENT_ERRORS, json_encode($report, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+                $forwarded = $code >= 200 && $code < 300;
+            } catch (\Throwable $e) {
+                self::log('POST ' . self::W10_CLIENT_ERRORS, $e->getMessage());
+            }
+        }
+        return [202, ['ok' => true, 'forwarded' => $forwarded]];
+    }
+
+    /** The controller a report goes to: the server of the (owned) service the app runs for, else none. */
+    private static function errorServer(array $req, bool $admin)
+    {
+        try {
+            $rsid = (int) ($req['reseller_site_id'] ?? 0);
+            if ($rsid > 0 && !$admin) {
+                require_once __DIR__ . '/Reseller.php';
+                return Reseller::ownedSite((int) ($req['client_id'] ?? 0), $rsid) ? Reseller::server() : null;
+            }
+            $id = (string) ($req['id'] ?? '');
+            if (!preg_match('/^[1-9][0-9]{0,9}$/D', $id)) {
+                return null;
+            }
+            $svc = Capsule::table('tblhosting')->where('id', (int) $id)->first(['id', 'userid', 'server']);
+            if (!$svc || (!$admin && (int) $svc->userid !== (int) ($req['client_id'] ?? 0))) {
+                return null;
+            }
+            $server = Capsule::table('tblservers')->where('id', (int) $svc->server)
+                ->first(['type', 'hostname', 'ipaddress', 'secure', 'port', 'accesshash', 'password']);
+            return $server && ($server->type ?? '') === 'pasargadcdn' ? $server : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /** Masks personal data and secrets in free text: e-mails, IPv4 addresses, key=value secrets, long tokens. */
+    public static function scrub(string $s): string
+    {
+        $s = (string) preg_replace('/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/', '[email]', $s);
+        $s = (string) preg_replace('/\b(?:\d{1,3}\.){3}\d{1,3}\b/', '[ip]', $s);
+        $s = (string) preg_replace('/\b((?:api[_-]?)?key|token|secret|password|passwd|auth|session|csrf)(["\']?\s*[=:]\s*["\']?)[^\s"\'&,;)]+/i', '$1$2[redacted]', $s);
+        return (string) preg_replace('/\b[A-Za-z0-9_\-]{32,}\b/', '[redacted]', $s);
+    }
+
+    /** URLs inside a text reduced to their path: no scheme / host, no query string, no fragment. */
+    public static function stripUrls(string $s): string
+    {
+        $s = (string) preg_replace('#[a-z][a-z0-9+.-]*://[^/\s)]*#i', '', $s);
+        return (string) preg_replace('/[?#][^\s):]*/', '', $s);
+    }
+
+    private static function clip(string $s, int $max): string
+    {
+        $s = (string) preg_replace('/[\x00-\x08\x0B-\x1F\x7F]/', '', $s);
+        if (!preg_match('//u', $s)) {
+            $s = function_exists('mb_convert_encoding') ? (string) mb_convert_encoding($s, 'UTF-8', 'UTF-8') : '';
+        }
+        if (strlen($s) <= $max) {
+            return $s;
+        }
+        $cut = substr($s, 0, $max);
+        // never end inside a multi-byte character
+        return function_exists('mb_strcut') ? mb_strcut($s, 0, $max, 'UTF-8') : (string) preg_replace('/[\x80-\xBF]*[\xC0-\xFF]?$/', '', $cut);
+    }
+
+    /**
+     * SPEC §18.4 report shape {message, source (path only), line, col, stack (≤ 4 KB, query strings stripped),
+     * page, ua}: every field typed, clipped and scrubbed; unknown fields dropped.
+     */
+    public static function sanitizeClientError(array $d): array
+    {
+        $str = function ($k) use ($d) {
+            return is_string($d[$k] ?? null) ? $d[$k] : '';
+        };
+        $int = function ($k) use ($d) {
+            $v = $d[$k] ?? 0;
+            return is_int($v) && $v >= 0 && $v <= 10000000 ? $v : 0;
+        };
+        $src = $str('source');
+        $path = (string) (parse_url($src, PHP_URL_PATH) ?? '');
+        if ($path === '' || $path[0] !== '/') {
+            $path = '';
+        }
+        $page = $str('page');
+        return [
+            'message' => self::clip(self::scrub(self::stripUrls($str('message'))), 1000),
+            'source' => self::clip(self::scrub($path), 300),
+            'line' => $int('line'),
+            'col' => $int('col'),
+            'stack' => self::clip(self::scrub(self::stripUrls($str('stack'))), self::CLIENT_ERROR_STACK),
+            'page' => preg_match('/^[a-z0-9_-]{1,40}$/D', $page) ? $page : 'unknown',
+            'ua' => self::clip($str('ua'), 300),
+        ];
     }
 
     public static function allowed(string $method, string $path): bool

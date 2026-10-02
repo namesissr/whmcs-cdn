@@ -5,6 +5,7 @@ namespace PasargadCdn\Admin;
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
 use PasargadCdn\ClientApi;
+use PasargadCdn\Download;
 use WHMCS\Database\Capsule;
 
 if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
@@ -17,7 +18,7 @@ if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
  */
 final class Admin
 {
-    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'settings', 'manage', 'api'];
+    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'referrals', 'settings', 'manage', 'api'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -42,7 +43,19 @@ final class Admin
         }
         if ($page === 'api') {
             [$code, $data] = self::api($get, $method);
+            if ($data instanceof Download) {
+                // SPEC §18.3: a statement / audit file of the customer app in admin mode
+                self::emit($code, $data->type, $data->body, $data->filename);
+                return '';
+            }
             self::emit($code, 'application/json; charset=utf-8', (string) json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            return '';
+        }
+        if ($page === 'audit' && ($get['export'] ?? '') === 'csv') {
+            // SPEC §18.3: the controller's platform-wide audit export (GET /api/v1/audit/export?from&to&format=csv)
+            [$code, $type, $body, $file] = Pages::auditCsv($get);
+            Env::log('audit CSV exported (' . $file . ') by admin #' . Env::adminId());
+            self::emit($code, $type, $body, $file);
             return '';
         }
         if ($page === 'usage' && ($get['export'] ?? '') === 'csv') {
@@ -98,6 +111,10 @@ final class Admin
             case 'audit':
                 $body = Pages::audit($get);
                 break;
+            case 'referrals':
+                require_once __DIR__ . '/Referrals.php';
+                $body = Referrals::adminPage($get);
+                break;
             case 'settings':
                 $body = Pages::settings();
                 break;
@@ -122,13 +139,20 @@ final class Admin
         if ($sid === '' || $sid !== $id) {
             return [404, ['detail' => 'سرویس یافت نشد.']];
         }
+        if (($get['action'] ?? '') === 'client-error') {
+            // SPEC §18.4: a JavaScript error of the customer app opened in admin mode (same sanitising / rate limit)
+            return ClientApi::clientError(['method' => $method, 'id' => $id, 'admin_id' => Env::adminId(),
+                'body' => $method === 'POST' ? self::readBody(ClientApi::CLIENT_ERROR_MAX_BODY + 1) : '',
+                'csrf' => (string) ($_SERVER['HTTP_X_PCDN_CSRF'] ?? ''), 'session_csrf' => (string) ($_SESSION['pasargadcdn_admin_csrf'] ?? '')],
+                $_SESSION, self::$apiFactory);
+        }
         $body = '';
         if ($method === 'POST' || $method === 'PUT') {
             // 256 KB, or 9 MB for PUT config/functions (SPEC §16.9 edge-function code) — ClientApi::maxBody
             $body = (string) self::readBody(ClientApi::maxBody($method, is_string($get['path'] ?? null) ? $get['path'] : '') + 1);
         }
         $query = $get;
-        unset($query['module'], $query['page'], $query['service'], $query['id'], $query['path'], $query['token']);
+        unset($query['module'], $query['page'], $query['service'], $query['id'], $query['path'], $query['token'], $query['action']);
         return ClientApi::handle([
             'method' => $method,
             'id' => $id,
@@ -245,6 +269,18 @@ final class Admin
                 return [[['ok', 'سرور ذخیره شد.']], []];
             case 'owner_sync':
                 return [[self::ownerSync($admin)], []];
+            case 'referral_cancel':
+                require_once __DIR__ . '/Referrals.php';
+                $rid = (int) ($post['id'] ?? 0);
+                return [[Referrals::cancel($rid, $admin) ? ['ok', 'پاداش معرفی #' . View::n($rid) . ' لغو شد.']
+                    : ['bad', 'این معرفی قابل لغو نیست (پرداخت یا لغو شده است).']], []];
+            case 'referral_run':
+                require_once __DIR__ . '/Referrals.php';
+                $r = Referrals::run();
+                Env::log('referral payout run by admin #' . $admin . ': ' . count($r['paid']) . ' paid, ' . count($r['cancelled']) . ' cancelled, '
+                    . count($r['deferred']) . ' deferred, ' . count($r['failed']) . ' failed');
+                return [[[$r['failed'] ? 'warn' : 'ok', 'پرداخت پاداش‌ها: ' . View::n(count($r['paid'])) . ' پرداخت، ' . View::n(count($r['cancelled'])) . ' لغو، '
+                    . View::n(count($r['deferred'])) . ' به ماه بعد (سقف ماهانه)، ' . View::n(count($r['failed'])) . ' ناموفق.']], []];
             case 'clear_cache':
                 Env::cacheDelete(WidgetData::KEY);
                 return [[['ok', 'حافظه موقت ویجت پاک شد؛ در بارگذاری بعدی صفحه اصلی داده تازه نمایش داده می‌شود.']], []];

@@ -28,6 +28,12 @@
  *    one GET /api/v1/sites per CDN server and at most 100 PATCH …/owner per run;
  *    afterwards one pass every 6 hours (addon setting «همگام‌سازی مالکیت دامنه‌ها»).
  *    Errors are logged, never thrown into WHMCS's cron.
+ *  - Wave 10 (SPEC §18.5) referral programme — every hook returns after one memoised settings read while
+ *    the programme is off (the default): ClientAreaPage keeps a `?ref=` code (session + 30-day cookie),
+ *    AfterShoppingCartCheckout attaches it to the new client's first CDN order, InvoicePaid qualifies it
+ *    (through Prepaid's single read of the invoice lines; only invoices with a Hosting line cost one more
+ *    settings read), InvoiceRefunded / InvoiceCancelled cancel an unpaid reward,
+ *    AfterCronJob pays due rewards once a day (AddCredit), ClientAreaHomepagePanels shows the client card.
  */
 
 if (!defined('WHMCS')) {
@@ -100,12 +106,110 @@ add_hook('InvoicePaid', 1, function ($vars) {
         require_once __DIR__ . '/lib/Prepaid.php';
         require_once __DIR__ . '/lib/Wizard.php';
         require_once __DIR__ . '/lib/AddonTraffic.php';
-        // Prepaid reads the invoice lines once; Wave 7 «Addon» lines go to AddonTraffic (any billing mode)
+        require_once __DIR__ . '/lib/Referrals.php';
+        // Prepaid reads the invoice lines once; Wave 7 «Addon» lines go to AddonTraffic (any billing mode); Wave 10
+        // Hosting lines of a referred client's first CDN invoice qualify the referral (Referrals)
         \PasargadCdn\Admin\Prepaid::onInvoicePaid($id);
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: InvoicePaid hook error: ' . $e->getMessage());
         }
+    }
+});
+
+// ---------------------------------------------------------------- Wave 10 (SPEC §18.5) referral programme
+
+add_hook('ClientAreaPage', 1, function ($vars) {
+    if (!isset($_GET['ref']) || !is_string($_GET['ref'])) {
+        return [];
+    }
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Referrals.php';
+        if (\PasargadCdn\Admin\Referrals::on()) {
+            \PasargadCdn\Admin\Referrals::capture($_GET);
+        }
+    } catch (\Throwable $e) {
+        // a referral link never breaks a page
+    }
+    return [];
+});
+
+add_hook('AfterShoppingCartCheckout', 1, function ($vars) {
+    $order = is_array($vars) ? (int) ($vars['OrderID'] ?? 0) : 0;
+    if ($order <= 0) {
+        return;
+    }
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Referrals.php';
+        if (\PasargadCdn\Admin\Referrals::on()) {
+            \PasargadCdn\Admin\Referrals::attach($order, (int) ($vars['InvoiceID'] ?? 0), '', (string) ($_SERVER['REMOTE_ADDR'] ?? ''));
+        }
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: referral checkout error (order not affected): ' . $e->getMessage());
+        }
+    }
+});
+
+foreach (['InvoiceRefunded' => 'refunded', 'InvoiceCancelled' => 'invoice_cancelled'] as $pcdnHook => $pcdnReason) {
+    add_hook($pcdnHook, 1, function ($vars) use ($pcdnReason) {
+        $id = is_array($vars) ? (int) ($vars['invoiceid'] ?? 0) : 0;
+        if ($id <= 0) {
+            return;
+        }
+        try {
+            require_once __DIR__ . '/lib/Env.php';
+            require_once __DIR__ . '/lib/View.php';
+            require_once __DIR__ . '/lib/Referrals.php';
+            \PasargadCdn\Admin\Referrals::onInvoiceReversed($id, $pcdnReason);
+        } catch (\Throwable $e) {
+            if (function_exists('logActivity')) {
+                logActivity('Pasargad CDN: referral refund hook error: ' . $e->getMessage());
+            }
+        }
+    });
+}
+unset($pcdnHook, $pcdnReason);
+
+add_hook('ClientAreaHomepagePanels', 1, function ($panels) {
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Referrals.php';
+        if (!is_object($panels) || !method_exists($panels, 'addChild') || !\PasargadCdn\Admin\Referrals::on()) {
+            return;
+        }
+        $uid = 0;
+        if (class_exists('\\WHMCS\\Authentication\\CurrentUser')) {
+            $c = (new \WHMCS\Authentication\CurrentUser())->client();
+            $uid = $c ? (int) $c->id : 0;
+        } else {
+            $uid = (int) ($_SESSION['uid'] ?? 0);
+        }
+        if ($uid <= 0) {
+            return;
+        }
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Pricing.php';
+        require_once __DIR__ . '/lib/Referrals.php';
+        if (!\PasargadCdn\Admin\Referrals::enabled()) {
+            return;
+        }
+        $lang = \PasargadCdn\Admin\Pricing::lang([]);
+        $panels->addChild('pasargadcdn_referral', [
+            'label' => \PasargadCdn\Admin\Referrals::tx('title', $lang),
+            'icon' => 'fa-gift',
+            'order' => 250,
+            'extras' => ['color' => 'teal', 'btn-link' => 'index.php?m=pasargadcdn_admin&page=referral',
+                'btn-text' => \PasargadCdn\Admin\Referrals::tx('more', $lang)],
+            'bodyHtml' => \PasargadCdn\Admin\Referrals::cardHtml($uid, $lang),
+        ]);
+    } catch (\Throwable $e) {
+        // the home page never breaks because of this card
     }
 });
 
@@ -167,6 +271,19 @@ add_hook('AfterCronJob', 1, function ($vars) {
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: owner sync cron hook error: ' . $e->getMessage());
+        }
+    }
+    // Wave 10 (SPEC §18.5): due referral rewards (once a day; nothing while the programme is off)
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Referrals.php';
+        if (\PasargadCdn\Admin\Referrals::on()) {
+            \PasargadCdn\Admin\Referrals::onCron();
+        }
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: referral cron hook error: ' . $e->getMessage());
         }
     }
     // SPEC §16.8: object-storage charges of the previous month (once, after the month closes)

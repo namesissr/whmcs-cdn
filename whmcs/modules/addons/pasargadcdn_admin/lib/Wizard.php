@@ -71,6 +71,11 @@ final class Wizard
     const FLAGS = ['ssl' => 3, 'waf' => 5, 'ddos' => 6, 'lb' => 7, 'image' => 8, 'customssl' => 9, 'dnssec' => 10, 'tunnel' => 15];
     const NUMS = ['records' => 2, 'rate' => 4, 'page' => 11, 'fw' => 12, 'rl' => 13, 'pools' => 14, 'tpaths' => 16, 'tconn' => 17, 'tmbps' => 18];
     const GROUP_OPTION = 19;
+    /**
+     * Wave 10 (SPEC §18.1/§18.2): plan features waiting_room / access in configoption20 / 21 as on | off — never
+     * left on «auto» by the wizard, so moving a service to a lower wizard plan takes the feature away again.
+     */
+    const W10 = ['wroom' => 20, 'access' => 21];
     const EDGE_GROUPS = ['general' => 'عمومی', 'tunnel' => 'تونل'];
     const NUM_MAX = ['bw' => 1000000, 'records' => 100000, 'rate' => 100000, 'page' => 10000, 'fw' => 10000, 'rl' => 10000, 'pools' => 1000,
         'tpaths' => 50, 'tconn' => 1000000, 'tmbps' => 100000];
@@ -84,6 +89,7 @@ final class Wizard
         'customssl' => 'گواهی اختصاصی', 'dnssec' => 'DNSSEC', 'page' => 'قوانین صفحه', 'fw' => 'قوانین فایروال',
         'rl' => 'قوانین محدودیت نرخ', 'pools' => 'استخر توزیع بار', 'tunnel' => 'حالت تونل (VPN)', 'tpaths' => 'مسیر تونل',
         'tconn' => 'اتصال همزمان هر نود', 'tmbps' => 'سقف سرعت اتصال (Mbps)', 'group' => 'گروه نودها',
+        'wroom' => 'اتاق انتظار', 'access' => 'دسترسی محافظت‌شده (ورود ایمیلی / IP)',
     ];
 
     // Tunnel (VPN-over-CDN, SPEC §7) is included in every CDN plan: no separate product, no extra cost —
@@ -92,16 +98,16 @@ final class Wizard
     const PLANS = [
         'basic' => ['title' => 'پایه', 'name' => 'CDN پایه', 'family' => 'site', 'bw' => 100, 'records' => 50, 'rate' => 0, 'ssl' => 1, 'waf' => 0,
             'ddos' => 1, 'lb' => 0, 'image' => 0, 'customssl' => 0, 'dnssec' => 1, 'page' => 3, 'fw' => 5, 'rl' => 1, 'pools' => 0,
-            'tunnel' => 1, 'tpaths' => 3, 'tconn' => 300, 'tmbps' => 0, 'group' => 'general'],
+            'tunnel' => 1, 'tpaths' => 3, 'tconn' => 300, 'tmbps' => 0, 'group' => 'general', 'wroom' => 0, 'access' => 0],
         'pro' => ['title' => 'حرفه‌ای', 'name' => 'CDN حرفه‌ای', 'family' => 'site', 'bw' => 500, 'records' => 200, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
             'ddos' => 1, 'lb' => 0, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 10, 'fw' => 20, 'rl' => 5, 'pools' => 0,
-            'tunnel' => 1, 'tpaths' => 10, 'tconn' => 2000, 'tmbps' => 0, 'group' => 'general'],
+            'tunnel' => 1, 'tpaths' => 10, 'tconn' => 2000, 'tmbps' => 0, 'group' => 'general', 'wroom' => 0, 'access' => 0],
         'business' => ['title' => 'تجاری', 'name' => 'CDN تجاری', 'family' => 'site', 'bw' => 2000, 'records' => 500, 'rate' => 0, 'ssl' => 1, 'waf' => 1,
             'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 25, 'fw' => 50, 'rl' => 15, 'pools' => 3,
-            'tunnel' => 1, 'tpaths' => 20, 'tconn' => 5000, 'tmbps' => 0, 'group' => 'general'],
+            'tunnel' => 1, 'tpaths' => 20, 'tconn' => 5000, 'tmbps' => 0, 'group' => 'general', 'wroom' => 1, 'access' => 1],
         'enterprise' => ['title' => 'سازمانی', 'name' => 'CDN سازمانی', 'family' => 'site', 'bw' => 10000, 'records' => 2000, 'rate' => 0, 'ssl' => 1,
             'waf' => 1, 'ddos' => 1, 'lb' => 1, 'image' => 1, 'customssl' => 1, 'dnssec' => 1, 'page' => 100, 'fw' => 200, 'rl' => 50, 'pools' => 10,
-            'tunnel' => 1, 'tpaths' => 30, 'tconn' => 0, 'tmbps' => 0, 'group' => 'general'],
+            'tunnel' => 1, 'tpaths' => 30, 'tconn' => 0, 'tmbps' => 0, 'group' => 'general', 'wroom' => 1, 'access' => 1],
     ];
 
     /** Default monthly price per plan by currency kind (unchanged — tunnel is included at no extra cost). */
@@ -202,6 +208,12 @@ final class Wizard
         }
         if ($p['dnssec']) {
             $extra[] = 'DNSSEC';
+        }
+        if (!empty($p['wroom'])) {
+            $extra[] = 'اتاق انتظار برای اوج ترافیک';
+        }
+        if (!empty($p['access'])) {
+            $extra[] = 'دسترسی محافظت‌شده با ورود ایمیلی / IP';
         }
         if ($extra) {
             $li[] = implode('، ', $extra);
@@ -421,6 +433,9 @@ final class Wizard
             foreach (self::FLAGS as $f => $_) {
                 $row[$f] = !empty($p[$f]) ? 1 : 0;
             }
+            foreach (self::W10 as $f => $_) {
+                $row[$f] = !empty($p[$f]) ? 1 : 0;
+            }
             if (!$row['lb']) {
                 $row['pools'] = 0;
             }
@@ -512,7 +527,7 @@ final class Wizard
         return (int) ceil($bw * (100 + (int) $in['overage_allow']) / 100);
     }
 
-    /** configoption1..19 for a plan. */
+    /** configoption1..21 for a plan (20 / 21: wave 10 features, on | off). */
     public static function configOptions(array $p, array $in): array
     {
         $o = ['configoption1' => (string) self::hardCap($p, $in)];
@@ -523,6 +538,9 @@ final class Wizard
             $o['configoption' . $n] = !empty($p[$f]) ? 'on' : '';
         }
         $o['configoption' . self::GROUP_OPTION] = ($p['group'] ?? 'general') === 'tunnel' ? 'tunnel' : 'general';
+        foreach (self::W10 as $f => $n) {
+            $o['configoption' . $n] = !empty($p[$f]) ? 'on' : 'off';
+        }
         ksort($o, SORT_NATURAL);
         return $o;
     }
@@ -989,6 +1007,20 @@ final class Wizard
                 } else {
                     if ($emailId && empty($prod->welcomeemail)) {
                         Capsule::table('tblproducts')->where('id', $pid)->update(['welcomeemail' => $emailId]);
+                    }
+                    // Wave 10: an existing wizard product that predates waiting_room / access gets the plan's
+                    // value once (an admin's own on / off is kept) — re-running the wizard changes nothing more
+                    $fill = [];
+                    foreach (self::W10 as $f => $n) {
+                        $cur = strtolower(trim((string) ($prod->{'configoption' . $n} ?? '')));
+                        if ($cur === '' || $cur === 'auto') {
+                            $fill['configoption' . $n] = !empty($p[$f]) ? 'on' : 'off';
+                        }
+                    }
+                    if ($fill) {
+                        Capsule::table('tblproducts')->where('id', $pid)->update(Env::onlyColumns('tblproducts', $fill));
+                        $out[] = ['op' => 'update', 'kind' => 'امکانات پلن', 'label' => $p['name'] . ' — '
+                            . self::FIELD_LABELS['wroom'] . ' / ' . self::FIELD_LABELS['access'], 'link' => 'configproducts.php?action=edit&id=' . $pid];
                     }
                     $out[] = ['op' => 'skip', 'kind' => 'محصول', 'label' => $p['name'], 'link' => 'configproducts.php?action=edit&id=' . $pid,
                         'plan' => $key, 'pid' => $pid];

@@ -35,7 +35,7 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.3.0',
+        'version' => '1.4.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',
@@ -154,6 +154,68 @@ function pasargadcdn_admin_config()
                 'Default' => '20',
                 'Description' => 'سقف پیش‌فرض تعداد زیرسایت‌هایی که هر نماینده می‌تواند بسازد (۰ = نامحدود)؛ برای هر نماینده قابل بازنویسی است',
             ],
+            // ---- Wave 10 (SPEC §18.5): public pricing page + referral programme — all off by default
+            'pricing_enabled' => [
+                'FriendlyName' => 'صفحهٔ عمومی قیمت‌ها',
+                'Type' => 'yesno',
+                'Default' => '',
+                'Description' => 'صفحهٔ مقایسهٔ پلن‌ها بدون نیاز به ورود: index.php?m=pasargadcdn_admin&page=pricing (و &format=json برای سایت اصلی)؛ ۱۰ دقیقه کش',
+            ],
+            'pricing_hidden' => [
+                'FriendlyName' => 'پلن‌های پنهان در صفحهٔ قیمت',
+                'Type' => 'text',
+                'Size' => '30',
+                'Default' => '',
+                'Description' => 'شناسهٔ محصولاتی که در صفحهٔ قیمت نمایش داده نشوند (با کاما جدا کنید)',
+            ],
+            'referral_enabled' => [
+                'FriendlyName' => 'برنامهٔ معرفی',
+                'Type' => 'yesno',
+                'Default' => '',
+                'Description' => 'هر مشتری لینک cart.php?ref=… دارد؛ پس از پرداخت اولین فاکتور CDN مشتری معرفی‌شده و گذشت مهلت، به هر دو اعتبار (Credit) WHMCS داده می‌شود',
+            ],
+            'referral_reward_referrer' => [
+                'FriendlyName' => 'پاداش معرف',
+                'Type' => 'text',
+                'Size' => '12',
+                'Default' => '0',
+                'Description' => 'مبلغ اعتبار برای معرف (به ارز پاداش؛ ۰ = بدون پاداش)',
+            ],
+            'referral_reward_referred' => [
+                'FriendlyName' => 'پاداش مشتری معرفی‌شده',
+                'Type' => 'text',
+                'Size' => '12',
+                'Default' => '0',
+                'Description' => 'مبلغ اعتبار خوش‌آمد برای مشتری جدید (به ارز پاداش؛ ۰ = بدون پاداش)',
+            ],
+            'referral_currency' => [
+                'FriendlyName' => 'ارز پاداش',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '',
+                'Description' => 'کد ارز WHMCS مبلغ‌های بالا (مثلاً IRT)؛ خالی = ارز پیش‌فرض. برای مشتری با ارز دیگر با نرخ WHMCS تبدیل می‌شود',
+            ],
+            'referral_delay_days' => [
+                'FriendlyName' => 'مهلت پرداخت پاداش (روز)',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '7',
+                'Description' => 'پاداش این تعداد روز پس از پرداخت فاکتور داده می‌شود (کران روزانه)؛ بازپرداخت در این مدت پاداش را لغو می‌کند',
+            ],
+            'referral_monthly_cap' => [
+                'FriendlyName' => 'سقف پاداش ماهانهٔ هر معرف',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '5',
+                'Description' => 'حداکثر تعداد پاداش هر معرف در یک ماه (۰ = نامحدود)؛ بقیه به ماه بعد منتقل می‌شوند',
+            ],
+            'referral_public_domains' => [
+                'FriendlyName' => 'دامنه‌های ایمیل عمومی',
+                'Type' => 'text',
+                'Size' => '60',
+                'Default' => '',
+                'Description' => 'هم‌دامنه بودن ایمیل معرف و مشتری جدید معرفی را رد می‌کند، مگر برای این سرویس‌دهنده‌های عمومی (خالی = فهرست پیش‌فرض: gmail.com، yahoo.com، outlook.com، …)',
+            ],
             'reserved' => [
                 'FriendlyName' => 'دامنه‌های رزرو',
                 'Type' => 'text',
@@ -201,9 +263,45 @@ function pasargadcdn_admin_output($vars)
     require_once __DIR__ . '/lib/Resellers.php';
     require_once __DIR__ . '/lib/Pages.php';
     require_once __DIR__ . '/lib/OwnerSync.php';
+    require_once __DIR__ . '/lib/Referrals.php';
     require_once __DIR__ . '/lib/Admin.php';
     echo PasargadCdn\Admin\Admin::output(is_array($vars) ? $vars : [], $_GET, $_POST,
         strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
+}
+
+/**
+ * Wave 10 (SPEC §18.5): the addon's client-area routes —
+ *   index.php?m=pasargadcdn_admin&page=pricing[&format=json][&lang=fa|en]  public plan comparison (no login)
+ *   index.php?m=pasargadcdn_admin&page=referral                          the client's referral link and counts
+ * Both are off until enabled in the addon settings.
+ */
+function pasargadcdn_admin_clientarea($vars)
+{
+    require_once __DIR__ . '/lib/View.php';
+    require_once __DIR__ . '/lib/Pricing.php';
+    require_once __DIR__ . '/lib/Referrals.php';
+    $get = array_filter($_GET, 'is_string');
+    $clientId = 0;
+    try {
+        if (class_exists('\\WHMCS\\Authentication\\CurrentUser')) {
+            $c = (new \WHMCS\Authentication\CurrentUser())->client();
+            $clientId = $c ? (int) $c->id : 0;
+        } else {
+            $clientId = (int) ($_SESSION['uid'] ?? 0);
+        }
+    } catch (\Throwable $e) {
+        $clientId = (int) ($_SESSION['uid'] ?? 0);
+    }
+    if (($get['page'] ?? 'pricing') === 'referral') {
+        $lang = PasargadCdn\Admin\Pricing::lang($get);
+        $title = PasargadCdn\Admin\Referrals::tx('title', $lang);
+        $html = $clientId > 0 && PasargadCdn\Admin\Referrals::enabled()
+            ? PasargadCdn\Admin\Referrals::cardHtml($clientId, $lang, true)
+            : '<div class="alert alert-info">' . htmlspecialchars(PasargadCdn\Admin\Referrals::tx('off', $lang), ENT_QUOTES, 'UTF-8') . '</div>';
+        return ['pagetitle' => $title, 'breadcrumb' => ['index.php?m=pasargadcdn_admin&page=referral' => $title],
+            'templatefile' => 'pricing', 'requirelogin' => true, 'forcessl' => false, 'vars' => ['pcdn_html' => $html, 'pcdn_lang' => $lang]];
+    }
+    return PasargadCdn\Admin\Pricing::clientArea($get, $clientId) ?? [];
 }
 
 function pasargadcdn_admin_sidebar($vars)
@@ -211,7 +309,7 @@ function pasargadcdn_admin_sidebar($vars)
     $link = htmlspecialchars((string) ($vars['modulelink'] ?? 'addonmodules.php?module=pasargadcdn_admin'), ENT_QUOTES, 'UTF-8');
     $items = ['dashboard' => 'داشبورد', 'sites' => 'سایت‌ها', 'edges' => 'نودها', 'plans' => 'پلن‌ها و قیمت‌گذاری',
         'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'resellers' => 'نمایندگان', 'events' => 'رویدادهای امنیتی',
-        'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'settings' => 'تنظیمات و سلامت'];
+        'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'referrals' => 'معرفی‌ها', 'settings' => 'تنظیمات و سلامت'];
     $h = '<span class="header"><i class="fas fa-bolt"></i> CDN پاسارگاد</span><ul class="menu" dir="rtl" style="text-align:right">';
     foreach ($items as $page => $label) {
         $h .= '<li><a href="' . $link . '&amp;page=' . $page . '">' . $label . '</a></li>';

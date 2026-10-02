@@ -102,6 +102,15 @@ final class Prepaid
             if ($addons && class_exists(__NAMESPACE__ . '\\AddonTraffic')) {
                 AddonTraffic::applyItems($invoiceId, $addons);
             }
+            // Wave 10 (SPEC §18.5): a referred client's first paid CDN invoice (Hosting lines only; one settings read
+            // while the referral programme is off)
+            if (in_array('Hosting', $types, true) && class_exists(__NAMESPACE__ . '\\Referrals')) {
+                try {
+                    Referrals::onInvoicePaid($invoiceId, $items);
+                } catch (\Throwable $e) {
+                    Env::log('referral InvoicePaid #' . $invoiceId . ' error: ' . $e->getMessage());
+                }
+            }
             if (!$topup && !$rtopup && !$funds) {
                 return; // ordinary invoice: one query, nothing else
             }

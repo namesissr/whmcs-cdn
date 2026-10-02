@@ -29,6 +29,8 @@ final class Pages
         'status' => ['وضعیت و رخدادها', 'activity'],
         'health' => ['سلامت سامانه', 'heart'],
         'audit' => ['حسابرسی', 'history'],
+        // Wave 10 (SPEC §18.5): referral ledger
+        'referrals' => ['معرفی‌ها', 'users'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
     ];
 
@@ -1919,7 +1921,8 @@ final class Pages
                 $h .= '<td><input class="pcdna-input" name="plan[' . $key . '][name]" maxlength="100" value="' . View::e($in['plans'][$key]['name']) . '" aria-label="نام محصول ' . View::e(Wizard::PLANS[$key]['title']) . '"></td>';
             }
             $h .= '</tr>';
-            $fields = ['bw', 'records', 'ssl', 'rate', 'waf', 'ddos', 'lb', 'image', 'customssl', 'dnssec', 'page', 'fw', 'rl', 'pools', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group'];
+            $fields = ['bw', 'records', 'ssl', 'rate', 'waf', 'ddos', 'lb', 'image', 'customssl', 'dnssec', 'page', 'fw', 'rl', 'pools', 'tunnel', 'tpaths', 'tconn', 'tmbps', 'group',
+                'wroom', 'access'];
             foreach ($fields as $f) {
                 $h .= '<tr data-field="' . $f . '"><th>' . View::e(Wizard::FIELD_LABELS[$f]) . '</th>';
                 foreach ($keys as $key) {
@@ -1930,7 +1933,7 @@ final class Pages
                         $h .= '<td>' . View::select($nm, Wizard::EDGE_GROUPS, (string) $v, $aria) . '</td>';
                         continue;
                     }
-                    $h .= '<td>' . (isset(Wizard::FLAGS[$f])
+                    $h .= '<td>' . (isset(Wizard::FLAGS[$f]) || isset(Wizard::W10[$f])
                             ? '<label class="pcdna-switch"><input type="checkbox" name="' . $nm . '" value="1"' . ($v ? ' checked' : '') . $aria . '><span></span></label>'
                             : '<input class="pcdna-input pcdna-input-num" name="' . $nm . '" dir="ltr" inputmode="numeric" value="' . (int) $v . '"' . $aria . '>') . '</td>';
                 }
@@ -1943,7 +1946,8 @@ final class Pages
             . 'با «گروه نودها = عمومی» تونل از همه نودها سرو می‌شود (پیشنهادی)؛ اگر «تونل» را انتخاب کنید فقط به نودهای گروه تونل هدایت می‌شود و در نبود نود آنلاین همه نودها پاسخ می‌دهند. '
             . '«اتصال همزمان هر نود» ۰ یعنی نامحدود (هر جریان WebSocket/gRPC یک اتصال است). '
             . '«سقف سرعت اتصال» ۰ یعنی بدون سقف و فعلاً روی جریان‌های تونل اعمال نمی‌شود. '
-            . 'این مقادیر در Module Settings محصول (configoption1..19) ذخیره می‌شوند؛ برای سرویس‌های موجود با دکمه «فعال‌سازی تونل روی سرویس‌های فعلی» (بالای همین صفحه) یا ChangePackage اعمال می‌شوند.</p></fieldset>';
+            . '«اتاق انتظار» و «دسترسی محافظت‌شده» (موج ۱۰) در configoption20 / 21 با on / off ذخیره می‌شوند؛ اجرای دوبارهٔ ویزارد برای محصولات قدیمی فقط مقدار خالی را پر می‌کند. '
+            . 'این مقادیر در Module Settings محصول (configoption1..21) ذخیره می‌شوند؛ برای سرویس‌های موجود با دکمه «فعال‌سازی تونل روی سرویس‌های فعلی» (بالای همین صفحه) یا ChangePackage اعمال می‌شوند.</p></fieldset>';
 
         // prices
         $h .= '<fieldset class="pcdna-fieldset"><legend>قیمت‌ها</legend><p class="pcdna-muted pcdna-small">خانه خالی یعنی آن دوره پرداخت غیرفعال است (در WHMCS با ‎-1 ذخیره می‌شود). '
@@ -2863,7 +2867,45 @@ final class Pages
         });
         $body = $entries ? self::auditTable($entries)
             : View::emptyState('رخدادی با این فیلتر پیدا نشد', 'فیلترها را تغییر دهید یا بازهٔ زمانی را گسترده‌تر کنید.', 'history');
-        return $h . View::card('حسابرسی (' . View::n(count($entries)) . ' مورد)', $body, '', 'pcdna-flush', 'history');
+        // SPEC §18.3: the whole platform audit of the chosen range as CSV (controller GET /api/v1/audit/export)
+        $export = '<a class="pcdna-btn pcdna-btn-sm pcdna-audit-export" href="' . View::url(['page' => 'audit', 'export' => 'csv', 'range' => $range]) . '">'
+            . View::icon('download') . '<span>دریافت CSV</span></a>';
+        return $h . View::card('حسابرسی (' . View::n(count($entries)) . ' مورد)', $body, $export, 'pcdna-flush', 'history');
+    }
+
+    const AUDIT_CSV_MAX = 16777216; // 16 MB
+
+    /**
+     * SPEC §18.3 «دریافت CSV» of the audit page: GET /api/v1/audit/export?from&to&format=csv with the admin key,
+     * streamed as the controller made it (≤ 16 MB, text/csv only). Range = the page's range filter (all = from
+     * the beginning). Returns [status, content type, body, filename].
+     */
+    public static function auditCsv(array $get): array
+    {
+        $range = array_key_exists((string) ($get['range'] ?? ''), self::AUDIT_RANGES) ? (string) $get['range'] : '7d';
+        $secs = self::AUDIT_RANGES[$range][1];
+        $now = time();
+        $q = ['format' => 'csv', 'to' => gmdate('Y-m-d\TH:i:s\Z', $now)];
+        if ($secs > 0) {
+            $q['from'] = gmdate('Y-m-d\TH:i:s\Z', $now - $secs);
+        }
+        $file = 'pasargadcdn-audit-' . ($secs > 0 ? gmdate('Y-m-d', $now - $secs) . '-' : 'all-') . gmdate('Y-m-d', $now) . '.csv';
+        try {
+            [$code, $body, $type] = Env::api(30)->download('/api/v1/audit/export?' . http_build_query($q), self::AUDIT_CSV_MAX, 'text/csv, application/json;q=0.5');
+        } catch (\Throwable $e) {
+            return [502, 'text/plain; charset=utf-8', 'controller error: ' . $e->getMessage(), ''];
+        }
+        if ($body === null) {
+            return [502, 'text/plain; charset=utf-8', 'controller error: export larger than 16 MB', ''];
+        }
+        if ($code === 404) {
+            return [404, 'text/plain; charset=utf-8', 'this controller has no audit export yet (GET /api/v1/audit/export)', ''];
+        }
+        $ct = strtolower(trim(explode(';', (string) $type)[0]));
+        if ($code !== 200 || !in_array($ct, ['text/csv', 'application/csv', 'text/plain'], true) || preg_match('/^(\xEF\xBB\xBF)?\s*</', (string) $body)) {
+            return [502, 'text/plain; charset=utf-8', 'controller error: HTTP ' . $code . ' ' . $ct, ''];
+        }
+        return [200, 'text/csv; charset=utf-8', (string) $body, $file];
     }
 
     private static function auditTable(array $entries): string

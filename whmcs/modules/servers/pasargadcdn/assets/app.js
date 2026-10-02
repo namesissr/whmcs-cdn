@@ -83,10 +83,12 @@
     { title: t('قوانین'), items: ['redirects', 'transform'] },
     // SPEC §16.9: «توابع لبه» once the controller's plan features carry edge_functions (functions.js).
     { title: t('توسعه'), items: ['functions'] },
-    { title: t('امنیت'), items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
+    // Wave 10 (SPEC §18.1/§18.2): «دسترسی محافظت‌شده» / «اتاق انتظار» once the controller returns the sections (w10.js).
+    { title: t('امنیت'), items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink', 'access', 'waitingroom'] },
     { title: t('SSL و هدرها'), items: ['ssl', 'headers', 'errorpages'] },
     // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.
-    { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement', 'emailreports'] },
+    // Wave 10 (SPEC §18.3): monthly PDF/CSV statement and the site's change log (w10.js).
+    { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement', 'monthly', 'changes', 'emailreports'] },
     { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys'] }
   ];
   if (RESELLER) NAV.unshift({ title: t('نمایندگی'), items: ['reseller'] });

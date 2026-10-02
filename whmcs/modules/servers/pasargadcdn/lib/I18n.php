@@ -50,6 +50,27 @@ class I18n
         'یافت نشد.' => 'Not found.',
         'ساخت زیرسایت ناموفق بود.' => 'Sub-site creation failed.',
         'متد مجاز نیست.' => 'Method not allowed.',
+        // Wave 10 (SPEC §18): downloads, waiting_room / access body checks, client error reports
+        'دریافت فایل از سرور CDN ممکن نشد.' => 'Could not get the file from the CDN server.',
+        'فایل دریافتی از سرور CDN بیش از حد بزرگ است.' => 'The file from the CDN server is too large.',
+        'فایل دریافتی از سرور CDN معتبر نبود.' => 'The CDN server did not return a valid file.',
+        'باید فهرست باشد.' => 'Must be a list.',
+        'حداکثر %s مورد مجاز است.' => 'At most %s items are allowed.',
+        'دست‌کم یک مسیر لازم است.' => 'At least one path is required.',
+        'پیشوند مسیر باید با / شروع شود، بدون * و ? باشد و حداکثر ۲۵۶ نویسه؛ مسیرهای /__pcdn/ رزرو شده‌اند.'
+            => 'A path prefix must start with /, contain no * or ? and be at most 256 characters; /__pcdn/ paths are reserved.',
+        'آدرس IP یا شبکهٔ نامعتبر است (شبکه حداکثر /8 برای IPv4 و /16 برای IPv6).'
+            => 'Invalid IP address or network (networks at most /8 for IPv4 and /16 for IPv6).',
+        'ایمیل یا @دامنهٔ نامعتبر است (مثل a@b.com یا @company.com).' => 'Invalid e-mail or @domain (like a@b.com or @company.com).',
+        'فیلد ناشناخته است.' => 'Unknown field.',
+        'باید روشن یا خاموش باشد.' => 'Must be on or off.',
+        'مقدار نامعتبر است.' => 'Invalid value.',
+        'باید عدد صحیح بین %s و %s باشد.' => 'Must be a whole number between %s and %s.',
+        'متن حداکثر ۵۰۰ نویسه و بدون نویسهٔ کنترلی باشد.' => 'Text must be at most 500 characters without control characters.',
+        'شناسهٔ برنامه فقط حروف کوچک انگلیسی، عدد و - باشد (حداکثر ۳۲ نویسه).' => 'The app ID may only contain lowercase letters, digits and - (at most 32 characters).',
+        'شناسهٔ برنامه‌ها باید یکتا باشد.' => 'App IDs must be unique.',
+        'نام برنامه لازم است (حداکثر ۱۰۰ نویسه، یک خط).' => 'The app name is required (at most 100 characters, one line).',
+        'گزارش خطا بیش از حد مجاز است؛ کمی بعد دوباره تلاش کنید.' => 'Too many error reports; try again a little later.',
         // ApiClient (controller connection; shown in the client app's error screen)
         'اتصال به سرور CDN برقرار نشد' => 'Could not connect to the CDN server',
         'اتصال به سرور CDN برقرار نشد: %s' => 'Could not connect to the CDN server: %s',
