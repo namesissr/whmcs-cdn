@@ -27,7 +27,7 @@ from . import alerts, kv, sections, webhooks
 from .config import settings
 from .models import AnalyticsMinute, Edge, Site, SiteEvent, State, UsageHourly, utcnow
 from .routes_edge import TUNNEL_ERROR_KEYS, TUNNEL_PROTOCOLS
-from .services import month_start, usage_totals
+from .services import billed_usage, month_start
 from .validation import num
 
 log = logging.getLogger("pcdn.tunnel")
@@ -231,7 +231,7 @@ def usage(db: Session, site: Site, days: int, now: datetime | None = None) -> di
         out.append({"date": key, **(buckets.get(key) or {"bytes_up": 0, "bytes_down": 0, "sessions": 0,
                                                          "by_protocol": {}, "by_path": {}})})
         d += timedelta(days=1)
-    used = usage_totals(db, site.id, mstart)["bytes"]
+    used = billed_usage(db, site, mstart)["bytes"]  # the quota counter (from billing_since, §19.2)
     limit = site.bandwidth_limit_gb * 1024**3 if site.bandwidth_limit_gb > 0 else None
     return {"days": out, "month": {**month_forecast(used, limit, now), "tunnel_bytes": tunnel_month,
                                    "month": now.strftime("%Y-%m")}}

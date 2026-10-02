@@ -362,6 +362,45 @@ def rotate_key(db: Session, site: Site, b: StorageBucket) -> str:
     return secret
 
 
+def pending_rotations(db: Session) -> list[StorageBucket]:
+    """Buckets whose access key a domain transfer still has to rotate (SPEC §19.2)."""
+    return list(db.scalars(select(StorageBucket).where(StorageBucket.credentials_rotation_pending_at.is_not(None))
+                           .order_by(StorageBucket.id)))
+
+
+def rotate_pending(db: Session, bucket_ids: list[int] | None = None) -> tuple[list[str], list[str]]:
+    """Rotate the access key of every bucket marked credentials_rotation_pending_at (or of those of
+    `bucket_ids` that are still marked) — after a domain transfer the previous owner must not keep a
+    working storage key. Each bucket is rotated under its row lock and committed on its own; a
+    failure leaves the mark for the next try (scheduler.job_storage_rotation). The new secret is not
+    shown to anyone: the new owner rotates once more to get a key of their own.
+    Returns (done, still pending) global bucket names."""
+    ids = bucket_ids if bucket_ids is not None else [b.id for b in pending_rotations(db)]
+    done: list[str] = []
+    pending: list[str] = []
+    for bid in ids:
+        b = db.scalar(select(StorageBucket).where(StorageBucket.id == bid,
+                                                  StorageBucket.credentials_rotation_pending_at.is_not(None))
+                      .with_for_update().execution_options(populate_existing=True))
+        if b is None:  # rotated meanwhile (another worker) or deleted
+            db.rollback()
+            continue
+        name = b.bucket
+        site = db.get(Site, b.site_id)
+        try:
+            if site is None:
+                raise StorageError("site not found", 404)
+            rotate_key(db, site, b)
+            b.credentials_rotation_pending_at = None
+            db.commit()
+            done.append(name)
+        except StorageError as e:
+            db.rollback()
+            log.warning("storage: key rotation of %s after a domain transfer failed (retried): %s", name, e)
+            pending.append(name)
+    return done, pending
+
+
 def on_site_delete(db: Session, site: Site) -> list[str]:
     """Best effort before a site is deleted: revoke every access key and remove the empty buckets.
     Non-empty buckets are left on MinIO (customer data is never deleted implicitly) and reported in

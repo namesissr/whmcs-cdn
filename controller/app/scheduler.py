@@ -531,6 +531,17 @@ def job_waf_learning(db, now: datetime | None = None):
     return waf_learning.end_expired(db, now)
 
 
+def job_storage_rotation(db, now: datetime | None = None, force: bool = False):
+    """Every tick (leader only): retry the storage access-key rotations a domain transfer could not
+    finish on MinIO (SPEC §19.2); /healthz/deep warns while any is pending."""
+    from . import storage
+
+    if not storage.pending_rotations(db):
+        return None
+    done, pending = storage.rotate_pending(db)
+    return {"done": done, "pending": pending}
+
+
 def job_capacity(db, now: datetime | None = None, force: bool = False):
     """Daily: edge-group capacity alert from the 3-day p95 of the hourly tx (SPEC §15.5, leader
     only)."""
@@ -544,7 +555,7 @@ JOBRUN_PREFIX = "jobrun:"
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
 JOBS = [job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
         job_capacity, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
-        job_log_export, job_storage, job_security_audit, job_waf_learning, job_bot_ranges]
+        job_log_export, job_storage, job_storage_rotation, job_security_audit, job_waf_learning, job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
 FAST_JOBS = [job_webhooks]
 FAST_INTERVAL = 30.0

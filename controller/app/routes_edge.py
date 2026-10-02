@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -867,6 +868,7 @@ def access_otp(body: AccessOtpIn, request: Request, edge: Edge = Depends(require
     record_audit(db, actor=edge.name, actor_kind="edge", action="access.otp_sent", target=site.domain,
                  detail={"app": app["id"], "email_ref": ref},
                  ip=request.client.host if request.client else None)
-    # valid in this window and the next one
-    expires_in = int((window + 2) * access_mod.WINDOW_SECONDS - unix)
+    # valid in this window and the next one: always MORE than one window. Rounded up to whole seconds
+    # (truncating answered exactly WINDOW_SECONDS during the last second of a window)
+    expires_in = math.ceil((window + 2) * access_mod.WINDOW_SECONDS - unix)
     return {"ok": True, "expires_in": expires_in}

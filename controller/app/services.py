@@ -230,23 +230,42 @@ def usage_totals(db: Session, site_id: int, start: datetime, end: datetime | Non
     return {"bytes": int(b), "requests": int(r), "cache_hits": int(h)}
 
 
+def billing_start(site: Site, start: datetime) -> datetime:
+    """Where the billed usage of a period starting at `start` begins: max(start, billing_since)
+    (SPEC §19.2 — after a transfer with reset_billing_anchor the new owner does not pay for the
+    previous owner's traffic)."""
+    since = getattr(site, "billing_since", None)
+    return since if since is not None and since > start else start
+
+
+def billed_usage(db: Session, site: Site, start: datetime, end: datetime | None = None) -> dict:
+    """usage_totals of [max(start, billing_since), end): the quota counter and every month figure
+    reported to WHMCS. Analytics / history keep using usage_totals (the full history)."""
+    begin = billing_start(site, start)
+    if end is not None and begin >= end:
+        return {"bytes": 0, "requests": 0, "cache_hits": 0}
+    return usage_totals(db, site.id, begin, end)
+
+
 QUOTA_WARNING_PERCENT = 80
 
 
-def refresh_quota(db: Session, site: Site, now: datetime | None = None) -> bool:
-    """Recompute over_quota for this month; returns True when it changed. Caller commits.
+def refresh_quota(db: Session, site: Site, now: datetime | None = None, emit: bool = True) -> bool:
+    """Recompute over_quota for this month (counted from max(month start, billing_since), SPEC
+    §19.2); returns True when it changed. Caller commits.
 
     Quota transitions emit webhooks (SPEC §14.3.3): `quota.exceeded` when the site goes over its
-    bandwidth limit, `quota.warning` once per month when usage reaches 80 % of it first."""
+    bandwidth limit, `quota.warning` once per month when usage reaches 80 % of it first. `emit=False`
+    (a domain transfer) only updates the flag."""
     now = now or utcnow()
     over = False
     used = limit = 0
     if site.bandwidth_limit_gb > 0:
-        used = usage_totals(db, site.id, month_start(now))["bytes"]
+        used = billed_usage(db, site, month_start(now))["bytes"]
         limit = site.bandwidth_limit_gb * 1024**3
         over = used >= limit
     changed = over != site.over_quota
-    if limit > 0:
+    if limit > 0 and emit:
         data = {"used_bytes": used, "limit_bytes": limit, "percent": round(used * 100 / limit, 1),
                 "month": now.strftime("%Y-%m")}
         warned = site.quota_warned_at is not None and site.quota_warned_at >= month_start(now)
@@ -261,7 +280,7 @@ def refresh_quota(db: Session, site: Site, now: datetime | None = None) -> bool:
 
 
 def site_to_dict(db: Session, site: Site) -> dict:
-    usage = usage_totals(db, site.id, month_start())
+    usage = billed_usage(db, site, month_start())
     # the function bodies are left out of the site object (SPEC §16.9: up to 8 MB of code per site)
     config = sections.config_view(sections.all_config(site))
     cache, ssl_opts = config["cache"], config["ssl"]
@@ -272,6 +291,11 @@ def site_to_dict(db: Session, site: Site) -> dict:
         "client_id": site.client_id,
         "reseller_client_id": site.reseller_client_id,
         "reseller_label": site.reseller_label,
+        # SPEC §19: client | reseller | operator; the admin-only note of an operator site; where the
+        # billed usage (usage_month, quota) of the current owner starts (null = the whole month)
+        "owner_kind": site.owner_kind or "client",
+        "operator_note": site.operator_note,
+        "billing_since": site.billing_since.isoformat() + "Z" if site.billing_since else None,
         "status": site.effective_status,
         "ns_verified": site.ns_verified_at is not None,
         "ns_found": json.loads(site.ns_found or "[]"),

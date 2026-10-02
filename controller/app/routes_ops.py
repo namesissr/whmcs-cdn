@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from . import alerts, crypto
 from .auth import require_admin
@@ -143,6 +143,21 @@ def deep_health() -> tuple[dict, int]:
                          "worst_uptime_30d": worst, "probe_failing": probe_failing}
         if probe_failing:
             warnings.append(f"{probe_failing} node(s) heartbeat but fail their health probe")
+    except Exception:  # noqa: BLE001
+        db.rollback()
+    finally:
+        db.close()
+
+    # storage keys a domain transfer still has to rotate (SPEC §19.2) ------------
+    db = SessionLocal()
+    try:
+        from .models import StorageBucket
+        pending = db.scalar(select(func.count(StorageBucket.id)).where(
+            StorageBucket.credentials_rotation_pending_at.is_not(None))) or 0
+        body["storage_rotation_pending"] = pending
+        if pending:
+            warnings.append(f"{pending} storage bucket key(s) of transferred domains are not rotated yet "
+                            "(the previous owner's key still works; retried every scheduler tick)")
     except Exception:  # noqa: BLE001
         db.rollback()
     finally:

@@ -318,7 +318,7 @@ def test_platform_overview_and_events(client):
                    {"t": now.isoformat(), "host": "other.org", "ip": "2.2.2.2", "action": "block",
                     "source": "firewall", "rule": "r1"}]})
     o = client.get("/api/v1/overview").json()
-    assert o["sites"] == {"total": 2, "by_status": {"pending_ns": 2}}
+    assert o["sites"] == {"total": 2, "by_status": {"pending_ns": 2}, "by_owner": {"client": 2}}
     assert {k: o["edges"][k] for k in ("total", "enabled", "online", "with_errors", "shed")} == \
         {"total": 2, "enabled": 2, "online": 1, "with_errors": 0, "shed": 0}
     assert len(o["edges"]["list"]) == 2 and all("uptime" in e for e in o["edges"]["list"])

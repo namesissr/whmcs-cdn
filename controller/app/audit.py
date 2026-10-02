@@ -36,7 +36,13 @@ DETAIL_WHITELIST = {
     # wave 10 (SPEC §18.2): access app id and a hash reference of the e-mail address (never the
     # address or the code), access.rotate / access.otp_sent
     "app", "email_ref",
+    # SPEC §19: site owner (client_id / owner_kind / operator_note) and site.transfer
+    # {from, to, related, revoked_keys, paused, billing_since, dry_run}
+    "client_id", "owner_kind", "operator_note", "from", "to", "related", "revoked_keys", "paused",
+    "billing_since", "rotated",
 }
+# whitelisted keys that contain a _SECRET_HINTS substring but hold no secret (a count)
+_HINT_EXEMPT = {"revoked_keys"}
 # NB "items" is also how a functions write is audited (SPEC §16.9): [{id, route, enabled, code_bytes}],
 # never the code itself (sections.functions_audit)
 # a key containing any of these substrings is never stored, as a second line of defence
@@ -51,7 +57,7 @@ def _clean_detail(detail: dict | None) -> dict:
         kl = str(k).lower()
         if k not in DETAIL_WHITELIST:
             continue
-        if any(h in kl for h in _SECRET_HINTS):
+        if k not in _HINT_EXEMPT and any(h in kl for h in _SECRET_HINTS):
             continue
         out[k] = v
     return out

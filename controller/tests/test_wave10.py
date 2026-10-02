@@ -395,6 +395,28 @@ def test_access_otp_sends_code(client, mailbox, caplog):
     assert otp(client, t, email="carol@company.com").status_code == 200
 
 
+@pytest.mark.parametrize("into_window", [0.0, 0.25, 150.0, 299.0, 299.5, 299.999])
+def test_access_otp_expires_in_at_window_edges(client, mailbox, monkeypatch, into_window):
+    """Regression (flaky test_access_otp_sends_code): a code is valid for the rest of its window plus
+    the next one, i.e. MORE than one window. expires_in used to be truncated, so a request in the last
+    second of a window (≈1 run in 300) answered exactly WINDOW_SECONDS."""
+    from app import routes_edge
+
+    mk_site(client, access=True)
+    t = add_edge(client)
+    heartbeat(client, t)
+    client.put(f"{S}/config/access", json={"enabled": True, "apps": APPS})
+    start = (access.otp_window() + 1) * access.WINDOW_SECONDS
+    at = datetime.fromtimestamp(start + into_window, tz=timezone.utc).replace(tzinfo=None)
+    monkeypatch.setattr(routes_edge, "utcnow", lambda: at)
+    r = otp(client, t)
+    assert r.status_code == 200, r.text
+    exp = r.json()["expires_in"]
+    assert access.WINDOW_SECONDS < exp <= 2 * access.WINDOW_SECONDS
+    # never claims more than the code's real lifetime by a whole second
+    assert exp - (2 * access.WINDOW_SECONDS - into_window) < 1
+
+
 def test_access_otp_errors(client, mailbox, monkeypatch):
     mk_site(client, access=True)
     mk_site(client, "other.com", access=True)

@@ -54,6 +54,13 @@ class Site(Base):
     # owning WHMCS client (tblclients.id, set by WHMCS); with reseller_client_id it decides who
     # "owns" a domain for the parent/child zone rule (tenancy.py, security review C1)
     client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True, default=None)
+    # SPEC §19.1: client | reseller | operator. Operator sites (the platform's own domains) have no
+    # client_id / reseller_client_id / external_id and share one tenancy owner ("operator")
+    owner_kind: Mapped[str] = mapped_column(String(10), default="client", server_default="client")
+    operator_note: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
+    # SPEC §19.2: quota and the month usage reported to WHMCS count from max(month start, billing_since)
+    # (set by a transfer with reset_billing_anchor, e.g. operator -> client)
+    billing_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
     # customer settings: JSON document of sections (see sections.SECTIONS / SPEC §2)
     config: Mapped[str] = mapped_column(Text, default="{}")
@@ -543,6 +550,9 @@ class StorageBucket(Base):
     usage_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     rotated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # SPEC §19.2: set by a domain transfer (revoke_credentials) until the access key has been rotated
+    # on MinIO (after the transfer's commit; retried by scheduler.job_storage_rotation, deep health warns)
+    credentials_rotation_pending_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     @property
     def secret_key(self) -> str | None:

@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from . import sections, storage
 from .models import Site, UsageHourly, utcnow
+from .services import billing_start
 from .validation import ValidationError, num
 from .validation import obj as _obj
 
@@ -150,7 +151,15 @@ def build(db: Session, site: Site, month: str | None = None, plan: str | None = 
     except Exception:  # noqa: BLE001 - storage samples are optional for a statement
         storage_block = {"gb_month": 0.0, "gb_hours": 0.0, "peak_gb": 0.0}
     limit_gb = int(site.bandwidth_limit_gb or 0)
-    used_gb = tb / GIB
+    # the quota section counts from max(month start, billing_since) like the quota itself (SPEC
+    # §19.2: after a transfer the new owner does not pay for the previous owner's traffic); the
+    # daily rows and totals keep the whole month
+    billed_from = billing_start(site, start)
+    billed = tb if billed_from == start else (
+        sum(int(b or 0) for (b,) in db.execute(select(UsageHourly.bytes).where(
+            UsageHourly.site_id == site.id, UsageHourly.hour >= billed_from, UsageHourly.hour < end)).all())
+        if billed_from < end else 0)
+    used_gb = billed / GIB
     over_gb = max(0.0, used_gb - limit_gb) if limit_gb > 0 else 0.0
     return {
         "domain": site.domain,
@@ -165,6 +174,8 @@ def build(db: Session, site: Site, month: str | None = None, plan: str | None = 
                                        "waiting_room", "access")}},
         "quota": {"limit_gb": limit_gb, "used_gb": round(used_gb, 3), "overage_gb": round(over_gb, 3),
                   "block_gb": block_gb, "blocks": math.ceil(over_gb / block_gb) if block_gb and over_gb > 0 else 0},
+        # where quota.used_gb starts when it is not the month start (SPEC §19.2), else null
+        "billing_since": billed_from.isoformat() + "Z" if billed_from != start else None,
         "totals": {"bytes": tb, "gb": _gb(tb), "requests": tr, "cache_hits": th,
                    "cache_hit_ratio": round(th * 100 / tr, 2) if tr else 0.0},
         "tunnel_gb": _gb(tunnel_b),

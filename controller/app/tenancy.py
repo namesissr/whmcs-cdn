@@ -14,6 +14,12 @@ service) or else ``reseller_client_id`` (a reseller's sub-site belongs to the re
 neither (created by an admin or by an older WHMCS module) has NO owner and never matches anyone, so
 it can neither nest nor be nested; an operator can set ``client_id`` on it
 (PATCH /api/v1/sites/{domain}/owner) to allow it.
+
+Operator sites (SPEC §19.1, ``owner_kind == "operator"``: the platform's own domains, no WHMCS
+client) all share ONE owner identity, :data:`OPERATOR`, which is distinct from every client id, so
+the operator may nest its own domains but a customer can never add a parent/child of an operator
+domain and vice versa. Owners are therefore comparable values: an ``int`` (WHMCS client id),
+:data:`OPERATOR`, or ``None`` (nobody — never equal to anything, not even another ``None``).
 """
 
 from sqlalchemy import or_, select
@@ -23,12 +29,20 @@ from . import psl
 from .models import Site
 
 
-def owner_of(client_id: int | None, reseller_client_id: int | None) -> int | None:
+OPERATOR = "operator"  # the one owner identity of every operator site (SPEC §19.1)
+
+Owner = int | str | None
+
+
+def owner_of(client_id: int | None, reseller_client_id: int | None, operator: bool = False) -> Owner:
+    if operator:
+        return OPERATOR
     return client_id or reseller_client_id or None
 
 
-def site_owner(site: Site) -> int | None:
-    return owner_of(getattr(site, "client_id", None), getattr(site, "reseller_client_id", None))
+def site_owner(site: Site) -> Owner:
+    return owner_of(getattr(site, "client_id", None), getattr(site, "reseller_client_id", None),
+                    getattr(site, "owner_kind", None) == "operator")
 
 
 def ancestors(domain: str) -> list[str]:
@@ -50,11 +64,11 @@ def related_sites(db: Session, domain: str, exclude_id: int | None = None) -> li
     return [s for s in db.scalars(stmt) if s.domain in parents or s.domain.endswith("." + domain)]
 
 
-def same_owner(owner: int | None, site: Site) -> bool:
+def same_owner(owner: Owner, site: Site) -> bool:
     return owner is not None and site_owner(site) == owner
 
 
-def domain_problem(db: Session, domain: str, owner: int | None, exclude_id: int | None = None
+def domain_problem(db: Session, domain: str, owner: Owner, exclude_id: int | None = None
                    ) -> tuple[str, str] | None:
     """Why `domain` may not become a site of `owner`: (code, Persian message) or None.
     code: public_suffix | exists | nested."""
@@ -98,3 +112,26 @@ def nested_conflicts(db: Session) -> list[tuple[str, str]]:
             if parent is not None and not same_owner(site_owner(s), parent):
                 out.append((parent.domain, s.domain))
     return sorted(out)
+
+
+def owner_group(db: Session, site: Site) -> tuple[list[Site], list[Site]]:
+    """For a transfer (SPEC §19.2): (sites of the same owner linked to `site` through parent/child
+    relations, any number of hops — they must move together; other-owner sites related to any of
+    them). `site` itself is in neither list. A site without an owner has no group."""
+    owner = site_owner(site)
+    group: dict[int, Site] = {site.id: site}
+    foreign: dict[int, Site] = {}
+    queue = [site]
+    while queue:
+        cur = queue.pop()
+        for other in related_sites(db, cur.domain, exclude_id=cur.id):
+            if other.id in group or other.id in foreign:
+                continue
+            if same_owner(owner, other):
+                group[other.id] = other
+                queue.append(other)
+            else:
+                foreign[other.id] = other
+    group.pop(site.id)
+    by_domain = lambda s: s.domain  # noqa: E731
+    return sorted(group.values(), key=by_domain), sorted(foreign.values(), key=by_domain)

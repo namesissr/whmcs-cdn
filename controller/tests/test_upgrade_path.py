@@ -156,6 +156,12 @@ def check_rows(engine, exp: dict):
             assert tuple(site) == (42, "Reseller A — shop")
         if S.at_least(rev, "0010"):
             assert c.execute(text("SELECT count(*) FROM edge_addresses")).scalar_one() == 2
+        # 0021: owner_kind derived from the reseller tag; no operator note / billing anchor anywhere
+        kinds = dict(c.execute(text("SELECT domain, owner_kind FROM sites")).all())
+        assert kinds == {S.SHOP: "reseller" if S.at_least(rev, "0008") else "client",
+                         S.TUNNEL: "client", S.SUSPENDED: "client"}
+        assert c.execute(text("SELECT count(*) FROM sites WHERE operator_note IS NOT NULL "
+                              "OR billing_since IS NOT NULL")).scalar_one() == 0
 
 
 def check_read_paths(engine, exp: dict):

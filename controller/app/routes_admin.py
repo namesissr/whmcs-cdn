@@ -10,13 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import bundle, dnsbuild, l4, nscheck, origin_guard, pdns, sections, tenancy, webhooks
+from . import bundle, dnsbuild, l4, nscheck, origin_guard, pdns, sections, tenancy, transfer, webhooks
 from .audit import record_audit
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
 from .models import ApiKey, AuditLog, Edge, EdgeAddress, Record, Site, UsageHourly, utcnow
 from .services import (
+    billed_usage,
     delete_platform_data,
     lock_site,
     refresh_quota,
@@ -29,7 +30,6 @@ from .services import (
     sync_all_dns,
     sync_site_dns,
     update_shed,
-    usage_totals,
 )
 from .validation import (
     ValidationError,
@@ -126,6 +126,9 @@ class SiteCreate(BaseModel):
     reseller_label: str | None = None
     # owning WHMCS client (userid) of a normal service; decides the parent/child zone rule (tenancy.py)
     client_id: int | None = Field(default=None, ge=1)
+    # SPEC §19.1: an operator (admin-owned) site — no client / reseller / external_id
+    operator: bool = False
+    operator_note: str | None = Field(default=None, max_length=200)
 
 
 class DomainCheckIn(BaseModel):
@@ -134,6 +137,34 @@ class DomainCheckIn(BaseModel):
     domain: str
     client_id: int | None = Field(default=None, ge=1)
     reseller_client_id: int | None = Field(default=None, ge=1)
+    operator: bool = False  # SPEC §19.1: check for the operator's own sites
+
+
+class OperatorNoteIn(BaseModel):
+    """Edit the admin-only note of an operator site (SPEC §19.1); null / "" clears it."""
+    model_config = ConfigDict(extra="forbid")
+    operator_note: str | None = Field(default=None, max_length=200)
+
+
+class TransferTo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["client", "operator"]
+    client_id: int | None = Field(default=None, ge=1)
+    # the WHMCS service id of the new owner's service; omitted on a client target = keep the current
+    # one (client -> client moves the WHMCS service itself)
+    external_id: str | None = Field(default=None, max_length=64)
+    operator_note: str | None = Field(default=None, max_length=200)
+
+
+class TransferIn(BaseModel):
+    """Domain transfer (SPEC §19.2)."""
+    model_config = ConfigDict(extra="forbid")
+    to: TransferTo
+    reset_billing_anchor: bool = False
+    revoke_credentials: bool = True
+    pause_integrations: bool = True
+    include_related: bool = False
+    dry_run: bool = False
 
 
 class OwnerIn(BaseModel):
@@ -154,6 +185,10 @@ def _clean_label(label: str | None) -> str | None:
         return None
     label = label.strip()[:120]
     return label or None
+
+
+OPERATOR_FIELDS_MSG = ("سایت اپراتور نباید client_id، external_id یا فیلدهای نماینده (reseller_client_id / "
+                       "reseller_label) داشته باشد")
 
 
 def _clean_addr_label(label: str | None) -> str:
@@ -280,14 +315,24 @@ def create_site(body: SiteCreate, request: Request, db: Session = Depends(get_db
         origin = validate_ip(body.origin_ip, 4) if body.origin_ip else None
     except ValidationError as e:
         bad(e)
+    if body.operator:
+        if body.client_id or body.reseller_client_id or body.reseller_label or body.external_id:
+            raise HTTPException(422, OPERATOR_FIELDS_MSG)
+    elif body.operator_note:
+        raise HTTPException(422, "operator_note فقط برای سایت اپراتور (operator: true) است")
     # C1: no public suffix, no parent/child of another owner's site (409 only for "already exists":
     # WHMCS treats a 409 as a re-run of Create on its own site)
-    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id))
+    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id,
+                                                                  body.operator))
     if problem is not None:
         raise HTTPException(409 if problem[0] == "exists" else 422, problem[1])
-    site = Site(domain=domain, external_id=body.external_id,
-                reseller_client_id=body.reseller_client_id, client_id=body.client_id,
-                reseller_label=_clean_label(body.reseller_label))
+    if body.operator:
+        site = Site(domain=domain, owner_kind="operator", operator_note=transfer.clean_note(body.operator_note))
+    else:
+        site = Site(domain=domain, external_id=body.external_id,
+                    reseller_client_id=body.reseller_client_id, client_id=body.client_id,
+                    reseller_label=_clean_label(body.reseller_label),
+                    owner_kind="reseller" if body.reseller_client_id else "client")
     apply_plan(site, body.plan)
     if origin:
         site.records = [
@@ -298,7 +343,7 @@ def create_site(body: SiteCreate, request: Request, db: Session = Depends(get_db
     db.commit()
     _audit(db, request, "site.create", site.domain,
            {"external_id": body.external_id, "reseller_client_id": body.reseller_client_id,
-            "client_id": body.client_id})
+            "client_id": body.client_id, "owner_kind": site.owner_kind})
     err = sync_site_dns(db, site)
     return {**site_to_dict(db, site), "dns_error": err}
 
@@ -311,15 +356,21 @@ def domain_check(body: DomainCheckIn, db: Session = Depends(get_db)):
         domain = normalize_domain(body.domain)
     except ValidationError as e:
         return {"ok": False, "code": "invalid", "error": str(e), "domain": None}
-    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id))
+    if body.operator and (body.client_id or body.reseller_client_id):
+        raise HTTPException(422, OPERATOR_FIELDS_MSG)
+    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id,
+                                                                  body.operator))
     if problem is not None:
         return {"ok": False, "code": problem[0], "error": problem[1], "domain": domain}
     return {"ok": True, "code": None, "error": None, "domain": domain}
 
 
 @router.get("/sites")
-def list_sites(reseller: int | None = None, db: Session = Depends(get_db)):
+def list_sites(reseller: int | None = None, owner: Literal["operator", "client", "reseller"] | None = None,
+               db: Session = Depends(get_db)):
     stmt = select(Site).order_by(Site.id)
+    if owner is not None:  # SPEC §19.1
+        stmt = stmt.where(Site.owner_kind == owner)
     if reseller is not None:
         # rolled-up report for one reseller (SPEC §10.5): only its sub-sites
         stmt = stmt.where(Site.reseller_client_id == reseller)
@@ -332,7 +383,9 @@ def list_sites(reseller: int | None = None, db: Session = Depends(get_db)):
     return [
         {"domain": s.domain, "status": s.effective_status, "external_id": s.external_id,
          "client_id": s.client_id,
-         "reseller_client_id": s.reseller_client_id, "reseller_label": s.reseller_label}
+         "reseller_client_id": s.reseller_client_id, "reseller_label": s.reseller_label,
+         "owner_kind": s.owner_kind, "operator_note": s.operator_note,
+         "billing_since": s.billing_since.isoformat() + "Z" if s.billing_since else None}
         for s in db.scalars(stmt)
     ]
 
@@ -386,10 +439,12 @@ def update_reseller(domain: str, body: ResellerIn, request: Request, db: Session
     """Set or clear the reseller tag on a site (SPEC §10.5). Only provided fields change;
     pass an explicit null to clear one."""
     site = get_site(db, domain)
+    _not_operator(site)
     fields = body.model_fields_set
     if "reseller_client_id" in fields:
         _check_owner_change(db, site, tenancy.owner_of(site.client_id, body.reseller_client_id))
         site.reseller_client_id = body.reseller_client_id
+        site.owner_kind = "reseller" if body.reseller_client_id else "client"
     if "reseller_label" in fields:
         site.reseller_label = _clean_label(body.reseller_label)
     db.commit()
@@ -398,7 +453,13 @@ def update_reseller(domain: str, body: ResellerIn, request: Request, db: Session
     return site_to_dict(db, site)
 
 
-def _check_owner_change(db: Session, site: Site, owner: int | None) -> None:
+def _not_operator(site: Site) -> None:
+    if site.owner_kind == "operator":
+        raise HTTPException(422, "این سایت متعلق به اپراتور است؛ برای واگذاری آن به مشتری از انتقال دامنه "
+                                 "(POST /api/v1/sites/{domain}/transfer) استفاده کنید")
+
+
+def _check_owner_change(db: Session, site: Site, owner: tenancy.Owner) -> None:
     """422 when the new owner would turn a same-owner parent/child pair into a pair of different
     owners (C1). Pairs that already had different owners (legacy data) are left as they are."""
     before = tenancy.site_owner(site)
@@ -413,11 +474,44 @@ def update_owner(domain: str, body: OwnerIn, request: Request, db: Session = Dep
     """Set the owning WHMCS client (C1, tenancy.py). Refused (422) when the change would put the
     site in a parent/child relation with a site of a different owner."""
     site = get_site(db, domain)
+    _not_operator(site)
     _check_owner_change(db, site, tenancy.owner_of(body.client_id, site.reseller_client_id))
     site.client_id = body.client_id
     db.commit()
     _audit(db, request, "site.owner", site.domain, {"client_id": site.client_id})
     return site_to_dict(db, site)
+
+
+@router.patch("/sites/{domain}/operator")
+def update_operator_note(domain: str, body: OperatorNoteIn, request: Request, db: Session = Depends(get_db)):
+    """Edit the admin-only note of an operator site (SPEC §19.1); 422 on any other site."""
+    site = get_site(db, domain)
+    if site.owner_kind != "operator":
+        raise HTTPException(422, "یادداشت اپراتور فقط برای سایت‌های اپراتور است")
+    site.operator_note = transfer.clean_note(body.operator_note)
+    db.commit()
+    _audit(db, request, "site.operator_note", site.domain, {"operator_note": site.operator_note})
+    return site_to_dict(db, site)
+
+
+@router.post("/sites/{domain}/transfer")
+def transfer_site(domain: str, body: TransferIn, request: Request, db: Session = Depends(get_db)):
+    """Domain transfer to another owner (SPEC §19.2, transfer.py): one transaction; `dry_run`
+    returns the same answer without changing anything. 422 (Persian `detail`) when refused."""
+    site = get_site(db, domain)
+    try:
+        result, post = transfer.transfer(db, site, body)
+    except transfer.TransferError as e:
+        db.rollback()
+        raise HTTPException(422, str(e))
+    if body.dry_run:
+        db.rollback()
+        return result
+    db.commit()
+    transfer.after_commit(db, result, post)  # TSIG push to PowerDNS, storage keys on MinIO
+    _audit(db, request, "site.transfer", result["domain"],
+           {k: result[k] for k in ("from", "to", "related", "revoked_keys", "paused", "billing_since", "rotated")})
+    return result
 
 
 @router.patch("/sites/{domain}/settings")
@@ -559,7 +653,8 @@ def site_usage(domain: str, days: int = 30, db: Session = Depends(get_db)):
         .group_by(func.date(UsageHourly.hour)).order_by(func.date(UsageHourly.hour))
     ).all()
     return {
-        "month": usage_totals(db, site.id, month_start()),
+        # billed month (from max(month start, billing_since), SPEC §19.2); "daily" is the full history
+        "month": billed_usage(db, site, month_start()),
         "daily": [{"date": str(d), "bytes": int(b or 0), "requests": int(r or 0), "cache_hits": int(h or 0)}
                   for d, b, r, h in rows],
     }
@@ -578,9 +673,11 @@ def all_usage(month: str | None = None, db: Session = Depends(get_db)):
     end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
     out = []
     for s in db.scalars(select(Site).order_by(Site.id)):
-        u = usage_totals(db, s.id, start, end)
+        # SPEC §19.2: the current owner's share of the month, from max(month start, billing_since)
+        u = billed_usage(db, s, start, end)
         out.append({"domain": s.domain, "external_id": s.external_id, "bandwidth_limit_gb": s.bandwidth_limit_gb,
-                    "status": s.effective_status, **u})
+                    "status": s.effective_status, "owner_kind": s.owner_kind,
+                    "billing_since": s.billing_since.isoformat() + "Z" if s.billing_since else None, **u})
     return {"month": start.strftime("%Y-%m"), "sites": out}
 
 

@@ -737,8 +737,10 @@ def overview(db: Session = Depends(get_db)):
 
     start = month_start()
     by_status = Counter()
+    by_owner = Counter()  # SPEC §19.1: operator sites are counted separately on the dashboard
     for s in db.scalars(select(Site)):
         by_status[s.effective_status] += 1
+        by_owner[s.owner_kind or "client"] += 1
     usage = Counter()
     requests = Counter()
     security = Counter()
@@ -755,7 +757,7 @@ def overview(db: Session = Depends(get_db)):
     from .services import edge_metrics
     ups = up.summaries(db)
     return {
-        "sites": {"total": sum(by_status.values()), "by_status": dict(by_status)},
+        "sites": {"total": sum(by_status.values()), "by_status": dict(by_status), "by_owner": dict(by_owner)},
         "edges": {"total": len(edges), "enabled": sum(1 for e in edges if e.enabled), "online": len(online),
                   "with_errors": sum(1 for e in edges if e.last_error),
                   "shed": sum(1 for e in edges if e.shed),

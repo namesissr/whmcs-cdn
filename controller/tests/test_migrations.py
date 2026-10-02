@@ -54,9 +54,11 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0008: sites.reseller_client_id / reseller_label; 0014: custom origin client certificate
     # (authenticated origin pulls, SPEC §14.2); 0015: integration secrets + quota warning (SPEC §14.3)
     site_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "sites")
-    # 0019: sites.client_id (owning WHMCS client, security review C1)
-    assert site_added == ["client_id", "integration_secrets", "origin_client_cert", "origin_client_expires_at",
-                          "origin_client_key", "quota_warned_at", "reseller_client_id", "reseller_label"], diff
+    # 0019: sites.client_id (owning WHMCS client, security review C1); 0021: owner_kind, operator_note,
+    # billing_since (operator sites and domain transfer, SPEC §19)
+    assert site_added == ["billing_since", "client_id", "integration_secrets", "operator_note",
+                          "origin_client_cert", "origin_client_expires_at", "origin_client_key", "owner_kind",
+                          "quota_warned_at", "reseller_client_id", "reseller_label"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
     # 0010: edge_addresses (multi-address edges / health-based failover);
     # 0011: usage_batches (idempotent usage reports, F7); 0012: audit_log (SPEC §13.2);
@@ -110,6 +112,9 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
         # 0015: no integration secret / quota warning on existing sites; the new tables are empty
         assert tuple(c.execute(text("SELECT integration_secrets, quota_warned_at FROM sites")).one()) \
             == (None, None)
+        # 0021: an existing site without a reseller tag is a client site
+        assert tuple(c.execute(text("SELECT owner_kind, operator_note, billing_since FROM sites")).one()) \
+            == ("client", None, None)
         # 0016: the site_events table is empty
         for table in ("analytics_minute", "log_spool", "webhook_delivery", "site_events"):
             assert c.execute(text(f"SELECT count(*) FROM {table}")).scalar() == 0
