@@ -82,17 +82,33 @@ class ApiClient
      */
     public function getMany(array $paths): array
     {
+        $reqs = [];
+        foreach (array_values(array_unique($paths)) as $path) {
+            $reqs[$path] = ['GET', $path, null];
+        }
+        return $this->requestMany($reqs);
+    }
+
+    /**
+     * Parallel requests (curl_multi) bounded by this client's timeout in total.
+     * $reqs: [key => [method, path, ?array body]]. Never throws: returns
+     * [key => ['code' => int, 'data' => mixed, 'error' => ?string]] (code 0 = no answer).
+     */
+    public function requestMany(array $reqs): array
+    {
         $out = [];
-        if (!$paths) {
+        if (!$reqs) {
             return $out;
         }
         $mh = curl_multi_init();
         $handles = [];
-        foreach (array_values(array_unique($paths)) as $path) {
+        foreach ($reqs as $key => [$method, $path, $body]) {
+            $payload = ($body !== null && $method !== 'GET')
+                ? json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
             $ch = curl_init($this->baseUrl . $path);
-            curl_setopt_array($ch, $this->curlOptions('GET', null));
+            curl_setopt_array($ch, $this->curlOptions($method, $payload));
             curl_multi_add_handle($mh, $ch);
-            $handles[$path] = $ch;
+            $handles[$key] = [$ch, $method . ' ' . $path, $payload];
         }
         $deadline = microtime(true) + $this->timeout + 1;
         do {
@@ -101,18 +117,18 @@ class ApiClient
                 curl_multi_select($mh, 0.2);
             }
         } while ($running && $status === CURLM_OK && microtime(true) < $deadline);
-        foreach ($handles as $path => $ch) {
+        foreach ($handles as $key => [$ch, $label, $payload]) {
             $raw = curl_multi_getcontent($ch);
             $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $err = curl_error($ch);
             if (function_exists('logModuleCall')) {
-                logModuleCall('pasargadcdn', 'GET ' . $path, null, self::redact($raw), null, [$this->apiKey]);
+                logModuleCall('pasargadcdn', $label, self::redact($payload), self::redact($raw), null, [$this->apiKey]);
             }
             if ($code === 0 || $raw === null || $raw === false) {
-                $out[$path] = ['code' => 0, 'data' => null, 'error' => $err !== '' ? I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err) : I18n::tr('اتصال به سرور CDN برقرار نشد')];
+                $out[$key] = ['code' => 0, 'data' => null, 'error' => $err !== '' ? I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err) : I18n::tr('اتصال به سرور CDN برقرار نشد')];
             } else {
                 $data = json_decode((string) $raw, true);
-                $out[$path] = ['code' => $code, 'data' => $data,
+                $out[$key] = ['code' => $code, 'data' => $data,
                     'error' => $code >= 400 ? self::errorMessage($data, $code) : null];
             }
             curl_multi_remove_handle($mh, $ch);

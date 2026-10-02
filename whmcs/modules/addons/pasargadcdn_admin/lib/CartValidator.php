@@ -14,8 +14,12 @@ if (class_exists(__NAMESPACE__ . '\\CartValidator', false)) {
  * Cost model: an empty cart costs nothing; a cart without CDN products costs
  * exactly one query (the memoised list of CDN product ids) and no HTTP call.
  * Only carts that contain CDN products run the domain/custom-field queries,
- * and only when every local rule passes is the controller asked (≤ 5 s,
- * fail-open with a logged warning).
+ * and only when every local rule passes (DomainRules: the first line) is the
+ * controller asked: POST /api/v1/domain-check once per domain (parallel, ≤ 5 s
+ * in total), memoised per request so a re-validation never asks again; any
+ * controller problem fails open with a logged warning. The controller's code
+ * (invalid | public_suffix | exists | nested, security review C1) becomes a
+ * message in the visitor's language.
  */
 final class CartValidator
 {
@@ -66,7 +70,7 @@ final class CartValidator
             }
         }
         if (!$errors && $toCheck && Env::enabled('cartcheck', true)) {
-            $errors = self::controllerCheck($toCheck);
+            $errors = self::controllerCheck($toCheck, self::visitor($vars));
         }
         return array_values(array_unique($errors));
     }
@@ -306,32 +310,115 @@ final class CartValidator
         return $out;
     }
 
-    /** Asks the controller whether the domains already exist. Fail-open. */
-    public static function controllerCheck(array $domains): array
+    const CHECK_PATH = '/api/v1/domain-check';
+
+    /**
+     * Asks the controller whether each domain may become a site of this visitor (client $uid, 0 = new
+     * sign-up: no owner) — POST /api/v1/domain-check, the checks of POST /api/v1/sites without creating
+     * anything. One parallel round for the domains not answered yet in this request (memoised, failures
+     * included). Fail-open: no server, unreachable, timeout, 5xx/401 … → no error, a logged warning.
+     * A controller without the endpoint (404/405, before the security review) gets the older existence
+     * check (GET /api/v1/sites/{domain}).
+     */
+    public static function controllerCheck(array $domains, int $uid = 0): array
     {
+        $domains = array_values(array_unique(array_filter($domains)));
+        $answers = [];
+        $todo = [];
+        foreach ($domains as $d) {
+            $key = 'domain-check:' . $d . ':' . $uid;
+            if (Env::memoHas($key)) {
+                $answers[$d] = Env::memoGet($key);
+            } else {
+                $todo[] = $d;
+            }
+        }
+        if ($todo) {
+            foreach (self::askController($todo, $uid) as $d => $answer) {
+                Env::memoSet('domain-check:' . $d . ':' . $uid, $answer);
+                $answers[$d] = $answer;
+            }
+        }
+        $errors = [];
+        foreach ($domains as $d) {
+            $code = $answers[$d] ?? null;
+            if ($code === null || $code === '') {
+                continue; // allowed (or fail-open)
+            }
+            $errors[] = self::refusal($d, $code);
+        }
+        return $errors;
+    }
+
+    /** domain => null (allowed / fail-open) or the refusal code. */
+    private static function askController(array $domains, int $uid): array
+    {
+        $out = array_fill_keys($domains, null);
         try {
             Env::loadServerModule();
             $api = Env::api(self::CONTROLLER_TIMEOUT);
         } catch (\Throwable $e) {
             Env::log('checkout check skipped (' . $e->getMessage() . ')');
-            return [];
+            return $out;
         }
-        $paths = [];
+        $reqs = [];
         foreach ($domains as $d) {
-            $paths[$d] = \PasargadCdn\ApiClient::site($d);
+            $body = ['domain' => $d];
+            if ($uid > 0) {
+                $body['client_id'] = $uid;
+            }
+            $reqs[$d] = ['POST', self::CHECK_PATH, $body];
         }
-        $res = $api->getMany(array_values($paths));
-        $errors = [];
-        foreach ($paths as $d => $path) {
-            $r = $res[$path] ?? ['code' => 0, 'error' => 'no response'];
-            if ($r['code'] === 200) {
-                $errors[] = 'دامنه ' . $d . ' از قبل روی CDN پاسارگاد ثبت شده است. اگر مالک این دامنه هستید با پشتیبانی تماس بگیرید.';
-            } elseif ($r['code'] !== 404) {
+        $res = $api->requestMany($reqs);
+        $legacy = [];
+        foreach ($domains as $d) {
+            $r = $res[$d] ?? ['code' => 0, 'data' => null, 'error' => 'no response'];
+            $data = is_array($r['data']) ? $r['data'] : null;
+            if ($r['code'] === 200 && $data !== null && array_key_exists('ok', $data)) {
+                if (empty($data['ok'])) {
+                    $out[$d] = is_string($data['code'] ?? null) && $data['code'] !== '' ? $data['code'] : 'refused';
+                    Env::log('checkout: CDN domain ' . $d . ' refused by the controller (' . $out[$d] . ')', $uid);
+                }
+            } elseif ($r['code'] === 404 || $r['code'] === 405) {
+                $legacy[] = $d;
+            } else {
                 Env::log('checkout controller check for ' . $d . ' failed (' . ($r['error'] ?: 'HTTP ' . $r['code'])
                     . ') — order allowed (fail-open)');
             }
         }
-        return $errors;
+        if ($legacy) {
+            $paths = [];
+            foreach ($legacy as $d) {
+                $paths[$d] = \PasargadCdn\ApiClient::site($d);
+            }
+            $res = $api->getMany(array_values($paths));
+            foreach ($paths as $d => $path) {
+                $r = $res[$path] ?? ['code' => 0, 'error' => 'no response'];
+                if ($r['code'] === 200) {
+                    $out[$d] = 'exists';
+                } elseif ($r['code'] !== 404) {
+                    Env::log('checkout controller check for ' . $d . ' failed (' . ($r['error'] ?: 'HTTP ' . $r['code'])
+                        . ') — order allowed (fail-open)');
+                }
+            }
+        }
+        return $out;
+    }
+
+    /** Checkout message for a controller refusal code (tenancy.domain_problem / domain-check). */
+    private static function refusal(string $d, string $code): string
+    {
+        switch ($code) {
+            case 'exists':
+                return self::tr('دامنه %s از قبل روی CDN پاسارگاد ثبت شده است. اگر مالک این دامنه هستید با پشتیبانی تماس بگیرید.', $d);
+            case 'nested':
+                return self::tr('دامنه %s زیردامنه یا دامنه اصلی سایتی است که متعلق به مشتری دیگری روی CDN است و قابل ثبت نیست. اگر مالک دامنه هستید با پشتیبانی تماس بگیرید.', $d);
+            case 'public_suffix':
+                return self::tr('«%s» یک پسوند عمومی دامنه است و نمی‌توان آن را به‌عنوان سایت روی CDN ثبت کرد؛ نام کامل دامنه خود را وارد کنید (مثلاً example.ir).', $d);
+            case 'invalid':
+                return self::tr('دامنه %s برای CDN معتبر نیست؛ نام دامنه را بدون http و مسیر وارد کنید (مثلاً example.com).', $d);
+        }
+        return self::tr('دامنه %s روی CDN قابل ثبت نیست. برای بررسی با پشتیبانی تماس بگیرید.', $d);
     }
 
     // ------------------------------------------------------------------ growth: free trial

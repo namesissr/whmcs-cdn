@@ -89,6 +89,23 @@ class I18n
             => '“%s” is a public domain suffix and cannot be added to the CDN as a site; enter your full domain name (for example example.ir).',
         'دامنه %s زیردامنه یا دامنه اصلی سایتی است که متعلق به مشتری دیگری روی CDN است و قابل ثبت نیست. اگر مالک دامنه هستید با پشتیبانی تماس بگیرید.'
             => 'The domain %s is a subdomain or parent domain of a site that belongs to another customer on the CDN and cannot be added. If you own the domain, contact support.',
+        // C1 checkout answers of the controller's POST /api/v1/domain-check (addon CartValidator)
+        'دامنه %s از قبل روی CDN پاسارگاد ثبت شده است. اگر مالک این دامنه هستید با پشتیبانی تماس بگیرید.'
+            => 'The domain %s is already registered on Pasargad CDN. If you own this domain, contact support.',
+        'دامنه %s برای CDN معتبر نیست؛ نام دامنه را بدون http و مسیر وارد کنید (مثلاً example.com).'
+            => 'The domain %s is not valid for the CDN; enter the domain name without http and path (for example example.com).',
+        'دامنه %s روی CDN قابل ثبت نیست. برای بررسی با پشتیبانی تماس بگیرید.'
+            => 'The domain %s cannot be added to the CDN. Contact support to look into it.',
+        // Security review (controller/app/tenancy.py, routes_capi.py) — controller details (translated by controller())
+        'این دامنه پسوند عمومی (مثل com یا co.ir) است و نمی‌تواند سایت باشد'
+            => 'This domain is a public suffix (like com or co.ir) and cannot be a site',
+        'این دامنه قبلاً ثبت شده است' => 'This domain is already registered',
+        'این دامنه زیردامنهٔ سایت دیگری است که متعلق به حساب دیگری است؛ زیردامنه‌ها و دامنهٔ والد فقط برای همان مالک قابل ثبت‌اند'
+            => 'This domain is a subdomain of another site that belongs to another account; subdomains and parent domains can only be added by the same owner',
+        'این دامنه دامنهٔ والدِ سایت دیگری است که متعلق به حساب دیگری است؛ زیردامنه‌ها و دامنهٔ والد فقط برای همان مالک قابل ثبت‌اند'
+            => 'This domain is the parent domain of another site that belongs to another account; subdomains and parent domains can only be added by the same owner',
+        'سرویس معلق است؛ تا رفع تعلیق فقط خواندن از طریق API مجاز است'
+            => 'The service is suspended; until it is unsuspended the API only allows reading',
         // SPEC §16.8 object storage — controller details (translated by controller(), see below)
         'نام باکت باید %s تا %s کاراکتر از حروف کوچک انگلیسی، رقم و - باشد و با حرف یا رقم شروع و تمام شود' => 'The bucket name must be %s to %s characters of lowercase English letters, digits and -, and start and end with a letter or digit',
         'باکت یافت نشد' => 'Bucket not found',

@@ -47,6 +47,12 @@ final class Wizard
     const STORAGE_GROUP = 'Pasargad CDN — فضای ذخیره‌سازی';
     const STORAGE_OPTION = 'Storage GB|فضای ذخیره‌سازی ابری (گیگابایت)';
     const STORAGE_SIZES = [0, 10, 50, 100];
+    /**
+     * Security review H1: optional yes/no configurable option «Secondary DNS» (→ features.dns_secondary,
+     * pasargadcdn_plan(); the controller default is off), in its own option group linked to every CDN product.
+     */
+    const DNS2_GROUP = 'Pasargad CDN — DNS ثانویه';
+    const DNS2_OPTION = 'Secondary DNS|DNS ثانویه (انتقال زون از سرور DNS شما)';
     const BILLING = [
         'prepaid' => 'پیش‌پرداخت از کیف پول (پیشنهادی)',
         'overage' => 'فاکتور ترافیک اضافه در پایان ماه',
@@ -220,7 +226,7 @@ final class Wizard
             'overage_price' => (float) self::BASE_OVERAGE[$kind], 'overage_allow' => 100,
             'email' => true, 'email_update' => false, 'update' => false, 'plans' => [],
             'addon' => true, 'addon_sizes' => self::ADDON_SIZES,
-            'storage_opt' => false, 'storage_sizes' => self::STORAGE_SIZES,
+            'storage_opt' => false, 'storage_sizes' => self::STORAGE_SIZES, 'dns2_opt' => false,
             'trial' => false, 'trial_name' => self::TRIAL_NAME, 'trial_days' => 7, 'trial_gb' => 5, 'trial_remind' => 2,
             'trial_end' => 'pause', 'trial_terminate_after' => 14, 'report_tpl' => true,
         ];
@@ -290,6 +296,7 @@ final class Wizard
             'addon_sizes' => self::ADDON_SIZES,
             'storage_opt' => !empty($post['storage_opt']),
             'storage_sizes' => self::STORAGE_SIZES,
+            'dns2_opt' => !empty($post['dns2_opt']),
             'trial' => !empty($post['trial']),
             'trial_name' => $str($post['trial_name'] ?? self::TRIAL_NAME, 100),
             'trial_days' => 7, 'trial_gb' => 5, 'trial_remind' => 2,
@@ -766,6 +773,11 @@ final class Wizard
                 $steps[] = $st;
             }
         }
+        if (!empty($in['dns2_opt'])) {
+            foreach (self::dns2Plan() as $st) {
+                $steps[] = $st;
+            }
+        }
         foreach (self::growthPlan($in) as $st) {
             $steps[] = $st;
         }
@@ -1042,6 +1054,11 @@ final class Wizard
         }
         if (!empty($in['storage_opt'])) {
             foreach (self::applyStorageOption($in) as $row) {
+                $out[] = $row;
+            }
+        }
+        if (!empty($in['dns2_opt'])) {
+            foreach (self::applyDns2Option() as $row) {
                 $out[] = $row;
             }
         }
@@ -1409,6 +1426,103 @@ final class Wizard
         }
         Env::kvSet('storage_option', ['gid' => $gid, 'cid' => $cid]);
         return [['op' => $op, 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Storage GB — ' . self::STORAGE_GROUP,
+            'link' => 'configproductoptions.php?action=managegroup&id=' . $gid]];
+    }
+
+    // ------------------------------------------------------------------ security review H1: «Secondary DNS» option
+
+    /** [group row|null, option row|null] of the wizard's «Secondary DNS» option (remembered ids first, then names). */
+    public static function findDns2Option(): array
+    {
+        foreach (self::STORAGE_TABLES as $tb) {
+            if (!Env::hasTable($tb)) {
+                return [null, null];
+            }
+        }
+        $mem = (array) Env::kvGet('dns2_option', []);
+        $opt = !empty($mem['cid']) ? Capsule::table('tblproductconfigoptions')->where('id', (int) $mem['cid'])->first() : null;
+        $group = $opt ? Capsule::table('tblproductconfiggroups')->where('id', (int) $opt->gid)->first() : null;
+        if (!$group) {
+            $group = Capsule::table('tblproductconfiggroups')->where('name', self::DNS2_GROUP)->first();
+            $opt = null;
+        }
+        if ($group && !$opt) {
+            foreach (Capsule::table('tblproductconfigoptions')->where('gid', (int) $group->id)->get() as $o) {
+                if (trim(explode('|', (string) $o->optionname)[0]) === 'Secondary DNS') {
+                    $opt = $o;
+                    break;
+                }
+            }
+        }
+        return [$group, $opt];
+    }
+
+    /** Read-only preview row of applyDns2Option(). */
+    private static function dns2Plan(): array
+    {
+        foreach (self::STORAGE_TABLES as $tb) {
+            if (!Env::hasTable($tb)) {
+                return [['op' => 'skip', 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Secondary DNS', 'detail' => 'جدول ' . $tb . ' در این نسخه‌ی WHMCS نیست']];
+            }
+        }
+        [, $opt] = self::findDns2Option();
+        return [['op' => $opt ? 'skip' : 'create', 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Secondary DNS — ' . self::DNS2_GROUP,
+            'detail' => ($opt ? 'گزینه‌ی موجود #' . (int) $opt->id . ' دست نمی‌خورد' : 'گزینه‌ی بله/خیر')
+                . ' — به همه‌ی محصولات CDN وصل می‌شود؛ قیمت صفر ساخته می‌شود و با مدیر است. «بله» بخش DNS ثانویه (انتقال زون از سرور DNS مشتری) را در پلن سرویس روشن می‌کند (dns_secondary)؛ بدون این گزینه خاموش است.']];
+    }
+
+    /** Creates (idempotently) the «Secondary DNS» yes/no option: group, option, its one sub-option, zero prices, product links. */
+    private static function applyDns2Option(): array
+    {
+        foreach (self::STORAGE_TABLES as $tb) {
+            if (!Env::hasTable($tb)) {
+                return [['op' => 'skip', 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Secondary DNS', 'link' => '']];
+            }
+        }
+        [$group, $opt] = self::findDns2Option();
+        $op = 'skip';
+        if ($group) {
+            $gid = (int) $group->id;
+        } else {
+            $gid = (int) Capsule::table('tblproductconfiggroups')->insertGetId(Env::onlyColumns('tblproductconfiggroups', ['name' => self::DNS2_GROUP,
+                'description' => 'DNS ثانویه سرویس CDN (قابلیت پلن dns_secondary) — بازبینی امنیتی H1']));
+            $op = 'create';
+        }
+        if ($opt) {
+            $cid = (int) $opt->id;
+        } else {
+            // optiontype 3 = yes/no: the service's configoptions['Secondary DNS'] is 1 or 0
+            $cid = (int) Capsule::table('tblproductconfigoptions')->insertGetId(Env::onlyColumns('tblproductconfigoptions', ['gid' => $gid,
+                'optionname' => self::DNS2_OPTION, 'optiontype' => '3', 'qtyminimum' => 0, 'qtymaximum' => 0, 'order' => 0, 'hidden' => 0]));
+            $op = 'create';
+        }
+        $sub = (int) Capsule::table('tblproductconfigoptionssub')->where('configid', $cid)->value('id');
+        if ($sub <= 0) {
+            $sub = (int) Capsule::table('tblproductconfigoptionssub')->insertGetId(Env::onlyColumns('tblproductconfigoptionssub',
+                ['configid' => $cid, 'optionname' => 'بله', 'sortorder' => 1, 'hidden' => 0]));
+            $op = $op === 'skip' ? 'update' : $op;
+        }
+        if (Env::hasTable('tblpricing')) {
+            $cols = ['msetupfee', 'qsetupfee', 'ssetupfee', 'asetupfee', 'bsetupfee', 'tsetupfee', 'monthly', 'quarterly', 'semiannually', 'annually', 'biennially', 'triennially'];
+            foreach (Capsule::table('tblcurrencies')->pluck('id')->all() as $cur) {
+                $key = ['type' => 'configoptions', 'currency' => (int) $cur, 'relid' => $sub];
+                if (!Capsule::table('tblpricing')->where($key)->exists()) {
+                    Capsule::table('tblpricing')->insert(Env::onlyColumns('tblpricing', $key + array_fill_keys($cols, 0)));
+                }
+            }
+        }
+        $linked = 0;
+        foreach (Capsule::table('tblproducts')->where('servertype', 'pasargadcdn')->orderBy('id')->pluck('id')->all() as $pid) {
+            if (!Capsule::table('tblproductconfiglinks')->where('gid', $gid)->where('pid', (int) $pid)->exists()) {
+                Capsule::table('tblproductconfiglinks')->insert(['gid' => $gid, 'pid' => (int) $pid]);
+                $linked++;
+            }
+        }
+        if ($linked && $op === 'skip') {
+            $op = 'update';
+        }
+        Env::kvSet('dns2_option', ['gid' => $gid, 'cid' => $cid]);
+        return [['op' => $op, 'kind' => 'گزینه‌ی قابل‌تنظیم', 'label' => 'Secondary DNS — ' . self::DNS2_GROUP,
             'link' => 'configproductoptions.php?action=managegroup&id=' . $gid]];
     }
 

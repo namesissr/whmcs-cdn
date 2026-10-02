@@ -1098,6 +1098,23 @@ final class Pages
             $o = '<p class="pcdna-okline">' . View::icon('check') . '<span>سایت بدون سرویس روی کنترلر وجود ندارد.</span></p>';
         }
         $h .= View::card('سایت‌های کنترلر بدون سرویس فعال در WHMCS', $o, '', '', 'server');
+
+        // Security review C1: owners of the sites (client_id) — sites made by an older module have none
+        require_once __DIR__ . '/OwnerSync.php';
+        $unowned = OwnerSync::unowned((array) $r['/api/v1/sites']['data']);
+        $btn = View::postButton($q, 'owner_sync', [], 'همگام‌سازی مالکیت دامنه‌ها', 'pcdna-btn pcdna-btn-sm pcdna-btn-primary', '', 'sync');
+        if ($unowned === null) {
+            $w = '<p class="pcdna-muted">کنترلر هنوز مالک سایت‌ها را نمی‌شناسد (نسخهٔ پیش از بازبینی امنیتی).</p>';
+            $btn = '';
+        } elseif ($unowned > 0) {
+            $w = View::alert('warn', View::n($unowned) . ' سرویس فعال یا معلق سایتی بدون مالک روی کنترلر دارد؛ تا مالک ثبت نشود، محافظت در برابر '
+                . 'ثبت زیردامنهٔ مشتری دیگر برای این دامنه‌ها کامل نیست و مشتری نمی‌تواند زیردامنهٔ دامنهٔ خودش را سفارش دهد. '
+                . '«همگام‌سازی مالکیت دامنه‌ها» شناسهٔ مشتری WHMCS هر سرویس را روی سایتش ثبت می‌کند (کران هم هر بار حداکثر '
+                . View::n(OwnerSync::MAX_PER_RUN) . ' سایت را انجام می‌دهد).');
+        } else {
+            $w = '<p class="pcdna-okline">' . View::icon('check') . '<span>همه سایت‌های سرویس‌های فعال و معلق مالک دارند.</span></p>';
+        }
+        $h .= View::card('مالکیت دامنه‌ها', $w, $btn, '', 'shield');
         return $h;
     }
 
@@ -1118,7 +1135,9 @@ final class Pages
         $h = '';
         $ctlUrl = Env::controllerUrl();
         if ($newToken) {
-            $cmd = self::installCmd($ctlUrl, (string) $newToken['token'], (string) ($newToken['region'] ?? 'home'), (string) ($newToken['role'] ?? 'general'));
+            // the controller's own one-liner when it sent one (POST /api/v1/edges), else built the same way (rotate-token)
+            $cmd = is_string($newToken['install'] ?? null) && $newToken['install'] !== '' ? (string) $newToken['install']
+                : self::installCmd($ctlUrl, (string) $newToken['token'], (string) ($newToken['region'] ?? 'home'), (string) ($newToken['role'] ?? 'general'));
             $h .= '<section class="pcdna-card pcdna-token" data-token-panel="1"><header class="pcdna-card-head"><h3>' . View::icon('key') . '<span>'
                 . View::e($newToken['title']) . '</span></h3></header><div class="pcdna-card-body">'
                 . View::alert('warn', '<strong>این توکن فقط همین یک بار نمایش داده می‌شود</strong> و جایی ذخیره یا ثبت نمی‌شود. همین حالا آن را کپی کنید.')
@@ -1193,14 +1212,31 @@ final class Pages
         return $h;
     }
 
-    /** Bootstrap one-command install for a node (SPEC §11.1): downloads the bundle from the controller and runs it. */
+    /**
+     * Bootstrap one-command install for a node (SPEC §11.1): downloads the bundle from the controller and runs it.
+     * Same shape as the controller's bundle.install_command: the one-time token travels in the environment
+     * (PCDN_EDGE_TOKEN, read by edge/bootstrap.sh), not on bash's argv, so other local users cannot see it in
+     * ps / /proc/<pid>/cmdline while the node installs. Used when the controller did not send its own `install`.
+     */
     public static function installCmd(string $ctlUrl, string $token, string $region = 'home', string $role = 'general'): string
     {
         $ctl = $ctlUrl !== '' ? $ctlUrl : 'https://<controller>';
         $region = $region === 'global' ? 'global' : 'home';
         $role = $role === 'tunnel' ? 'tunnel' : 'general';
-        return 'curl -fsSL ' . $ctl . '/edge/bootstrap.sh | sudo bash -s -- --controller ' . $ctl . ' --token ' . $token
+        return 'curl -fsSL ' . $ctl . '/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=' . self::shellQuote($token) . ' bash -s -- --controller ' . $ctl
             . ' --region ' . $region . ' --role ' . $role;
+    }
+
+    /**
+     * Python's shlex.quote (the controller's quoting, byte for byte): safe words as they are, anything else in
+     * single quotes with ' as '"'"'. Unlike escapeshellarg() it never drops non-ASCII bytes under a C locale.
+     */
+    public static function shellQuote(string $v): string
+    {
+        if ($v !== '' && preg_match('#^[A-Za-z0-9@%+=:,./_-]+$#D', $v)) {
+            return $v;
+        }
+        return "'" . str_replace("'", "'\"'\"'", $v) . "'";
     }
 
     /** Re-run bootstrap with --upgrade on an existing node to pull the current bundle (SPEC §11.1). */
@@ -1842,6 +1878,12 @@ final class Pages
             . View::e(implode(', ', array_map('intval', (array) ($in['storage_sizes'] ?? Wizard::STORAGE_SIZES)))) . '">'
             . '<small>مقدار انتخاب‌شده در سفارش، سهمیه‌ی فضای ذخیره‌سازی سرویس (storage_gb) می‌شود؛ محصولی که این گزینه را ندارد فضای ذخیره‌سازی ندارد. '
             . 'قیمت‌ها صفر ساخته می‌شوند: یا در Setup ← Configurable Options برای هر اندازه قیمت ماهانه بگذارید، یا در تنظیمات ماژول «قیمت هر گیگابایت-ماه ذخیره‌سازی» را تعیین کنید تا مصرف واقعی هر ماه فاکتور شود. اجرای دوباره چیزی را تکرار نمی‌کند.</small></label></div></fieldset>';
+
+        // Security review H1: optional «Secondary DNS» configurable option (plan feature dns_secondary)
+        $h .= '<fieldset class="pcdna-fieldset" data-dns2-fs="1"><legend>DNS ثانویه (اختیاری)</legend><div class="pcdna-checks-row">'
+            . self::check('dns2_opt', !empty($in['dns2_opt']), 'گزینه‌ی قابل‌تنظیم «Secondary DNS» ساخته شود (بله/خیر، متصل به همه‌ی محصولات CDN)')
+            . '</div><p class="pcdna-muted">DNS ثانویه (انتقال زون از سرور DNS خود مشتری) قابلیت پلن است و روی کنترلر به‌طور پیش‌فرض خاموش است؛ '
+            . 'فقط سرویس‌هایی که این گزینه را «بله» دارند صفحه‌ی «DNS ثانویه» را باز می‌بینند. قیمت صفر ساخته می‌شود؛ در Setup ← Configurable Options قیمت بگذارید.</p></fieldset>';
 
         // Growth: free trial product + its e-mails; the scheduled usage-report e-mail template
         $h .= '<fieldset class="pcdna-fieldset" data-trial-fs="1"><legend>پلن آزمایشی رایگان و گزارش ایمیلی</legend><div class="pcdna-checks-row">'

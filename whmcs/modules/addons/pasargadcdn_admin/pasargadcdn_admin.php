@@ -122,6 +122,12 @@ function pasargadcdn_admin_config()
                 'Default' => 'yes',
                 'Description' => 'کران WHMCS رویدادهای تونل کنترلر را می‌خواند و برای قطع و وصل دوباره‌ی سرور پشت تونل به صاحب سرویس ایمیل «قطعی سرور پشت تونل» / «اتصال دوباره برقرار شد» می‌فرستد (هر رویداد یک بار)',
             ],
+            'owner_sync' => [
+                'FriendlyName' => 'همگام‌سازی مالکیت دامنه‌ها',
+                'Type' => 'yesno',
+                'Default' => 'yes',
+                'Description' => 'کران WHMCS شناسه‌ی مشتری هر سرویس فعال/معلق CDN را روی سایتی که هنوز مالک ندارد ثبت می‌کند (حداکثر ۱۰۰ سایت در هر اجرا) تا محافظت در برابر ثبت زیردامنه‌ی دامنه‌ی مشتری دیگر برای سرویس‌های قدیمی هم کامل باشد',
+            ],
             'widget' => [
                 'FriendlyName' => 'ویجت صفحه اصلی',
                 'Type' => 'yesno',
@@ -194,6 +200,7 @@ function pasargadcdn_admin_output($vars)
     require_once __DIR__ . '/lib/WidgetData.php';
     require_once __DIR__ . '/lib/Resellers.php';
     require_once __DIR__ . '/lib/Pages.php';
+    require_once __DIR__ . '/lib/OwnerSync.php';
     require_once __DIR__ . '/lib/Admin.php';
     echo PasargadCdn\Admin\Admin::output(is_array($vars) ? $vars : [], $_GET, $_POST,
         strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));

@@ -103,6 +103,7 @@ function pasargadcdn_ConfigOptions()
  *   L4 Proxy — yes/no; L4 Apps — number (SPEC §16.4)
  *   Storage GB — number / dropdown «50|50 GB» (SPEC §16.8 features.storage_gb)
  *   Edge Functions — yes/no; Max Functions — number (SPEC §16.9 features.edge_functions / max_functions)
+ *   Secondary DNS — yes/no (security review H1: features.dns_secondary, default off on the controller)
  * Products saved before v2 have empty configoption5..14, i.e. every v2
  * feature off / 0 until the admin ticks them; likewise products saved before
  * tunnel mode (configoption15..19 empty) get tunnel off, group "general".
@@ -195,6 +196,13 @@ function pasargadcdn_plan(array $params): array
     if (isset($co['Max Functions']) && $co['Max Functions'] !== '') {
         $plan['features']['max_functions'] = min(32, max(0, (int) $co['Max Functions']));
     }
+    // Security review H1: section `dns_secondary` (our nameservers transfer the zone from the customer's
+    // primaries) is a plan feature, OFF by default on the controller. Configurable option «Secondary DNS»
+    // (yes/no) → features.dns_secondary, sent ONLY when the product has the option (an older controller
+    // without the feature never receives the key; Features is extra="forbid").
+    if (isset($co['Secondary DNS'])) {
+        $plan['features']['dns_secondary'] = (bool) $co['Secondary DNS'];
+    }
     // Controller ranges (SPEC §7.1) — out-of-range values would make Create/ChangePackage fail.
     $f = &$plan['features'];
     $f['max_tunnel_paths'] = min(50, max(0, $f['max_tunnel_paths']));
@@ -248,6 +256,12 @@ function pasargadcdn_CreateAccount(array $params)
             'external_id' => (string) $params['serviceid'],
             'plan' => pasargadcdn_cap_plan($params),
         ];
+        // Security review C1: the owning WHMCS client decides the parent/child zone rule on the controller
+        // (controller/app/tenancy.py). Reseller sub-sites are owned through reseller_client_id (Reseller.php).
+        $clientId = (int) ($params['userid'] ?? 0);
+        if ($clientId > 0) {
+            $body['client_id'] = $clientId;
+        }
         $origin = trim((string) ($params['customfields']['Origin IP'] ?? ''));
         if ($origin !== '') {
             $body['origin_ip'] = $origin;
@@ -255,6 +269,9 @@ function pasargadcdn_CreateAccount(array $params)
         try {
             ApiClient::fromParams($params)->post('/api/v1/sites', $body);
         } catch (ApiException $e) {
+            if ($e->getCode() === 422) {
+                throw new ApiException(pasargadcdn_refused_text($domain, $e->getMessage()), 422);
+            }
             if ($e->getCode() !== 409) {
                 throw $e;
             }
@@ -268,12 +285,37 @@ function pasargadcdn_CreateAccount(array $params)
                     . ') ثبت شده است. از بخش «همگام‌سازی» ماژول مدیریت CDN آن را بررسی کنید.', 409);
             }
             $api->patch(ApiClient::site($domain) . '/plan', pasargadcdn_cap_plan($params));
+            // C1: a site created by an older module has no owner yet — claim it for this client (best effort;
+            // the addon's «همگام‌سازی مالکیت دامنه‌ها» does the same for every service).
+            if ($clientId > 0 && array_key_exists('client_id', $site) && empty($site['client_id']) && empty($site['reseller_client_id'])) {
+                try {
+                    $api->patch(ApiClient::site($domain) . '/owner', ['client_id' => $clientId]);
+                } catch (ApiException $e) {
+                    // left to the owner sync, which logs it
+                }
+            }
         }
         // Growth: a service on the wizard's «CDN آزمایشی» product starts its trial clock now (best effort).
         if (Trial::isTrialPid((int) ($params['pid'] ?? $params['packageid'] ?? 0))) {
             Trial::register((int) $params['serviceid'], (int) ($params['userid'] ?? 0), $domain);
         }
     });
+}
+
+/**
+ * Admin-facing text of a 422 from POST /api/v1/sites (security review C1, controller/app/tenancy.py): the
+ * domain is a public suffix, or a parent / child of a site that belongs to another owner. Shown as the
+ * module command result (WHMCS service page, failed-provisioning e-mail / ticket).
+ */
+function pasargadcdn_refused_text(string $domain, string $detail): string
+{
+    if (strpos($detail, 'پسوند عمومی') !== false) {
+        return 'دامنه ' . $domain . ' روی CDN ساخته نشد: ' . $detail . '. این سفارش با نام یک پسوند عمومی (مثل co.ir یا com) ثبت شده است؛ '
+            . 'دامنه سرویس را به نام کامل دامنه مشتری (مثلاً example.ir) اصلاح و دوباره «Create» را اجرا کنید.';
+    }
+    return 'دامنه ' . $domain . ' روی CDN ساخته نشد: ' . $detail . '. زیردامنه یا دامنهٔ والد سایتی که روی CDN متعلق به مشتری دیگری است '
+        . 'قابل ثبت نیست (جلوگیری از تصاحب زیردامنه). اگر هر دو دامنه متعلق به همین مشتری‌اند، در ماژول مدیریت CDN «همگام‌سازی مالکیت دامنه‌ها» '
+        . 'را اجرا کنید (سایت‌های قدیمی بدون مالک ثبت شده‌اند) و دوباره «Create» را بزنید؛ وگرنه به مشتری اطلاع دهید که مالکیت دامنه را تأیید کند.';
 }
 
 function pasargadcdn_SuspendAccount(array $params)
@@ -912,7 +954,7 @@ function pasargadcdn_features_text(array $f): string
     }
     $on = [];
     foreach (['waf' => 'WAF', 'ddos' => 'DDoS', 'load_balancer' => 'LB', 'image_optimization' => 'Image',
-                 'custom_ssl' => 'Custom SSL', 'dnssec' => 'DNSSEC'] as $k => $label) {
+                 'custom_ssl' => 'Custom SSL', 'dnssec' => 'DNSSEC', 'dns_secondary' => 'Secondary DNS'] as $k => $label) {
         if (!empty($f[$k])) {
             $on[] = $label;
         }

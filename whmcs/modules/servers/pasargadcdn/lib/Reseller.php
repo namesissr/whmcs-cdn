@@ -287,6 +287,8 @@ class Reseller
             return [false, I18n::tr('سرور CDN تنظیم نشده است؛ با پشتیبانی تماس بگیرید.')];
         }
         $plan = self::wholesalePlan();
+        // C1 (controller/app/tenancy.py): a sub-site is owned by the reseller through reseller_client_id —
+        // the same WHMCS client id its own services send as client_id, so its own domains may nest.
         $body = [
             'domain' => $domain,
             'origin_ip' => $originIp,
@@ -297,7 +299,8 @@ class Reseller
         try {
             $r = self::api($server, 15, $factory)->post('/api/v1/sites', $body);
         } catch (\Throwable $e) {
-            return [false, I18n::tr('ساخت سایت روی کنترلر ناموفق بود: %s', $e->getMessage())];
+            // a controller refusal (409 exists / 422 public suffix or another owner's parent/child) in the app's language
+            return [false, I18n::tr('ساخت سایت روی کنترلر ناموفق بود: %s', I18n::controller($e->getMessage()))];
         }
         $ctlId = (int) ($r['id'] ?? 0);
         $now = date('Y-m-d H:i:s');

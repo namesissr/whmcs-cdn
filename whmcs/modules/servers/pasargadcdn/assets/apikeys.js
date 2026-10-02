@@ -22,12 +22,15 @@
   var MAX_KEYS = 5;
   var SCOPES = [
     ['purge', t('پاکسازی کش'), t('ارسال درخواست پاکسازی کش (‎/capi/v1/purge)')],
-    ['stats', t('آمار و رویدادها'), t('خواندن آنالیتیکس و رویدادها (‎/capi/v1/analytics‎، ‎/capi/v1/events)')],
-    // Scopes split by the controller (security review): `dns` = records only, `config` = configuration
-    // sections, `functions` = edge functions. Keys created before keep whatever scopes they had.
-    ['dns', t('رکوردهای DNS'), t('مدیریت رکوردهای DNS (‎/capi/v1/records)')],
-    ['config', t('تنظیمات سایت'), t('خواندن و تغییر بخش‌های پیکربندی مثل کش، امنیت و SSL (‎/capi/v1/config)')],
-    ['functions', t('توابع لبه'), t('مدیریت کد و مسیرهای توابع لبه (‎/capi/v1/functions)')]
+    ['stats', t('آمار و رویدادها'), t('خواندن آنالیتیکس، رویدادها، گزارش تونل و آمار توابع (‎/capi/v1/analytics‎، ‎/capi/v1/events …)')],
+    // Scopes of the controller (security review M2/M3, controller/app/routes_capi.py): `dns` = DNS records and
+    // the `dns_secondary` section; `config` = every other configuration section, the redirect CSV import and the
+    // image-signing key; `functions` = the `functions` section (edge function code). Keys created before the
+    // split kept `dns` and got `config` (migration 0019), not `functions`. While the service is suspended a key
+    // can only read: every write answers 403.
+    ['dns', t('DNS (رکوردها و DNS ثانویه)'), t('رکوردهای DNS و تنظیمات DNS ثانویه (‎/capi/v1/records‎، ‎/capi/v1/config/dns_secondary)')],
+    ['config', t('تنظیمات سایت'), t('بقیهٔ بخش‌های پیکربندی مثل کش، امنیت و SSL، ورود CSV ریدایرکت‌ها و کلید امضای تصویر (‎/capi/v1/config‎، ‎/capi/v1/redirects/import‎، ‎/capi/v1/image/transform-secret)')],
+    ['functions', t('توابع لبه'), t('کد و مسیرهای توابع لبه (‎/capi/v1/config/functions)')]
   ];
   function scopeLabel(s) {
     for (var i = 0; i < SCOPES.length; i++) if (SCOPES[i][0] === s) return SCOPES[i][1];
@@ -146,7 +149,7 @@
       h('p', { className: 'pcdn-muted', text: t('کلید را در هدر Authorization به‌صورت Bearer بفرستید. نمونه پاکسازی کامل کش:') }),
       h('pre', { className: 'pcdn-code-block', dir: 'ltr' }, h('code', { text: curlSnippet(null) }),
         P.copyBtn(curlSnippet(null), t('کپی دستور'), { text: t('کپی'), done: t('کپی شد') })),
-      h('p', { className: 'pcdn-muted pcdn-small' }, t('دسترسی هر کلید محدود به همین سرویس است. راهنمای کامل هر بخش (purge / stats / dns): '),
+      h('p', { className: 'pcdn-muted pcdn-small' }, t('دسترسی هر کلید محدود به همین سرویس است و وقتی سرویس معلق است، کلید فقط می‌خواند (هر تغییر با خطای 403 رد می‌شود). راهنمای کامل هر دسترسی (purge / stats / dns / config / functions): '),
         h('a', { className: 'pcdn-link pcdn-apikeys-docs', href: DOCS_URL, target: '_blank', rel: 'noopener noreferrer', 'data-ro-ok': '1' },
           h('span', { text: t('مستندات API') }), icon('external'))),
       // SPEC §14.3.5: machine-readable description of the same customer API (no auth needed), e.g. for code generators

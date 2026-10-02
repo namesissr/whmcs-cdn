@@ -51,6 +51,22 @@ final class Env
         }
     }
 
+    /** Per-request memo for callers outside Env (e.g. the checkout's domain-check answers); cleared by reset(). */
+    public static function memoHas(string $key): bool
+    {
+        return array_key_exists('x:' . $key, self::$memo);
+    }
+
+    public static function memoGet(string $key, $default = null)
+    {
+        return array_key_exists('x:' . $key, self::$memo) ? self::$memo['x:' . $key] : $default;
+    }
+
+    public static function memoSet(string $key, $value): void
+    {
+        self::$memo['x:' . $key] = $value;
+    }
+
     // ------------------------------------------------------------------ server module
 
     public static function serverModuleDir(): string

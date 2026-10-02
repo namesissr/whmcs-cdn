@@ -7,7 +7,8 @@
  *
  *  - ShoppingCartValidateCheckout: empty cart → no work; cart without CDN
  *    products → one memoised query (CDN product ids); CDN products → domain /
- *    Origin IP rules, then at most one controller request (≤ 5 s, fail-open).
+ *    Origin IP rules, then one POST /api/v1/domain-check per CDN domain (in
+ *    parallel, ≤ 5 s, memoised per request, fail-open).
  *  - ShoppingCartValidateProductUpdate: same local rules for the edited item,
  *    no controller request.
  *  - AdminHomeWidgets: registers the widget (data cached 5 minutes).
@@ -23,6 +24,9 @@
  *    cap retries / month rollover (AddonTraffic). SPEC §16.8: once a month, after it
  *    closes, one GET /api/v1/storage/usage per CDN server and one invoice / billable item
  *    per service that stored data (StorageBilling; off while the storage price is 0).
+ *    Security review C1: owner sync (OwnerSync) — while existing sites lack an owner,
+ *    one GET /api/v1/sites per CDN server and at most 100 PATCH …/owner per run;
+ *    afterwards one pass every 6 hours (addon setting «همگام‌سازی مالکیت دامنه‌ها»).
  *    Errors are logged, never thrown into WHMCS's cron.
  */
 
@@ -152,6 +156,17 @@ add_hook('AfterCronJob', 1, function ($vars) {
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: e-mail report cron hook error: ' . $e->getMessage());
+        }
+    }
+    // Security review C1: owners (client_id) of sites created before the controller knew them
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/Data.php';
+        require_once __DIR__ . '/lib/OwnerSync.php';
+        \PasargadCdn\Admin\OwnerSync::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: owner sync cron hook error: ' . $e->getMessage());
         }
     }
     // SPEC §16.8: object-storage charges of the previous month (once, after the month closes)

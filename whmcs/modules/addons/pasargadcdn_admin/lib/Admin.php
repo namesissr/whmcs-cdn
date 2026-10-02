@@ -243,11 +243,43 @@ final class Admin
                 Pages::reset();
                 Env::log('admin panel server set to #' . $sid . ' by admin #' . $admin);
                 return [[['ok', 'سرور ذخیره شد.']], []];
+            case 'owner_sync':
+                return [[self::ownerSync($admin)], []];
             case 'clear_cache':
                 Env::cacheDelete(WidgetData::KEY);
                 return [[['ok', 'حافظه موقت ویجت پاک شد؛ در بارگذاری بعدی صفحه اصلی داده تازه نمایش داده می‌شود.']], []];
         }
         return [[['bad', 'عملیات نامعتبر است.']], []];
+    }
+
+    /** Security review C1: «همگام‌سازی مالکیت دامنه‌ها» — the cron's owner pass, now, refusals retried. */
+    private static function ownerSync(int $admin): array
+    {
+        require_once __DIR__ . '/OwnerSync.php';
+        $r = OwnerSync::run(OwnerSync::MAX_PER_RUN * 2, true);
+        Env::log('owner sync started by admin #' . $admin . ': ' . count($r['fixed']) . ' set, ' . count($r['refused']) . ' refused, '
+            . $r['remaining'] . ' remaining');
+        Pages::reset();
+        if ($r['unsupported'] && !$r['checked']) {
+            return ['warn', 'کنترلر هنوز مالک سایت‌ها را نمی‌شناسد (نسخهٔ پیش از بازبینی امنیتی)؛ ابتدا کنترلر را به‌روز کنید.'];
+        }
+        $msg = 'همگام‌سازی مالکیت: ' . View::n(count($r['fixed'])) . ' سایت مالک گرفت'
+            . ($r['checked'] ? '، ' . View::n($r['checked']) . ' سرویس بررسی شد' : '') . '.';
+        if ($r['remaining']) {
+            $msg .= ' ' . View::n($r['remaining']) . ' سایت دیگر مانده است؛ دوباره اجرا کنید (کران هم ادامه می‌دهد).';
+        }
+        if ($r['refused']) {
+            $msg .= ' کنترلر ' . View::n(count($r['refused'])) . ' مورد را نپذیرفت (زیردامنه/والدِ سایتی با مالک دیگر): ' . implode('، ', array_map(function ($x) {
+                return View::ltr($x['domain']);
+            }, array_slice($r['refused'], 0, 10))) . ' — جزئیات در Activity Log.';
+        }
+        if ($r['errors']) {
+            $msg .= ' خطا: ' . View::e(implode('؛ ', $r['errors']));
+        }
+        if ($r['mismatch']) {
+            $msg .= ' ' . View::n(count($r['mismatch'])) . ' سایت روی کنترلر مالک دیگری دارد (سرویس جابه‌جا شده؟) و تغییر داده نشد؛ جزئیات در Activity Log.';
+        }
+        return [$r['errors'] || $r['refused'] ? 'warn' : 'ok', $msg];
     }
 
     /** Service row (CDN products only) + its server, or an error string. */
@@ -406,7 +438,8 @@ final class Admin
         $token = is_string($r['token'] ?? null) ? $r['token'] : '';
         return [[['ok', 'نود ' . View::ltr($old['name']) . ' ثبت شد.']], $token !== ''
             ? ['token' => ['token' => $token, 'name' => $old['name'], 'title' => 'نود جدید: دستور نصب',
-                'region' => $old['region'], 'role' => $old['group'] === 'tunnel' ? 'tunnel' : 'general']] : []];
+                'region' => $old['region'], 'role' => $old['group'] === 'tunnel' ? 'tunnel' : 'general',
+                'install' => is_string($r['install'] ?? null) ? $r['install'] : '']] : []];
     }
 
     /** Batch add: POST /api/v1/edges/batch → N edges each with a one-time token + ready install one-liner (SPEC §11.1). */

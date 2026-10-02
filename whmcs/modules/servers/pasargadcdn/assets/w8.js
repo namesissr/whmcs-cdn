@@ -864,7 +864,11 @@
       rec: t('همیشه TSIG با hmac-sha256 و فقط آی‌پی‌های مشخص.'),
       mistakes: [t('فراموش کردن مجاز کردن انتقال زون روی سرور اصلی.'), t('وارد نکردن نیم‌سرورهای ما در رکوردهای NS زون اصلی.'), t('گم کردن کلید TSIG (نمایش داده نمی‌شود؛ مقدار تازه بدهید).')]
     },
+    upsell: t('با ارتقای پلن، نیم‌سرورهای ما می‌توانند DNS ثانویهٔ دامنه شما باشند و زون را از سرور DNS خودتان انتقال دهند.'),
     hidden: function (s) { return !sectionOf(s, 'dns_secondary'); },
+    // security review H1: a plan feature (features.dns_secondary, off by default on the controller, which
+    // refuses the write with 403). Explicit false only: a controller from before the review has no such key.
+    lock: function (f) { return f.dns_secondary === false; },
     render: function (Aa) { return renderSecondary(Aa); }
   };
 
