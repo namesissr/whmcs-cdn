@@ -44,6 +44,10 @@ def edge(tmp_path_factory):
         cfg.update({
             "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
             "ACCESS_LOG": str(tmp / "access.log"), "PAGES_DIR": str(agent.HERE) + "/pages",
+            # the test origin is on loopback: allow it past the edge's origin guard, and keep the agent
+            # off the host's real L4 / functions usage logs
+            "ORIGIN_PRIVATE_ALLOW": "127.0.0.0/8 ::1/128",
+            "L4_ACCESS_LOG": str(tmp / "l4.log"), "FN_USAGE_LOG": str(tmp / "fn-usage.log"),
             "NJS_FILE": str(agent.HERE) + "/njs/pcdn.js", "BASE_TEMPLATE": str(agent.HERE) + "/nginx/pcdn-base.conf",
             "GEOIP_DB": str(tmp / "country.mmdb"), "RESOLVER": "127.0.0.1", "NGINX_USER": "root",
             "LISTEN_IPV6": "no", "HTTP_PORT": str(free_port()), "HTTPS_PORT": str(free_port()),
