@@ -86,7 +86,7 @@
     { title: t('امنیت'), items: ['firewall', 'waf', 'bots', 'ddos', 'ratelimit', 'hotlink'] },
     { title: t('SSL و هدرها'), items: ['ssl', 'headers', 'errorpages'] },
     // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.
-    { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement'] },
+    { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement', 'emailreports'] },
     { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys'] }
   ];
   if (RESELLER) NAV.unshift({ title: t('نمایندگی'), items: ['reseller'] });
@@ -206,6 +206,9 @@
     if (P.getLayer) roObs.observe(P.getLayer(), { childList: true, subtree: true });
   }
   if (READONLY) root.classList.add('pcdn-ro');
+  // Growth (growth.js): free-trial CTA, onboarding progress kept in WHMCS, e-mail report opt-in.
+  var GROWTH = P.growth || null;
+  if (GROWTH) GROWTH.init(boot, { admin: !!ADMIN, readonly: READONLY });
 
   function reloadSite() {
     return api('GET', '').then(function (res) {
@@ -383,7 +386,7 @@
     var p = page(S.page);
     var side = h('aside', { className: 'pcdn-side' },
       h('div', { className: 'pcdn-side-head' },
-        h('div', { className: 'pcdn-brand' }, h('span', { className: 'pcdn-brand-mark' }, icon('cloud')), h('span', { text: t('پاسارگاد CDN') }), langSwitch()),
+        brandHead(),
         h('div', { className: 'pcdn-side-domain' }, ltr(S.site.domain, 'pcdn-domain'), statusPill(S.site.status))),
       h('nav', { className: 'pcdn-nav', 'aria-label': t('بخش‌های CDN') }, navTree()));
     var mbar = h('div', { className: 'pcdn-mbar' },
@@ -394,6 +397,23 @@
     append(root, h('div', { className: 'pcdn-shell' }, side, h('div', { className: 'pcdn-col' }, mbar, mainEl)));
     renderMain();
     measure();
+  }
+
+  /**
+   * App header brand. While a reseller manages one of its sub-sites, the reseller's own white-label name /
+   * logo (boot.reseller.brand, set in the reseller panel) replaces «پاسارگاد CDN». The logo is a validated
+   * raster data: URI (never SVG) and is only ever set as an <img> src.
+   */
+  function brandHead() {
+    var b = RSITE && RESELLER && RESELLER.brand && typeof RESELLER.brand === 'object' ? RESELLER.brand : null;
+    var logo = b && typeof b.logo === 'string' && /^data:image\/(png|jpeg|webp|gif);base64,/.test(b.logo) ? b.logo : null;
+    return h('div', { className: 'pcdn-brand' + (b ? ' is-white-label' : ''), 'data-white-label': b ? '1' : null },
+      logo ? h('img', { className: 'pcdn-brand-logo', src: logo, alt: '' }) : h('span', { className: 'pcdn-brand-mark' }, icon('cloud')),
+      h('span', { className: 'pcdn-brand-name', text: b && b.name ? b.name : t('پاسارگاد CDN') }), langSwitch());
+  }
+  function refreshBrand() {
+    var el = root.querySelector('.pcdn-side .pcdn-brand');
+    if (el && el.parentNode) el.parentNode.replaceChild(brandHead(), el);
   }
 
   function pageHead(p, id) {
@@ -459,7 +479,8 @@
       h('div', { className: 'pcdn-banner-actions' }, WALLET.limit_reached ? h('a', { href: UPGRADE_URL, className: 'pcdn-btn pcdn-btn-primary', 'data-ro-ok': '1', text: t('ارتقای پلن') }) : addFundsBtn())], { icon: 'ban' });
     else if (S.site.status === 'over_quota') banner = P.alertBox('danger', [h('strong', { text: t('ترافیک ماهانه تمام شده است. ') }), t('برای ادامه سرویس‌دهی، پلن را ارتقا دهید. '),
       h('a', { href: UPGRADE_URL, className: 'pcdn-link', text: t('ارتقای پلن') })]);
-    append(mainEl, [adminBar, roBar, banner, pageHead(p, id)]);
+    var trialBar = GROWTH && id !== 'overview' ? GROWTH.trialBanner() : null;
+    append(mainEl, [adminBar, roBar, banner, trialBar, pageHead(p, id)]);
     var body = h('div', { className: 'pcdn-page', 'data-panel': id });
     mainEl.appendChild(body);
     if (locked(id)) append(body, upgradePanel(p));
@@ -585,12 +606,62 @@
       var tn = cfg.tunnel || {};
       steps.push({ id: 'tunnel', title: t('تونل (VPN) را راه‌اندازی کنید'), done: !!tn.enabled && Array.isArray(tn.paths) && tn.paths.length > 0 });
     }
-    steps.push({ id: 'realip', title: t('آی‌پی واقعی بازدیدکننده را روی سرور تنظیم کنید'), done: P.store('realip-' + SID) === '1' });
+    steps.push({ id: 'realip', title: t('آی‌پی واقعی بازدیدکننده را روی سرور تنظیم کنید'), done: onb().done.indexOf('realip') >= 0 });
+    // optional steps the client chose to skip count as handled (and can be brought back)
+    var sk = onb().skipped;
+    steps.forEach(function (x) { x.skipped = !x.done && SKIPPABLE.indexOf(x.id) >= 0 && sk.indexOf(x.id) >= 0; });
     return steps;
+  }
+  var SKIPPABLE = ['security', 'tunnel', 'realip'];
+  /** Onboarding progress: WHMCS-side per service (growth.js), else this browser. */
+  function onb() {
+    if (GROWTH) return GROWTH.onboarding();
+    return { done: P.store('realip-' + SID) === '1' ? ['realip'] : [], skipped: [], dismissed: false };
+  }
+  function saveOnb(patch) {
+    if (!GROWTH) { if (patch.done) P.store('realip-' + SID, patch.done.indexOf('realip') >= 0 ? '1' : null); return Promise.resolve({ ok: true }); }
+    return GROWTH.saveOnboarding(patch).then(function (r) { if (!r.ok) P.toast(P.errorText(r.res), 'error'); return r; });
+  }
+  function onbToggle(list, id, on) {
+    var cur = onb()[list].filter(function (x) { return x !== id; });
+    if (on) cur.push(id);
+    var patch = {};
+    patch[list] = cur;
+    return saveOnb(patch);
   }
   function setupProgress() {
     var st = setupSteps();
-    return { total: st.length, done: st.filter(function (x) { return x.done; }).length, steps: st };
+    return { total: st.length, done: st.filter(function (x) { return x.done || x.skipped; }).length, steps: st };
+  }
+
+  /**
+   * Live NS check of the first-run guide: while the NS step is current on the overview, the site is re-read
+   * every 30 s (at most 20 times; reads only, so read-only members get it too) — the controller checks the
+   * delegation by itself; when it flips to verified the guide moves on without a reload.
+   */
+  var nsPoll = { timer: null, n: 0, last: null };
+  function startNsPoll(slot) {
+    if (nsPoll.timer || nsPoll.n >= 20 || !S.site || S.site.ns_verified) return;
+    nsPoll.timer = setTimeout(function tick() {
+      nsPoll.timer = null;
+      if (S.page !== 'overview' || !document.body.contains(slot)) return;
+      nsPoll.n++;
+      api('GET', '').then(function (res) {
+        nsPoll.last = new Date();
+        if (res.ok && res.data && res.data.ns_verified) {
+          S.site = res.data;
+          renderAll();
+          P.toast(t('نیم‌سرورها تأیید شدند و CDN برای دامنه فعال شد.'));
+          return;
+        }
+        if (res.ok && res.data) S.site.ns_found = res.data.ns_found || S.site.ns_found;
+        if (document.body.contains(slot)) {
+          slot.textContent = t('بررسی خودکار فعال است · آخرین بررسی: {0}', P.date(nsPoll.last.toISOString(), { timeStyle: 'short' }));
+          startNsPoll(slot);
+        }
+      });
+    }, Number(window.PCDN_NS_POLL_MS) > 0 ? Number(window.PCDN_NS_POLL_MS) : 30000);  // test hook: e2e shortens the interval
+    onLeave(function () { if (nsPoll.timer) { clearTimeout(nsPoll.timer); nsPoll.timer = null; } });
   }
 
   function stepBody(st) {
@@ -600,6 +671,12 @@
       out.push(h('p', { text: t('پیش از تغییر نیم‌سرورها، همه رکوردهای فعلی دامنه (سایت، ایمیل و زیردامنه‌ها) را اینجا وارد کنید و رکوردهای وب‌سایت (مثل @ و www) را «پروکسی» کنید تا ترافیک از CDN عبور کند.') }));
       out.push(h('p', { className: 'pcdn-muted', text: num(recs.length) + t(' رکورد ثبت شده · ') + num(px) + t(' رکورد پروکسی') }));
       acts.push(P.btn(t('مدیریت رکوردها'), { kind: st.done ? '' : 'primary', icon: 'server', onclick: function () { go('dns'); } }));
+      acts.push(P.btn(t('ورود از فایل زون'), { icon: 'upload', cls: 'pcdn-onb-import', onclick: function () {
+        go('dns').then(function (ok) {
+          var z = ok && root.querySelector('[data-card="zone"]');
+          if (z && z.setOpen) { z.setOpen(true); if (z.scrollIntoView) z.scrollIntoView({ block: 'start', behavior: reduced() ? 'auto' : 'smooth' }); }
+        });
+      } }));
       acts.push(tutLink('quickstart', t('آموزش شروع سریع')));
     } else if (st.id === 'ns') {
       out.push(h('p', { text: t('در پنل ثبت‌کننده دامنه (برای دامنه‌های ‎.ir سایت nic.ir) نیم‌سرورهای دامنه را دقیقاً به موارد زیر تغییر دهید و نیم‌سرورهای قبلی را حذف کنید:') }));
@@ -624,6 +701,9 @@
           });
         } });
         acts.push(chk);
+        var live = h('p', { className: 'pcdn-muted pcdn-small pcdn-ns-live', 'data-ns-live': '1', text: t('بررسی خودکار فعال است؛ هر ۳۰ ثانیه وضعیت نیم‌سرورها دوباره خوانده می‌شود.') });
+        out.push(live);
+        startNsPoll(live);
       }
       acts.push(tutLink('quickstart', t('آموزش تغییر نیم‌سرور (ایرنیک و سایر)')));
     } else if (st.id === 'ssl') {
@@ -660,28 +740,49 @@
       out.push(h('p', { text: t('پشت CDN، سرور شما آی‌پی سرورهای CDN را می‌بیند. با چند خط تنظیم (nginx، Apache، وردپرس و ...) آی‌پی واقعی بازدیدکنندگان در لاگ‌ها و افزونه‌های امنیتی ثبت می‌شود.') }));
       acts.push(P.btn(t('مشاهده آموزش'), { kind: st.done ? '' : 'primary', icon: 'book', onclick: function () { go('help', 'realip'); } }));
       var mark = P.btn(st.done ? t('برگرداندن به انجام‌نشده') : t('انجام دادم'), { icon: st.done ? 'refresh' : 'check', cls: 'pcdn-realip-done', onclick: function () {
-        P.store('realip-' + SID, st.done ? null : '1');
-        renderAll();
+        P.busy(mark, onbToggle('done', 'realip', !st.done)).then(function () { renderAll(); });
       } });
       mark.setAttribute('data-ro-ok', '1');
       acts.push(mark);
     }
+    if (SKIPPABLE.indexOf(st.id) >= 0 && !st.done) {
+      var skip = P.btn(st.skipped ? t('برگرداندن این مرحله') : t('فعلاً رد شود'), { kind: 'ghost', icon: st.skipped ? 'refresh' : 'x', cls: 'pcdn-step-skip', onclick: function () {
+        P.busy(skip, onbToggle('skipped', st.id, !st.skipped)).then(function () { renderMain(); });
+      } });
+      skip.setAttribute('data-ro-ok', '1');
+      acts.push(skip);
+    }
     return [out, h('div', { className: 'pcdn-row-actions' }, acts)];
+  }
+
+  /** The guide was dismissed: a one-line strip that brings it back. */
+  function checklistStrip(pr) {
+    var show = P.btn(t('نمایش راهنمای راه‌اندازی'), { size: 'sm', icon: 'rocket', cls: 'pcdn-onb-restore', onclick: function () {
+      P.busy(show, saveOnb({ dismissed: false })).then(function () { renderMain(); });
+    } });
+    show.setAttribute('data-ro-ok', '1');
+    return h('div', { className: 'pcdn-onb-strip', 'data-card': 'setup', 'data-dismissed': '1' }, icon('rocket'),
+      h('span', { text: t('راه‌اندازی: {0} از {1} مرحله انجام شده', num(pr.done), num(pr.total)) }), show);
   }
 
   function checklist() {
     var pr = setupProgress(), complete = pr.done === pr.total;
+    if (!complete && onb().dismissed) return checklistStrip(pr);
+    var hide = complete ? null : P.btn(t('بستن راهنما'), { kind: 'ghost', size: 'sm', icon: 'x', cls: 'pcdn-onb-dismiss', onclick: function () {
+      P.busy(hide, saveOnb({ dismissed: true })).then(function () { renderMain(); });
+    } });
+    if (hide) hide.setAttribute('data-ro-ok', '1');
     var c = P.card({ title: complete ? t('راه‌اندازی کامل شد') : t('راه‌اندازی CDN'), icon: complete ? 'checkCircle' : 'rocket', tone: complete ? 'success' : 'brand',
       subtitle: complete ? t('همه مراحل انجام شده است. سایت شما از طریق CDN سرویس می‌گیرد.') : t('این مراحل را به ترتیب انجام دهید تا سایت شما کاملاً از CDN استفاده کند.'),
       cls: 'pcdn-setup' + (complete ? ' is-complete' : ''), id: 'setup',
       actions: complete ? h('button', { type: 'button', className: 'pcdn-btn pcdn-btn-ghost pcdn-btn-sm', 'aria-expanded': String(S.showSetup), 'data-ro-ok': '1',
-        onclick: function () { S.showSetup = !S.showSetup; renderMain(); } }, h('span', { text: S.showSetup ? t('پنهان کردن مراحل') : t('نمایش مراحل') }), icon('chevronDown')) : null });
+        onclick: function () { S.showSetup = !S.showSetup; renderMain(); } }, h('span', { text: S.showSetup ? t('پنهان کردن مراحل') : t('نمایش مراحل') }), icon('chevronDown')) : hide });
     append(c.body, h('div', { className: 'pcdn-progress' },
       h('div', { className: 'pcdn-progress-text' }, h('strong', { text: num(pr.done) + t(' از ') + num(pr.total) }), h('span', { text: t(' مرحله انجام شده') })),
       P.meter(pr.done / pr.total, complete ? 'success' : 'brand')));
     if (complete && !S.showSetup) { c.body.classList.add('is-compact'); return c; }
     var current = null;
-    pr.steps.forEach(function (st) { if (!current && !st.done) current = st.id; });
+    pr.steps.forEach(function (st) { if (!current && !st.done && !st.skipped) current = st.id; });
     var list = h('ol', { className: 'pcdn-steps' });
     pr.steps.forEach(function (st, i) {
       var open = st.id === current;
@@ -696,9 +797,9 @@
         } },
         h('span', { className: 'pcdn-step-mark' }, st.done ? icon('check') : h('span', { text: num(i + 1) })),
         h('span', { className: 'pcdn-step-title', text: st.title }),
-        h('span', { className: 'pcdn-step-state', text: st.done ? t('انجام شد') : st.id === current ? t('مرحله فعلی') : '' }),
+        h('span', { className: 'pcdn-step-state', text: st.done ? t('انجام شد') : st.skipped ? t('رد شد') : st.id === current ? t('مرحله فعلی') : '' }),
         icon('chevronDown', 'pcdn-caret'));
-      var li = h('li', { className: 'pcdn-step' + (st.done ? ' is-done' : '') + (open ? ' is-open is-current' : ''), 'data-step': st.id }, head, body);
+      var li = h('li', { className: 'pcdn-step' + (st.done ? ' is-done' : '') + (st.skipped ? ' is-skipped' : '') + (open ? ' is-open is-current' : ''), 'data-step': st.id }, head, body);
       list.appendChild(li);
     });
     c.body.appendChild(list);
@@ -807,6 +908,8 @@
           h('span', { text: t('باز کردن سایت') }), icon('external'))),
       spark);
     out.push(hero);
+    var trial = GROWTH ? GROWTH.trialCard() : null;
+    if (trial) out.push(trial);
 
     var hint = h('div', { className: 'pcdn-hint-slot' });
     var sug = suggestBanner();
@@ -1561,7 +1664,7 @@
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
     reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
-    readonly: READONLY, onLeave: onLeave, refreshNav: refreshNav, recordModal: recordModal
+    readonly: READONLY, onLeave: onLeave, refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand
   };
 
   // ------------------------------------------------------------------ boot

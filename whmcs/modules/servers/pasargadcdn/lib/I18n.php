@@ -73,6 +73,22 @@ class I18n
         'حذف رکورد محلی ناموفق بود: %s' => 'Deleting the local record failed: %s',
         'زیرسایت حذف شد.' => 'Sub-site deleted.',
         'سرور CDN تنظیم نشده است.' => 'No CDN server is configured.',
+        // Growth: onboarding / e-mail report opt-in (ClientApi local ops) and reseller white-label
+        'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.' => 'Could not save the setting in WHMCS; try again.',
+        'ذخیره برند ممکن نشد؛ دوباره تلاش کنید.' => 'Could not save the brand; try again.',
+        'نام برند حداکثر %s نویسه است.' => 'The brand name is limited to %s characters.',
+        'لوگو باید تصویر PNG، JPEG، WebP یا GIF و حداکثر ۶۴ کیلوبایت باشد.' => 'The logo must be a PNG, JPEG, WebP or GIF image of at most 64 KB.',
+        // Growth: free-trial checkout rules (addon CartValidator, in the visitor's language)
+        'در هر سفارش فقط یک سرویس آزمایشی CDN مجاز است.' => 'Only one free CDN trial is allowed per order.',
+        'برای این دامنه قبلاً از دوره آزمایشی CDN استفاده شده است. برای ادامه یکی از پلن‌های CDN را سفارش دهید.'
+            => 'This domain has already used the free CDN trial. Order one of the CDN plans to continue.',
+        'هر مشتری فقط یک بار می‌تواند از دوره آزمایشی رایگان CDN استفاده کند. برای ادامه یکی از پلن‌های CDN را سفارش دهید.'
+            => 'Each customer can use the free CDN trial only once. Order one of the CDN plans to continue.',
+        // C1: public suffixes and parent/child domains of other clients (checkout + reseller sub-sites)
+        '«%s» یک پسوند عمومی دامنه است و نمی‌توان آن را به‌عنوان سایت روی CDN ثبت کرد؛ نام کامل دامنه خود را وارد کنید (مثلاً example.ir).'
+            => '“%s” is a public domain suffix and cannot be added to the CDN as a site; enter your full domain name (for example example.ir).',
+        'دامنه %s زیردامنه یا دامنه اصلی سایتی است که متعلق به مشتری دیگری روی CDN است و قابل ثبت نیست. اگر مالک دامنه هستید با پشتیبانی تماس بگیرید.'
+            => 'The domain %s is a subdomain or parent domain of a site that belongs to another customer on the CDN and cannot be added. If you own the domain, contact support.',
         // SPEC §16.8 object storage — controller details (translated by controller(), see below)
         'نام باکت باید %s تا %s کاراکتر از حروف کوچک انگلیسی، رقم و - باشد و با حرف یا رقم شروع و تمام شود' => 'The bucket name must be %s to %s characters of lowercase English letters, digits and -, and start and end with a letter or digit',
         'باکت یافت نشد' => 'Bucket not found',

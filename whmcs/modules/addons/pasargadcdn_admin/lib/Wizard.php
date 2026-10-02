@@ -30,6 +30,13 @@ final class Wizard
     const EMAIL_TUNNEL_DOWN = 'Pasargad CDN Tunnel Origin Down';
     const EMAIL_TUNNEL_UP = 'Pasargad CDN Tunnel Origin Up';
     /** Wave 7: «بسته‌ی ترافیک افزوده» product add-ons, one per size (WHMCS add-ons carry no configurable options). */
+    /** Growth: free trial e-mails (sent by Trials) and the scheduled usage report (sent by Reports). */
+    const EMAIL_TRIAL_ENDING = 'Pasargad CDN Trial Ending';
+    const EMAIL_TRIAL_ENDED = 'Pasargad CDN Trial Ended';
+    const EMAIL_REPORT = 'Pasargad CDN Usage Report';
+    const TRIAL_NAME = 'CDN آزمایشی';
+    const TRIAL_ENDS = ['pause' => 'توقف روی CDN (سرویس WHMCS فعال می‌ماند تا مشتری درجا ارتقا دهد — پیشنهادی)',
+        'suspend' => 'تعلیق سرویس در WHMCS (ModuleSuspend)', 'terminate' => 'حذف سرویس (ModuleTerminate)'];
     const ADDON_NAME = 'بسته‌ی ترافیک افزوده';
     const ADDON_SIZES = [10, 50, 100];
     /**
@@ -214,7 +221,17 @@ final class Wizard
             'email' => true, 'email_update' => false, 'update' => false, 'plans' => [],
             'addon' => true, 'addon_sizes' => self::ADDON_SIZES,
             'storage_opt' => false, 'storage_sizes' => self::STORAGE_SIZES,
+            'trial' => false, 'trial_name' => self::TRIAL_NAME, 'trial_days' => 7, 'trial_gb' => 5, 'trial_remind' => 2,
+            'trial_end' => 'pause', 'trial_terminate_after' => 14, 'report_tpl' => true,
         ];
+        $tc = self::trialConfig();
+        if ($tc) {
+            $in['trial_days'] = $tc['days'];
+            $in['trial_gb'] = $tc['gb'];
+            $in['trial_remind'] = $tc['remind'];
+            $in['trial_end'] = $tc['end'];
+            $in['trial_terminate_after'] = $tc['terminate_after'];
+        }
         $existing = self::existingServerGroup();
         if ($existing) {
             $in['servergroup'] = (int) $existing->id;
@@ -273,7 +290,31 @@ final class Wizard
             'addon_sizes' => self::ADDON_SIZES,
             'storage_opt' => !empty($post['storage_opt']),
             'storage_sizes' => self::STORAGE_SIZES,
+            'trial' => !empty($post['trial']),
+            'trial_name' => $str($post['trial_name'] ?? self::TRIAL_NAME, 100),
+            'trial_days' => 7, 'trial_gb' => 5, 'trial_remind' => 2,
+            'trial_end' => in_array($post['trial_end'] ?? '', ['pause', 'suspend', 'terminate'], true) ? (string) $post['trial_end'] : 'pause',
+            'trial_terminate_after' => 14,
+            'report_tpl' => !empty($post['report_tpl']),
         ];
+        // Growth: free trial (days 1..90, GB 1..1000, reminder 0..days, auto-terminate 0..365 days)
+        foreach (['trial_days' => [1, 90, 7], 'trial_gb' => [1, 1000, 5], 'trial_remind' => [0, 90, 2], 'trial_terminate_after' => [0, 365, 14]] as $k => [$lo, $hi, $dv]) {
+            $v = $numv($post[$k] ?? (string) $dv);
+            if (!ctype_digit($v) || (int) $v < $lo || (int) $v > $hi) {
+                if ($in['trial']) {
+                    $e[] = ['trial_days' => 'مدت دوره آزمایشی باید عددی بین ۱ تا ۹۰ روز باشد.', 'trial_gb' => 'ترافیک دوره آزمایشی باید عددی بین ۱ تا ۱۰۰۰ گیگابایت باشد.',
+                        'trial_remind' => 'یادآوری پایان دوره آزمایشی باید عددی بین ۰ تا ۹۰ روز باشد.', 'trial_terminate_after' => 'حذف خودکار پس از پایان دوره آزمایشی باید عددی بین ۰ تا ۳۶۵ روز باشد.'][$k];
+                }
+                continue;
+            }
+            $in[$k] = (int) $v;
+        }
+        if ($in['trial'] && $in['trial_remind'] >= $in['trial_days']) {
+            $e[] = 'یادآوری پایان دوره آزمایشی باید کمتر از مدت دوره باشد.';
+        }
+        if ($in['trial'] && $in['trial_name'] === '') {
+            $e[] = 'نام محصول آزمایشی را وارد کنید.';
+        }
         // SPEC §16.8: «Storage GB» sizes, e.g. "0, 10, 50, 100" (GB, 0..1000000, 1 to 8 values, at least one > 0)
         $rawSt = trim(str_replace(['،', '-', '/'], ',', (string) Env::input($post['storage_sizes'] ?? '')));
         if ($rawSt !== '') {
@@ -725,6 +766,9 @@ final class Wizard
                 $steps[] = $st;
             }
         }
+        foreach (self::growthPlan($in) as $st) {
+            $steps[] = $st;
+        }
         $perMb = self::perMb($in['overage_price']);
         $found = [];
         foreach ($in['plans'] as $key => $p) {
@@ -814,6 +858,23 @@ final class Wizard
         }
         if (Env::setting('billing', '') !== $in['billing']) {
             Env::saveSetting('billing', $in['billing']);
+        }
+        // Growth: the trial config the provisioning module / cron / checkout read (mod_pasargadcdn_settings k=trial)
+        foreach ($summary as $s) {
+            if (!empty($s['trial_pid'])) {
+                Env::kvSet('trial', ['pid' => (int) $s['trial_pid'], 'days' => $in['trial_days'], 'gb' => $in['trial_gb'],
+                    'remind' => $in['trial_remind'], 'end' => $in['trial_end'], 'terminate_after' => $in['trial_terminate_after']]);
+                if (Env::setting('trial_pid', '') !== (string) (int) $s['trial_pid']) {
+                    Env::saveSetting('trial_pid', (string) (int) $s['trial_pid']);
+                }
+                if (class_exists('\\PasargadCdn\\Trial')) {
+                    \PasargadCdn\Trial::reset();
+                }
+            }
+        }
+        // Growth: the e-mail report cron and the client app's «گزارش ایمیلی» page need the report template
+        if (!empty($in['report_tpl']) && Env::setting('report_tpl_on', '') !== 'on') {
+            Env::saveSetting('report_tpl_on', 'on');
         }
         // Wave 7: lets the cron's add-on pass (cap retries / month rollover) run only where add-ons exist
         if (!empty($in['addon']) && Env::setting('traffic_addon_on', '') !== 'on') {
@@ -984,6 +1045,243 @@ final class Wizard
                 $out[] = $row;
             }
         }
+        foreach (self::applyGrowth($in, $now, $gid, $sgid, $emailId, $pids) as $row) {
+            $out[] = $row;
+        }
+        return $out;
+    }
+
+    // ------------------------------------------------------------------ growth: free trial + e-mail report templates
+
+    /** The stored trial config (mod_pasargadcdn_settings k=trial), or null. */
+    public static function trialConfig(): ?array
+    {
+        $d = Env::kvGet('trial');
+        if (!is_array($d) || (int) ($d['pid'] ?? 0) <= 0) {
+            return null;
+        }
+        return Env::loadServerModule() && class_exists('\\PasargadCdn\\Trial') ? \PasargadCdn\Trial::clean($d) : null;
+    }
+
+    /** The wizard's trial product: remembered id first, then by name. */
+    public static function findTrialProduct(string $name)
+    {
+        $c = self::trialConfig();
+        if ($c) {
+            $p = Capsule::table('tblproducts')->where('id', $c['pid'])->where('servertype', 'pasargadcdn')->first();
+            if ($p) {
+                return $p;
+            }
+        }
+        return Capsule::table('tblproducts')->where('name', $name)->where('servertype', 'pasargadcdn')->orderBy('id')->first();
+    }
+
+    /** Plan row of the trial product: the basic tier's security, a small cap and NO tunnel (a free VPN invites abuse). */
+    public static function trialPlan(array $in): array
+    {
+        $p = self::PLANS['basic'];
+        $p['bw'] = (int) $in['trial_gb'];
+        $p['tunnel'] = 0;
+        $p['tpaths'] = 0;
+        $p['tconn'] = 0;
+        $p['tmbps'] = 0;
+        $p['records'] = 20;
+        $p['name'] = $in['trial_name'];
+        return $p;
+    }
+
+    public static function findEmailLang(string $name, string $lang)
+    {
+        return Capsule::table('tblemailtemplates')->where('name', $name)->where('type', 'product')->where('language', $lang)->orderBy('id')->first();
+    }
+
+    /** name => [fa subject, fa body, en subject, en body] of the growth templates enabled in $in. */
+    public static function growthTemplates(array $in): array
+    {
+        $out = [];
+        $wrapFa = function (string $inner, string $accent = '#1d5fd6') {
+            return '<div dir="rtl" style="text-align:right;font-family:Tahoma,Arial,sans-serif;line-height:1.9;font-size:14px;color:#1f2933">' . "\n"
+                . '<div style="border-right:4px solid ' . $accent . ';padding:2px 12px;margin:0 0 14px"><div style="font-size:16px;font-weight:bold;color:' . $accent . '">پاسارگاد سی‌دی‌ان</div>'
+                . '<div style="font-size:12px;color:#7b8794">شبکه توزیع محتوا و امنیت وب پاسارگاد میزبان</div></div>' . "\n" . $inner . "\n"
+                . '<p style="margin-top:16px;font-size:12px;color:#7b8794">این پیام درباره سرویس CDN دامنه <strong dir="ltr">{$service_domain}</strong> فرستاده شده است.</p>'
+                . "\n<p>{\$signature}</p>\n</div>";
+        };
+        $wrapEn = function (string $inner, string $accent = '#1d5fd6') {
+            return '<div dir="ltr" style="text-align:left;font-family:Arial,sans-serif;line-height:1.7;font-size:14px;color:#1f2933">' . "\n"
+                . '<div style="border-left:4px solid ' . $accent . ';padding:2px 12px;margin:0 0 14px"><div style="font-size:16px;font-weight:bold;color:' . $accent . '">Pasargad CDN</div>'
+                . '<div style="font-size:12px;color:#7b8794">Content delivery and web security by Pasargad Mizban</div></div>' . "\n" . $inner . "\n"
+                . '<p style="margin-top:16px;font-size:12px;color:#7b8794">This message is about the CDN service of <strong>{$service_domain}</strong>.</p>'
+                . "\n<p>{\$signature}</p>\n</div>";
+        };
+        $btn = function (string $href, string $label) {
+            return '<p style="margin:14px 0"><a href="' . $href . '" style="display:inline-block;background:#1d5fd6;color:#fff;padding:9px 20px;border-radius:8px;text-decoration:none;font-weight:bold">' . $label . '</a></p>';
+        };
+        $up = '{$whmcs_url}{$cdn_trial_upgrade_path}';
+        if (!empty($in['trial'])) {
+            $out[self::EMAIL_TRIAL_ENDING] = [
+                'دوره آزمایشی CDN دامنه {$service_domain} به‌زودی تمام می‌شود',
+                $wrapFa("<p>{\$client_name} عزیز، سلام</p>\n<p>دوره آزمایشی رایگان CDN برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> "
+                    . "<strong>{\$cdn_trial_days_left} روز دیگر</strong> ({\$cdn_trial_end_date}) تمام می‌شود.</p>\n"
+                    . "<p>برای اینکه سایت شما بدون وقفه از CDN سرویس بگیرد و همه تنظیمات (DNS، کش، امنیت و SSL) حفظ شود، همین حالا سرویس را به یکی از پلن‌های CDN ارتقا دهید.</p>\n"
+                    . $btn($up, 'ارتقا به پلن کامل'), '#de911d'),
+                'Your CDN trial for {$service_domain} ends soon',
+                $wrapEn("<p>Dear {\$client_name},</p>\n<p>The free CDN trial of <strong>{\$service_domain}</strong> ends in <strong>{\$cdn_trial_days_left} day(s)</strong> ({\$cdn_trial_end_date}).</p>\n"
+                    . "<p>Upgrade the service to one of the CDN plans now to keep your site on the CDN without interruption, with all of its settings (DNS, cache, security and SSL).</p>\n"
+                    . $btn($up, 'Upgrade to a full plan'), '#de911d'),
+            ];
+            $out[self::EMAIL_TRIAL_ENDED] = [
+                'دوره آزمایشی CDN دامنه {$service_domain} تمام شد',
+                $wrapFa("<p>{\$client_name} عزیز، سلام</p>\n<p>دوره آزمایشی رایگان {\$cdn_trial_days} روزه CDN برای دامنه <strong dir=\"ltr\">{\$service_domain}</strong> تمام شد و سایت دیگر از طریق CDN سرویس نمی‌گیرد.</p>\n"
+                    . "{if \$cdn_trial_paused}<p>تنظیمات شما محفوظ است: با ارتقای سرویس به یکی از پلن‌های CDN، سایت ظرف چند ثانیه دوباره از CDN سرویس می‌گیرد.</p>\n" . $btn($up, 'ارتقا و فعال‌سازی دوباره')
+                    . "{else}<p>برای ادامه استفاده از CDN، یکی از پلن‌های CDN را سفارش دهید.</p>\n" . $btn('{$whmcs_url}cart.php', 'سفارش پلن CDN') . "{/if}\n"
+                    . '<p style="font-size:13px;color:#52606d">پیش از ارتقا، اگر نیم‌سرورهای دامنه را به CDN داده‌اید و فعلاً قصد ادامه ندارید، آن‌ها را به حالت قبل برگردانید.</p>', '#d64545'),
+                'Your CDN trial for {$service_domain} has ended',
+                $wrapEn("<p>Dear {\$client_name},</p>\n<p>The {\$cdn_trial_days}-day free CDN trial of <strong>{\$service_domain}</strong> has ended and the site is no longer served through the CDN.</p>\n"
+                    . "{if \$cdn_trial_paused}<p>Your settings are kept: upgrade the service to one of the CDN plans and the site is back on the CDN within seconds.</p>\n" . $btn($up, 'Upgrade and reactivate')
+                    . "{else}<p>Order one of the CDN plans to keep using the CDN.</p>\n" . $btn('{$whmcs_url}cart.php', 'Order a CDN plan') . "{/if}\n"
+                    . '<p style="font-size:13px;color:#52606d">If you pointed the domain\'s name servers to the CDN and do not plan to continue, switch them back.</p>', '#d64545'),
+            ];
+        }
+        if (!empty($in['report_tpl'])) {
+            $manage = '{$whmcs_url}clientarea.php?action=productdetails&amp;id={$service_id}#pcdn=emailreports';
+            $out[self::EMAIL_REPORT] = [
+                'گزارش {$cdn_report_kind} CDN دامنه {$service_domain} — {$cdn_report_period}',
+                $wrapFa("<p>{\$client_name} عزیز، سلام</p>\n<p>گزارش {\$cdn_report_kind} سرویس CDN دامنه <strong dir=\"ltr\">{\$service_domain}</strong> برای بازه <strong>{\$cdn_report_period}</strong>:</p>\n"
+                    . '<table cellpadding="6" style="border-collapse:collapse;font-size:14px">'
+                    . '<tr><td>درخواست‌ها</td><td><strong>{$cdn_report_requests}</strong></td></tr>'
+                    . '<tr><td>ترافیک</td><td><strong>{$cdn_report_traffic}</strong></td></tr>'
+                    . '<tr><td>نرخ کش</td><td><strong>{$cdn_report_cache_ratio}</strong></td></tr>'
+                    . '<tr><td>تهدیدهای متوقف‌شده</td><td><strong>{$cdn_report_threats}</strong>{if $cdn_report_threats_detail} <small>({$cdn_report_threats_detail})</small>{/if}</td></tr>'
+                    . '{if $cdn_report_sla}<tr><td>دسترس‌پذیری (SLA)</td><td><strong>{$cdn_report_sla}</strong>{if $cdn_report_sla_target} — هدف {$cdn_report_sla_target}{/if}</td></tr>{/if}'
+                    . '{if $cdn_report_tunnel}<tr><td>مصرف تونل</td><td><strong>{$cdn_report_tunnel}</strong> — {$cdn_report_tunnel_sessions} اتصال</td></tr>{/if}'
+                    . '<tr><td>ترافیک ماه جاری تاکنون</td><td>{$cdn_report_month_traffic}</td></tr></table>' . "\n"
+                    . '{if $cdn_report_countries_html}<p><strong>کشورهای پربازدید</strong></p>{$cdn_report_countries_html}{/if}' . "\n"
+                    . '{if $cdn_report_paths_html}<p><strong>مسیرهای پربازدید</strong></p>{$cdn_report_paths_html}{/if}' . "\n"
+                    . '<p style="font-size:12px;color:#7b8794">این گزارش را خودتان در ناحیه کاربری فعال کرده‌اید؛ برای تغییر یا لغو: <a href="' . $manage . '">تنظیم گزارش ایمیلی</a></p>'),
+                'Your {$cdn_report_kind} CDN report for {$service_domain} — {$cdn_report_period}',
+                $wrapEn("<p>Dear {\$client_name},</p>\n<p>Here is the {\$cdn_report_kind} report of the CDN service of <strong>{\$service_domain}</strong> for <strong>{\$cdn_report_period}</strong>:</p>\n"
+                    . '<table cellpadding="6" style="border-collapse:collapse;font-size:14px">'
+                    . '<tr><td>Requests</td><td><strong>{$cdn_report_requests}</strong></td></tr>'
+                    . '<tr><td>Traffic</td><td><strong>{$cdn_report_traffic}</strong></td></tr>'
+                    . '<tr><td>Cache hit ratio</td><td><strong>{$cdn_report_cache_ratio}</strong></td></tr>'
+                    . '<tr><td>Threats stopped</td><td><strong>{$cdn_report_threats}</strong>{if $cdn_report_threats_detail} <small>({$cdn_report_threats_detail})</small>{/if}</td></tr>'
+                    . '{if $cdn_report_sla}<tr><td>Availability (SLA)</td><td><strong>{$cdn_report_sla}</strong>{if $cdn_report_sla_target} — target {$cdn_report_sla_target}{/if}</td></tr>{/if}'
+                    . '{if $cdn_report_tunnel}<tr><td>Tunnel usage</td><td><strong>{$cdn_report_tunnel}</strong> — {$cdn_report_tunnel_sessions} connections</td></tr>{/if}'
+                    . '<tr><td>This month so far</td><td>{$cdn_report_month_traffic}</td></tr></table>' . "\n"
+                    . '{if $cdn_report_countries_html}<p><strong>Top countries</strong></p>{$cdn_report_countries_html}{/if}' . "\n"
+                    . '{if $cdn_report_paths_html}<p><strong>Top paths</strong></p>{$cdn_report_paths_html}{/if}' . "\n"
+                    . '<p style="font-size:12px;color:#7b8794">You turned this report on in the client area; to change or stop it: <a href="' . $manage . '">e-mail report settings</a></p>'),
+            ];
+        }
+        return $out;
+    }
+
+    /** Read-only preview rows of applyGrowth(). */
+    private static function growthPlan(array $in): array
+    {
+        $steps = [];
+        foreach (self::growthTemplates($in) as $name => $_) {
+            foreach (['' => 'فارسی (پیش‌فرض)', 'english' => 'ترجمه انگلیسی'] as $lang => $label) {
+                $tpl = self::findEmailLang($name, $lang) ?: ($lang === '' ? self::findEmail($name) : null);
+                $steps[] = ['op' => $tpl ? ($in['email_update'] ? 'update' : 'skip') : 'create', 'kind' => 'قالب ایمیل', 'label' => $name . ' — ' . $label,
+                    'detail' => $tpl ? ($in['email_update'] ? 'متن قالب موجود بازنویسی می‌شود' : 'قالب موجود دست نمی‌خورد')
+                        : ($name === self::EMAIL_REPORT ? 'گزارش ایمیلی هفتگی/ماهانه‌ای که مشتری در ناحیه کاربری فعال می‌کند' : 'یادآوری / پایان دوره آزمایشی رایگان')];
+            }
+        }
+        if (!empty($in['trial'])) {
+            $prod = self::findTrialProduct($in['trial_name']);
+            $steps[] = ['op' => $prod ? ($in['update'] ? 'update' : 'skip') : 'create', 'kind' => 'محصول', 'label' => $in['trial_name'],
+                'detail' => ($prod ? 'محصول موجود #' . (int) $prod->id . ' — ' : '') . 'رایگان، ' . View::n($in['trial_days']) . ' روز، ' . View::n($in['trial_gb'])
+                    . ' گیگابایت، بدون تونل؛ یک بار برای هر مشتری / ایمیل / دامنه؛ یادآوری ' . View::n($in['trial_remind']) . ' روز مانده؛ پایان: '
+                    . self::TRIAL_ENDS[$in['trial_end']] . ($in['trial_terminate_after'] > 0 && $in['trial_end'] !== 'terminate' ? '؛ حذف ' . View::n($in['trial_terminate_after']) . ' روز بعد' : '')
+                    . '؛ مسیر ارتقا به همه پلن‌های پولی'];
+        }
+        return $steps;
+    }
+
+    /** Creates / refreshes the growth templates (fa + en) and the trial product (idempotent). */
+    private static function applyGrowth(array $in, string $now, int $gid, int $sgid, int $emailId, array $pids): array
+    {
+        $out = [];
+        foreach (self::growthTemplates($in) as $name => [$faSub, $faBody, $enSub, $enBody]) {
+            foreach (['' => [$faSub, $faBody], 'english' => [$enSub, $enBody]] as $lang => [$sub, $body]) {
+                $tpl = self::findEmailLang($name, $lang) ?: ($lang === '' ? self::findEmail($name) : null);
+                $fields = ['subject' => $sub, 'message' => $body, 'updated_at' => $now];
+                if ($tpl) {
+                    if ($in['email_update']) {
+                        Capsule::table('tblemailtemplates')->where('id', (int) $tpl->id)->update(Env::onlyColumns('tblemailtemplates', $fields));
+                    }
+                    $id = (int) $tpl->id;
+                    $op = $in['email_update'] ? 'update' : 'skip';
+                } else {
+                    $id = (int) Capsule::table('tblemailtemplates')->insertGetId(Env::onlyColumns('tblemailtemplates', $fields + [
+                        'type' => 'product', 'name' => $name, 'attachments' => '', 'fromname' => '', 'fromemail' => '', 'disabled' => 0, 'custom' => 1,
+                        'language' => $lang, 'copyto' => '', 'blind_copy_to' => '', 'plaintext' => 0, 'created_at' => $now]));
+                    $op = 'create';
+                }
+                $out[] = ['op' => $op, 'kind' => 'قالب ایمیل', 'label' => $name . ($lang === '' ? '' : ' (' . $lang . ')'), 'link' => 'configemailtemplates.php?action=edit&id=' . $id];
+            }
+        }
+        if (empty($in['trial'])) {
+            return $out;
+        }
+        $p = self::trialPlan($in);
+        $p['desc'] = '<ul><li>' . View::n($in['trial_days']) . ' روز استفاده رایگان از CDN پاسارگاد — بدون نیاز به پرداخت</li><li>'
+            . View::n($in['trial_gb']) . ' گیگابایت ترافیک، SSL رایگان، حفاظت DDoS و DNSSEC</li><li>هر مشتری و هر دامنه فقط یک بار؛ در پایان دوره می‌توانید درجا به پلن کامل ارتقا دهید</li></ul>';
+        $cols = self::productColumns($p, ['overage' => false] + $in, $gid, $sgid, $emailId, 0);
+        $cols['paytype'] = 'free';
+        $cols['autosetup'] = 'order';
+        $cols['configoption1'] = (string) (int) $in['trial_gb'];
+        $prod = self::findTrialProduct($in['trial_name']);
+        if ($prod) {
+            $pid = (int) $prod->id;
+            if ($in['update']) {
+                $upd = $cols;
+                unset($upd['gid'], $upd['order'], $upd['hidden']);
+                if (!$emailId) {
+                    unset($upd['welcomeemail']);
+                }
+                Capsule::table('tblproducts')->where('id', $pid)->update(Env::onlyColumns('tblproducts', $upd));
+            }
+            $op = $in['update'] ? 'update' : 'skip';
+        } else {
+            $pid = self::createProduct($p, ['overage' => false] + $in, $cols, $gid, $sgid, $emailId, 0);
+            Capsule::table('tblproducts')->where('id', $pid)->update(['paytype' => 'free', 'autosetup' => 'order']);
+            $op = 'create';
+        }
+        $out[] = ['op' => $op, 'kind' => 'محصول', 'label' => $in['trial_name'], 'link' => 'configproducts.php?action=edit&id=' . $pid, 'trial_pid' => $pid];
+        if (!self::originField($pid)) {
+            Capsule::table('tblcustomfields')->insert(Env::onlyColumns('tblcustomfields', [
+                'type' => 'product', 'relid' => $pid, 'fieldname' => self::ORIGIN_FIELD, 'fieldtype' => 'text',
+                'description' => 'اختیاری — IP عمومی سرور فعلی سایت (IPv4).', 'fieldoptions' => '', 'regexpr' => self::ORIGIN_REGEX, 'adminonly' => '',
+                'required' => '', 'showorder' => 'on', 'showinvoice' => '', 'sortorder' => 0, 'created_at' => $now, 'updated_at' => $now]));
+        }
+        // upgrade paths trial → every paid wizard plan (one direction: a paid plan never «upgrades» to the trial)
+        $paid = array_values(array_unique(array_merge(array_values($pids), array_map('intval', array_values((array) Env::kvGet('wizard_pids', []))))));
+        $added = 0;
+        foreach ($paid as $b) {
+            $b = (int) $b;
+            if ($b <= 0 || $b === $pid) {
+                continue;
+            }
+            if (Env::hasTable('tblproduct_upgrade_products')) {
+                $row = ['product_id' => $pid, 'upgrade_product_id' => $b];
+                if (!Capsule::table('tblproduct_upgrade_products')->where($row)->exists()) {
+                    Capsule::table('tblproduct_upgrade_products')->insert($row);
+                    $added++;
+                }
+            } elseif (Env::hasColumn('tblproducts', 'upgradepackages')) {
+                $cur = Capsule::table('tblproducts')->where('id', $pid)->value('upgradepackages');
+                $list = $cur ? @unserialize((string) $cur, ['allowed_classes' => false]) : [];
+                $list = is_array($list) ? array_map('intval', $list) : [];
+                if (!in_array($b, $list, true)) {
+                    $list[] = $b;
+                    Capsule::table('tblproducts')->where('id', $pid)->update(['upgradepackages' => serialize($list)]);
+                    $added++;
+                }
+            }
+        }
+        $out[] = ['op' => $added ? 'create' : 'skip', 'kind' => 'مسیر ارتقا', 'label' => View::n($added) . ' مسیر جدید — ' . $in['trial_name'] . ' ← پلن‌های پولی', 'link' => ''];
         return $out;
     }
 

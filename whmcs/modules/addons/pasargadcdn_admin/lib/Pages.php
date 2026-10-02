@@ -1843,6 +1843,22 @@ final class Pages
             . '<small>مقدار انتخاب‌شده در سفارش، سهمیه‌ی فضای ذخیره‌سازی سرویس (storage_gb) می‌شود؛ محصولی که این گزینه را ندارد فضای ذخیره‌سازی ندارد. '
             . 'قیمت‌ها صفر ساخته می‌شوند: یا در Setup ← Configurable Options برای هر اندازه قیمت ماهانه بگذارید، یا در تنظیمات ماژول «قیمت هر گیگابایت-ماه ذخیره‌سازی» را تعیین کنید تا مصرف واقعی هر ماه فاکتور شود. اجرای دوباره چیزی را تکرار نمی‌کند.</small></label></div></fieldset>';
 
+        // Growth: free trial product + its e-mails; the scheduled usage-report e-mail template
+        $h .= '<fieldset class="pcdna-fieldset" data-trial-fs="1"><legend>پلن آزمایشی رایگان و گزارش ایمیلی</legend><div class="pcdna-checks-row">'
+            . self::check('trial', !empty($in['trial']), 'محصول «' . Wizard::TRIAL_NAME . '» ساخته شود (رایگان، بدون تونل، یک بار برای هر مشتری / ایمیل / دامنه، با قالب‌های «'
+                . Wizard::EMAIL_TRIAL_ENDING . '» و «' . Wizard::EMAIL_TRIAL_ENDED . '» به فارسی و انگلیسی)')
+            . '</div><div class="pcdna-form-grid">'
+            . '<label><span>نام محصول آزمایشی</span><input class="pcdna-input" name="trial_name" maxlength="100" value="' . View::e((string) ($in['trial_name'] ?? Wizard::TRIAL_NAME)) . '"></label>'
+            . '<label><span>مدت دوره (روز)</span><input class="pcdna-input" name="trial_days" dir="ltr" inputmode="numeric" value="' . (int) ($in['trial_days'] ?? 7) . '"></label>'
+            . '<label><span>سقف ترافیک دوره (گیگابایت)</span><input class="pcdna-input" name="trial_gb" dir="ltr" inputmode="numeric" value="' . (int) ($in['trial_gb'] ?? 5) . '"></label>'
+            . '<label><span>ایمیل یادآوری (روز پیش از پایان؛ ۰ = بدون یادآوری)</span><input class="pcdna-input" name="trial_remind" dir="ltr" inputmode="numeric" value="' . (int) ($in['trial_remind'] ?? 2) . '"></label>'
+            . '<label><span>در پایان دوره</span>' . View::select('trial_end', Wizard::TRIAL_ENDS, (string) ($in['trial_end'] ?? 'pause')) . '</label>'
+            . '<label><span>حذف خودکار پس از پایان (روز؛ ۰ = هرگز)</span><input class="pcdna-input" name="trial_terminate_after" dir="ltr" inputmode="numeric" value="' . (int) ($in['trial_terminate_after'] ?? 14) . '"></label>'
+            . '</div><small class="pcdna-muted">هنگام پرداخت سبد خرید، هر مشتری، هر ایمیل و هر دامنه فقط یک بار دوره آزمایشی می‌گیرد. کران WHMCS یادآوری را می‌فرستد و در پایان دوره، سرویس را متوقف / معلق / حذف می‌کند؛ '
+            . 'در حالت «توقف روی CDN» مشتری با ارتقای درجا (مسیر ارتقا به همه پلن‌ها ساخته می‌شود) بلافاصله و با همه تنظیمات برمی‌گردد.</small>'
+            . '<div class="pcdna-checks-row">' . self::check('report_tpl', !empty($in['report_tpl']), 'قالب «' . Wizard::EMAIL_REPORT . '» (گزارش هفتگی/ماهانه‌ای که مشتری در ناحیه کاربری فعال می‌کند) به فارسی و انگلیسی ساخته شود')
+            . '</div></fieldset>';
+
         // feature matrix, one table per plan family (a single «CDN» family now — tunnel is included in every plan)
         $h .= '<fieldset class="pcdna-fieldset"><legend>امکانات پلن‌ها</legend>';
         foreach (Wizard::FAMILIES as $fam => $famLabel) {

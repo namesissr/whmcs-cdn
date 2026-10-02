@@ -38,7 +38,7 @@ add_hook('ShoppingCartValidateCheckout', 1, function ($vars) {
     try {
         require_once __DIR__ . '/lib/Env.php';
         require_once __DIR__ . '/lib/CartValidator.php';
-        return \PasargadCdn\Admin\CartValidator::checkout($cart);
+        return \PasargadCdn\Admin\CartValidator::checkout($cart, is_array($vars) ? $vars : []);
     } catch (\Throwable $e) {
         // Never block a sale because of an unexpected error in this addon.
         if (function_exists('logActivity')) {
@@ -128,6 +128,30 @@ add_hook('AfterCronJob', 1, function ($vars) {
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: tunnel/add-on cron hook error: ' . $e->getMessage());
+        }
+    }
+    // Growth: free-trial reminders / end of trial, and the scheduled e-mail reports — independent passes
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Wizard.php';
+        require_once __DIR__ . '/lib/Reports.php';
+        require_once __DIR__ . '/lib/Trials.php';
+        \PasargadCdn\Admin\Trials::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: trial cron hook error: ' . $e->getMessage());
+        }
+    }
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Wizard.php';
+        require_once __DIR__ . '/lib/Reports.php';
+        \PasargadCdn\Admin\Reports::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: e-mail report cron hook error: ' . $e->getMessage());
         }
     }
     // SPEC §16.8: object-storage charges of the previous month (once, after the month closes)

@@ -1555,3 +1555,23 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-lang-btn { display: inline-flex; align-items: center; gap: 4px; margin-inline-start: auto; padding: 2px 8px; border: 1px solid var(--pc-border); border-radius: 999px; background: var(--pc-surface); color: var(--pc-muted); font-size: 12px; font-weight: 700; line-height: 1.6; cursor: pointer; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-lang-btn:hover { color: var(--pc-text); border-color: var(--pc-border-strong); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-lang-btn .pcdn-icon { width: 14px; height: 14px; }
+
+/* ---- growth (growth.js / reseller.js): free trial, onboarding strip, e-mail report, white-label, bulk ---- */
+:is(#pcdn-app, #pcdn-layer) .pcdn-trial-banner .pcdn-banner-actions { margin-top: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-trial-plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin: 12px 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-trial-plan { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--pc-border); border-radius: 12px; background: var(--pc-surface); min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-trial-plan .pcdn-btn { align-self: flex-start; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-trial-price { font-weight: 700; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-onb-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 14px; border: 1px dashed var(--pc-border-strong); border-radius: 12px; color: var(--pc-muted); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-onb-strip .pcdn-btn { margin-inline-start: auto; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-step.is-skipped .pcdn-step-title { color: var(--pc-muted); text-decoration: line-through; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-choice-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-radio-pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--pc-border); border-radius: 999px; cursor: pointer; background: var(--pc-surface); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-radio-pill:has(input:checked) { border-color: var(--pc-brand); box-shadow: 0 0 0 3px var(--pc-brand-50); font-weight: 700; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-report-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-list { margin: 0; padding-inline-start: 20px; line-height: 2; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-brand-logo { width: 30px; height: 30px; border-radius: 8px; object-fit: contain; background: var(--pc-surface); flex: none; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-brand-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-brand-preview { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--pc-border); border-radius: 10px; font-weight: 800; max-width: 100%; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-bulk-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-bulk-bar > span { flex: 1 1 200px; }

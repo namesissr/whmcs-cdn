@@ -35,7 +35,7 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.2.0',
+        'version' => '1.3.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',

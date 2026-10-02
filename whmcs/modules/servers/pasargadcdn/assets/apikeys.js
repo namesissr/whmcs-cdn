@@ -23,7 +23,11 @@
   var SCOPES = [
     ['purge', t('پاکسازی کش'), t('ارسال درخواست پاکسازی کش (‎/capi/v1/purge)')],
     ['stats', t('آمار و رویدادها'), t('خواندن آنالیتیکس و رویدادها (‎/capi/v1/analytics‎، ‎/capi/v1/events)')],
-    ['dns', t('DNS و تنظیمات'), t('مدیریت رکوردها و بخش‌های پیکربندی (‎/capi/v1/records‎، ‎/capi/v1/config)')]
+    // Scopes split by the controller (security review): `dns` = records only, `config` = configuration
+    // sections, `functions` = edge functions. Keys created before keep whatever scopes they had.
+    ['dns', t('رکوردهای DNS'), t('مدیریت رکوردهای DNS (‎/capi/v1/records)')],
+    ['config', t('تنظیمات سایت'), t('خواندن و تغییر بخش‌های پیکربندی مثل کش، امنیت و SSL (‎/capi/v1/config)')],
+    ['functions', t('توابع لبه'), t('مدیریت کد و مسیرهای توابع لبه (‎/capi/v1/functions)')]
   ];
   function scopeLabel(s) {
     for (var i = 0; i < SCOPES.length; i++) if (SCOPES[i][0] === s) return SCOPES[i][1];

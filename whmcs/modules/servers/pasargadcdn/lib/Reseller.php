@@ -5,6 +5,7 @@ namespace PasargadCdn;
 use WHMCS\Database\Capsule;
 
 require_once __DIR__ . '/I18n.php';
+require_once __DIR__ . '/DomainRules.php';
 
 if (class_exists(__NAMESPACE__ . '\\Reseller', false)) {
     return;
@@ -30,6 +31,13 @@ class Reseller
     const TBL_RESELLERS = 'mod_pasargadcdn_resellers';
     const TBL_SITES = 'mod_pasargadcdn_reseller_sites';
     const TBL_TOPUPS = 'mod_pasargadcdn_reseller_topups';
+    /** Growth: white-label name/logo of a reseller (shown in the client-app header for its sub-sites). */
+    const TBL_BRAND = 'mod_pasargadcdn_reseller_brand';
+    /** Growth: sub-sites the reseller paused by hand (bulk suspend) — kept apart from the wallet's `suspended`. */
+    const TBL_HOLDS = 'mod_pasargadcdn_reseller_holds';
+    const BRAND_NAME_MAX = 60;
+    const LOGO_MAX = 65536; // bytes of the decoded image
+    const BULK_MAX = 200;
 
     /** Per-sub-site controller cap (GB). Aggregate wallet + suspend/reconnect do the real cutting. */
     const SITE_CAP_GB = 1000000;
@@ -241,6 +249,18 @@ class Reseller
         if (!self::validDomain($domain)) {
             return [false, I18n::tr('دامنه معتبر نیست.')];
         }
+        // C1: never a public suffix, never nested in / around another client's CDN domain
+        if (DomainRules::isPublicSuffix($domain)) {
+            return [false, I18n::tr('«%s» یک پسوند عمومی دامنه است و نمی‌توان آن را به‌عنوان سایت روی CDN ثبت کرد؛ نام کامل دامنه خود را وارد کنید (مثلاً example.ir).', $domain)];
+        }
+        try {
+            $pids = array_map('intval', Capsule::table('tblproducts')->where('servertype', 'pasargadcdn')->pluck('id')->all());
+            if (DomainRules::foreignNested($domain, $userid, DomainRules::related($domain, $pids)) !== null) {
+                return [false, I18n::tr('دامنه %s زیردامنه یا دامنه اصلی سایتی است که متعلق به مشتری دیگری روی CDN است و قابل ثبت نیست. اگر مالک دامنه هستید با پشتیبانی تماس بگیرید.', $domain)];
+            }
+        } catch (\Throwable $e) {
+            // the controller enforces the same rule
+        }
         if (!self::validOrigin($originIp)) {
             return [false, I18n::tr('آی‌پی سرور اصلی (Origin) باید یک IPv4 عمومی معتبر باشد.')];
         }
@@ -379,6 +399,7 @@ class Reseller
                 $out['error'] = I18n::tr('سرور CDN تنظیم نشده است.');
             }
         }
+        $held = array_flip(self::heldIds($userid));
         foreach ($rows as $r) {
             $d = strtolower(\pasargadcdn_domain(['domain' => (string) $r->domain]));
             $gb = $usageByDomain[$d] ?? 0.0;
@@ -386,13 +407,231 @@ class Reseller
             $out['sites'][] = [
                 'id' => (int) $r->id, 'domain' => $d, 'label' => (string) $r->label,
                 'gb' => round($gb, 3), 'cost' => $cost, 'suspended' => (int) $r->suspended === 1,
+                'held' => isset($held[(int) $r->id]),
             ];
             $out['total_gb'] += $gb;
             $out['total_cost'] += $cost;
         }
         $out['total_gb'] = round($out['total_gb'], 3);
         $out['total_cost'] = round($out['total_cost'], 2);
+        $out['limits'] = self::limits($userid, count($rows));
         return $out;
+    }
+
+    // ------------------------------------------------------------------ growth: limits, white-label, holds, bulk, export
+
+    /** Creates the brand / holds tables when missing (also run by the addon's Env::ensureTable()). Never throws. */
+    public static function ensureExtras(): bool
+    {
+        try {
+            $schema = Capsule::schema();
+            if (!$schema->hasTable(self::TBL_BRAND)) {
+                $schema->create(self::TBL_BRAND, function ($t) {
+                    $t->integer('userid')->primary();
+                    $t->string('name', 120)->default('');
+                    $t->mediumText('logo')->nullable();   // data:image/(png|jpeg|webp|gif);base64,… (no SVG: scripts)
+                    $t->dateTime('updated_at')->nullable();
+                });
+            }
+            if (!$schema->hasTable(self::TBL_HOLDS)) {
+                $schema->create(self::TBL_HOLDS, function ($t) {
+                    $t->integer('site_id')->primary();     // mod_pasargadcdn_reseller_sites.id
+                    $t->integer('userid');
+                    $t->dateTime('created_at')->nullable();
+                    $t->index('userid', 'mod_pcdn_rhold_user');
+                });
+            }
+            return true;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /** What this reseller may do and has used: sub-site cap, wholesale rate, top-up block size / monthly cap, sub-site plan. */
+    public static function limits(int $userid, ?int $count = null): array
+    {
+        $cfg = self::config($userid);
+        $bought = 0;
+        try {
+            if (self::has(self::TBL_TOPUPS)) {
+                $bought = (int) Capsule::table(self::TBL_TOPUPS)->where('userid', $userid)->where('month', \pasargadcdn_month())
+                    ->where('status', 'paid')->sum('blocks');
+            }
+        } catch (\Throwable $e) {
+            $bought = 0;
+        }
+        $plan = self::wholesalePlan();
+        return [
+            'max_sites' => $cfg['max_sites'], 'sites' => $count ?? self::siteCount($userid), 'hard_max_sites' => self::MAX_SITES_HARD,
+            'rate' => $cfg['rate'], 'block_gb' => self::blockGb(), 'max_blocks' => self::maxBlocks(), 'blocks_month' => $bought,
+            'held' => count(self::heldIds($userid)),
+            'site_plan' => ['ssl' => !empty($plan['ssl_allowed']), 'waf' => !empty($plan['features']['waf']), 'ddos' => !empty($plan['features']['ddos'])],
+        ];
+    }
+
+    /** Sub-site ids this reseller paused by hand. */
+    public static function heldIds(int $userid): array
+    {
+        if ($userid <= 0 || !self::has(self::TBL_HOLDS)) {
+            return [];
+        }
+        try {
+            return array_map('intval', Capsule::table(self::TBL_HOLDS)->where('userid', $userid)->pluck('site_id')->all());
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /** Is this sub-site paused by its reseller? (the wallet reconnect must leave it suspended) */
+    public static function isHeld(int $siteId): bool
+    {
+        if ($siteId <= 0 || !self::has(self::TBL_HOLDS)) {
+            return false;
+        }
+        try {
+            return Capsule::table(self::TBL_HOLDS)->where('site_id', $siteId)->exists();
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /** White-label of a reseller: ['name' => string, 'logo' => ?data-URI] or null when none is set. */
+    public static function brand(int $userid): ?array
+    {
+        if ($userid <= 0 || !self::has(self::TBL_BRAND)) {
+            return null;
+        }
+        try {
+            $r = Capsule::table(self::TBL_BRAND)->where('userid', $userid)->first();
+        } catch (\Throwable $e) {
+            return null;
+        }
+        if (!$r || (trim((string) $r->name) === '' && empty($r->logo))) {
+            return null;
+        }
+        $logo = is_string($r->logo) && self::validLogo($r->logo) ? $r->logo : null;
+        return ['name' => (string) $r->name, 'logo' => $logo];
+    }
+
+    /** A data URI of a small raster image (PNG / JPEG / WebP / GIF, ≤ LOGO_MAX bytes) whose bytes really are that image. */
+    public static function validLogo(string $uri): bool
+    {
+        if (!preg_match('#^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$#D', $uri, $m)) {
+            return false;
+        }
+        $bin = base64_decode($m[2], true);
+        if ($bin === false || $bin === '' || strlen($bin) > self::LOGO_MAX) {
+            return false;
+        }
+        $magic = ['png' => "\x89PNG\r\n\x1a\n", 'jpeg' => "\xff\xd8\xff", 'gif' => 'GIF8'];
+        if ($m[1] === 'webp') {
+            return substr($bin, 0, 4) === 'RIFF' && substr($bin, 8, 4) === 'WEBP';
+        }
+        return strncmp($bin, $magic[$m[1]], strlen($magic[$m[1]])) === 0;
+    }
+
+    /**
+     * Saves the reseller's white-label ($name '' and $logo '' clear it; $logo null keeps the stored one).
+     * @return array [bool ok, array|string brand-or-message]
+     */
+    public static function saveBrand(int $userid, string $name, ?string $logo): array
+    {
+        if (!self::isReseller($userid)) {
+            return [false, I18n::tr('حساب شما به‌عنوان نماینده فعال نیست.')];
+        }
+        $name = trim(preg_replace('/[\x00-\x1f\x7f<>]+/u', ' ', $name) ?? '');
+        if (mb_strlen($name) > self::BRAND_NAME_MAX) {
+            return [false, I18n::tr('نام برند حداکثر %s نویسه است.', self::BRAND_NAME_MAX)];
+        }
+        if ($logo !== null && $logo !== '' && !self::validLogo($logo)) {
+            return [false, I18n::tr('لوگو باید تصویر PNG، JPEG، WebP یا GIF و حداکثر ۶۴ کیلوبایت باشد.')];
+        }
+        if (!self::ensureExtras()) {
+            return [false, I18n::tr('ذخیره برند ممکن نشد؛ دوباره تلاش کنید.')];
+        }
+        $row = ['name' => $name, 'updated_at' => date('Y-m-d H:i:s')];
+        if ($logo !== null) {
+            $row['logo'] = $logo === '' ? null : $logo;
+        }
+        try {
+            Capsule::table(self::TBL_BRAND)->updateOrInsert(['userid' => $userid], $row);
+        } catch (\Throwable $e) {
+            return [false, I18n::tr('ذخیره برند ممکن نشد؛ دوباره تلاش کنید.')];
+        }
+        return [true, self::brand($userid) ?? ['name' => '', 'logo' => null]];
+    }
+
+    /**
+     * Bulk pause / resume of the reseller's OWN sub-sites. Ids that are missing or owned by someone else are
+     * reported as not found (never touched, never distinguished). Resume of a site the wallet cut leaves it
+     * cut (only the reseller's own hold is removed). @return array {done: int[], skipped: [{id, reason}]}
+     */
+    public static function bulk(int $userid, array $ids, string $action, ?callable $factory = null): array
+    {
+        $out = ['done' => [], 'skipped' => []];
+        $ids = array_values(array_unique(array_filter(array_map('intval', array_slice($ids, 0, self::BULK_MAX)), function ($x) {
+            return $x > 0;
+        })));
+        if (!in_array($action, ['suspend', 'unsuspend'], true) || !self::ensureExtras()) {
+            return $out;
+        }
+        $server = self::server();
+        foreach ($ids as $id) {
+            $row = self::ownedSite($userid, $id);
+            if (!$row) {
+                $out['skipped'][] = ['id' => $id, 'reason' => 'not_found'];
+                continue;
+            }
+            $domain = \pasargadcdn_domain(['domain' => (string) $row->domain]);
+            $held = self::isHeld($id);
+            if (($action === 'suspend' && $held) || ($action === 'unsuspend' && !$held)) {
+                $out['skipped'][] = ['id' => $id, 'reason' => 'unchanged'];
+                continue;
+            }
+            // the controller call is skipped when the wallet already keeps the site cut (resume) / cut (pause)
+            $callCtl = (int) $row->suspended !== 1;
+            try {
+                if ($callCtl) {
+                    if (!$server || !self::validDomain($domain)) {
+                        throw new ApiException(I18n::tr('سرور CDN تنظیم نشده است.'));
+                    }
+                    self::api($server, 15, $factory)->post(ApiClient::site($domain) . '/' . $action);
+                }
+                if ($action === 'suspend') {
+                    Capsule::table(self::TBL_HOLDS)->insert(['site_id' => $id, 'userid' => $userid, 'created_at' => date('Y-m-d H:i:s')]);
+                } else {
+                    Capsule::table(self::TBL_HOLDS)->where('site_id', $id)->where('userid', $userid)->delete();
+                }
+                $out['done'][] = $id;
+            } catch (\Throwable $e) {
+                $out['skipped'][] = ['id' => $id, 'reason' => 'error'];
+            }
+        }
+        if ($out['done']) {
+            self::log('reseller bulk ' . $action . ' of ' . count($out['done']) . ' sub-site(s) by client #' . $userid, $userid);
+        }
+        return $out;
+    }
+
+    /** Per-sub-site usage of the current month as CSV (formula-injection safe). @return array {filename, csv, month} */
+    public static function exportCsv(int $userid, ?callable $factory = null): array
+    {
+        $rep = self::report($userid, $factory);
+        $cell = function ($v): string {
+            $v = (string) $v;
+            if ($v !== '' && strpos('=+-@' . "\t\r", $v[0]) !== false) {
+                $v = "'" . $v;
+            }
+            return '"' . str_replace('"', '""', $v) . '"';
+        };
+        $lines = [implode(',', array_map($cell, ['domain', 'label', 'month', 'gb', 'cost', 'currency', 'rate_per_gb', 'wallet_cut', 'paused']))];
+        foreach ($rep['sites'] as $s) {
+            $lines[] = implode(',', array_map($cell, [$s['domain'], $s['label'], $rep['month'], number_format((float) $s['gb'], 3, '.', ''),
+                number_format((float) $s['cost'], 2, '.', ''), $rep['currency'], number_format((float) $rep['rate'], 2, '.', ''),
+                $s['suspended'] ? 'yes' : 'no', !empty($s['held']) ? 'yes' : 'no']));
+        }
+        return ['filename' => 'reseller-usage-' . $rep['month'] . '.csv', 'csv' => "\xEF\xBB\xBF" . implode("\r\n", $lines) . "\r\n",
+            'month' => $rep['month'], 'rows' => count($rep['sites']), 'error' => $rep['error']];
     }
 
     /** [credit, currency unit, currency→default rate] for a client. */

@@ -34,6 +34,8 @@ final class Env
     const ADDON_ITEMS = 'mod_pasargadcdn_addon_items';
     /** SPEC §16.8: one storage charge per service and month (StorageBilling) */
     const STORAGE_BILLS = 'mod_pasargadcdn_storage_bills';
+    /** Growth: one scheduled e-mail report per service and period (Reports cron dedupe / retry ledger). */
+    const REPORTS = 'mod_pasargadcdn_reports';
     const DEAD_STATUSES = ['Terminated', 'Cancelled', 'Fraud'];
     const DEFAULT_NS = ['ns1.pasargadmizban.com', 'ns2.pasargadmizban.com'];
 
@@ -328,6 +330,28 @@ final class Env
             });
         }
         self::$memo['tbl:' . self::STORAGE_BILLS] = true;
+        // ---- growth: e-mail reports ledger + the server module's per-service / trial / reseller tables -------
+        if (!$schema->hasTable(self::REPORTS)) {
+            $schema->create(self::REPORTS, function ($t) {
+                $t->increments('id');
+                $t->integer('service_id');
+                $t->string('period', 16);                     // W2026-39 | M2026-09
+                $t->string('freq', 8)->default('');
+                $t->string('lang', 2)->default('fa');
+                $t->string('status', 16)->default('sending');  // sending | sent | failed | skipped
+                $t->integer('attempts')->default(0);
+                $t->string('error', 191)->nullable();
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+                $t->unique(['service_id', 'period'], 'mod_pcdn_reports_once');
+            });
+        }
+        self::$memo['tbl:' . self::REPORTS] = true;
+        if (self::loadServerModule()) {
+            \PasargadCdn\ServiceState::ensure();
+            \PasargadCdn\Trial::ensure();
+            \PasargadCdn\Reseller::ensureExtras();
+        }
     }
 
     // ------------------------------------------------------------------ servers / controller

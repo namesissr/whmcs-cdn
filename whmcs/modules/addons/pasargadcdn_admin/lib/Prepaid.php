@@ -1101,7 +1101,10 @@ final class Prepaid
             }
             $domain = Env::domain((string) $s->domain);
             try {
-                if ($server && Env::validHostname($domain)) {
+                // Growth: a sub-site the reseller paused by hand (bulk pause) stays paused on the controller;
+                // only the wallet's own cut flag is cleared.
+                $held = class_exists('\\PasargadCdn\\Reseller') && \PasargadCdn\Reseller::isHeld((int) $s->id);
+                if (!$held && $server && Env::validHostname($domain)) {
                     Env::api(15, $server)->post(ApiClient::site($domain) . '/unsuspend');
                 }
                 Capsule::table(Env::RESELLER_SITES)->where('id', (int) $s->id)->update(['suspended' => 0, 'updated_at' => date('Y-m-d H:i:s')]);

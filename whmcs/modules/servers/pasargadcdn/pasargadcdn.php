@@ -19,12 +19,17 @@ require_once __DIR__ . '/lib/I18n.php';
 require_once __DIR__ . '/lib/ApiClient.php';
 require_once __DIR__ . '/lib/Reseller.php';
 require_once __DIR__ . '/lib/TeamAccess.php';
+require_once __DIR__ . '/lib/ServiceState.php';
+require_once __DIR__ . '/lib/Trial.php';
+require_once __DIR__ . '/lib/DomainRules.php';
 
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
 use PasargadCdn\I18n;
 use PasargadCdn\Reseller;
+use PasargadCdn\ServiceState;
 use PasargadCdn\TeamAccess;
+use PasargadCdn\Trial;
 use WHMCS\Database\Capsule;
 
 /** SPEC §10.5 — is this WHMCS client an enabled reseller? Exposed for the client-app bootstrap. */
@@ -264,6 +269,10 @@ function pasargadcdn_CreateAccount(array $params)
             }
             $api->patch(ApiClient::site($domain) . '/plan', pasargadcdn_cap_plan($params));
         }
+        // Growth: a service on the wizard's «CDN آزمایشی» product starts its trial clock now (best effort).
+        if (Trial::isTrialPid((int) ($params['pid'] ?? $params['packageid'] ?? 0))) {
+            Trial::register((int) $params['serviceid'], (int) ($params['userid'] ?? 0), $domain);
+        }
     });
 }
 
@@ -304,10 +313,14 @@ function pasargadcdn_TerminateAccount(array $params)
 function pasargadcdn_ChangePackage(array $params)
 {
     return pasargadcdn_call(function () use ($params) {
-        ApiClient::fromParams($params)->patch(
-            ApiClient::site(pasargadcdn_domain($params)) . '/plan',
-            pasargadcdn_cap_plan($params)
-        );
+        $api = ApiClient::fromParams($params);
+        $site = ApiClient::site(pasargadcdn_domain($params));
+        $api->patch($site . '/plan', pasargadcdn_cap_plan($params));
+        // Growth: a trial upgraded to a paid product is no longer a trial; a trial the cron had paused on the
+        // CDN (end action «pause») comes back immediately with its configuration intact.
+        if (Trial::onChangePackage((int) ($params['serviceid'] ?? 0), (int) ($params['pid'] ?? $params['packageid'] ?? 0))) {
+            $api->post($site . '/unsuspend');
+        }
     });
 }
 
@@ -510,6 +523,10 @@ function pasargadcdn_config_options($ids): array
 function pasargadcdn_prepaid(array $p, array $configoptions = []): ?array
 {
     if (pasargadcdn_billing_mode() !== 'prepaid' || pasargadcdn_overage($p) !== null) {
+        return null;
+    }
+    // Growth: the free trial is never topped up from the wallet — its small cap is the whole trial.
+    if (Trial::isTrialPid((int) ($p['id'] ?? 0))) {
         return null;
     }
     $planGb = pasargadcdn_plan(['configoption1' => $p['configoption1'] ?? '', 'configoptions' => $configoptions])['bandwidth_limit_gb'];
@@ -980,8 +997,15 @@ function pasargadcdn_ClientArea(array $params)
             'enabled' => true,
             'max_sites' => $cfg['max_sites'],
             'count' => Reseller::siteCount($uid),
+            // white-label name/logo shown in the app header while the reseller manages a sub-site
+            'brand' => Reseller::brand($uid),
         ];
     }
+    // Growth: free-trial CTA (days left + upgrade links), onboarding progress and the e-mail report opt-in.
+    $sid = (int) $params['serviceid'];
+    $boot['trial'] = Trial::boot(['serviceid' => $sid, 'pid' => (int) ($params['pid'] ?? $params['packageid'] ?? 0),
+        'currency' => (int) ($params['clientsdetails']['currency'] ?? 0)]);
+    $boot['growth'] = pasargadcdn_growth_boot($sid);
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base, $lang);
     $noJs = I18n::tr('برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.');
@@ -1003,6 +1027,23 @@ function pasargadcdn_ClientArea(array $params)
             'pcdnBoot' => pasargadcdn_boot_json($boot),
         ],
     ];
+}
+
+/**
+ * Growth state of the client app: onboarding progress and the e-mail report opt-in, stored per service in
+ * WHMCS (lib/ServiceState.php). persist=false when the table is unavailable — the app then keeps the
+ * onboarding progress in the browser and hides the e-mail report page.
+ */
+function pasargadcdn_growth_boot(int $sid): array
+{
+    if ($sid <= 0 || !ServiceState::ensure()) {
+        return ['persist' => false];
+    }
+    $r = ServiceState::report($sid);
+    return ['persist' => true, 'onboarding' => ServiceState::onboarding($sid),
+        // the e-mail report page is offered once the admin wizard created the report template
+        'reports' => (pasargadcdn_addon_settings()['report_tpl_on'] ?? '') === 'on',
+        'report' => ['freq' => $r['freq'], 'last' => ServiceState::lastReport($sid)]];
 }
 
 /**
@@ -1028,7 +1069,7 @@ function pasargadcdn_assets(string $base, string $lang = 'fa'): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'reseller.js', 'app.js'])),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'reseller.js', 'app.js'])),
     ];
 }
 

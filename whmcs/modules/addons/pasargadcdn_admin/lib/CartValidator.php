@@ -22,11 +22,16 @@ final class CartValidator
     const CONTROLLER_TIMEOUT = 5;
 
     /** ShoppingCartValidateCheckout */
-    public static function checkout(array $cart): array
+    public static function checkout(array $cart, array $vars = []): array
     {
         $items = self::cdnItems($cart);
         if (!$items) {
             return [];
+        }
+        // Growth: free trial — one per order, per client, per e-mail address and per domain, ever.
+        $trialErrors = self::trialErrors($items, $vars);
+        if ($trialErrors) {
+            return $trialErrors;
         }
         $errors = [];
         $seen = [];
@@ -45,6 +50,9 @@ final class CartValidator
             if ($err === null && isset($taken[$d])) {
                 $err = 'برای دامنه ' . $d . ' از قبل سرویس CDN ثبت شده است (' . self::statusFa($taken[$d]) . '). '
                     . 'برای تغییر پلن از بخش ارتقای سرویس فعلی استفاده کنید یا با پشتیبانی تماس بگیرید.';
+            }
+            if ($err === null) {
+                $err = self::nestedError($d, self::visitor($vars));
             }
             if ($err !== null) {
                 $errors[] = $err;
@@ -88,6 +96,8 @@ final class CartValidator
                 $taken = self::existingServices([$d]);
                 if (isset($taken[$d])) {
                     $err = 'برای دامنه ' . $d . ' از قبل سرویس CDN ثبت شده است (' . self::statusFa($taken[$d]) . ').';
+                } else {
+                    $err = self::nestedError($d, self::visitor([]));
                 }
             }
             if ($err !== null) {
@@ -149,6 +159,9 @@ final class CartValidator
             // The raw input is not echoed back (cart templates may print errors unescaped).
             return 'دامنه واردشده برای ' . $label . ' معتبر نیست. نام دامنه را بدون http و مسیر وارد کنید (مثلاً example.com).';
         }
+        if (self::publicSuffix($d)) {
+            return self::tr('«%s» یک پسوند عمومی دامنه است و نمی‌توان آن را به‌عنوان سایت روی CDN ثبت کرد؛ نام کامل دامنه خود را وارد کنید (مثلاً example.ir).', $d);
+        }
         foreach (Env::reservedDomains() as $r) {
             if ($d === $r || substr($d, -strlen('.' . $r)) === '.' . $r) {
                 return 'دامنه ' . $d . ' متعلق به زیرساخت پاسارگاد میزبان است و نمی‌توان آن را روی CDN ثبت کرد.';
@@ -209,20 +222,87 @@ final class CartValidator
             return [];
         }
         $variants = [];
+        $ps = self::rulesLoaded();
         foreach ($domains as $d) {
-            $variants[] = $d;
-            $variants[] = 'www.' . $d;
+            // C1: the same query also returns the parents / children of each domain (nestedError)
+            foreach (array_merge([$d], $ps ? \PasargadCdn\DomainRules::parents($d) : []) as $x) {
+                $variants[] = $x;
+                $variants[] = 'www.' . $x;
+            }
         }
         $out = [];
+        self::$related = [];
         try {
-            $rows = Capsule::table('tblhosting')->whereIn('packageid', $pids)->whereIn('domain', $variants)
-                ->whereNotIn('domainstatus', Env::DEAD_STATUSES)->get(['domain', 'domainstatus']);
+            $rows = Capsule::table('tblhosting')->whereIn('packageid', $pids)
+                ->where(function ($q) use ($variants, $domains, $ps) {
+                    $q->whereIn('domain', $variants);
+                    if ($ps) {
+                        foreach ($domains as $d) {
+                            $q->orWhere('domain', 'like', '%.' . $d . '%');
+                        }
+                    }
+                })
+                ->whereNotIn('domainstatus', Env::DEAD_STATUSES)->get(['domain', 'domainstatus', 'userid']);
             foreach ($rows as $r) {
-                $out[Env::domain((string) $r->domain)] = (string) $r->domainstatus;
+                $n = Env::domain((string) $r->domain);
+                if (in_array($n, $domains, true)) {
+                    $out[$n] = (string) $r->domainstatus;
+                }
+                foreach ($domains as $d) {
+                    if ($ps && \PasargadCdn\DomainRules::nested($n, $d)) {
+                        self::$related[$d][] = ['domain' => $n, 'userid' => (int) ($r->userid ?? 0), 'status' => (string) $r->domainstatus, 'kind' => 'service'];
+                    }
+                }
             }
         } catch (\Throwable $e) {
             return [];
         }
+        return $out;
+    }
+
+    /** @var array domain => parent/child rows found by the last existingServices() */
+    private static $related = [];
+
+    private static function rulesLoaded(): bool
+    {
+        return Env::loadServerModule() && class_exists('\\PasargadCdn\\DomainRules');
+    }
+
+    private static function publicSuffix(string $d): bool
+    {
+        return self::rulesLoaded() && \PasargadCdn\DomainRules::isPublicSuffix($d);
+    }
+
+    /** Logged-in client of the checkout (0 for a new sign-up). */
+    private static function visitor(array $vars): int
+    {
+        return (int) ($vars['userid'] ?? ($_SESSION['uid'] ?? 0));
+    }
+
+    /** C1: a parent / child of another client's live CDN domain (from the existingServices() rows). */
+    private static function nestedError(string $d, int $uid): ?string
+    {
+        if (!self::rulesLoaded()) {
+            return null;
+        }
+        $other = \PasargadCdn\DomainRules::foreignNested($d, $uid, self::$related[$d] ?? []);
+        if ($other === null) {
+            return null;
+        }
+        Env::log('checkout: CDN domain ' . $d . ' refused — nested with another client\'s ' . $other, $uid);
+        return self::tr('دامنه %s زیردامنه یا دامنه اصلی سایتی است که متعلق به مشتری دیگری روی CDN است و قابل ثبت نیست. اگر مالک دامنه هستید با پشتیبانی تماس بگیرید.', $d);
+    }
+
+    /** A checkout message in the visitor's language (lib/I18n.php). */
+    private static function tr(string $fa, ...$args): string
+    {
+        if (!Env::loadServerModule() || !class_exists('\\PasargadCdn\\I18n')) {
+            return $args ? vsprintf($fa, $args) : $fa;
+        }
+        $prev = \PasargadCdn\I18n::$current;
+        \PasargadCdn\I18n::$current = \PasargadCdn\I18n::lang();
+        $out = \PasargadCdn\I18n::tr($fa, ...$args);
+        \PasargadCdn\I18n::$current = $prev;
         return $out;
     }
 
@@ -250,6 +330,72 @@ final class CartValidator
                 Env::log('checkout controller check for ' . $d . ' failed (' . ($r['error'] ?: 'HTTP ' . $r['code'])
                     . ') — order allowed (fail-open)');
             }
+        }
+        return $errors;
+    }
+
+    // ------------------------------------------------------------------ growth: free trial
+
+    /**
+     * Trial rules for the CDN items of a cart. The client is the logged-in one ($_SESSION['uid'] / $vars['userid']);
+     * a new sign-up is identified by the e-mail of the checkout form ($vars['email'] / $_POST['email']).
+     * Messages follow the visitor's language (lib/I18n.php). Fail-open on any database error (Trial::hadTrial).
+     */
+    public static function trialErrors(array $items, array $vars = []): array
+    {
+        // the wizard mirrors the trial product id into the (memoised) addon settings: no trial → no extra query
+        if ((int) Env::setting('trial_pid', '0') <= 0 || !Env::loadServerModule() || !class_exists('\\PasargadCdn\\Trial')) {
+            return [];
+        }
+        $pid = \PasargadCdn\Trial::pid();
+        if ($pid <= 0) {
+            return [];
+        }
+        $trials = array_values(array_filter($items, function ($it) use ($pid) {
+            return (int) $it['pid'] === $pid;
+        }));
+        if (!$trials) {
+            return [];
+        }
+        $prev = \PasargadCdn\I18n::$current;
+        \PasargadCdn\I18n::$current = \PasargadCdn\I18n::lang();
+        $tr = function (string $fa, ...$a) {
+            return \PasargadCdn\I18n::tr($fa, ...$a);
+        };
+        $errors = [];
+        if (count($trials) > 1) {
+            $errors[] = $tr('در هر سفارش فقط یک سرویس آزمایشی CDN مجاز است.');
+        }
+        $uid = (int) ($vars['userid'] ?? ($_SESSION['uid'] ?? 0));
+        $email = '';
+        foreach ([$vars['email'] ?? null, $_POST['email'] ?? null] as $e) {
+            if (is_string($e) && trim($e) !== '') {
+                $email = Env::input($e);
+                break;
+            }
+        }
+        if ($email === '' && $uid > 0) {
+            try {
+                $email = (string) Capsule::table('tblclients')->where('id', $uid)->value('email');
+            } catch (\Throwable $e) {
+                $email = '';
+            }
+        }
+        $why = null;
+        foreach ($trials as $it) {
+            $why = \PasargadCdn\Trial::hadTrial($uid, $email, self::normalize((string) $it['domain']));
+            if ($why !== null) {
+                break;
+            }
+        }
+        if ($why === 'domain') {
+            $errors[] = $tr('برای این دامنه قبلاً از دوره آزمایشی CDN استفاده شده است. برای ادامه یکی از پلن‌های CDN را سفارش دهید.');
+        } elseif ($why !== null) {
+            $errors[] = $tr('هر مشتری فقط یک بار می‌تواند از دوره آزمایشی رایگان CDN استفاده کند. برای ادامه یکی از پلن‌های CDN را سفارش دهید.');
+        }
+        \PasargadCdn\I18n::$current = $prev;
+        if ($errors) {
+            Env::log('checkout: free CDN trial refused (' . ($why ?? 'several in one order') . ')', $uid);
         }
         return $errors;
     }

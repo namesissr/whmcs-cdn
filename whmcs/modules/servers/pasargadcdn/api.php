@@ -36,7 +36,7 @@ if ($method === 'POST' || $method === 'PUT') {
     $body = (string) file_get_contents('php://input', false, null, 0, ClientApi::maxBody($method, $str($_GET['path'] ?? '')) + 1);
 }
 $query = $_GET;
-unset($query['id'], $query['path'], $query['rsid'], $query['rop']);
+unset($query['id'], $query['path'], $query['rsid'], $query['rop'], $query['lop']);
 
 // Reseller context (SPEC §10.5) — gathered server-side from the request; the logged-in
 // client id decides ownership. A reseller-site id selects one of the client's OWN sub-sites
@@ -56,6 +56,8 @@ $rop = $str($_GET['rop'] ?? '');
     'client_id' => pasargadcdn_api_client_id(),
     'reseller_site_id' => $rsid,
     'reseller_op' => $rop,
+    // Growth (onboarding progress / e-mail report opt-in of this service, stored in WHMCS)
+    'local_op' => $str($_GET['lop'] ?? ''),
     // SPEC §14.3.7: a WHMCS user who is not the account owner and lacks "manageproducts" may only
     // read; ClientApi refuses every non-GET call for them (server side, whatever the UI shows).
     // Only writes need the decision, so reads (e.g. the 30 s live-analytics poll) skip the lookup.

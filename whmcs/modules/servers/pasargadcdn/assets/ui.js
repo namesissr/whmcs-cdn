@@ -233,7 +233,8 @@
     Object.keys(query || {}).forEach(function (k) { url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
     // X-PCDN-Lang: api.php answers its own error details in the app's language (SPEC §16.10).
     var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'X-PCDN-Lang': P.lang || 'fa', 'Accept': 'application/json' } };
-    if (body !== undefined) {
+    // a GET never carries a body (fetch() rejects one — the reseller report used to pass null)
+    if (body !== undefined && !(body === null && (method === 'GET' || method === 'HEAD'))) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }

@@ -151,6 +151,12 @@ class ClientApi
         }
         // Reseller-level operations (list / create / delete sub-site, rolled-up report).
         // Not tied to a controller sub-path, so handled before the site whitelist.
+        // Growth ops on WHMCS-side state of THIS service (onboarding progress, e-mail report opt-in):
+        // same login / CSRF / read-only rules, ownership checked against tblhosting, never the controller.
+        $lop = (string) ($req['local_op'] ?? '');
+        if ($lop !== '') {
+            return self::localOp($lop, $req, $admin);
+        }
         $rop = (string) ($req['reseller_op'] ?? '');
         if ($rop !== '') {
             return self::resellerOp($rop, $req, $clientFactory);
@@ -318,7 +324,72 @@ class ClientApi
         return [200, ['pem' => $pem, 'filename' => 'pasargadcdn-origin-pull-ca.pem', 'fingerprint_sha256' => $fp]];
     }
 
-    const RESELLER_OPS = ['list', 'create', 'delete', 'report'];
+    const RESELLER_OPS = ['list', 'create', 'delete', 'report', 'brand', 'bulk', 'export'];
+    const LOCAL_OPS = ['state', 'onboarding', 'report'];
+
+    /**
+     * Growth local ops (WHMCS-side, per service): GET state → {onboarding, report}; POST onboarding
+     * {done?, skipped?, dismissed?}; POST report {freq: off|weekly|monthly}. Admin mode has no local ops.
+     */
+    private static function localOp(string $op, array $req, bool $admin): array
+    {
+        require_once __DIR__ . '/ServiceState.php';
+        $method = strtoupper((string) ($req['method'] ?? 'GET'));
+        if ($admin || !in_array($op, self::LOCAL_OPS, true)) {
+            return self::fail(404, 'عملیات نامعتبر است.');
+        }
+        $id = (string) ($req['id'] ?? '');
+        if (!preg_match('/^[1-9][0-9]{0,9}$/D', $id)) {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $svc = Capsule::table('tblhosting')->where('id', (int) $id)->first(['id', 'userid', 'packageid', 'domainstatus']);
+        if (!$svc || (int) $svc->userid !== (int) ($req['client_id'] ?? 0)) {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $product = Capsule::table('tblproducts')->where('id', (int) $svc->packageid)->first(['servertype']);
+        if (!$product || $product->servertype !== 'pasargadcdn') {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $status = (string) $svc->domainstatus;
+        if ($method === 'GET' ? !in_array($status, ['Active', 'Suspended'], true) : $status !== 'Active') {
+            return self::fail(403, 'این سرویس فعال نیست.');
+        }
+        $sid = (int) $svc->id;
+        if (!ServiceState::ensure()) {
+            return self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
+        }
+        if ($op === 'state' && $method === 'GET') {
+            $r = ServiceState::report($sid);
+            return [200, ['onboarding' => ServiceState::onboarding($sid), 'report' => ['freq' => $r['freq'], 'last' => ServiceState::lastReport($sid)]]];
+        }
+        if ($method !== 'POST') {
+            return self::fail(405, 'متد مجاز نیست.');
+        }
+        $data = self::jsonBody($req);
+        if ($data === null) {
+            return self::fail(400, 'بدنه درخواست باید JSON معتبر باشد.');
+        }
+        if ($op === 'onboarding') {
+            $patch = array_intersect_key($data, ['done' => 1, 'skipped' => 1, 'dismissed' => 1]);
+            foreach (['done', 'skipped'] as $k) {
+                if (array_key_exists($k, $patch) && !is_array($patch[$k])) {
+                    return self::fail(400, 'پارامتر نامعتبر است.');
+                }
+            }
+            $saved = ServiceState::saveOnboarding($sid, $patch);
+            return $saved === null ? self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.') : [200, ['onboarding' => $saved]];
+        }
+        if ($op === 'report') {
+            $freq = is_string($data['freq'] ?? null) ? $data['freq'] : '';
+            if (!in_array($freq, ServiceState::FREQS, true)) {
+                return self::fail(400, 'پارامتر نامعتبر است.');
+            }
+            $saved = ServiceState::setReport($sid, $freq);
+            return $saved === null ? self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.')
+                : [200, ['report' => ['freq' => $saved['freq'], 'last' => ServiceState::lastReport($sid)]]];
+        }
+        return self::fail(405, 'متد مجاز نیست.');
+    }
 
     /**
      * Reseller-level operations for the logged-in client (already CSRF-checked). Every op
@@ -348,15 +419,39 @@ class ClientApi
 
         if ($op === 'list' && $method === 'GET') {
             $sites = [];
+            $held = array_flip(Reseller::heldIds($clientId));
             foreach (Reseller::sites($clientId) as $r) {
                 $sites[] = ['id' => (int) $r->id, 'domain' => (string) $r->domain, 'label' => (string) $r->label,
-                    'suspended' => (int) $r->suspended === 1];
+                    'suspended' => (int) $r->suspended === 1, 'held' => isset($held[(int) $r->id])];
             }
             $cfg = Reseller::config($clientId);
             return [200, ['sites' => $sites, 'max_sites' => $cfg['max_sites'], 'count' => count($sites)]];
         }
         if ($op === 'report' && $method === 'GET') {
             return [200, Reseller::report($clientId, $factory)];
+        }
+        // Growth: white-label (GET / POST {name, logo?}), bulk pause/resume (POST {ids, action}), usage CSV (GET).
+        if ($op === 'brand' && $method === 'GET') {
+            return [200, ['brand' => Reseller::brand($clientId)]];
+        }
+        if ($op === 'brand' && $method === 'POST') {
+            $data = self::jsonBody($req);
+            if ($data === null || !is_string($data['name'] ?? '') || (array_key_exists('logo', $data) && !is_string($data['logo']) && $data['logo'] !== null)) {
+                return self::fail(400, 'بدنه درخواست باید JSON معتبر باشد.');
+            }
+            [$ok, $res] = Reseller::saveBrand($clientId, (string) ($data['name'] ?? ''), array_key_exists('logo', $data) ? $data['logo'] : null);
+            return $ok ? [200, ['brand' => $res]] : self::fail(400, is_string($res) ? $res : 'ذخیره برند ممکن نشد؛ دوباره تلاش کنید.');
+        }
+        if ($op === 'bulk' && $method === 'POST') {
+            $data = self::jsonBody($req);
+            $action = is_string($data['action'] ?? null) ? $data['action'] : '';
+            if ($data === null || !is_array($data['ids'] ?? null) || !in_array($action, ['suspend', 'unsuspend'], true)) {
+                return self::fail(400, 'پارامتر نامعتبر است.');
+            }
+            return [200, Reseller::bulk($clientId, $data['ids'], $action, $factory)];
+        }
+        if ($op === 'export' && $method === 'GET') {
+            return [200, Reseller::exportCsv($clientId, $factory)];
         }
         if ($op === 'create' && $method === 'POST') {
             $data = self::jsonBody($req);
