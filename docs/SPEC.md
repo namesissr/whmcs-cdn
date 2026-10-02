@@ -1129,8 +1129,8 @@ third parties; refuses targets not given explicitly. A tiny echo origin (`tools/
 for ws/grpc/xhttp sinks. Runbook `docs/LOADTEST.md` (Persian): how to size `capacity_mbps`.
 
 ### 16.2 CLI (`cli/pcdn`, Go) + provider release
-`pcdn` command for the customer API: `site`, `records list|add|update|delete`, `config get|set
-<section> [file]`, `purge --url/--prefix/--everything`, `analytics`, `tunnel quality|usage`,
+`pcdn` command for the customer API: `site`, `records list|add|update|delete`, `config get|set <section> [file]`,
+`purge --url/--prefix/--everything`, `analytics`, `tunnel quality|usage`,
 `--endpoint/--api-key` flags or env (same as Terraform), JSON or table output. GoReleaser config for
 both the CLI and `terraform-provider-pcdn` (signed checksums, registry manifest) and a GitHub Actions
 `release.yml` triggered by tags `cli/v*` / `provider/v*` (the GPG key comes from repository secrets,

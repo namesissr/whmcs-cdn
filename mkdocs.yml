@@ -86,6 +86,7 @@ nav:
       - راه‌اندازی (README): getting-started.md
       - معماری: ARCHITECTURE.md
       - به‌روزرسانی: UPGRADE.md
+      - استقرار تدریجی (Rollout): ROLLOUT.md
   - عملیات:
       - راهنمای عملیات: OPERATIONS.md
       - پایش و هشدار: MONITORING.md

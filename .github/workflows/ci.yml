@@ -175,6 +175,11 @@ jobs:
           curl -fsSL https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin prometheus-3.5.0.linux-amd64/promtool
           curl -fsSL https://github.com/prometheus/alertmanager/releases/download/v0.28.1/alertmanager-0.28.1.linux-amd64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin alertmanager-0.28.1.linux-amd64/amtool
       - run: python3 deploy/monitoring/tools/check_monitoring.py
+      - name: Preflight tool tests (SPEC §18.6)
+        run: |
+          pip install pytest pyflakes
+          python3 -m pyflakes tools/preflight
+          python3 -m pytest -q tools/preflight/tests
       - name: Alertmanager config renders and validates
         run: |
           mkdir -p /tmp/sec && printf x > /tmp/sec/telegram_bot_token
