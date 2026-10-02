@@ -199,6 +199,46 @@ class ClientApi
     const CLIENT_ERROR_MAX_BODY = 16384;
     const CLIENT_ERROR_STACK = 4096;
 
+    // ------------------------------------------------------------------ SPEC §20.1 domain sharing: per-role allow-list (deny by default)
+    const SHARE_ROLES = ['viewer', 'dns', 'editor'];
+    /** Every whitelisted GET except the customer API keys (owner only). */
+    const SHARE_READ_DENY = ['apikeys'];
+    /** dns: records (incl. import / export), the NS re-check and the secondary-DNS section; DNSSEC is view-only. */
+    const SHARE_DNS = [
+        'POST' => ['records', 'records/import', 'ns-check'],
+        'PUT' => ['config/dns_secondary', 'records/[1-9][0-9]{0,9}'],
+        'DELETE' => ['records/[1-9][0-9]{0,9}'],
+    ];
+    /**
+     * editor: every configuration write listed explicitly — NOT customer API keys (POST apikeys / DELETE apikeys/N) and NOT
+     * storage bucket key rotation; billing / upgrade / add-ons / cancel / transfer / sharing / team / site delete are not
+     * proxied at all. A route added to ROUTES later stays denied until it is listed here.
+     */
+    const SHARE_EDITOR = [
+        'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'redirects/import', 'logs/test',
+            'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)', 'image/transform-secret', 'storage/buckets', 'waf/learning/apply', self::W10_ACCESS_ROTATE],
+        'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
+        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client', 'image/transform-secret', 'storage/buckets/' . self::BUCKET],
+    ];
+
+    /** May a member with $role call $method $path (already on the whitelist)? */
+    public static function shareAllows(string $role, string $method, string $path): bool
+    {
+        if (!in_array($role, self::SHARE_ROLES, true) || !self::allowed($method, $path)) {
+            return false;
+        }
+        if ($method === 'GET') {
+            return !in_array($path, self::SHARE_READ_DENY, true);
+        }
+        $list = $role === 'editor' ? self::SHARE_EDITOR : ($role === 'dns' ? self::SHARE_DNS : []);
+        foreach ($list[$method] ?? [] as $re) {
+            if (preg_match('#^' . $re . '$#D', $path)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Answer for a write by a read-only team member (SPEC §14.3.7). */
     const READONLY_DETAIL = 'دسترسی شما به این سرویس فقط‌خواندنی است؛ برای تغییر تنظیمات از مالک حساب بخواهید دسترسی «مدیریت محصولات» را به شما بدهد.';
 
@@ -260,6 +300,25 @@ class ClientApi
         // operator domain and its server, built server-side by the addon (Admin\Operator::apiContext — never from
         // request input; api.php never passes 'context'). Same whitelist, CSRF, query and body rules as every
         // other mode; admin-only, every write audited with the admin's name.
+        if ($hasCtx && is_array($req['context']) && ($req['context']['kind'] ?? '') === 'shared') {
+            // SPEC §20.3: a member of a shared domain — the addon's «دامنه‌های اشتراکی» route builds this context from the
+            // member's ACTIVE share row (re-read on every request), never from input: one domain, one role, owner's server.
+            $ctx = $req['context'];
+            $role = (string) ($ctx['role'] ?? '');
+            if ($admin || (int) ($req['client_id'] ?? 0) <= 0 || !is_string($ctx['domain'] ?? null) || !is_object($ctx['server'] ?? null)
+                || !in_array($role, self::SHARE_ROLES, true)) {
+                return self::fail(404, 'سرویس یافت نشد.');
+            }
+            if (!self::shareAllows($role, $method, $path)) {
+                return self::fail(403, 'نقش شما در این دامنه اجازهٔ این کار را نمی‌دهد.');
+            }
+            if ($method !== 'GET' && !empty($ctx['readonly'])) {
+                return self::fail(403, 'این سرویس فعال نیست.');
+            }
+            $domain = \pasargadcdn_domain(['domain' => $ctx['domain']]);
+            $svc = (object) ['id' => (int) ($ctx['service_id'] ?? 0), 'userid' => (int) ($ctx['owner_client_id'] ?? 0), 'domain' => $domain];
+            return self::proxy($method, $path, $domain, $ctx['server'], $req, false, 0, $svc, $clientFactory);
+        }
         if ($hasCtx) {
             $ctx = $req['context'];
             if (!$admin || !is_array($ctx) || !is_string($ctx['domain'] ?? null) || !is_object($ctx['server'] ?? null)) {
@@ -392,6 +451,11 @@ class ClientApi
             ];
             // Admin pages keep every controller call within 10 s.
             $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params, $admin ? 10 : 20);
+            $share = self::shareCtx($req);
+            if ($share && method_exists($api, 'setActor')) {
+                // SPEC §20.3: the controller records it as `on_behalf_of` in the audit detail
+                $api->setActor(self::actor($req));
+            }
             if (isset(self::PUBLIC_FILES[$path])) {
                 return self::pemFile($api, self::PUBLIC_FILES[$path]);
             }
@@ -402,6 +466,9 @@ class ClientApi
             [$code, $data] = $api->raw($method, $target, $body);
         } catch (\Throwable $e) {
             self::log($method . ' ' . $target, $e->getMessage());
+            if (self::shareCtx($req) && $method !== 'GET') {
+                self::shareLog($req, $method, $path, $svc, 'failed: controller unreachable');
+            }
             if ($admin && $method !== 'GET') {
                 self::adminLog($adminId, $method, $path, $svc, 'failed: controller unreachable', (string) ($req['admin_user'] ?? ''));
             }
@@ -409,6 +476,9 @@ class ClientApi
         }
         if ($admin && $method !== 'GET') {
             self::adminLog($adminId, $method, $path, $svc, 'HTTP ' . $code, (string) ($req['admin_user'] ?? ''));
+        }
+        if (self::shareCtx($req) && $method !== 'GET') {
+            self::shareLog($req, $method, $path, $svc, 'HTTP ' . $code);
         }
         if ($code >= 500 || $code < 200 || ($code >= 300 && $code < 400)) {
             self::log($method . ' ' . $target, 'HTTP ' . $code);
@@ -459,7 +529,8 @@ class ClientApi
 
     const RESELLER_OPS = ['list', 'create', 'delete', 'report', 'brand', 'bulk', 'export'];
     // SPEC §19.2: `transfer` (POST) dismisses the one-time «این دامنه به حساب شما منتقل شد» notice
-    const LOCAL_OPS = ['state', 'onboarding', 'report', 'transfer'];
+    // SPEC §20.2: `shares` — the owner page «اشتراک دامنه» (GET list; POST {action: invite|role|revoke})
+    const LOCAL_OPS = ['state', 'onboarding', 'report', 'transfer', 'shares'];
 
     /**
      * Growth local ops (WHMCS-side, per service): GET state → {onboarding, report}; POST onboarding
@@ -476,7 +547,7 @@ class ClientApi
         if (!preg_match('/^[1-9][0-9]{0,9}$/D', $id)) {
             return self::fail(404, 'سرویس یافت نشد.');
         }
-        $svc = Capsule::table('tblhosting')->where('id', (int) $id)->first(['id', 'userid', 'packageid', 'domainstatus']);
+        $svc = Capsule::table('tblhosting')->where('id', (int) $id)->first(['id', 'userid', 'packageid', 'domainstatus', 'domain']);
         if (!$svc || (int) $svc->userid !== (int) ($req['client_id'] ?? 0)) {
             return self::fail(404, 'سرویس یافت نشد.');
         }
@@ -489,6 +560,9 @@ class ClientApi
             return self::fail(403, 'این سرویس فعال نیست.');
         }
         $sid = (int) $svc->id;
+        if ($op === 'shares') {
+            return self::sharesOp($method, $svc, $req);
+        }
         if (!ServiceState::ensure()) {
             return self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
         }
@@ -528,6 +602,70 @@ class ClientApi
                 : [200, ['report' => ['freq' => $saved['freq'], 'last' => ServiceState::lastReport($sid)]]];
         }
         return self::fail(405, 'متد مجاز نیست.');
+    }
+
+    /**
+     * SPEC §20.2 owner page: the service owner (or an owner-side team member with manage rights — read-only team users are
+     * refused even for reads) lists, invites, re-roles and revokes members of THIS service's domain. Ownership was checked by
+     * localOp(); every id is scoped to this service. Invite tokens leave only in the invite e-mail, or once in this answer
+     * as a link when the invitee has no WHMCS account yet (the owner forwards it).
+     */
+    private static function sharesOp(string $method, $svc, array $req): array
+    {
+        require_once __DIR__ . '/Shares.php';
+        if (!empty($req['readonly'])) {
+            return self::fail(403, self::READONLY_DETAIL);
+        }
+        $domain = \pasargadcdn_domain(['domain' => (string) ($svc->domain ?? '')]);
+        $owner = ['service_id' => (int) $svc->id, 'owner_client_id' => (int) $svc->userid, 'domain' => $domain];
+        if (!Shares::ensure()) {
+            return self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
+        }
+        $list = function () use ($owner) {
+            $cfg = Shares::settings();
+            return ['members' => array_map([Shares::class, 'ownerView'], Shares::forOwner($owner)), 'roles' => self::SHARE_ROLES,
+                'max_members' => $cfg['max_members']];
+        };
+        if ($method === 'GET') {
+            return [200, $list()];
+        }
+        $data = self::jsonBody($req);
+        $action = is_string($data['action'] ?? null) ? $data['action'] : '';
+        if ($data === null || !in_array($action, ['invite', 'role', 'revoke'], true)) {
+            return self::fail(400, 'پارامتر نامعتبر است.');
+        }
+        $who = 'client #' . (int) ($req['client_id'] ?? 0);
+        if ($action === 'invite') {
+            [$ok, $res] = Shares::invite($owner, is_string($data['email'] ?? null) ? $data['email'] : '', is_string($data['role'] ?? null) ? $data['role'] : '',
+                'client:' . (int) $svc->userid);
+            if (!$ok) {
+                return [400, ['detail' => I18n::tr($res)]];
+            }
+            $row = $res['row'];
+            $ownerName = Shares::ownerName($row);
+            $mailed = Shares::mailInvite($row, $res['token'], $res['client'], $ownerName);
+            Shares::log('#' . (int) $row->id . ' invite ' . $domain . ' (' . $row->role . ') to ' . $row->email . ' by ' . $who
+                . ($res['client'] ? ' — existing client #' . (int) $res['client']->id . ($mailed ? ', e-mailed' : ', e-mail failed') : ' — no account yet'), (int) $svc->userid);
+            return [201, $list() + ['invited' => Shares::ownerView($row), 'mailed' => $mailed,
+                // no WHMCS account with that e-mail: the owner forwards the register-then-accept link
+                'link' => $res['client'] ? null : Shares::inviteLink($res['token'])]];
+        }
+        $id = (int) ($data['id'] ?? 0);
+        if ($action === 'role') {
+            $role = is_string($data['role'] ?? null) ? $data['role'] : '';
+            $row = Shares::setRole($id, $owner, $role);
+            if (!$row) {
+                return self::fail(404, 'عضو یا دعوت پیدا نشد.');
+            }
+            Shares::log('#' . $id . ' role of ' . $row->email . ' on ' . $domain . ' set to ' . $role . ' by ' . $who, (int) $svc->userid);
+            return [200, $list()];
+        }
+        $row = Shares::revoke($id, $owner);
+        if (!$row) {
+            return self::fail(404, 'عضو یا دعوت پیدا نشد.');
+        }
+        Shares::log('#' . $id . ' (' . $row->email . ') revoked on ' . $domain . ' by ' . $who, (int) $svc->userid);
+        return [200, $list()];
     }
 
     /**
@@ -1125,6 +1263,34 @@ class ClientApi
                 : sprintf('operator site %s', (string) $svc->domain);
             logActivity(sprintf('Pasargad CDN [admin #%d%s, full management]: %s %s on %s — %s',
                 $adminId, $user !== '' ? ' ' . $user : '', $method, $path === '' ? '/' : $path, $on, $result), (int) $svc->userid);
+        }
+    }
+
+    /** The shared-member context of a request, or null. */
+    private static function shareCtx(array $req): ?array
+    {
+        $c = $req['context'] ?? null;
+        return is_array($c) && ($c['kind'] ?? '') === 'shared' ? $c : null;
+    }
+
+    /** `share:<member client id>:<role>` (SPEC §20.3). */
+    public static function actor(array $req): string
+    {
+        $c = self::shareCtx($req);
+        return $c ? 'share:' . (int) ($req['client_id'] ?? 0) . ':' . (string) ($c['role'] ?? '') : '';
+    }
+
+    /** A member's write: WHMCS activity log (owner's client log) + module log, path and facts only — never a body. */
+    private static function shareLog(array $req, string $method, string $path, $svc, string $result): void
+    {
+        $c = self::shareCtx($req);
+        $line = sprintf('Pasargad CDN [%s]: %s %s on shared site %s (share #%d%s) — %s', self::actor($req), $method, $path === '' ? '/' : $path,
+            (string) $svc->domain, (int) ($c['share_id'] ?? 0), (int) $svc->id > 0 ? ', service #' . (int) $svc->id : ', operator site', $result);
+        if (function_exists('logActivity')) {
+            logActivity($line, (int) $svc->userid);
+        }
+        if (function_exists('logModuleCall')) {
+            logModuleCall('pasargadcdn', 'share ' . $method . ' ' . ($path === '' ? '/' : $path), self::actor($req), $result);
         }
     }
 

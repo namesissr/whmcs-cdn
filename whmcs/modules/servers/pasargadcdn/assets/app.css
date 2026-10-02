@@ -1666,3 +1666,9 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
   :is(#pcdn-app, #pcdn-layer) .pcdn-w10-month, :is(#pcdn-app, #pcdn-layer) .pcdn-w10-subsite { min-width: 0; width: 100%; }
   :is(#pcdn-app, #pcdn-layer) .pcdn-w10-tools .pcdn-field { width: 100%; }
 }
+
+/* SPEC §20.3 shared domain: no upgrade / add-funds links, controls the role cannot use are hidden */
+.pcdn-shared a[href="#pcdn-no-upgrade"], .pcdn-shared .pcdn-addfunds, .pcdn-shared .pcdn-st-rotate { display: none !important; }
+.pcdn-share-bar .pcdn-admin-badge { white-space: nowrap; }
+.pcdn-shares-table td { vertical-align: middle; }
+.pcdn-shares-table select.pcdn-input { min-width: 140px; }

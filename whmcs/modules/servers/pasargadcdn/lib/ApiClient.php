@@ -22,6 +22,8 @@ class ApiClient
     private string $baseUrl;
     private string $apiKey;
     private int $timeout;
+    /** SPEC §20.3: X-PCDN-Actor of a shared member's write (`share:<client id>:<role>`), '' = none */
+    private string $actor = '';
 
     public function __construct(string $baseUrl, string $apiKey, int $timeout = 20)
     {
@@ -69,6 +71,16 @@ class ApiClient
             'serveraccesshash' => $hash,
             'serverpassword' => $password,
         ], $timeout);
+    }
+
+    /**
+     * SPEC §20.3: forward who acts on behalf of the owner (the controller records it as `on_behalf_of`). Only
+     * `[a-z0-9:_-]{1,64}` is ever sent; anything else clears it.
+     */
+    public function setActor(string $actor): self
+    {
+        $this->actor = preg_match('/^[a-z0-9:_-]{1,64}$/D', $actor) ? $actor : '';
+        return $this;
     }
 
     public function getTimeout(): int
@@ -144,6 +156,9 @@ class ApiClient
             'Authorization: Bearer ' . $this->apiKey,
             'Accept: application/json',
         ];
+        if ($this->actor !== '' && $method !== 'GET') {
+            $headers[] = 'X-PCDN-Actor: ' . $this->actor;
+        }
         $opts = [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,

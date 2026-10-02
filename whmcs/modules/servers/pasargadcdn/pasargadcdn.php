@@ -23,12 +23,14 @@ require_once __DIR__ . '/lib/ServiceState.php';
 require_once __DIR__ . '/lib/Trial.php';
 require_once __DIR__ . '/lib/DomainRules.php';
 require_once __DIR__ . '/lib/Transfers.php';
+require_once __DIR__ . '/lib/Shares.php';
 
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
 use PasargadCdn\I18n;
 use PasargadCdn\Reseller;
 use PasargadCdn\ServiceState;
+use PasargadCdn\Shares;
 use PasargadCdn\TeamAccess;
 use PasargadCdn\Transfers;
 use PasargadCdn\Trial;
@@ -391,9 +393,10 @@ function pasargadcdn_TerminateAccount(array $params)
 {
     // SPEC §19.2: never delete a site that was handed to the operator
     if (($g = pasargadcdn_transfer_guard($params, 'Terminate')) !== null) {
+        pasargadcdn_end_shares($params);
         return $g;
     }
-    return pasargadcdn_call(function () use ($params) {
+    $r = pasargadcdn_call(function () use ($params) {
         try {
             ApiClient::fromParams($params)->delete(ApiClient::site(pasargadcdn_domain($params)));
         } catch (ApiException $e) {
@@ -402,6 +405,20 @@ function pasargadcdn_TerminateAccount(array $params)
             }
         }
     });
+    if ($r === 'success') {
+        pasargadcdn_end_shares($params);
+    }
+    return $r;
+}
+
+/** SPEC §20.2: terminating a service ends every share / pending invite of it (members lose access at once). */
+function pasargadcdn_end_shares(array $params): void
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    $n = Shares::removeForService($sid);
+    if ($n > 0) {
+        Shares::log('of service #' . $sid . ' (' . pasargadcdn_domain($params) . '): ' . $n . ' share(s) / invite(s) ended by Terminate', (int) ($params['userid'] ?? 0));
+    }
 }
 
 function pasargadcdn_ChangePackage(array $params)
@@ -961,6 +978,25 @@ function pasargadcdn_transfer_button(array $params): string
         . $sid . '">انتقال دامنه به مشتری دیگر / اپراتور</a>';
 }
 
+/** SPEC §20.4: members / pending invites of this service on the admin service tab ([] when none). */
+function pasargadcdn_share_field(array $params): array
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    try {
+        $rows = $sid > 0 ? Shares::forOwner(['service_id' => $sid]) : [];
+    } catch (\Throwable $e) {
+        $rows = [];
+    }
+    if (!$rows) {
+        return [];
+    }
+    $out = [];
+    foreach ($rows as $r) {
+        $out[] = pasargadcdn_e($r->email) . ' — ' . pasargadcdn_e(Shares::roleLabel((string) $r->role)) . ($r->status === 'pending' ? ' (دعوت در انتظار)' : '');
+    }
+    return ['اعضای اشتراک دامنه' => implode('<br>', $out) . '<br><a href="addonmodules.php?module=pasargadcdn_admin&amp;page=shares&amp;service=' . $sid . '">مدیریت اشتراک‌ها</a>'];
+}
+
 function pasargadcdn_AdminServicesTabFields(array $params)
 {
     $transfer = pasargadcdn_transfer_button($params);
@@ -972,7 +1008,7 @@ function pasargadcdn_AdminServicesTabFields(array $params)
     }
     $h = 'pasargadcdn_e';
     $u = $s['usage_month'] ?? [];
-    return ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []) + [
+    return ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []) + pasargadcdn_share_field($params) + [
         'وضعیت CDN' => $h($s['status'] ?? '-'),
         'نیم‌سرورها' => $h(implode(' , ', $s['nameservers'] ?? []))
             . (!empty($s['ns_verified']) ? ' ✅' : ' ⏳ (فعلی: ' . $h(implode(', ', $s['ns_found'] ?? [])) . ')'),
@@ -1124,6 +1160,8 @@ function pasargadcdn_ClientArea(array $params)
     $boot['growth'] = pasargadcdn_growth_boot($sid);
     // SPEC §19.2: one-time notice for the new owner of a transferred domain (until dismissed — local op `transfer`)
     $boot['transfer'] = Transfers::banner($sid, $uid);
+    // SPEC §20.2: the owner page «اشتراک دامنه» — owner and owner-side team members with manage rights only
+    $boot['sharing'] = $boot['readonly'] ? null : ['enabled' => true];
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base, $lang);
     $noJs = I18n::tr('برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.');
@@ -1187,7 +1225,7 @@ function pasargadcdn_assets(string $base, string $lang = 'fa'): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'waflearn.js', 'w10.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'reseller.js', 'app.js'])),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'waflearn.js', 'w10.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'sharing.js', 'reseller.js', 'app.js'])),
     ];
 }
 

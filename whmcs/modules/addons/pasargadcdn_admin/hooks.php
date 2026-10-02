@@ -181,7 +181,7 @@ add_hook('ClientAreaHomepagePanels', 1, function ($panels) {
         require_once __DIR__ . '/lib/Env.php';
         require_once __DIR__ . '/lib/View.php';
         require_once __DIR__ . '/lib/Referrals.php';
-        if (!is_object($panels) || !method_exists($panels, 'addChild') || !\PasargadCdn\Admin\Referrals::on()) {
+        if (!is_object($panels) || !method_exists($panels, 'addChild')) {
             return;
         }
         $uid = 0;
@@ -192,6 +192,26 @@ add_hook('ClientAreaHomepagePanels', 1, function ($panels) {
             $uid = (int) ($_SESSION['uid'] ?? 0);
         }
         if ($uid <= 0) {
+            return;
+        }
+        // SPEC §20.2: «دعوت به مدیریت دامنه» — pending invitations to this client's primary e-mail (one query when none)
+        try {
+            require_once __DIR__ . '/lib/Data.php';
+            require_once __DIR__ . '/lib/Sharing.php';
+            if (\PasargadCdn\Admin\Env::loadServerModule() && ($card = \PasargadCdn\Admin\Sharing::homeCard($uid)) !== '') {
+                $en = function_exists('pasargadcdn_lang') && \pasargadcdn_lang([]) === 'en';
+                $panels->addChild('pasargadcdn_share_invites', [
+                    'label' => $en ? 'Invitation to manage a domain' : 'دعوت به مدیریت دامنه',
+                    'icon' => 'fa-share-alt',
+                    'order' => 240,
+                    'extras' => ['color' => 'blue', 'btn-link' => \PasargadCdn\Admin\Sharing::ROUTE, 'btn-text' => $en ? 'View invitations' : 'مشاهدهٔ دعوت‌ها'],
+                    'bodyHtml' => $card,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            // the home page never breaks because of this card
+        }
+        if (!\PasargadCdn\Admin\Referrals::on()) {
             return;
         }
         require_once __DIR__ . '/lib/View.php';
@@ -285,6 +305,18 @@ add_hook('AfterCronJob', 1, function ($vars) {
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: referral cron hook error: ' . $e->getMessage());
+        }
+    }
+    // SPEC §20.2: pending domain-share invitations past their 7 days → expired (once a day)
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Data.php';
+        require_once __DIR__ . '/lib/Sharing.php';
+        \PasargadCdn\Admin\Sharing::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: share cron hook error: ' . $e->getMessage());
         }
     }
     // SPEC §16.8: object-storage charges of the previous month (once, after the month closes)

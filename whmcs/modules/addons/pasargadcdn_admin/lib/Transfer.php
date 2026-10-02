@@ -130,7 +130,7 @@ final class Transfer
 
     public static function defaults(string $dir, array $src): array
     {
-        return ['move_unpaid' => true, 'move_paid' => false, 'credit' => '0', 'include_related' => false, 'email_old' => true, 'email_new' => true,
+        return ['move_unpaid' => true, 'move_paid' => false, 'credit' => '0', 'include_related' => false, 'email_old' => true, 'email_new' => true, 'keep_shares' => false,
             'pid' => 0, 'cycle' => 'monthly', 'nextdue' => date('Y-m-d', strtotime('+1 month')), 'invoice' => true, 'gateway' => '',
             'note' => ''];
     }
@@ -142,7 +142,7 @@ final class Transfer
             return in_array((string) ($post[$k] ?? ''), ['1', 'on', 'yes'], true);
         };
         $o = ['move_unpaid' => $b('move_unpaid'), 'move_paid' => $b('move_paid'), 'include_related' => $b('include_related'),
-            'email_old' => $b('email_old'), 'email_new' => $b('email_new'), 'invoice' => $b('invoice'),
+            'email_old' => $b('email_old'), 'email_new' => $b('email_new'), 'invoice' => $b('invoice'), 'keep_shares' => $b('keep_shares'),
             'credit' => trim(str_replace([',', '٬', ' '], '', strtr(Env::input($post['credit'] ?? '0'), ['۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4',
                 '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9', '٫' => '.']))),
             'pid' => (int) ($post['pid'] ?? 0), 'cycle' => Env::input($post['cycle'] ?? 'monthly'), 'nextdue' => trim(Env::input($post['nextdue'] ?? '')),
@@ -443,6 +443,11 @@ final class Transfer
             $l[] = [$o['invoice'] ? 'ok' : 'muted', $o['invoice'] ? 'اولین صورت‌حساب سرویس صادر می‌شود (بدون ارسال ایمیل سفارش).' : 'صورت‌حسابی صادر نمی‌شود.'];
             $l[] = ['ok', 'شروع شمارش مصرف (billing anchor) از همین لحظه: ترافیک دورهٔ اپراتور برای مشتری حساب نمی‌شود.'];
         }
+        $nShares = self::liveShares($src['domain']);
+        if ($nShares > 0) {
+            $l[] = [$o['keep_shares'] ? 'warn' : 'ok', $o['keep_shares'] ? View::n($nShares) . ' اشتراک / دعوت این دامنه همراه آن نزد مالک جدید می‌ماند.'
+                : View::n($nShares) . ' اشتراک / دعوت این دامنه لغو می‌شود (اعضا بلافاصله دسترسی را از دست می‌دهند).'];
+        }
         if ($o['email_old'] && $src['kind'] === 'client') {
             $l[] = ['ok', 'ایمیل «' . self::EMAIL_OLD . '» به مالک قبلی ارسال می‌شود.'];
         }
@@ -526,6 +531,19 @@ final class Transfer
                     throw new \RuntimeException('test failpoint after the controller transfer');
                 }
             }
+            // SPEC §20.2: shares of the moved site end by default; «keep» re-points them to the new owner scope
+            if ($o['keep_shares']) {
+                $ns = \PasargadCdn\Shares::repoint($domain, $dir === 'client_operator' ? null : $sid, $dir === 'client_operator' ? null : $cid);
+                self::step($steps, 'ok', 'shares kept: ' . $ns . ' moved to the new owner', $domain, $cid);
+            } else {
+                $ns = \PasargadCdn\Shares::removeForDomain($domain);
+                if ($sid > 0) {
+                    $ns += \PasargadCdn\Shares::removeForService($sid);
+                }
+                if ($ns) {
+                    self::step($steps, 'ok', 'shares: ' . $ns . ' ended', $domain, $cid);
+                }
+            }
             Capsule::table(Transfers::TABLE)->insert(['domain' => $domain, 'service_id' => $sid, 'direction' => $dir,
                 'from_client' => $src['kind'] === 'client' ? (int) $src['client'] : 0, 'to_client' => $cid, 'admin_id' => $admin, 'status' => 'done',
                 'guard' => $dir === 'client_operator' ? 1 : 0, 'banner' => $dir === 'client_operator' ? 0 : 1,
@@ -596,6 +614,61 @@ final class Transfer
             $msg .= ' سرویس جدید: <a href="' . View::e(Data::serviceUrl($cid, $sid)) . '">#' . View::n($sid) . '</a>.';
         }
         return [array_merge([['ok', $msg]], $flash), ['done' => $steps, 'service' => $sid]];
+    }
+
+    /** Live shares / pending invites of a domain (SPEC §20). */
+    public static function liveShares(string $domain): int
+    {
+        try {
+            return \PasargadCdn\Shares::ensure() ? (int) Capsule::table(\PasargadCdn\Shares::TABLE)->where('domain', strtolower($domain))
+                ->whereIn('status', \PasargadCdn\Shares::LIVE)->count() : 0;
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /** Persian text of a step (the activity log keeps the English line; the page shows both). */
+    public static function faStep(string $en): string
+    {
+        $who = function ($x) {
+            return strtr($x, ['client #' => 'مشتری #', 'operator' => 'اپراتور']);
+        };
+        $map = [
+            '/^start (\S+) \((.*)\)$/' => function ($m) use ($who) { return 'شروع انتقال ' . (self::DIR_LABEL[$m[1]] ?? $m[1]) . ': ' . $who($m[2]); },
+            '/^controller transfer refused: (.*)$/s' => 'کنترلر انتقال را نپذیرفت: $1',
+            '/^controller transfer done with reset_billing_anchor \((.*)\)$/s' => 'انتقال روی کنترلر انجام شد و شمارش مصرف از نو شروع شد ($1)',
+            '/^controller transfer done \((.*)\)$/s' => 'انتقال روی کنترلر انجام شد ($1)',
+            '/^WHMCS step failed, database rolled back: (.*)$/s' => 'مرحلهٔ WHMCS ناموفق بود و پایگاه داده برگردانده شد: $1',
+            '/^site transferred back to its previous owner.*$/s' => 'سایت روی کنترلر به مالک قبلی برگردانده شد (کلیدهای API باطل‌شده برنمی‌گردند و یکپارچه‌سازی‌ها متوقف می‌مانند)',
+            '/^transferring the site back FAILED: (.*) — fix the owner on the controller by hand$/s' => 'برگرداندن سایت روی کنترلر ناموفق بود: $1 — مالک سایت را دستی اصلاح کنید',
+            '/^WHMCS changes committed$/' => 'تغییرات WHMCS ذخیره شد',
+            '/^TSIG key rotated: (.*)$/s' => 'کلید TSIG عوض شد: $1',
+            '/^tblhosting #(\d+) userid (\d+) → (\d+)$/u' => 'سرویس #$1 از مشتری #$2 به مشتری #$3 منتقل شد',
+            '/^tblhostingaddons of service #(\d+): (\d+) moved$/' => '$2 افزونهٔ سرویس #$1 منتقل شد',
+            '/^(\S+): (\d+) row\(s\) moved$/' => '$2 ردیف از $1 منتقل شد',
+            '/^invoices moved: (.*)$/' => 'صورت‌حساب‌های منتقل‌شده: $1',
+            '/^mixed invoices left with client #(\d+): (.*)$/' => 'صورت‌حساب‌های ترکیبی نزد مشتری #$1 ماند: $2',
+            '/^credit (\S+) moved from client #(\d+) to client #(\d+)$/' => 'اعتبار $1 از مشتری #$2 به مشتری #$3 منتقل شد',
+            '/^service #(\d+) set to Cancelled.*$/' => 'سرویس #$1 «لغوشده» شد (بدون Terminate ماژول؛ نشانهٔ انتقال ثبت شد)',
+            '/^credit (\S+) added to client #(\d+)$/' => 'اعتبار $1 به مشتری #$2 افزوده شد',
+            '/^AddOrder #(\d+) → service #(\d+), invoice #(\d+)$/u' => 'سفارش #$1 ثبت شد ← سرویس #$2، صورت‌حساب #$3',
+            '/^AddOrder #(\d+) → service #(\d+), no invoice$/u' => 'سفارش #$1 ثبت شد ← سرویس #$2، بدون صورت‌حساب',
+            '/^AcceptOrder #(\d+) .*$/u' => 'سفارش #$1 تأیید شد (بدون راه‌اندازی خودکار؛ Create ماژول اجرا نشد)',
+            '/^service #(\d+) Active on server #(\d+), next due (\S+)$/' => 'سرویس #$1 روی سرور #$2 فعال شد؛ سررسید بعدی $3',
+            '/^removed rows committed outside the transaction: (.*)$/' => 'ردیف‌هایی که بیرون از تراکنش ثبت شده بودند حذف شد: $1',
+            '/^cleanup failed: (.*)$/s' => 'پاک‌سازی ناموفق بود: $1',
+            '/^e-mail templates could not be created: (.*)$/s' => 'قالب‌های ایمیل ساخته نشد: $1',
+            '/^e-mail «(.*)» to client #(\d+): sent$/u' => 'ایمیل «$1» برای مشتری #$2 ارسال شد',
+            '/^e-mail «(.*)» to client #(\d+): failed — (.*)$/us' => 'ایمیل «$1» برای مشتری #$2 ارسال نشد — $3',
+            '/^shares: (\d+) ended$/' => '$1 اشتراک / دعوت این دامنه لغو شد',
+            '/^shares kept: (\d+) moved to the new owner$/' => '$1 اشتراک / دعوت همراه دامنه نزد مالک جدید ماند',
+        ];
+        foreach ($map as $re => $to) {
+            if (preg_match($re, $en, $m)) {
+                return is_callable($to) ? $to($m) : preg_replace($re, $to, $en);
+            }
+        }
+        return $en;
     }
 
     private static function ctlSummary($r): string
@@ -1006,6 +1079,9 @@ final class Transfer
         }
         $f .= '<div class="pcdna-col-2">' . Pages::check('include_related', $o['include_related'], 'انتقال همراه زیردامنه‌ها (سایت‌های مرتبطِ همین مالک: زیردامنه / دامنهٔ والد)')
             . '<small>بدون این گزینه، اگر زیردامنه یا دامنهٔ والدِ همین مالک روی CDN باشد کنترلر انتقال را رد می‌کند. سرویس‌های WHMCS سایت‌های مرتبط جابه‌جا نمی‌شوند.</small></div>';
+        $nShares = self::liveShares($src['domain']);
+        $f .= '<div class="pcdn-col-2 pcdna-col-2" data-shares-live="' . $nShares . '">' . Pages::check('keep_shares', $o['keep_shares'], 'اشتراک‌های این دامنه (' . View::n($nShares) . ' عضو / دعوت) نزد مالک جدید بماند')
+            . '<small>پیش‌فرض: همهٔ اشتراک‌ها و دعوت‌های در انتظار این دامنه هنگام انتقال لغو می‌شوند (§20.2).</small></div>';
         if ($src['kind'] === 'client') {
             $f .= '<div>' . Pages::check('email_old', $o['email_old'], 'ایمیل «' . self::EMAIL_OLD . '» به مالک فعلی') . '</div>';
         }
@@ -1055,7 +1131,7 @@ final class Transfer
         $b .= '</ul>';
         $f = '<form method="post" action="' . View::url($q + ['to' => $to]) . '" class="pcdna-form" data-transfer-execute="1">' . self::hiddenSrc($q, $to)
             . '<input type="hidden" name="a" value="transfer_execute">';
-        foreach (['move_unpaid', 'move_paid', 'include_related', 'email_old', 'email_new', 'invoice'] as $k) {
+        foreach (['move_unpaid', 'move_paid', 'include_related', 'email_old', 'email_new', 'invoice', 'keep_shares'] as $k) {
             if (!empty($o[$k])) {
                 $f .= '<input type="hidden" name="' . $k . '" value="1">';
             }
@@ -1087,7 +1163,9 @@ final class Transfer
     {
         $b = '<ol class="pcdna-timeline pcdna-xfer-steps" data-transfer-steps="1">';
         foreach ($steps as [$tone, $text]) {
-            $b .= '<li class="pcdna-w-' . View::e($tone === 'ok' ? 'ok' : $tone) . '"><span dir="ltr">' . View::e($text) . '</span></li>';
+            // bilingual: Persian first, the English line of the activity log under it
+            $b .= '<li class="pcdna-w-' . View::e($tone === 'ok' ? 'ok' : $tone) . '"><span>' . View::e(self::faStep($text)) . '</span>'
+                . '<small class="pcdna-muted pcdna-xfer-en" dir="ltr" lang="en">' . View::e($text) . '</small></li>';
         }
         return View::card('مراحل انتقال (در گزارش فعالیت WHMCS هم ثبت شد)', $b . '</ol>', '', '', 'history');
     }

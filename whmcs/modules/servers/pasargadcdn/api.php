@@ -83,7 +83,8 @@ $rop = $str($_GET['rop'] ?? '');
     // SPEC §14.3.7: a WHMCS user who is not the account owner and lacks "manageproducts" may only
     // read; ClientApi refuses every non-GET call for them (server side, whatever the UI shows).
     // Only writes need the decision, so reads (e.g. the 30 s live-analytics poll) skip the lookup.
-    'readonly' => $method !== 'GET' && TeamAccess::readonly(),
+    // SPEC §20.2: the sharing page (lop=shares) is refused to read-only team users even for reads.
+    'readonly' => ($method !== 'GET' || $str($_GET['lop'] ?? '') === 'shares') && TeamAccess::readonly(),
     // SPEC §16.10: the app's language (fa | en) for the error details it shows.
     'lang' => (string) ($_SERVER['HTTP_X_PCDN_LANG'] ?? ''),
 ]);

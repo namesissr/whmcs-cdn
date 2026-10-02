@@ -25,7 +25,10 @@
   var WEBROOT = P.CFG.api.replace(/modules\/servers\/pasargadcdn\/api\.php$/, '');
   // Admin mode (addon «مدیریت کامل»): boot.admin carries WHMCS admin links; plan changes happen on the admin service page.
   var ADMIN = boot.admin && typeof boot.admin === 'object' ? boot.admin : null;
-  var UPGRADE_URL = ADMIN ? String(ADMIN.serviceUrl || '#') : WEBROOT + 'upgrade.php?type=package&id=' + encodeURIComponent(boot.serviceId || '');
+  // SPEC §20.3: a member of a shared domain (addon route «دامنه‌های اشتراکی»): {id, role, owner}. No owner billing in the boot;
+  // upgrade / add-funds links are never shown; controls the role cannot use are locked and some pages hidden.
+  var SHARE = boot.share && typeof boot.share === 'object' && !ADMIN ? boot.share : null;
+  var UPGRADE_URL = SHARE ? '#pcdn-no-upgrade' : ADMIN ? String(ADMIN.serviceUrl || '#') : WEBROOT + 'upgrade.php?type=package&id=' + encodeURIComponent(boot.serviceId || '');
   var SID = String(boot.serviceId || '0');
   // Overage billing: included traffic (WHMCS soft limit) vs the controller hard cap.
   var BILL = boot.billing && Number(boot.billing.included_gb) > 0 ? boot.billing : null;
@@ -40,10 +43,21 @@
   var RSITE = null;                  // active reseller sub-site context {id, domain, label} or null
   var OWN_SITE = boot.site || null;  // the reseller's own service site, to return to after managing a sub-site
   var OWN_ACTIVE = !!boot.active;
-  var ADDFUNDS_URL = ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
+  var ADDFUNDS_URL = SHARE ? '#pcdn-no-upgrade' : ADMIN ? String(ADMIN.clientUrl || '#') : WEBROOT + 'clientarea.php?action=addfunds';
   // §14.3.7 team access: a WHMCS user without the manage-products permission gets a read-only app
   // (api.php refuses their writes with 403 regardless; this only keeps the UI honest).
   var READONLY = !!boot.readonly && !ADMIN;
+  /** SPEC §20.1: pages a role may change (null = every page); everything else is view-only for the member. */
+  var SHARE_WRITE = { viewer: [], dns: ['dns', 'secondary'], editor: null };
+  /** Pages a member never sees: customer API keys, sharing management, the owner's e-mail reports / reseller panel / top-up statement. */
+  var SHARE_HIDE = ['apikeys', 'sharing', 'emailreports', 'reseller', 'statement'];
+  function shareLocked(id) {
+    if (!SHARE) return false;
+    var w = SHARE_WRITE.hasOwnProperty(SHARE.role) ? SHARE_WRITE[SHARE.role] : [];
+    return w !== null && w.indexOf(id) < 0;
+  }
+  /** Read-only right now: a read-only team member, or a member whose role cannot change the current page. */
+  function roNow() { return READONLY || shareLocked(S.page); }
   // SPEC §19.2: the domain was just transferred to this account — one-time notice until dismissed (local op `transfer`).
   var TRANSFER = boot.transfer && typeof boot.transfer === 'object' && !ADMIN ? boot.transfer : null;
   function money(v) {
@@ -91,14 +105,14 @@
     // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.
     // Wave 10 (SPEC §18.3): monthly PDF/CSV statement and the site's change log (w10.js).
     { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement', 'monthly', 'changes', 'emailreports'] },
-    { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys'] }
+    { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys', 'sharing'] }
   ];
   if (RESELLER) NAV.unshift({ title: t('نمایندگی'), items: ['reseller'] });
   var pages = P.pages = P.pages || {};
   function page(id) { return available(id) ? pages[id] : pages.overview; }
   function locked(id) { var p = pages[id]; return !!(p && p.lock && p.lock(features())); }
   /** A registered page this controller supports (feature-detected pages declare hidden(site)). */
-  function available(id) { var p = pages[id]; return !!p && !(p.hidden && p.hidden(S.site)); }
+  function available(id) { var p = pages[id]; return !!p && !(SHARE && SHARE_HIDE.indexOf(id) >= 0) && !(p.hidden && p.hidden(S.site)); }
 
   function readHash() {
     var m = /^#pcdn=([a-z]+)(?:\/([a-z0-9_-]+))?$/.exec(window.location.hash || '');
@@ -194,15 +208,15 @@
   /** Read-only mode for services that are not Active, and for read-only team members (§14.3.7). */
   var WRITE_SEL = 'input,select,textarea,button[data-write]', TEAM_SEL = WRITE_SEL + ',button[data-team-write]';
   function lockWrites(el) {
-    if ((S.active && !READONLY) || !el) return;
-    var sel = READONLY ? TEAM_SEL : WRITE_SEL;
+    if ((S.active && !roNow()) || !el) return;
+    var sel = roNow() ? TEAM_SEL : WRITE_SEL;
     if (el.matches && el.matches(sel) && !el.hasAttribute('data-ro-ok')) el.disabled = true;
     Array.prototype.forEach.call(el.querySelectorAll(sel), function (x) {
       if (!x.hasAttribute('data-ro-ok')) x.disabled = true;
     });
   }
   // Read-only team member: also lock write controls that pages add later (async lists, dialogs, drawers).
-  if (READONLY && window.MutationObserver) {
+  if ((READONLY || SHARE) && window.MutationObserver) {
     var roObs = new window.MutationObserver(function (muts) {
       muts.forEach(function (m) { Array.prototype.forEach.call(m.addedNodes, function (n) { if (n.nodeType === 1) lockWrites(n); }); });
     });
@@ -210,9 +224,10 @@
     if (P.getLayer) roObs.observe(P.getLayer(), { childList: true, subtree: true });
   }
   if (READONLY) root.classList.add('pcdn-ro');
+  if (SHARE) root.classList.add('pcdn-shared', 'pcdn-share-' + String(SHARE.role).replace(/[^a-z]/g, ''));
   // Growth (growth.js): free-trial CTA, onboarding progress kept in WHMCS, e-mail report opt-in.
   var GROWTH = P.growth || null;
-  if (GROWTH) GROWTH.init(boot, { admin: !!ADMIN, readonly: READONLY });
+  if (GROWTH) GROWTH.init(boot, { admin: !!ADMIN || !!SHARE, readonly: READONLY || !!SHARE });
 
   function reloadSite() {
     return api('GET', '').then(function (res) {
@@ -276,7 +291,7 @@
       updateSaveBar();
       if (Math.abs(window.pageYOffset - y) > 2) window.scrollTo(0, y);
     };
-    f.dirty = function () { return S.active && !READONLY && snap(f.draft) !== f.original; };
+    f.dirty = function () { return S.active && !roNow() && snap(f.draft) !== f.original; };
     f.reset = function () { clear(f.summary); f.load(); f.redraw(); };
     f.save = function (button) {
       clear(f.summary);
@@ -473,7 +488,8 @@
     S.form = null;
     var id = S.page, p = page(id);
     var banner = null, adminBar = ADMIN ? adminBanner() : (RSITE ? resellerSubBanner() : null);
-    var roBar = READONLY ? readonlyBanner() : null;
+    var roBar = SHARE ? shareBanner(id) : READONLY ? readonlyBanner() : null;
+    root.classList.toggle('pcdn-ro', roNow());
     var xferBar = TRANSFER && !RSITE ? transferBanner() : null;
     if (!S.active) banner = P.alertBox('warning', [h('strong', { text: t('این سرویس فعال نیست. ') }), t('اطلاعات فقط قابل مشاهده است و امکان تغییر تنظیمات وجود ندارد.')], { icon: 'lock' });
     else if (S.site.status === 'suspended') banner = P.alertBox('danger', t('این سرویس در CDN معلق است و بازدیدکنندگان صفحه تعلیق را می‌بینند.'));
@@ -493,6 +509,16 @@
     mainEl.appendChild(buildSaveBar());
     lockWrites(mainEl);
     updateSaveBar();
+  }
+
+  /** SPEC §20.3: role badge of a shared domain + what this role may do on the current page. */
+  function shareBanner(id) {
+    var labels = { viewer: t('مشاهده‌گر'), dns: t('مدیر DNS'), editor: t('ویرایشگر') };
+    return h('div', { className: 'pcdn-admin-bar pcdn-share-bar', role: 'note', 'data-share-role': String(SHARE.role) },
+      h('span', { className: 'pcdn-admin-badge' }, icon('link'), h('span', { text: t('دامنهٔ اشتراکی — نقش: ') + (labels[SHARE.role] || SHARE.role) })),
+      h('span', { className: 'pcdn-admin-text', text: (SHARE.owner ? t('مالک: ') + String(SHARE.owner) + '. ' : '') +
+        (shareLocked(id) ? t('در این صفحه فقط مشاهده ممکن است.') : t('تغییرات شما با نام شما در گزارش تغییرات مالک ثبت می‌شود.')) }),
+      SHARE.back ? h('span', { className: 'pcdn-admin-links' }, h('a', { className: 'pcdn-link', href: String(SHARE.back), 'data-ro-ok': '1', text: t('دامنه‌های اشتراکی') })) : null);
   }
 
   /** SPEC §19.2: shown to the new owner after a domain transfer, on every page, until «متوجه شدم». */
@@ -1702,8 +1728,11 @@
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
     reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
-    readonly: READONLY, onLeave: onLeave, refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand
+    onLeave: onLeave, share: SHARE, sharing: SHARE || ADMIN ? null : (boot.sharing || null), refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand
   };
+
+  // §14.3.7 / §20.1: modules ask A().readonly when they render — read-only team member or a role that cannot change this page
+  Object.defineProperty(A, 'readonly', { enumerable: true, get: function () { return roNow(); } });
 
   // ------------------------------------------------------------------ boot
 

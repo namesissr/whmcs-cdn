@@ -629,6 +629,14 @@
       return k + ': ' + (typeof x === 'object' ? JSON.stringify(x) : String(x)).slice(0, 80);
     }).join(' · ');
   }
+  /** SPEC §20.3: a member of a shared domain did it — detail.on_behalf_of = share:<client id>:<role>. */
+  function behalf(d) {
+    var v = isObj(d) && typeof d.on_behalf_of === 'string' ? d.on_behalf_of : '';
+    var m = /^share:(\d{1,10}):(viewer|dns|editor)$/.exec(v);
+    if (!m) return null;
+    var roles = { viewer: t('مشاهده‌گر'), dns: t('مدیر DNS'), editor: t('ویرایشگر') };
+    return h('div', { className: 'pcdn-w10-behalf', 'data-on-behalf': v }, P.badge(t('عضو اشتراکی #{0} — {1}', m[1], roles[m[2]]), 'violet'));
+  }
   function renderAudit(Aa, holder) {
     var st = { days: '30' };
     var c = P.card({ title: t('گزارش تغییرات'), icon: 'activity', id: 'w10-audit',
@@ -656,7 +664,7 @@
               var k = ACTOR_KINDS[kind] || [kind || '—', 'muted'];
               return h('tr', null, h('td', { className: 'pcdn-nowrap', text: P.date(r.at || r.t) }),
                 h('td', null, ltr(String(r.action || '—')), r.target ? h('div', { className: 'pcdn-muted' }, ltr(String(r.target).slice(0, 80))) : null),
-                h('td', null, P.badge(k[0], k[1]), r.actor ? ' ' : null, r.actor ? ltr(String(r.actor).slice(0, 40)) : null),
+                h('td', null, P.badge(k[0], k[1]), r.actor ? ' ' : null, r.actor ? ltr(String(r.actor).slice(0, 40)) : null, behalf(r.detail)),
                 h('td', { className: 'pcdn-w10-detail' }, ltr(auditDetail(r.detail))));
             }))))]);
       });

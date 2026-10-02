@@ -20,7 +20,7 @@ final class Admin
 {
     // SPEC §19: «دامنه‌های اپراتور» (operator), its full manager (opmanage) and the «انتقال دامنه» wizard (transfer)
     const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'referrals', 'settings', 'manage', 'api',
-        'operator', 'opmanage', 'transfer'];
+        'operator', 'opmanage', 'transfer', 'shares'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -120,6 +120,10 @@ final class Admin
             case 'settings':
                 $body = Pages::settings();
                 break;
+            case 'shares':
+                require_once __DIR__ . '/Sharing.php';
+                $body = Sharing::adminPage($get);
+                break;
             case 'operator':
                 require_once __DIR__ . '/Operator.php';
                 $body = Operator::page($get, $state);
@@ -141,7 +145,7 @@ final class Admin
         }
         // After a POST, the browser URL is replaced with the GET URL so a refresh never re-submits.
         $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'id' => $get['id'] ?? null,
-            'service' => $page === 'transfer' ? ($get['service'] ?? null) : null, 'domain' => $page === 'transfer' ? ($get['domain'] ?? null) : null,
+            'service' => in_array($page, ['transfer', 'shares'], true) ? ($get['service'] ?? null) : null, 'domain' => $page === 'transfer' ? ($get['domain'] ?? null) : null,
             'q' => $get['q'] ?? null, 'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
         return Pages::layout($page, $body, $flash, $clean);
     }
@@ -232,6 +236,10 @@ final class Admin
         require_once __DIR__ . '/Operator.php';
         if (in_array($action, Operator::ACTIONS, true)) {
             return Operator::action($action, $post, $admin);
+        }
+        if ($action === 'share_revoke') {
+            require_once __DIR__ . '/Sharing.php';
+            return [[Sharing::adminRevoke((int) ($post['id'] ?? 0), $admin)], []];
         }
         if ($action === 'transfer_preview' || $action === 'transfer_execute') {
             require_once __DIR__ . '/Transfer.php';
@@ -455,6 +463,7 @@ final class Admin
             return ['bad', View::e('حذف ' . $domain . ' ناموفق بود: ' . $e->getMessage())];
         }
         Env::log('orphan site ' . $domain . ' deleted from the controller by admin #' . $admin);
+        \PasargadCdn\Shares::removeForDomain($domain);   // SPEC §20.2: a deleted site keeps no shares
         Pages::reset();
         return ['ok', 'سایت ' . View::ltr($domain) . ' از کنترلر حذف شد.'];
     }

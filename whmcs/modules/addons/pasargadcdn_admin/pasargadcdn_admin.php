@@ -35,7 +35,7 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.4.0',
+        'version' => '1.5.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',
@@ -216,6 +216,27 @@ function pasargadcdn_admin_config()
                 'Default' => '',
                 'Description' => 'هم‌دامنه بودن ایمیل معرف و مشتری جدید معرفی را رد می‌کند، مگر برای این سرویس‌دهنده‌های عمومی (خالی = فهرست پیش‌فرض: gmail.com، yahoo.com، outlook.com، …)',
             ],
+            // SPEC §20: domain sharing with other client accounts
+            'share_max_members' => [
+                'FriendlyName' => 'حداکثر اعضای اشتراک هر دامنه',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '20',
+                'Description' => 'اعضا و دعوت‌های در انتظار یک دامنه (اشتراک دامنه با حساب‌های دیگر)',
+            ],
+            'share_max_pending' => [
+                'FriendlyName' => 'حداکثر دعوت در انتظار هر مالک',
+                'Type' => 'text',
+                'Size' => '6',
+                'Default' => '50',
+                'Description' => 'دعوت‌های پذیرفته‌نشدهٔ همهٔ دامنه‌های یک مشتری (دعوت‌ها پس از ۷ روز منقضی می‌شوند)',
+            ],
+            'share_notify_owner' => [
+                'FriendlyName' => 'ایمیل پذیرش دعوت به مالک',
+                'Type' => 'yesno',
+                'Default' => 'on',
+                'Description' => 'وقتی کسی دعوت مدیریت دامنه را بپذیرد، به مالک سرویس ایمیل «پذیرش دعوت مدیریت دامنه» فرستاده شود',
+            ],
             'reserved' => [
                 'FriendlyName' => 'دامنه‌های رزرو',
                 'Type' => 'text',
@@ -266,6 +287,7 @@ function pasargadcdn_admin_output($vars)
     require_once __DIR__ . '/lib/Referrals.php';
     require_once __DIR__ . '/lib/Operator.php';
     require_once __DIR__ . '/lib/Transfer.php';
+    require_once __DIR__ . '/lib/Sharing.php';
     require_once __DIR__ . '/lib/Admin.php';
     echo PasargadCdn\Admin\Admin::output(is_array($vars) ? $vars : [], $_GET, $_POST,
         strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
@@ -294,6 +316,13 @@ function pasargadcdn_admin_clientarea($vars)
     } catch (\Throwable $e) {
         $clientId = (int) ($_SESSION['uid'] ?? 0);
     }
+    // SPEC §20.3: «دامنه‌های اشتراکی» (members) and its JSON proxy for the client app
+    if (in_array($get['page'] ?? '', ['shared', 'sharedapi'], true)) {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/Data.php';
+        require_once __DIR__ . '/lib/Sharing.php';
+        return PasargadCdn\Admin\Sharing::clientArea($get, array_filter($_POST, 'is_scalar'), strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')), $clientId) ?? [];
+    }
     if (($get['page'] ?? 'pricing') === 'referral') {
         $lang = PasargadCdn\Admin\Pricing::lang($get);
         $title = PasargadCdn\Admin\Referrals::tx('title', $lang);
@@ -311,7 +340,7 @@ function pasargadcdn_admin_sidebar($vars)
     $link = htmlspecialchars((string) ($vars['modulelink'] ?? 'addonmodules.php?module=pasargadcdn_admin'), ENT_QUOTES, 'UTF-8');
     $items = ['dashboard' => 'داشبورد', 'sites' => 'سایت‌ها', 'edges' => 'نودها', 'plans' => 'پلن‌ها و قیمت‌گذاری',
         'operator' => 'دامنه‌های اپراتور', 'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'resellers' => 'نمایندگان', 'events' => 'رویدادهای امنیتی',
-        'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'referrals' => 'معرفی‌ها', 'settings' => 'تنظیمات و سلامت'];
+        'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'referrals' => 'معرفی‌ها', 'shares' => 'اشتراک‌ها', 'settings' => 'تنظیمات و سلامت'];
     $h = '<span class="header"><i class="fas fa-bolt"></i> CDN پاسارگاد</span><ul class="menu" dir="rtl" style="text-align:right">';
     foreach ($items as $page => $label) {
         $h .= '<li><a href="' . $link . '&amp;page=' . $page . '">' . $label . '</a></li>';

@@ -372,6 +372,8 @@ final class Env
             \PasargadCdn\Reseller::ensureExtras();
             // SPEC §19.2: domain-transfer ledger (Terminate guard + new-owner notice)
             \PasargadCdn\Transfers::ensure();
+            // SPEC §20: domain sharing
+            \PasargadCdn\Shares::ensure();
         }
     }
 

@@ -49,7 +49,9 @@ final class Operator
     /** a context's operator check is repeated after this many seconds */
     const RECHECK = 60;
 
-    const ACTIONS = ['op_check', 'op_add', 'op_nscheck', 'op_purge', 'op_suspend', 'op_unsuspend', 'op_plan', 'op_note', 'op_delete'];
+    const ACTIONS = ['op_check', 'op_add', 'op_nscheck', 'op_purge', 'op_suspend', 'op_unsuspend', 'op_plan', 'op_note', 'op_delete',
+        // SPEC §20.2: operator sites are shared by the admin (same roles as customers' shares)
+        'op_share_invite', 'op_share_revoke'];
 
     // ------------------------------------------------------------------ plan templates
 
@@ -199,12 +201,25 @@ final class Operator
                     Env::log('operator site ' . $domain . ': note edited by ' . $who);
                     Pages::reset();
                     return [[['ok', 'یادداشت ' . View::ltr($domain) . ' ذخیره شد.']], []];
+                case 'op_share_invite':
+                    require_once __DIR__ . '/Sharing.php';
+                    return [[Sharing::adminInvite($domain, Env::input($post['email'] ?? ''), Env::input($post['role'] ?? ''))], []];
+                case 'op_share_revoke':
+                    require_once __DIR__ . '/Sharing.php';
+                    $sid = (int) ($post['id'] ?? 0);
+                    // scoped to THIS operator domain: an id of another site's share is refused
+                    if (!\PasargadCdn\Shares::revoke($sid, ['operator_domain' => $domain])) {
+                        return [[['bad', 'اشتراک یا دعوتی با این شناسه برای این دامنه نیست.']], []];
+                    }
+                    \PasargadCdn\Shares::log('#' . $sid . ' on operator site ' . $domain . ' revoked by ' . $who);
+                    return [[['ok', 'دسترسی لغو شد.']], []];
                 case 'op_delete':
                     if (strtolower(trim(Env::input($post['confirm'] ?? ''))) !== $domain) {
                         return [[['bad', 'برای حذف، نام دامنه را دقیقاً تایپ کنید؛ چیزی حذف نشد.']], []];
                     }
                     $api->delete($path);
                     self::remember($domain, null, $admin);
+                    \PasargadCdn\Shares::removeForDomain($domain);   // SPEC §20.2: a deleted site keeps no shares
                     Env::log('operator site ' . $domain . ' deleted from the controller by ' . $who);
                     Pages::reset();
                     return [[['ok', 'سایت اپراتور ' . View::ltr($domain) . ' از کنترلر حذف شد.']], []];
@@ -394,6 +409,7 @@ final class Operator
                 . '<input type="hidden" name="a" value="op_note"><input type="hidden" name="domain" value="' . View::e($domain) . '">'
                 . '<input class="pcdna-input" name="note" maxlength="' . self::NOTE_MAX . '" value="' . View::e($note) . '" aria-label="یادداشت">'
                 . '<button type="submit" class="pcdna-btn pcdna-btn-sm">ذخیره یادداشت</button></form>';
+            $shares = self::shareBox($domain);
             $del = '<form method="post" action="' . self::url() . '" class="pcdna-form-inline pcdna-op-delete">' . View::csrf()
                 . '<input type="hidden" name="a" value="op_delete"><input type="hidden" name="domain" value="' . View::e($domain) . '">'
                 . '<label class="pcdna-small">برای حذف، نام دامنه را تایپ کنید: <input class="pcdna-input" name="confirm" dir="ltr" autocomplete="off" placeholder="' . View::e($domain) . '" aria-label="تأیید حذف"></label>'
@@ -410,11 +426,31 @@ final class Operator
                 . View::icon('sliders') . '<span>مدیریت</span></a>'
                 . '<details class="pcdna-menu"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="عملیات بیشتر" title="عملیات بیشتر">' . View::icon('more') . '</summary>'
                 . '<div class="pcdna-menu-list">' . $menu . '</div></details>'
+                . '<details class="pcdna-op-more pcdna-op-share"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost">' . View::icon('link') . '<span>اشتراک</span></summary>' . $shares . '</details>'
                 . '<details class="pcdna-op-more pcdna-op-del"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost">' . View::icon('trash') . '<span>حذف</span></summary>' . $del . '</details>'
                 . '</td></tr>';
         }
         $t .= '</tbody></table></div>';
         return View::card('دامنه‌های اپراتور (' . View::n(count($sites)) . ')', $t, '', 'pcdna-flush', 'globe');
+    }
+
+    /** SPEC §20.2: members / pending invites of an operator site + the admin's invite form. */
+    private static function shareBox(string $domain): string
+    {
+        $rows = \PasargadCdn\Shares::forOwner(['operator_domain' => $domain]);
+        $h = '<ul class="pcdna-bullets pcdna-op-members">';
+        foreach ($rows as $r) {
+            $h .= '<li data-share-id="' . (int) $r->id . '">' . View::ltr((string) $r->email) . ' — ' . View::e(\PasargadCdn\Shares::roleLabel((string) $r->role))
+                . ($r->status === 'pending' ? ' ' . View::badge('در انتظار', 'warn') : '')
+                . View::postButton(['page' => 'operator'], 'op_share_revoke', ['domain' => $domain, 'id' => (int) $r->id], 'لغو', 'pcdna-btn pcdna-btn-sm pcdna-btn-ghost',
+                    'دسترسی ' . $r->email . ' لغو شود؟') . '</li>';
+        }
+        $h .= $rows ? '</ul>' : '<li class="pcdna-muted">هنوز با کسی به اشتراک گذاشته نشده است.</li></ul>';
+        return $h . '<form method="post" action="' . self::url() . '" class="pcdna-form-inline pcdna-op-share-form">' . View::csrf()
+            . '<input type="hidden" name="a" value="op_share_invite"><input type="hidden" name="domain" value="' . View::e($domain) . '">'
+            . '<input class="pcdna-input" type="email" name="email" dir="ltr" required maxlength="191" placeholder="name@example.com" aria-label="ایمیل">'
+            . View::select('role', ['viewer' => 'مشاهده‌گر', 'dns' => 'مدیر DNS', 'editor' => 'ویرایشگر'], 'viewer', ' aria-label="نقش"')
+            . '<button type="submit" class="pcdna-btn pcdna-btn-sm pcdna-btn-primary">دعوت</button></form>';
     }
 
     // ------------------------------------------------------------------ manage (client app in an admin context)

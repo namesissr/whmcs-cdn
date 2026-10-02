@@ -36,6 +36,8 @@ final class Pages
         'audit' => ['حسابرسی', 'history'],
         // Wave 10 (SPEC §18.5): referral ledger
         'referrals' => ['معرفی‌ها', 'users'],
+        // SPEC §20.4: domain sharing
+        'shares' => ['اشتراک‌ها', 'link'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
     ];
 
