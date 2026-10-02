@@ -15,8 +15,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import (dns_secondary, edge_functions, images, l4, logexport, origin_pull, pdns, sections, ssl, tunnel,
-               waf_learning, webhooks)
+from . import (access, dns_secondary, edge_functions, images, l4, logexport, origin_pull, pdns, sections, ssl,
+               tunnel, waf_learning, waiting_room, webhooks)
 from .audit import record_audit
 from .auth import require_admin
 from .config import settings
@@ -117,6 +117,10 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
         except IntegrityError:
             db.rollback()
             raise HTTPException(409, "همین حالا پورتی که انتخاب شد به سرویس دیگری داده شد؛ دوباره تلاش کنید")
+    elif section == "waiting_room":  # SPEC §18.1: the site's wr_secret exists before edges need it
+        waiting_room.after_write(site, value)
+    elif section == "access":  # SPEC §18.2: the site's access_secret (encrypted, never returned)
+        access.after_write(site, value)
     sections.store_section(site, section, value)
     try:
         db.commit()

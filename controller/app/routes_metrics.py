@@ -214,6 +214,16 @@ def _collect(out: _Out) -> None:
         except Exception:  # noqa: BLE001
             log.exception("metrics: webhooks/log export block failed")
             db.rollback()
+        # client app errors (SPEC §18.4): bounded page label set (errortrack.PAGES + "other") -------
+        try:
+            from . import errortrack
+
+            for page, n in sorted(errortrack.client_error_counts(db).items()):
+                out.metric("pcdn_client_errors_total", n, "JavaScript errors reported by the WHMCS client app, "
+                           "by page.", "counter", labels={"page": page})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: client errors block failed")
+            db.rollback()
     finally:
         db.close()
 

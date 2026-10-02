@@ -11,6 +11,7 @@ from . import (
     routes_metrics,
     routes_ops,
     routes_platform,
+    routes_reports,
     routes_storage,
     routes_tunnel,
     routes_v2,
@@ -55,6 +56,9 @@ def secrets_at_rest():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from . import errortrack
+
+    errortrack.init_sentry()  # SPEC §18.4: only with SENTRY_DSN (sentry-sdk imported lazily)
     init_db()
     secrets_at_rest()
     from . import pdns
@@ -82,6 +86,8 @@ app.include_router(routes_v2.router)
 app.include_router(routes_platform.router)
 # wave 7 (SPEC §15.3/§15.4): tunnel quality, usage forecast, origin health
 app.include_router(routes_tunnel.router)
+# wave 10 (SPEC §18): waiting room / access / statements / audit export / client errors
+app.include_router(routes_reports.router)
 # SPEC §16.8: object storage buckets (MinIO) + GB-hour usage for invoicing
 app.include_router(routes_storage.router)
 # public, unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)

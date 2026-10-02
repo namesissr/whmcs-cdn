@@ -7,3 +7,9 @@ httpx==0.28.1
 dnspython==2.8.0
 pydantic==2.13.5
 cryptography==50.0.1
+# wave 10 (SPEC §18.3): monthly statement PDFs (fpdf2 pulls fonttools, Pillow, defusedxml); uharfbuzz
+# shapes Persian (RTL joining) with the bundled Vazirmatn font (app/fonts, OFL)
+fpdf2==2.8.9
+uharfbuzz==0.56.2
+# SPEC §18.4: error tracking, used only when SENTRY_DSN is set (imported lazily)
+sentry-sdk==2.71.0

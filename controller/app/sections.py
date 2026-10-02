@@ -55,6 +55,9 @@ DEFAULT_FEATURES = {
     # security review H1: section `dns_secondary` (our nameservers AXFR the zone from the customer's
     # primary) is a plan feature, off by default
     "dns_secondary": False,
+    # wave 10 (SPEC §18.1 / §18.2): sections `waiting_room` and `access`, off by default
+    "waiting_room": False,
+    "access": False,
 }
 EDGE_GROUPS = ("general", "tunnel")
 WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
@@ -104,6 +107,8 @@ class Features(Strict):
     edge_functions: bool = False
     max_functions: int = Field(0, ge=0, le=FUNCTIONS_MAX)
     dns_secondary: bool = False
+    waiting_room: bool = False
+    access: bool = False
 
 
 # ------------------------------------------------------------------ sections
@@ -1731,6 +1736,186 @@ def functions_audit(value: dict) -> dict:
                       for i in value["items"]]}
 
 
+# ------------------------------------------------------------------ wave 10 (SPEC §18.1 / §18.2)
+
+PREFIX_MAX = 256
+RESERVED_PREFIX = "/__pcdn"  # the edge's own endpoints: never queued, never protected
+TEXT_MAX = 500
+EMAIL_RE = re.compile(r"^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                      r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+EMAIL_DOMAIN_RE = re.compile(r"^@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+ACCESS_APP_ID_RE = r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$"
+# a CIDR shorter than these would open (access) / bypass (waiting room) for most of the internet
+CIDR_MIN_PREFIX = {4: 8, 6: 16}
+
+
+def _prefixes(v: list[str], what: str) -> list[str]:
+    """URL path prefixes: start with /, the PATH_PATTERN_RE characters, no query, never /__pcdn;
+    duplicates removed (order kept)."""
+    out = []
+    for p in v:
+        p = (p or "").strip()
+        if not p.startswith("/") or len(p) > PREFIX_MAX or not PATH_PATTERN_RE.match(p) or "*" in p:
+            raise ValueError(f"{what}: پیشوند مسیر باید با / شروع شود و بدون * و ? باشد ({p[:60]})")
+        if p == RESERVED_PREFIX or p.startswith(RESERVED_PREFIX + "/") or p.startswith(RESERVED_PREFIX + "_"):
+            raise ValueError(f"{what}: مسیرهای /__pcdn/ رزرو شده‌اند")
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _cidrs_list(v: list[str], what: str) -> list[str]:
+    """IPv4/IPv6 addresses or networks, normalized (host bits cleared), deduplicated."""
+    out = []
+    for c in v:
+        try:
+            net = ipaddress.ip_network((c or "").strip(), strict=False)
+        except ValueError:
+            raise ValueError(f"{what}: آدرس یا شبکهٔ نامعتبر: {str(c)[:60]}") from None
+        if net.prefixlen < CIDR_MIN_PREFIX[net.version]:
+            raise ValueError(f"{what}: شبکهٔ {net} بیش از حد بزرگ است (حداقل /{CIDR_MIN_PREFIX[net.version]})")
+        s = str(net)
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def _plain_text(v: str, what: str) -> str:
+    """Plain text shown on an edge page (the edge HTML-escapes it): no control characters except
+    newline / tab."""
+    v = (v or "").strip()
+    if any((ord(ch) < 32 and ch not in "\n\t") or ord(ch) == 127 for ch in v):
+        raise ValueError(f"{what}: نویسهٔ کنترلی مجاز نیست")
+    return v
+
+
+class QueuePage(Strict):
+    """Texts of the waiting room's queue page; "" = the edge's built-in text."""
+    title_fa: str = Field("", max_length=TEXT_MAX)
+    title_en: str = Field("", max_length=TEXT_MAX)
+    message_fa: str = Field("", max_length=TEXT_MAX)
+    message_en: str = Field("", max_length=TEXT_MAX)
+
+    @field_validator("title_fa", "title_en", "message_fa", "message_en")
+    @classmethod
+    def _text(cls, v, info: ValidationInfo):
+        return _plain_text(v, info.field_name)
+
+
+class WaitingRoomBypass(Strict):
+    verified_bots: bool = True
+    paths: list[str] = Field(default_factory=list, max_length=20)
+    ips: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("paths")
+    @classmethod
+    def _paths(cls, v):
+        return _prefixes(v, "bypass.paths")
+
+    @field_validator("ips")
+    @classmethod
+    def _ips(cls, v):
+        return _cidrs_list(v, "bypass.ips")
+
+
+class WaitingRoom(Strict):
+    """SPEC §18.1: queue visitors above `max_active` active visitors site-wide. The controller sends
+    each serving edge `node_max` = ceil(max_active / healthy edges of the site's group) (waiting_room.py)."""
+    enabled: bool = False
+    mode: Literal["queue", "off"] = "queue"
+    paths: list[str] = Field(default_factory=lambda: ["/"], min_length=1, max_length=20)
+    max_active: int = Field(1000, ge=1, le=1_000_000)
+    session_minutes: int = Field(10, ge=1, le=120)
+    queue_page: QueuePage = Field(default_factory=QueuePage)
+    bypass: WaitingRoomBypass = Field(default_factory=WaitingRoomBypass)
+
+    @field_validator("paths")
+    @classmethod
+    def _paths(cls, v):
+        return _prefixes(v, "paths")
+
+
+def _emails(v: list[str]) -> list[str]:
+    out = []
+    for e in v:
+        e = (e or "").strip().lower()
+        if len(e) > 254 or not (EMAIL_RE.match(e) or EMAIL_DOMAIN_RE.match(e)):
+            raise ValueError(f"ایمیل یا دامنهٔ نامعتبر: {e[:80]} (مثل a@b.com یا @company.com)")
+        if e not in out:
+            out.append(e)
+    return out
+
+
+def prefixes_overlap(a: str, b: str) -> bool:
+    """Two path prefixes overlap when one is a (string) prefix of the other, as the edge matches."""
+    return a.startswith(b) or b.startswith(a)
+
+
+class AccessApp(Strict):
+    id: str = Field(pattern=ACCESS_APP_ID_RE)
+    name: str = Field(min_length=1, max_length=100)
+    paths: list[str] = Field(min_length=1, max_length=20)
+    methods: Literal["otp", "ip", "otp_or_ip"] = "otp"
+    emails: list[str] = Field(default_factory=list, max_length=200)
+    ips: list[str] = Field(default_factory=list, max_length=100)
+    session_hours: int = Field(24, ge=1, le=720)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        v = _plain_text(v, "name")
+        if not v or "\n" in v:
+            raise ValueError("نام برنامه لازم است (یک خط)")
+        return v
+
+    @field_validator("paths")
+    @classmethod
+    def _paths(cls, v):
+        return _prefixes(v, "paths")
+
+    @field_validator("emails")
+    @classmethod
+    def _emails(cls, v):
+        return _emails(v)
+
+    @field_validator("ips")
+    @classmethod
+    def _ips(cls, v):
+        return _cidrs_list(v, "ips")
+
+    @model_validator(mode="after")
+    def _method_needs(self):
+        if self.methods == "otp" and not self.emails:
+            raise ValueError(f"برنامه «{self.id}»: روش otp دست‌کم یک ایمیل یا @دامنه لازم دارد")
+        if self.methods == "ip" and not self.ips:
+            raise ValueError(f"برنامه «{self.id}»: روش ip دست‌کم یک آدرس IP یا شبکه لازم دارد")
+        if self.methods == "otp_or_ip" and not (self.emails or self.ips):
+            raise ValueError(f"برنامه «{self.id}»: دست‌کم یک ایمیل یا یک آدرس IP لازم است")
+        return self
+
+
+class Access(Strict):
+    """SPEC §18.2: protect path prefixes with an e-mail one-time code and/or an IP allow list. The
+    per-site `access_secret` lives in site_secrets (access.py), never in the section."""
+    enabled: bool = False
+    apps: list[AccessApp] = Field(default_factory=list, max_length=20)
+
+    @field_validator("apps")
+    @classmethod
+    def _apps(cls, v):
+        ids = [a.id for a in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError("شناسهٔ برنامه‌ها باید یکتا باشد")
+        for i, a in enumerate(v):
+            for b in v[i + 1:]:
+                for pa in a.paths:
+                    for pb in b.paths:
+                        if prefixes_overlap(pa, pb):
+                            raise ValueError(f"مسیر {pa} از برنامهٔ «{a.id}» با مسیر {pb} از برنامهٔ «{b.id}» "
+                                             "هم‌پوشانی دارد")
+        return v
+
+
 SECTIONS: dict[str, type[BaseModel]] = {
     "cache": Cache,
     "ssl": Ssl,
@@ -1756,12 +1941,16 @@ SECTIONS: dict[str, type[BaseModel]] = {
     "dns_secondary": DnsSecondary,
     # SPEC §16.9
     "functions": Functions,
+    # wave 10 (SPEC §18.1 / §18.2)
+    "waiting_room": WaitingRoom,
+    "access": Access,
 }
 
 # section -> feature flag that must be on to write it
 FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
                  "tunnel": "tunnel", "logs": "log_export", "l4": "l4_proxy",
-                 "functions": "edge_functions", "dns_secondary": "dns_secondary"}
+                 "functions": "edge_functions", "dns_secondary": "dns_secondary",
+                 "waiting_room": "waiting_room", "access": "access"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -2193,8 +2382,10 @@ def _is_enabled(name: str, value: dict) -> bool:
         return bool(value["pools"])
     if name == "l4":
         return bool(value["apps"])
-    if name in ("tunnel", "logs"):
+    if name in ("tunnel", "logs", "access"):
         return value["enabled"]
+    if name == "waiting_room":
+        return value["enabled"] and value["mode"] != "off"
     if name == "functions":
         return value["enabled"] or bool(value["items"])
     if name == "dns_secondary":

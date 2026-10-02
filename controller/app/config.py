@@ -311,5 +311,19 @@ class Settings:
     # API key would cross the internet in clear). Default: warn + alert only.
     pdns_api_require_private: bool = field(default_factory=lambda: _bool("PDNS_API_REQUIRE_PRIVATE", False))
 
+    # ---- wave 10 (SPEC §18) ----
+    # §18.2 access one-time codes, e-mailed through the SMTP_* settings above (sender ACCESS_MAIL_FROM,
+    # default SMTP_FROM). Controller limits per hour: codes per e-mail address / per site.
+    access_mail_from: str = field(default_factory=lambda: os.getenv("ACCESS_MAIL_FROM", "").strip())
+    access_otp_per_email_hour: int = field(
+        default_factory=lambda: max(1, int(os.getenv("ACCESS_OTP_PER_EMAIL_HOUR") or 5)))
+    access_otp_per_site_hour: int = field(
+        default_factory=lambda: max(1, int(os.getenv("ACCESS_OTP_PER_SITE_HOUR") or 50)))
+    # §18.4 error tracking (opt-in): empty DSN = off (sentry-sdk is then never imported)
+    sentry_dsn: str = field(default_factory=lambda: os.getenv("SENTRY_DSN", "").strip())
+    sentry_environment: str = field(default_factory=lambda: (os.getenv("SENTRY_ENVIRONMENT") or "production").strip())
+    sentry_traces_sample_rate: float = field(
+        default_factory=lambda: min(1.0, max(0.0, float(os.getenv("SENTRY_TRACES_SAMPLE_RATE") or 0))))
+
 
 settings = Settings()

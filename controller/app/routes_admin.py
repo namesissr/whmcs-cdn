@@ -103,6 +103,9 @@ class FeaturesIn(BaseModel):
     # security review H1: section `dns_secondary` (our nameservers transfer the zone from the
     # customer's primary) is a plan feature, off by default
     dns_secondary: bool | None = None
+    # wave 10 (SPEC §18.1 / §18.2): sections `waiting_room` and `access`
+    waiting_room: bool | None = None
+    access: bool | None = None
 
 
 class Plan(BaseModel):
@@ -873,6 +876,8 @@ def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
         # {"http3", "early_hints", "webp_convert", "modules"} or null when never reported
         "shield": e.shield,
         "capabilities": edge_capabilities(e),
+        # SPEC §18.4: agent errors in the last hour from the latest heartbeat (null = never reported)
+        "errors_last_hour": e.errors_last_hour,
     }
 
 

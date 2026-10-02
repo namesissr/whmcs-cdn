@@ -125,23 +125,46 @@ class EmailNotifier:
         msg["Date"] = formatdate(localtime=False)
         msg["Message-ID"] = make_msgid(domain="pcdn.alerts")
         msg.set_content(body, charset="utf-8")
-        security = settings.smtp_security
-        port = settings.smtp_port or (465 if security == "ssl" else 587 if security == "starttls" else 25)
-        timeout = settings.alert_timeout
-        try:
-            if security == "ssl":
-                smtp = smtplib.SMTP_SSL(settings.smtp_host, port, timeout=timeout,
-                                        context=ssl_lib.create_default_context())
-            else:
-                smtp = smtplib.SMTP(settings.smtp_host, port, timeout=timeout)
-            with smtp:
-                if security == "starttls":
-                    smtp.starttls(context=ssl_lib.create_default_context())
-                if settings.smtp_user:
-                    smtp.login(settings.smtp_user, settings.smtp_password)
-                smtp.send_message(msg)
-        except (OSError, smtplib.SMTPException) as e:
-            raise AlertError(_redact(f"{type(e).__name__}: {e}")) from None
+        smtp_send(msg)
+
+
+def mail_configured() -> bool:
+    """SMTP is set up (for mail to customers' visitors, e.g. access codes; no ALERT_EMAILS needed)."""
+    return bool(settings.smtp_host)
+
+
+def send_mail(to: str, subject: str, body: str, sender: str = "") -> None:
+    """One plain-text UTF-8 e-mail to `to` over the SMTP_* settings (SPEC §18.2 access codes).
+    Raises AlertError (secret-free message) on failure."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender or settings.smtp_from or settings.smtp_user or f"pcdn@{settings.smtp_host}"
+    msg["To"] = to
+    msg["Date"] = formatdate(localtime=False)
+    msg["Message-ID"] = make_msgid(domain="pcdn.mail")
+    msg.set_content(body, charset="utf-8")
+    smtp_send(msg)
+
+
+def smtp_send(msg: EmailMessage) -> None:
+    """Deliver one message over the SMTP_* settings within ALERT_TIMEOUT; AlertError on failure."""
+    security = settings.smtp_security
+    port = settings.smtp_port or (465 if security == "ssl" else 587 if security == "starttls" else 25)
+    timeout = settings.alert_timeout
+    try:
+        if security == "ssl":
+            smtp = smtplib.SMTP_SSL(settings.smtp_host, port, timeout=timeout,
+                                    context=ssl_lib.create_default_context())
+        else:
+            smtp = smtplib.SMTP(settings.smtp_host, port, timeout=timeout)
+        with smtp:
+            if security == "starttls":
+                smtp.starttls(context=ssl_lib.create_default_context())
+            if settings.smtp_user:
+                smtp.login(settings.smtp_user, settings.smtp_password)
+            smtp.send_message(msg)
+    except (OSError, smtplib.SMTPException) as e:
+        raise AlertError(_redact(f"{type(e).__name__}: {e}")) from None
 
 
 def notifiers() -> list:

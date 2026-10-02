@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import (botranges, crypto, dnsbuild, images, l4, logexport, origin_guard, origin_pull, pdns, sections, storage,
-               waf_learning, webhooks)
+from . import (access, botranges, crypto, dnsbuild, images, l4, logexport, origin_guard, origin_pull, pdns, sections,
+               storage, waf_learning, waiting_room, webhooks)
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -437,6 +437,7 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
     buckets = storage.edge_buckets(db)  # SPEC §16.8 storage origins: (site id, name) -> bucket
     # origin host names that resolve to non-public addresses (origin_guard.py): never handed out
     blocked_hosts = origin_guard.blocked(db)
+    online = None  # SPEC §18.1: computed once, only when some site has a waiting room
     for site in db.scalars(select(Site).order_by(Site.id)):
         hosts, seen = [], set()
         storage_on = bool(buckets) and sections.features_of(site)["storage_gb"] > 0
@@ -526,6 +527,11 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
         if not hosts:
             continue
         shield_used = shield_used or cache["shield"]
+        wr_serving = 1
+        if cfg["waiting_room"]["enabled"]:
+            if online is None:
+                online = online_edges(db)
+            wr_serving = waiting_room.serving_edges(site, online)
         # SPEC §14.2 authenticated origin pulls: what the edges present to this site's origin.
         # {"mode": "off"|"platform"} or {"mode": "custom", "cert", "key"} (this site's own pair); a
         # custom mode without a usable uploaded certificate is folded to off
@@ -572,6 +578,11 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "logs": logexport.edge_block(site, cfg["logs"], feats),
             # SPEC §16.9 edge functions (run by pcdn-fn on nodes installed with --functions)
             "functions": functions_for_edge(site, cfg["functions"], feats),
+            # SPEC §18.1: node_max = ceil(max_active / healthy edges serving the site), the wr_secret
+            # (64 hex = 32 bytes) for the __pcdn_wr cookie; enabled folded with plan + site status
+            "waiting_room": waiting_room.edge_block(site, cfg["waiting_room"], feats, wr_serving),
+            # SPEC §18.2: protected apps + access_secret (64 hex = 32 bytes, HMAC key = the raw bytes)
+            "access": access.edge_block(site, cfg["access"], feats),
         })
     body = {
         "sites": out,
@@ -656,10 +667,10 @@ def delete_platform_data(db: Session, site_id: int) -> None:
 
     from .models import AnalyticsMinute, ApiKey, LogSpool, Purge, SecurityEvent, UsageHourly, WebhookDelivery
 
-    from .models import StorageBucket, StorageUsageHourly
+    from .models import AccessOtp, StorageBucket, StorageUsageHourly
 
     for model in (ApiKey, UsageHourly, SecurityEvent, Purge, AnalyticsMinute, LogSpool, WebhookDelivery,
-                  StorageBucket, StorageUsageHourly):
+                  StorageBucket, StorageUsageHourly, AccessOtp):
         db.execute(delete(model).where(model.site_id == site_id))
     l4.delete_site(db, site_id)  # SPEC §16.4: the site's edge ports are free again
     keys = [logexport.STATUS_KEY.format(site_id), logexport.DROPPED_KEY.format(site_id),

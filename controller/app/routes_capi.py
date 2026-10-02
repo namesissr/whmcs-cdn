@@ -46,6 +46,7 @@ from .routes_admin import (
     update_record_of,
 )
 from .routes_platform import live_of
+from .routes_reports import access_log_of, access_rotate_of, site_audit_of, statement_of, waiting_room_of
 from .routes_tunnel import quality_of, usage_of
 from .routes_v2 import (
     LearningApplyIn,
@@ -269,6 +270,45 @@ def waf_learning_apply(body: LearningApplyIn, request: Request,
     if result["applied"]:
         _audit(db, request, key, "waf.learning.apply", waf_learning_audit(result))
     return result
+
+
+# ------------------------------------------------------------------ wave 10 (SPEC §18)
+
+@router.get("/waiting-room")
+def waiting_room_stats(hours: int = 24, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Waiting room state, live estimate and hourly counters (scope stats)."""
+    return waiting_room_of(db, _site(key), hours)
+
+
+@router.get("/access/log")
+def access_log(limit: int = 200, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Newest access sign-ins / failed attempts (≤200) and counters (scope stats)."""
+    return access_log_of(db, _site(key), limit)
+
+
+@router.post("/access/rotate")
+def access_rotate(request: Request, key: ApiKey = Depends(require_scope("config", write=True)),
+                  db: Session = Depends(get_db)):
+    """New access secret: every access session is signed out (scope config; refused while suspended)."""
+    result = access_rotate_of(db, _site(_rate_limit_config(key)))
+    _audit(db, request, key, "access.rotate")
+    return result
+
+
+@router.get("/statement")
+def statement(month: str | None = None, format: str = "json", lang: str = "fa", plan: str | None = None,
+              block_gb: float | None = None, key: ApiKey = Depends(require_scope("stats")),
+              db: Session = Depends(get_db)):
+    """Monthly usage statement as pdf, csv or json (scope stats)."""
+    return statement_of(db, _site(key), month, format, lang, plan, block_gb)
+
+
+@router.get("/audit")
+def audit(request: Request, format: str = "json", key: ApiKey = Depends(require_scope("stats")),
+          db: Session = Depends(get_db)):
+    """The site's audit entries in [from, to] (json or csv, ≤10 000, actor masked; scope stats)."""
+    q = request.query_params
+    return site_audit_of(db, _site(key), q.get("from"), q.get("to"), format)
 
 
 # ------------------------------------------------------------------ records (scope: dns), config (config / functions)

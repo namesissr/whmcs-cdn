@@ -33,6 +33,9 @@ DETAIL_WHITELIST = {
     "mode",
     # webhooks / log export (SPEC §14.3): which hook, and the outcome of a test
     "hook_id", "ok",
+    # wave 10 (SPEC §18.2): access app id and a hash reference of the e-mail address (never the
+    # address or the code), access.rotate / access.otp_sent
+    "app", "email_ref",
 }
 # NB "items" is also how a functions write is audited (SPEC §16.9): [{id, route, enabled, code_bytes}],
 # never the code itself (sections.functions_audit)

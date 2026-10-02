@@ -54,7 +54,9 @@ def set_logs_secret(site, value: str | None) -> None:
 # ------------------------------------------------------------------ other scalar secrets (SPEC §16)
 
 # every top-level key holding one encrypted string (the webhooks map is handled separately)
-SCALAR_KEYS = ("logs", "image_transform", "tsig")
+# wave 10 (SPEC §18.1/§18.2): "waiting_room" (wr_secret) and "access" (access_secret), each 64 lowercase
+# hex = 32 random bytes; unlike the others these two DO travel to the edges (waiting_room.py, access.py)
+SCALAR_KEYS = ("logs", "image_transform", "tsig", "waiting_room", "access")
 
 
 def has_secret(site, key: str) -> bool:

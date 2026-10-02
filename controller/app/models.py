@@ -246,6 +246,11 @@ class Edge(Base):
     # node capabilities from the latest heartbeat (SPEC §14.1), JSON
     # {"http3": bool, "early_hints": bool, "webp_convert": bool, "modules": [str]}; NULL = never reported
     capabilities: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # wave 10 (SPEC §18.4): agent errors in the last hour from the latest heartbeat (NULL = never
+    # reported) and (SPEC §18.1) the latest per-site waiting room counters, JSON
+    # {"at": "<iso>Z", "sites": {"<domain>": {"active": n, "queued": n}}} (bounded, see waiting_room.py)
+    errors_last_hour: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    waiting_room: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # additional addresses of the same node for health-based failover (SPEC §12); ipv4/ipv6
     # above stay the primary address
@@ -570,3 +575,16 @@ class StorageUsageHourly(Base):
     hour: Mapped[datetime] = mapped_column(DateTime, index=True)
     bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     objects: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class AccessOtp(Base):
+    """One access one-time code sent by e-mail (SPEC §18.2), for the controller's rate limits
+    (5 per e-mail address per hour, 50 per site per hour). Never the code or the address: only a
+    hash of the lower-cased address. Rows older than a day are pruned (access.prune)."""
+
+    __tablename__ = "access_otp"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    email_hash: Mapped[str] = mapped_column(String(64), index=True)
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

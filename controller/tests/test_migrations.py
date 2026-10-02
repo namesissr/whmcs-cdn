@@ -43,10 +43,11 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0011: per-family primary probe (probe_ok4/fail4/ok6/fail6, F32) + shed hysteresis
     # (shed_high / shed_since, F25); 0013: origin shield flag + heartbeat capabilities (SPEC §14.1)
     added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "edges")
-    assert added == ["bundle_version", "capabilities", "capacity_mbps", "cpu_high", "group", "load_high",
-                     "logs", "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
+    # 0020: errors_last_hour + waiting_room (wave 10 heartbeat, SPEC §18.4 / §18.1)
+    assert added == ["bundle_version", "capabilities", "capacity_mbps", "cpu_high", "errors_last_hour", "group",
+                     "load_high", "logs", "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
                      "probe_fail4", "probe_fail6", "probe_ms", "probe_ok", "probe_ok4", "probe_ok6",
-                     "shed", "shed_high", "shed_since", "shield"], diff
+                     "shed", "shed_high", "shed_since", "shield", "waiting_room"], diff
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
@@ -63,10 +64,11 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0016: site_events (tunnel origin-down / origin-up events, SPEC §15.4);
     # 0017: l4_ports (TCP/UDP proxy edge ports, SPEC §16.4)
     # 0018: storage_buckets + storage_usage_hourly (object storage, SPEC §16.8)
+    # 0020: access_otp (rate limits of the access one-time codes, SPEC §18.2)
     tables = {d[1].name for d in flat if d[0] == "add_table"}
     assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses",
             "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
-            "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly"} <= tables, diff
+            "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly", "access_otp"} <= tables, diff
     # 0017: weighted / controller-checked DNS records (SPEC §16.7); 0018: records.storage_bucket
     record_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "records")
     assert record_added == ["health_at", "health_error", "health_fail", "health_ms", "health_ok", "health_path",
@@ -78,7 +80,7 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
              and not (d[0] == "add_index" and d[1].table.name in
                       ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses",
                        "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
-                       "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly"))]
+                       "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly", "access_otp"))]
     assert other == [], other
 
 

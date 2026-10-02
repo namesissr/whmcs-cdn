@@ -16,7 +16,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import access as access_mod
 from . import alerts, dnsbuild, live, logexport, sections, waf_learning, webhooks
+from . import waiting_room as wr_mod
 from .auth import require_edge
 from .config import settings
 from .db import get_db
@@ -140,6 +142,23 @@ class Heartbeat(BaseModel):
     # previously stored capabilities are kept) instead of failing the heartbeat: a 422 here would
     # make a healthy node look silent and drop it from DNS over an informational field.
     capabilities: Capabilities | None = None
+    # wave 10, older agents omit them. SPEC §18.4: agent errors logged in the last hour (shown on the
+    # node page); SPEC §18.1: per-site waiting room counters {"<domain>": {"active": n, "queued": n}}
+    # (≤1000 sites). Malformed values are ignored, never a 422 (a heartbeat must not fail on them).
+    errors_last_hour: int | None = None
+    waiting_room: dict[str, dict[str, int]] | None = None
+
+    @field_validator("errors_last_hour", mode="before")
+    @classmethod
+    def _errors(cls, v):
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= wr_mod.HEARTBEAT_MAX_VALUE:
+            return None
+        return v
+
+    @field_validator("waiting_room", mode="before")
+    @classmethod
+    def _wr(cls, v):
+        return None if v is None else wr_mod.clean_heartbeat(v)
 
     @field_validator("capabilities", mode="wrap")
     @classmethod
@@ -189,6 +208,10 @@ def heartbeat(body: Heartbeat, request: Request, edge: Edge = Depends(require_ed
     if body.metrics is not None:
         # the shed flag changes here; scheduler.job_edges rewrites DNS on its next tick
         record_metrics(edge, body.metrics.model_dump(), edge.last_seen_at)
+    if body.errors_last_hour is not None:
+        edge.errors_last_hour = body.errors_last_hour
+    if body.waiting_room is not None:
+        wr_mod.record_heartbeat(edge, body.waiting_room, edge.last_seen_at)
     db.commit()
     return {"ok": True}
 
@@ -384,6 +407,18 @@ class UsageItem(BaseModel):
     # mode (waf_learning.WafLearn: junk keys dropped and bounded, bad counters 422). Reports for a site
     # that is not learning (or for an hour outside its window) are dropped by the controller.
     waf_learn: waf_learning.WafLearn | None = None
+    # SPEC §18.1 (optional): waiting room counters of this host-hour {admitted, queued, max_wait_s,
+    # peak_active}; bad counters 422 like every other usage counter
+    waiting_room: wr_mod.WaitingRoomUsage | None = None
+    # SPEC §18.2 (optional): access sign-in counters {ok, fail, otp} and ≤50 events
+    # [{t, app, email_hash, ok}] (malformed events are dropped, never a 422)
+    access: access_mod.AccessUsage | None = None
+    access_events: list[access_mod.AccessEvent] = []
+
+    @field_validator("access_events", mode="before")
+    @classmethod
+    def _access_events(cls, v):
+        return access_mod.clean_events(v)
 
     @field_validator("l4", mode="before")
     @classmethod
@@ -491,6 +526,11 @@ def _merge_details(current: dict, add: dict) -> dict:
                 a = apps[app_id] = {}
             for k in L4_COUNTERS:
                 a[k] = num(a.get(k)) + num(c.get(k))
+    wr = _obj(add.get("waiting_room"))
+    if wr:
+        current["waiting_room"] = wr_mod.merge(current.get("waiting_room"), wr)
+    if add.get("access") or add.get("access_events"):
+        access_mod.merge(current, add)
     wl = _obj(add.get("waf_learn"))
     if wl:
         current["waf_learn"] = waf_learning.merge(current.get("waf_learn"), wl)
@@ -741,3 +781,92 @@ def _naive(dt: datetime) -> datetime:
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
+
+
+# ------------------------------------------------------------------ access one-time codes (SPEC §18.2)
+
+class AccessOtpIn(BaseModel):
+    """POST /edge/v1/access/otp from the edge's internal location; unknown keys are ignored."""
+    domain: str = Field(min_length=1, max_length=253)
+    app: str = Field(min_length=1, max_length=32)
+    email: str = Field(min_length=3, max_length=254)
+
+
+def _serves(db: Session, edge: Edge, site: Site) -> bool:
+    """The edge answers for the site: same edge group, or (DNS fail-open) the site's group has no
+    online edge at all."""
+    from .services import online_edges
+
+    group = dnsbuild.site_edge_group(site)
+    if dnsbuild.edge_group(edge) == group:
+        return True
+    return not any(dnsbuild.edge_group(e) == group for e in online_edges(db))
+
+
+@router.post("/access/otp")
+def access_otp(body: AccessOtpIn, request: Request, edge: Edge = Depends(require_edge),
+               db: Session = Depends(get_db)):
+    """Generate the visitor's one-time code (access.otp_code) and e-mail it. The code never appears
+    in a response, a log line or the audit log (only a hash of the address does).
+
+    200 {"ok": true, "expires_in": s} | 403 not served by this edge / site not active / access off /
+    app without e-mail codes / address not allowed | 404 unknown site or app | 422 bad body or address
+    | 429 rate limited (Retry-After) | 503 no SMTP / no usable secret / delivery failed."""
+    from fastapi import HTTPException
+
+    from .audit import record_audit
+    from .validation import ValidationError, normalize_domain
+
+    try:
+        domain = normalize_domain(body.domain)
+    except ValidationError:
+        raise HTTPException(422, "invalid domain") from None
+    email = body.email.strip().lower()
+    if not sections.EMAIL_RE.match(email):
+        raise HTTPException(422, "invalid email")
+    site = db.scalar(select(Site).where(Site.domain == domain))
+    if site is None:
+        raise HTTPException(404, "site not found")
+    if not _serves(db, edge, site):
+        raise HTTPException(403, "site not served by this edge")
+    if site.effective_status != "active":
+        raise HTTPException(403, "site not active")
+    value = sections.get_section(site, "access")
+    if not (value["enabled"] and sections.features_of(site).get("access")):
+        raise HTTPException(403, "access not enabled")
+    app = next((a for a in value["apps"] if a["id"] == body.app), None)
+    if app is None:
+        raise HTTPException(404, "app not found")
+    if app["methods"] == "ip":
+        raise HTTPException(403, "app does not use e-mail codes")
+    if not access_mod.email_allowed(app, email):
+        raise HTTPException(403, "email not allowed")
+    secret = access_mod.secret_of(site)
+    if not secret:
+        raise HTTPException(503, "access secret unavailable")
+    if not alerts.mail_configured():
+        raise HTTPException(503, "mail not configured")
+    ref = access_mod.email_ref(email)
+    now = utcnow()
+    try:
+        access_mod.check_rate(db, site, ref, now)
+    except access_mod.RateLimited as e:
+        raise HTTPException(429, f"rate limited ({e.scope})", headers={"Retry-After": str(e.retry_after)}) from None
+    access_mod.note_sent(db, site, ref, now)  # counted even when delivery fails (no retry loops)
+    edge.last_seen_at = now
+    db.commit()
+    unix = now.replace(tzinfo=timezone.utc).timestamp()
+    window = access_mod.otp_window(unix)
+    subject, text = access_mod.mail_text(site.domain, app["name"],
+                                         access_mod.otp_code(secret, app["id"], email, window))
+    try:
+        alerts.send_mail(email, subject, text, sender=settings.access_mail_from)
+    except alerts.AlertError as e:
+        log.warning("access code e-mail for %s (app %s) failed: %s", site.domain, app["id"], e)
+        raise HTTPException(503, "mail delivery failed") from None
+    record_audit(db, actor=edge.name, actor_kind="edge", action="access.otp_sent", target=site.domain,
+                 detail={"app": app["id"], "email_ref": ref},
+                 ip=request.client.host if request.client else None)
+    # valid in this window and the next one
+    expires_in = int((window + 2) * access_mod.WINDOW_SECONDS - unix)
+    return {"ok": True, "expires_in": expires_in}
