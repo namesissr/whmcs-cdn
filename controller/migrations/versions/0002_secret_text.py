@@ -22,7 +22,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # only possible while secrets are stored in plaintext (64 hex characters)
+    # only possible while secrets are stored in plaintext (64 hex characters): refuse clearly instead of
+    # failing half-way on PostgreSQL / silently over-filling the column on SQLite
+    n = op.get_bind().execute(sa.text("SELECT count(*) FROM sites WHERE length(secret) > 64")).scalar()
+    if n:
+        raise RuntimeError(f"cannot downgrade below 0002: {n} site secret(s) are longer than 64 characters "
+                           "(encrypted with DATA_ENCRYPTION_KEY); decrypt them first or stay at >= 0002")
     with op.batch_alter_table("sites") as batch_op:
         batch_op.alter_column("secret", existing_type=sa.Text(), type_=sa.String(length=64),
                               existing_nullable=False)
