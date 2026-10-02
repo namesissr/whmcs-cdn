@@ -213,11 +213,14 @@ def test_11_suspend_serves_the_suspended_page(api, edges, site):
         r = edge_request(ip, DOMAIN, "/hello?nocache=1")
         return r.status == 503 and SUSPENDED_MARK in r.text and r.headers.get("x-origin") is None
     _all_edges(edges, suspended, "the suspended page")
+    # tunnel reconnects get the cheap 503 too (cut_paths). Waited for like the page: right after the
+    # edge applies the suspension, a connection can still land on an nginx worker of the previous
+    # config (graceful reload)
+    _all_edges(edges, lambda ip: ws_echo(ip, DOMAIN, TUNNEL_PATH, "x")[0] == 503, "the tunnel 503")
     hits = origin_hits("/hello")
     for ip in edges.values():
-        status, _ = ws_echo(ip, DOMAIN, TUNNEL_PATH, "x")
-        assert status == 503  # tunnel reconnects get the cheap 503 too (cut_paths)
-        edge_request(ip, DOMAIN, "/hello?nocache=1")
+        assert ws_echo(ip, DOMAIN, TUNNEL_PATH, "x")[0] == 503
+        assert suspended(ip)
     assert origin_hits("/hello") == hits  # nothing reaches the origin while suspended
 
 
