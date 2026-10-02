@@ -9,7 +9,7 @@ from ..common import (
 )
 from ..settings import log
 from ..validation.regex import regex_unsafe
-from ..validation.rules import WAF_PACKS, norm_bots, norm_image_v2, page_rules
+from ..validation.rules import WAF_PACKS, norm_bots, norm_image_v2, norm_waf_learning, page_rules
 
 
 def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None,
@@ -68,6 +68,7 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
     # SPEC §14.2 additions appear only when used, so sites without them keep a byte-identical entry
     packs = list(dict.fromkeys(p for p in (waf.get("packs") if isinstance(waf.get("packs"), list) else [])
                                if p in WAF_PACKS))
+    learn_until = norm_waf_learning(site)   # SPEC §17.1, only while configured (njs checks the clock)
     extra = {}
     bots = norm_bots(site)
     if bots:
@@ -98,7 +99,8 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
                      "groups": [g for g in (waf.get("groups") or []) if g in WAF_GROUPS],
                      "exclusions": excl,
                      "off_paths": [r["_jre"] for r in page_rules(site) if r.get("waf") is False]},
-                    **({"packs": packs} if packs else {})),
+                    **({"packs": packs} if packs else {}),
+                    **({"learn_until": learn_until} if learn_until else {})),
         "pools": pools,
         "image": dict({"enabled": bool(im.get("enabled")), "quality": _int(im.get("quality"), 85, 1, 100),
                        "max_width": _int(im.get("max_width"), 2000, 16, 10000)},

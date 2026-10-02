@@ -1258,3 +1258,24 @@ it only observes and proposes; the customer applies proposals explicitly.
 ### 17.3 WHMCS
 - WAF page: «حالت یادگیری» card (start with days, progress, stop), proposals list with Persian
   explanation, confidence, preview of the exact change, apply selected; bilingual.
+
+### 17.4 As built
+- Edge config: `waf.learning = {enabled, until}` (ISO, `Z`); `enabled` is false when the plan has no WAF.
+  The edge renders `learn_until` (epoch) into sites.js and njs compares per request, so learning ends on
+  time without a re-render. While learning every WAF/pack verdict is `log:waf:<id>` (even in mode `off`);
+  `log:waf:<id>:a` marks a request that also carried another attack signal (other WAF group, firewall/bot
+  log verdict). Firewall, rate limits, bots and DDoS are unchanged.
+- Wire shape (per host-hour usage item, learning hosts only):
+  `waf_learn: {rules: {"<id>": {hits, clients, attack, methods: {M: n}, paths: {"<prefix>": {hits,
+  clients, attack}}}}, paths: {"<prefix>": {req, max_rpm, p95_rpm, p95_rps_min, methods}}, clients:
+  {max_rpm, p95_rpm}}`. Prefix = first two path segments, no query. Caps: 100 rules, 10 prefixes per
+  rule, 50 path prefixes, 10 methods (`OTHER` for the rest). `hits/attack/req/methods` are deltas per push;
+  `clients` (linear-counting estimate), `max_rpm`, `p95_rpm` are hour-to-date values, merged by maximum.
+  `p95_rps_min` is kept as an alias of `max_rpm`.
+- Controller: learning is `PUT config/waf` with `learning: {enabled, days 1..30}` (`started_at`/`until`
+  set by the controller). Proposal `id` = `p_` + 16 hex; `change = {section, op: add_exclusion|add_rule|
+  remove_pack, value}`; proposals also carry `evidence` and `applied`. An exclusion needs ≥ 20 distinct
+  clients and no attack hits; the rate limit is max(3 × p95, ceil(1.5 × max), 30). Apply returns
+  `{applied, unchanged, changed, sections}`; unknown/stale ids → 422, nothing applied. No migration
+  (state in the site config, data in the hourly usage details).
+- WHMCS proxy forwards apply bodies of exactly `{ids}` (1..100 ids matching `^p_[0-9a-f]{16}$`).

@@ -26,7 +26,7 @@ from .render.shield import norm_shield
 from .render.tree import render_tree
 from .settings import agent_source_files, log
 from .usage import (
-    live_cutoff, live_items, read_l4_usage, read_usage, trim_live_backlog, usage_item, video_hosts,
+    learn_hosts, live_cutoff, live_items, read_l4_usage, read_usage, trim_live_backlog, usage_item, video_hosts,
 )
 from .validation.rules import key_infos, with_cached_bot_ranges
 
@@ -174,6 +174,11 @@ class Agent:
                 st["video_hosts"] = vh
             else:
                 st.pop("video_hosts", None)
+            lh = learn_hosts(body)   # SPEC §17.1 waf_learn attribution (agent-side only)
+            if lh:
+                st["learn_hosts"] = lh
+            else:
+                st.pop("learn_hosts", None)
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
         try:   # origin guard: private shield peers stay reachable (agent-side only, never rendered)
@@ -264,13 +269,14 @@ class Agent:
             return
         outbox = self.state.setdefault("outbox", [])
         keys, evs = list(pending), list(events)
+        lh = self.state.get("waf_learn_hour")   # SPEC §17.1 hour-to-date statistics (read only here)
         now = time.time()
         cutoff = live_cutoff(now)
         entries = []
         while keys or evs:
             bk, keys = keys[:MAX_ITEMS], keys[MAX_ITEMS:]
             be, evs = evs[:MAX_EVENTS], evs[MAX_EVENTS:]
-            entries.append({"id": _new_batch_id(), "ts": now, "items": [usage_item(k, pending[k]) for k in bk],
+            entries.append({"id": _new_batch_id(), "ts": now, "items": [usage_item(k, pending[k], lh) for k in bk],
                             "events": be})
         # SPEC §14.3.1: the host-minutes ride in the same outbox entry (same batch_id, so a retry stays
         # idempotent); ≤ LIVE_MAX per POST, oldest minutes dropped beyond that (best-effort)

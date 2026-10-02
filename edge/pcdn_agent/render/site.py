@@ -18,7 +18,7 @@ from ..validation.origin import (
 )
 from ..validation.rules import (
     BODY_CAP, NGX_VAR_NAME, _hvar, _legacy_sections, _qre, key_options, norm_image_v2, norm_redirects,
-    norm_transform, norm_video, origin_client, page_rules, preload_links, redirect_maps,
+    norm_transform, norm_video, norm_waf_learning, origin_client, page_rules, preload_links, redirect_maps,
 )
 from ..validation.storage import norm_storage_origin, storage_log_repr
 from .http import mtls_token
@@ -621,8 +621,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     waf_sec = _sec(site, "waf")
     body_packs = {"wordpress", "api"} & set(p for p in (waf_sec.get("packs") if isinstance(waf_sec.get("packs"), list)
                                                         else []) if isinstance(p, str))
+    # a learning site (SPEC §17.1) inspects bodies log-only even when its WAF mode is off
     body_on = bool(active and njs_ok and fallback == "origin" and body_packs
-                   and waf_sec.get("mode") in ("detect", "block"))
+                   and (waf_sec.get("mode") in ("detect", "block") or norm_waf_learning(site) is not None))
 
     # --- authenticated origin pulls (SPEC §14.2): client certificate on origin-bound HTTPS hops only
     # (never on the edge -> shield hop, which carries the shield's own TLS; the shield itself presents

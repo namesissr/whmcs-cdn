@@ -6,6 +6,7 @@ never "fixed"."""
 import hashlib
 import ipaddress
 import re
+from datetime import datetime, timezone
 
 from ..common import HOP_HEADERS, SAFE_CIDR, SAFE_HEADER, SAFE_ID, SAFE_PATTERN, _int, _sec, wildcard_re
 from .regex import pcre_regex
@@ -435,3 +436,35 @@ def norm_video(site: dict) -> dict | None:
     return {"segment_ttl": _int(v.get("segment_ttl"), 86400, 1, 31536000),
             "manifest_ttl": _int(v.get("manifest_ttl"), 2, 1, 3600),
             "prefetch": v.get("prefetch_next", True) is not False}
+
+
+LEARN_MAX_SECONDS = 31 * 86400   # the controller allows 1..30 days; a later `until` is not trusted
+
+
+def norm_waf_learning(site: dict, now: float | None = None) -> int | None:
+    """SPEC §17.1 `waf.learning` {enabled, until: ISO 8601 | null} -> the end of learning as a UNIX
+    epoch second, or None (not learning: disabled, no / unparsable `until`).
+
+    With `now` the result is None once `until` has passed and is capped at now + 31 days; without it
+    the parsed `until` is returned as is (deterministic, for rendering: njs compares it with the
+    clock at request time, so learning ends on time without a re-render)."""
+    ln = _sec(site, "waf").get("learning")
+    if not isinstance(ln, dict) or ln.get("enabled") is not True or not isinstance(ln.get("until"), str):
+        return None
+    raw = ln["until"].strip()
+    if not raw or len(raw) > 40:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    until = int(dt.timestamp())
+    if until <= 0 or until > 4102444800:   # 2100-01-01: nonsense
+        return None
+    if now is not None:
+        if until <= now:
+            return None
+        until = min(until, int(now) + LEARN_MAX_SECONDS)
+    return until

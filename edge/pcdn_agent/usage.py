@@ -1,7 +1,9 @@
 """Usage accounting from the access log: per-host hourly usage, security events, tunnel quality
 (SPEC §15.1), live minute aggregates (SPEC §14.3.1), platform errors and L4 usage (SPEC §16.4)."""
 
+import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -9,7 +11,7 @@ from datetime import datetime, timezone
 
 from .common import EVENT_BACKLOG, PATHS_PER_ITEM, PATH_TRACK, SAFE_ID, SAFE_NAME, TUNNEL_PROTOCOLS
 from .settings import log
-from .validation.rules import norm_video
+from .validation.rules import norm_video, norm_waf_learning
 
 
 # ----------------------------------------------------------------- usage
@@ -351,8 +353,305 @@ def video_host(vh: dict, host: str) -> bool:
     return any(host.endswith(w) for w in vh.get("wild") or ())
 
 
+# ---- WAF learning mode (SPEC §17.1): per host-hour `waf_learn`, only for hosts of learning sites.
+# Every structure below is capped; what does not fit is not counted (never an unbounded dict).
+#
+# Counters (rule hits, path requests, methods) live in the pending host-hour bucket and are sent
+# as deltas with each usage push, like every other counter. Distinct clients and per-minute rates
+# cannot be summed, so they are kept per host-hour across pushes (state["waf_learn_hour"]) and
+# every push reports the hour-to-date value; the controller keeps the maximum.
+WAF_LEARN_RULES = 100          # rule ids per host-hour
+WAF_LEARN_RULE_PATHS = 50      # path prefixes counted per rule (top WAF_LEARN_RULE_TOP sent)
+WAF_LEARN_RULE_TOP = 10
+WAF_LEARN_PATHS = 200          # path prefixes counted per host-hour (top WAF_LEARN_PATHS_TOP sent)
+WAF_LEARN_PATHS_TOP = 50
+WAF_LEARN_METHODS = 9          # methods per map; any further one is counted as "OTHER" (≤ 10 keys)
+WAF_LEARN_SEG = 64             # characters kept of each of the two path segments
+WAF_LEARN_HOSTS = 64           # hosts with an open per-minute client window at the same time
+WAF_LEARN_IPS = 2000           # client IPs counted per host-minute
+WAF_LEARN_PAIRS = 4000         # (path prefix, client IP) pairs counted per host-minute
+WAF_LEARN_RULE_PATH_SKETCHES = 1000   # (rule, prefix) distinct-client sketches per host-hour
+WAF_LEARN_HOURS = 128          # host-hours of hour-to-date statistics kept
+WAF_LEARN_HOUR_TTL = 3 * 3600  # ... and at most this much older than the newest one (s)
+WAF_LEARN_FLUSH_LAG = 120      # a host-minute is closed once the clock is this far past it (s)
+RPM_EXACT = 200                # per-client rpm values up to this are kept exactly in the histogram,
+RPM_STEP = 1.05                # larger ones in geometric buckets (≤ 5 % high; ≈ 220 more keys up to 1e7)
+PATH_RPM_EXACT = 32            # the same per path prefix, coarser (≤ 20 % high; ≈ 100 keys up to 1e7)
+PATH_RPM_STEP = 1.2
+SKETCH_RULE_BITS = 256         # linear-counting bitmaps of distinct client IPs: ≈ exact for small
+SKETCH_PATH_BITS = 256         # counts, ≤ ~15 % off up to a few hundred, saturating at m ln m = 1420
+_METHOD = re.compile(r"^[A-Z]{1,10}$")
+_WAF_RULE = re.compile(r"^[1-9]\d{0,6}$")
+
+
+def learn_hosts(config: dict, now: float | None = None) -> dict:
+    """SPEC §17.1: {"exact": {host: until}, "wild": {".suffix": until}} of the active sites that are
+    learning now (until = UNIX second learning ends, see norm_waf_learning); {} when none. Kept in the
+    agent state (agent-side only) to attribute access-log lines without a log-format change."""
+    t = time.time() if now is None else now
+    exact, wild = {}, {}
+    for s in config.get("sites", []) if isinstance(config, dict) else []:
+        if not isinstance(s, dict) or s.get("status", "active") in ("suspended", "over_quota"):
+            continue
+        until = norm_waf_learning(s, t)
+        if until is None:
+            continue
+        for h in s.get("hosts") or []:
+            n = str((h or {}).get("name") or "").lower() if isinstance(h, dict) else ""
+            if n.startswith("*.") and SAFE_NAME.match(n):
+                wild[n[1:]] = until
+            elif SAFE_NAME.match(n):
+                exact[n] = until
+    return {"exact": exact, "wild": wild} if exact or wild else {}
+
+
+def learn_until(lh: dict, host: str) -> int:
+    """End of learning (UNIX second) of a host; 0 = not learning."""
+    u = (lh.get("exact") or {}).get(host)
+    if u:
+        return int(u)
+    for suf, u in (lh.get("wild") or {}).items():
+        if host.endswith(suf):
+            return int(u)
+    return 0
+
+
+def learn_prefix(path: str) -> str:
+    """Path prefix of the learning aggregates: the first two segments ("/wp-json/wp/v2/x" ->
+    "/wp-json/wp"; "/" -> "/"), each cut to WAF_LEARN_SEG characters."""
+    segs = [x for x in path.split("/") if x][:2]
+    return "/" + "/".join(x[:WAF_LEARN_SEG] for x in segs)
+
+
+def _learn_method(m) -> str:
+    m = str(m or "").upper()
+    return m if _METHOD.match(m) else "OTHER"
+
+
+def _minc(d: dict, m: str):
+    if m not in d and len(d) >= WAF_LEARN_METHODS:
+        m = "OTHER"
+    d[m] = d.get(m, 0) + 1
+
+
+def rpm_bucket(n: int, exact: int = RPM_EXACT, step: float = RPM_STEP) -> int:
+    """Histogram key of a per-client-minute request count: exact up to `exact`, else the upper
+    bound of its geometric bucket (≥ n, < n * step + 1)."""
+    if n <= exact:
+        return max(0, int(n))
+    k = math.ceil(math.log(n / exact) / math.log(step))
+    b = math.ceil(exact * step ** k)
+    while b < n:                       # float rounding
+        k += 1
+        b = math.ceil(exact * step ** k)
+    return b
+
+
+def p95_hist(hist: dict) -> int:
+    """Nearest-rank 95th percentile of a {value: count} histogram (keys may be strings); 0 if empty."""
+    items = sorted((int(k), int(v)) for k, v in hist.items() if int(v) > 0)
+    total = sum(v for _, v in items)
+    if not total:
+        return 0
+    rank, acc = math.ceil(0.95 * total), 0
+    for val, cnt in items:
+        acc += cnt
+        if acc >= rank:
+            return val
+    return items[-1][0]
+
+
+def _hinc(hist: dict, n: int, exact: int, step: float):
+    k = str(rpm_bucket(n, exact, step))
+    hist[k] = hist.get(k, 0) + 1
+
+
+def sketch_add(bm: int, ip: str, bits: int) -> int:
+    """Linear-counting bitmap (an int, JSON-safe) with `ip` added."""
+    h = int.from_bytes(hashlib.blake2b(ip.encode(), digest_size=4).digest(), "big")
+    return bm | (1 << (h % bits))
+
+
+def sketch_count(bm: int, bits: int) -> int:
+    """Estimated distinct IPs of a bitmap: -m ln(zero bits / m), m ln m once every bit is set."""
+    zeros = bits - bin(int(bm) & ((1 << bits) - 1)).count("1")
+    return int(round(bits * math.log(bits))) if zeros <= 0 else int(round(-bits * math.log(zeros / bits)))
+
+
+def _learn_obj(a: dict) -> dict:
+    return a.setdefault("waf_learn", {"rules": {}, "paths": {}})
+
+
+def _learn_hour(hours: dict, key: str) -> dict:
+    """Hour-to-date statistics of a host-hour ("host|hour"): client rpm histogram / max, per prefix
+    rpm histogram / max, distinct-client sketches per rule and per (rule, prefix)."""
+    H = hours.get(key)
+    if H is None:
+        if len(hours) >= WAF_LEARN_HOURS:
+            for k in sorted(hours, key=lambda k: k.rsplit("|", 1)[1])[: max(1, len(hours) // 4)]:
+                del hours[k]
+        H = hours[key] = {"mx": 0, "h": {}, "pmx": {}, "ph": {}, "rc": {}, "rpc": {}}
+    return H
+
+
+def prune_learn_hours(state: dict):
+    """Drop hour-to-date statistics more than WAF_LEARN_HOUR_TTL older than the newest hour held
+    (relative to the log, not the clock, so a backlog read after an outage keeps its statistics)."""
+    hours = state.get("waf_learn_hour")
+    if not hours:
+        state.pop("waf_learn_hour", None)
+        return
+    newest = max(k.rsplit("|", 1)[1] for k in hours)
+    try:
+        cut = (_utc(newest.replace("Z", "+00:00")).timestamp() - WAF_LEARN_HOUR_TTL)
+    except ValueError:
+        return
+    cut_key = datetime.fromtimestamp(cut, timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
+    for k in [k for k in hours if k.rsplit("|", 1)[1] < cut_key]:
+        del hours[k]
+
+
+def _learn_close(learn: dict, host: str, w: dict):
+    """Fold one closed host-minute client window into its host-hour statistics (and make sure the
+    next usage push carries an item for that host-hour, so the new values are reported)."""
+    key = f"{host}|{w['h']}"
+    _learn_obj(_bucket(learn["pending"], key))
+    H = _learn_hour(learn["hour"], key)
+    for n in w["ip"].values():
+        if n > H["mx"]:
+            H["mx"] = n
+        _hinc(H["h"], n, RPM_EXACT, RPM_STEP)
+    pmx, ph = H["pmx"], H["ph"]
+    for key, n in w["pi"].items():
+        prefix = key.rsplit(" ", 1)[0]
+        if prefix not in pmx and len(pmx) >= WAF_LEARN_PATHS:
+            continue
+        if n > pmx.get(prefix, 0):
+            pmx[prefix] = n
+        _hinc(ph.setdefault(prefix, {}), n, PATH_RPM_EXACT, PATH_RPM_STEP)
+
+
+def _learn_ctx(state: dict) -> dict:
+    return {"hosts": state.get("learn_hosts") or {}, "win": state.setdefault("waf_learn_win", {}),
+            "hour": state.setdefault("waf_learn_hour", {}), "pending": state.setdefault("pending", {})}
+
+
+def learn_flush(state: dict, before_minute: str | None = None):
+    """Close the per-minute client windows (state['waf_learn_win']) of minutes before
+    `before_minute` ("YYYY-MM-DDTHH:MM:00Z"; None = all of them) into the hour-to-date statistics."""
+    if not state.get("waf_learn_win"):
+        return
+    learn = _learn_ctx(state)
+    for host, w in list(learn["win"].items()):
+        if before_minute is None or w["m"] < before_minute:
+            _learn_close(learn, host, w)
+            del learn["win"][host]
+
+
+def _account_learn(a: dict, learn: dict, host: str, hour: str, minute: str, e: dict, path: str,
+                   source: str, rule: str, attack: bool = False):
+    """One request of a learning host (SPEC §17.1). attack: the WAF verdict carried ":a" (the request
+    also had another attack signal, see waf() in pcdn.js)."""
+    L = _learn_obj(a)
+    prefix = learn_prefix(path)
+    method = _learn_method(e.get("m"))
+    ip = str(e.get("ip") or "")[:45]
+    paths = L["paths"]
+    p = paths.get(prefix)
+    if p is None and len(paths) < WAF_LEARN_PATHS:
+        p = paths[prefix] = {"req": 0, "methods": {}}
+    if p is not None:
+        p["req"] += 1
+        _minc(p["methods"], method)
+    if source == "waf" and _WAF_RULE.match(rule):
+        rules = L["rules"]
+        r = rules.get(rule)
+        if r is None and len(rules) < WAF_LEARN_RULES:
+            r = rules[rule] = {"hits": 0, "attack": 0, "paths": {}, "pa": {}, "methods": {}}
+        if r is not None:
+            r["hits"] += 1
+            tracked = prefix in r["paths"] or len(r["paths"]) < WAF_LEARN_RULE_PATHS
+            if tracked:
+                _inc(r["paths"], prefix)
+            if attack:
+                r["attack"] += 1
+                if tracked:
+                    _inc(r["pa"], prefix)
+            _minc(r["methods"], method)
+            if ip:   # distinct clients, hour to date
+                H = _learn_hour(learn["hour"], f"{host}|{hour}")
+                rc, rpc = H["rc"], H["rpc"]
+                if rule in rc or len(rc) < WAF_LEARN_RULES:
+                    rc[rule] = sketch_add(rc.get(rule, 0), ip, SKETCH_RULE_BITS)
+                k = rule + " " + prefix
+                if k in rpc or len(rpc) < WAF_LEARN_RULE_PATH_SKETCHES:
+                    rpc[k] = sketch_add(rpc.get(k, 0), ip, SKETCH_PATH_BITS)
+    # per-client requests per minute: one open window per host (the current minute); a line of an
+    # older minute (logged late) is not counted there
+    win = learn["win"]
+    w = win.get(host)
+    if w is None or minute > w["m"]:
+        if w is not None:
+            _learn_close(learn, host, w)
+        elif len(win) >= WAF_LEARN_HOSTS:
+            return
+        w = win[host] = {"m": minute, "h": hour, "ip": {}, "pi": {}}
+    if minute != w["m"] or not ip:
+        return
+    if ip in w["ip"] or len(w["ip"]) < WAF_LEARN_IPS:
+        _inc(w["ip"], ip)
+    k = prefix + " " + ip
+    if k in w["pi"] or len(w["pi"]) < WAF_LEARN_PAIRS:
+        _inc(w["pi"], k)
+
+
+def waf_learn_item(L: dict | None, H: dict | None) -> dict:
+    """Wire shape of a host-hour `waf_learn` (SPEC §17.1; field names as the controller's
+    waf_learning.WafLearn): L = the counters of this push (deltas), H = hour-to-date statistics.
+
+      rules:   {rule_id: {hits, clients, attack, methods: {M: n}, paths: {prefix: {hits, clients, attack}}}}
+               clients = distinct client IPs (hour to date, estimated), attack = hits on requests that
+               also carried another attack signal
+               (≤ 100 rules, busiest first; ≤ 10 prefixes per rule)
+      paths:   {prefix: {req, max_rpm, p95_rpm, p95_rps_min, methods: {M: n}}} (≤ 50 prefixes)
+               max_rpm = most requests one client IP sent to the prefix in one minute (hour to date),
+               p95_rps_min = the same value under the SPEC §17.1 name, p95_rpm = the 95th percentile
+               of the per-(client IP, minute) request counts to the prefix
+      clients: {max_rpm, p95_rpm} over every (client IP, minute) of the host-hour (hour to date)."""
+    L, H = L or {}, H or {}
+
+    def n(v):
+        try:
+            return max(0, int(v or 0))
+        except (TypeError, ValueError):
+            return 0
+    rc, rpc = H.get("rc") or {}, H.get("rpc") or {}
+    rules = {}
+    for rid, r in sorted((L.get("rules") or {}).items(), key=lambda kv: (-n(kv[1].get("hits")), kv[0]))[:WAF_LEARN_RULES]:
+        rp = _top(r.get("paths") or {}, WAF_LEARN_RULE_TOP)
+        rules[rid] = {"hits": n(r.get("hits")),
+                      "clients": sketch_count(rc[rid], SKETCH_RULE_BITS) if rid in rc else 0,
+                      "attack": n(r.get("attack")),
+                      "paths": {k: {"hits": n(v), "clients": sketch_count(rpc[f"{rid} {k}"], SKETCH_PATH_BITS)
+                                    if f"{rid} {k}" in rpc else 0, "attack": n((r.get("pa") or {}).get(k))}
+                                for k, v in rp.items()},
+                      "methods": {k: n(v) for k, v in sorted((r.get("methods") or {}).items())}}
+    lp, pmx, ph = L.get("paths") or {}, H.get("pmx") or {}, H.get("ph") or {}
+    order = sorted(lp, key=lambda k: (-n(lp[k].get("req")), k))
+    # prefixes with only hour-to-date rates in this push (their minute closed after their requests
+    # were sent) follow, busiest client first
+    order += sorted((k for k in pmx if k not in lp), key=lambda k: (-n(pmx[k]), k))
+    paths = {}
+    for k in order[:WAF_LEARN_PATHS_TOP]:
+        p, mx = lp.get(k) or {}, n(pmx.get(k))
+        paths[k] = {"req": n(p.get("req")), "max_rpm": mx, "p95_rpm": min(mx, p95_hist(ph.get(k) or {})),
+                    "p95_rps_min": mx, "methods": {m: n(v) for m, v in sorted((p.get("methods") or {}).items())}}
+    mx = n(H.get("mx"))
+    return {"rules": rules, "paths": paths, "clients": {"max_rpm": mx, "p95_rpm": min(mx, p95_hist(H.get("h") or {}))}}
+
+
 def _account(e: dict, pending: dict, events: list, live: dict | None = None, cutoff: str = "",
-             ship=None, raw: bytes | None = None, vhosts: dict | None = None):
+             ship=None, raw: bytes | None = None, vhosts: dict | None = None, learn: dict | None = None):
     """Fold one access-log record into the host-hour (`pending`), the security `events`, the
     host-minute `live` buckets (SPEC §14.3.1; minutes before `cutoff` skipped) and, for sites with
     log export, the sampler `ship` (SPEC §14.3.2; `raw` is the log line, the sampling key)."""
@@ -394,6 +693,9 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
         v["requests"] += 1
         v["cache_hits"] += int(hit)
     parts = str(e.get("v") or "ok").split(":", 2)
+    attack = False
+    if len(parts) == 3 and parts[1] == "waf" and parts[2].endswith(":a"):   # SPEC §17.1 learning marker
+        parts[2], attack = parts[2][:-2], True
     if len(parts) == 3 and parts[0] in ("block", "challenge", "captcha", "log"):
         action, source, rule = parts
         _inc(a["security"], source)
@@ -403,6 +705,12 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
                        "country": cc, "method": str(e.get("m") or ""), "path": uri[:2048], "action": action,
                        "source": source, "rule": rule, "user_agent": str(e.get("ua") or "")[:512]})
     # best-effort extras last, so nothing in them can cut the hourly / security accounting short
+    if learn and not tn and not path.startswith("/__pcdn/"):
+        # SPEC §17.1: learning hosts only, until their learning ends (learn = _learn_ctx(state))
+        lu = learn_until(learn["hosts"], host)
+        if lu and dt.timestamp() < lu:
+            src, rid = (parts[1], parts[2]) if len(parts) == 3 else ("", "")
+            _account_learn(a, learn, host, hour, minute, e, path, src, rid, attack)
     if live is not None and minute >= cutoff:
         _account_live(live, host, minute, nbytes, hit, code, cc, path, live_tn)
     if ship is not None:
@@ -474,6 +782,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
     cutoff = live_cutoff() if cutoff is None else cutoff
     vh = state.get("video_hosts") or None
     vhosts = dict(vh, _set=frozenset(vh.get("exact") or ())) if isinstance(vh, dict) else None
+    learn = _learn_ctx(state) if state.get("learn_hosts") else None
     read = 0
     with open(path, "rb", buffering=1 << 20) as f:
         f.seek(pos)
@@ -483,7 +792,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
             pos += len(raw)
             read += len(raw)
             try:
-                _account(json.loads(raw), pending, events, live, cutoff, ship, raw, vhosts)
+                _account(json.loads(raw), pending, events, live, cutoff, ship, raw, vhosts, learn)
             except (ValueError, KeyError, TypeError, AttributeError):
                 pass
             if read >= max_bytes or (deadline is not None and time.monotonic() > deadline):
@@ -534,6 +843,14 @@ def read_usage(state: dict, log_path: str, max_bytes: int = 64 * 1024 * 1024, ti
         pos = 0  # truncated
     state["log_pos"] = _consume(log_path, pos, state, max_bytes, deadline, ship)
     state["log_inode"] = st.st_ino
+    if state.get("waf_learn_win") and state["log_pos"] >= st.st_size:
+        # SPEC §17.1: close the client windows of minutes that are over (only once the log is read
+        # up to its end, so a backlog drained over several ticks does not split a minute)
+        learn_flush(state, datetime.fromtimestamp(time.time() - WAF_LEARN_FLUSH_LAG, timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:00Z"))
+    prune_learn_hours(state)
+    if not state.get("waf_learn_win"):
+        state.pop("waf_learn_win", None)
     if len(pending) > 50000:  # controller unreachable for a long time: keep newest
         for k in sorted(pending, key=lambda k: k.split("|")[1])[: len(pending) - 50000]:
             del pending[k]
@@ -607,7 +924,8 @@ def read_l4_usage(state: dict, path: str, max_bytes: int = L4_READ_MAX) -> None:
     state["l4_inode"] = st.st_ino
 
 
-def usage_item(key: str, a) -> dict:
+def usage_item(key: str, a, learn_hours: dict | None = None) -> dict:
+    """One hourly usage item. learn_hours: state['waf_learn_hour'] (SPEC §17.1 hour-to-date stats)."""
     a = _bucket({key: a}, key)
     host, hour = key.split("|", 1)
     item = {"host": host, "hour": hour, "bytes": a["bytes"], "requests": a["requests"], "cache_hits": a["cache_hits"],
@@ -629,6 +947,9 @@ def usage_item(key: str, a) -> dict:
     if a.get("l4"):      # SPEC §16.4 (optional): per app; NOT included in bytes (billed by the controller)
         item["l4"] = {app: {k: int(c.get(k) or 0) for k in ("bytes_in", "bytes_out", "sessions")}
                       for app, c in sorted(a["l4"].items())}
+    lhour = (learn_hours or {}).get(key)
+    if a.get("waf_learn") or lhour:   # SPEC §17.1 (optional): learning sites only
+        item["waf_learn"] = waf_learn_item(a.get("waf_learn"), lhour)
     if a.get("functions"):   # SPEC §16.9 (optional): edge function invocations of this host-hour
         item["functions"] = {k: int(a["functions"].get(k) or 0)
                              for k in ("invocations", "cpu_ms", "errors", "timeouts")}
@@ -649,5 +970,5 @@ def tpath_item(p: dict) -> dict:
             "errors": {k: n(errs.get(k)) for k in TUNNEL_ERRORS}}
 
 
-def usage_items(pending: dict) -> list[dict]:
-    return [usage_item(k, v) for k, v in pending.items()]
+def usage_items(pending: dict, learn_hours: dict | None = None) -> list[dict]:
+    return [usage_item(k, v, learn_hours) for k, v in pending.items()]

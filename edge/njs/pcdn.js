@@ -469,6 +469,8 @@ function prepSite(id, s) {
         body: packs.wordpress || packs.api ? { xmlrpc: !!packs.wordpress, json: !!packs.api } : null,
         excl: (w.exclusions || []).map(function (e) { return { id: +e.rule_id || 0, re: reOrNull(e.path_re, '') }; }),
         off: (w.off_paths || []).map(function (p) { return reOrNull(p, ''); }).filter(Boolean),
+        // SPEC §17.1 learning mode: until this epoch second the WAF runs log-only (see wafMode)
+        learnUntil: Math.max(0, +w.learn_until || 0),
     };
     // JSON body string values are checked with the site's query-string signatures
     P.waf.jsonRules = P.waf.rules.filter(function (r) { return r.t.indexOf('q') >= 0; });
@@ -626,7 +628,9 @@ function evaluate(r) {
     v = waf(ctx, site);
     if (v) {
         if (v.indexOf('log:') !== 0) return v;
+        // a learning site records the WAF rule id even after a firewall / bot "log" (SPEC §17.1)
         if (!logged) logged = v;
+        else if (wafLearning(site.waf)) logged = withAttack(v);
     }
     return logged || 'ok';
 }
@@ -838,33 +842,54 @@ function wafExcluded(w, id, path) {
     return w.excl.some(function (e) { return (e.id === 0 || e.id === id) && (!e.re || rxTest(e.re, path)); });
 }
 
-function waf(ctx, site) {
-    const w = site.waf;
-    if (w.mode !== 'block' && w.mode !== 'detect') return null;
-    if (w.off.some(function (re) { return rxTest(re, ctx.path); })) return null;
-    let hit = 0;
-    for (let i = 0; i < w.proto.length && !hit; i++) {
+// SPEC §17.1: the effective WAF mode. While the site is learning (waf.learn_until in the future)
+// the WAF, its packs and the body inspection run exactly as in detect ("log") mode whatever the
+// configured mode is - never a block from a WAF verdict. Firewall / rate limits / DDoS are untouched.
+function wafLearning(w) { return w.learnUntil > 0 && now() < w.learnUntil; }
+function wafMode(w) { return wafLearning(w) ? 'detect' : w.mode; }
+
+// group of a WAF rule: its group, its pack, or "protocol"
+function wafGroup(rule) { return rule.g || rule.k || 'protocol'; }
+
+// first matching WAF rule (null = none), skipping the rules of group `skip` ('' = none)
+function wafScan(ctx, w, skip) {
+    for (let i = 0; i < w.proto.length; i++) {
         const pr = w.proto[i];
-        if (!wafExcluded(w, pr.id, ctx.path) && pr.f(ctx)) hit = pr.id;
+        if (skip !== 'protocol' && !wafExcluded(w, pr.id, ctx.path) && pr.f(ctx)) return pr;
     }
-    for (let i = 0; i < w.fn.length && !hit; i++) {
+    for (let i = 0; i < w.fn.length; i++) {
         const fr = w.fn[i];
-        if (!wafExcluded(w, fr.id, ctx.path) && fr.f(ctx)) hit = fr.id;
+        if (fr.k !== skip && !wafExcluded(w, fr.id, ctx.path) && fr.f(ctx)) return fr;
     }
-    if (!hit && w.rules.length) {
-        const T = wafTargets(ctx);
-        for (let i = 0; i < w.rules.length && !hit; i++) {
+    if (w.rules.length) {
+        if (!ctx._wt) ctx._wt = wafTargets(ctx);
+        const T = ctx._wt;
+        for (let i = 0; i < w.rules.length; i++) {
             const rule = w.rules[i];
-            if (wafExcluded(w, rule.id, ctx.path)) continue;
-            for (let j = 0; j < rule.t.length && !hit; j++) {
+            if (wafGroup(rule) === skip || wafExcluded(w, rule.id, ctx.path)) continue;
+            for (let j = 0; j < rule.t.length; j++) {
                 const vals = T[rule.t.charAt(j)];
-                for (let k = 0; k < vals.length; k++) if (rule.re.test(vals[k])) { hit = rule.id; break; }
+                for (let k = 0; k < vals.length; k++) if (rule.re.test(vals[k])) return rule;
             }
         }
     }
-    if (!hit) return null;
-    return (w.mode === 'block' ? 'block' : 'log') + ':waf:' + hit;
+    return null;
 }
+
+// SPEC §17.1: a learning site's WAF verdict ends in ":a" ("log:waf:<id>:a") when the request also
+// carried another attack signal (a rule of another WAF group / pack, an earlier firewall / bot
+// verdict), so the controller does not propose an exclusion for it. The usage reader strips it.
+function waf(ctx, site) {
+    const w = site.waf, mode = wafMode(w);
+    if (mode !== 'block' && mode !== 'detect') return null;
+    if (w.off.some(function (re) { return rxTest(re, ctx.path); })) return null;
+    const hit = wafScan(ctx, w, '');
+    if (!hit) return null;
+    const v = (mode === 'block' ? 'block' : 'log') + ':waf:' + hit.id;
+    return wafLearning(w) && wafScan(ctx, w, wafGroup(hit)) ? v + ':a' : v;
+}
+
+function withAttack(v) { return v.substring(v.length - 2) === ':a' ? v : v + ':a'; }
 
 // ------------------------------------------------------------------ request-body inspection (WAF packs)
 // js_set $pcdn_bodychk: evaluated at server level right after the verdict, so only requests the
@@ -875,8 +900,8 @@ function bodyNeed(r) {
     try {
         const site = siteOf(r);
         if (!site || !site.waf.body) return '';
-        const w = site.waf, m = r.method;
-        if ((w.mode !== 'block' && w.mode !== 'detect') || r.variables.pcdn_wafskip) return '';
+        const w = site.waf, m = r.method, mode = wafMode(w);
+        if ((mode !== 'block' && mode !== 'detect') || r.variables.pcdn_wafskip) return '';
         if (m !== 'POST' && m !== 'PUT' && m !== 'PATCH') return '';
         const uri = String(r.uri);
         if (uri.indexOf('/__pcdn/') === 0 || inTunnel(site, uri) || w.off.some(function (re) { return rxTest(re, uri); })) return '';
@@ -960,9 +985,16 @@ function bodyInspect(r) {
     let hit = 0;
     try { if (site) hit = inspectBody(r, site, path); } catch (e) { r.error('pcdn body: ' + e); hit = 0; }
     if (hit) {
-        const v = (site.waf.mode === 'block' ? 'block' : 'log') + ':waf:' + hit;
+        let v = (wafMode(site.waf) === 'block' ? 'block' : 'log') + ':waf:' + hit;
         const cur = String(r.variables.pcdn_vmemo || 'ok');
-        if (v.indexOf('block:') === 0 || cur === 'ok') {
+        let set = v.indexOf('block:') === 0 || cur === 'ok';
+        if (!set && wafLearning(site.waf) && cur.indexOf('log:') === 0) {
+            // learning (SPEC §17.1): the request already carried a signal - keep a WAF id, mark ":a"
+            const same = cur === v || cur === v + ':a';   // the same rule matched the URI already
+            v = same ? cur : withAttack(cur.indexOf('log:waf:') === 0 ? cur : v);
+            set = v !== cur;
+        }
+        if (set) {
             // the access log reports this verdict ($pcdn_verdict was cached as "ok" before the body
             // was read, so it is overwritten as well as the memo)
             try { r.variables.pcdn_vmemo = v; r.variables.pcdn_verdict = v; } catch (e) { r.error('pcdn body verdict: ' + e); }
