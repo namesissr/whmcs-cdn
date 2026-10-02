@@ -1403,3 +1403,78 @@ without the customer's action; every new section is plan-gated and validated on 
   deterministic (creation date = month start). Audit export masks actors for customers.
 - WHMCS products get options `Waiting room` / `Protected access` (auto|on|off; `auto` sends nothing).
   Referral rewards over the monthly cap are deferred to the next month, not cancelled.
+
+## 19. Operator domains and domain transfer
+
+### 19.1 Operator (admin-owned) sites
+The operator can run the platform's own domains on the CDN without a WHMCS service.
+- Controller: `Site.owner_kind` = `client` | `reseller` | `operator` (migration; existing rows derived:
+  reseller_client_id → reseller, else client). Operator sites have `client_id` = `reseller_client_id` =
+  `external_id` = null, `operator_note` (≤200 chars, admin-only). Tenancy: all operator sites share one
+  owner identity (`"operator"`), distinct from every client, so a customer can never add a parent/child
+  of an operator domain and vice versa (same rule as C1).
+- `POST /api/v1/sites` accepts `{"operator": true, "operator_note"?}` (then client_id / reseller fields /
+  external_id must be absent → 422 otherwise). `GET /api/v1/sites?owner=operator|client|reseller`.
+  `site_to_dict` exposes `owner_kind`, `operator_note`. `POST /api/v1/domain-check` accepts `operator`.
+- Plans: an operator site takes any `plan` like other sites; the WHMCS page offers the wizard's plans as
+  templates plus «داخلی — همه امکانات» (all features on, `bandwidth_limit_gb` 0 = unlimited, plan caps
+  at their maximum validated values). Operator sites are never billed, never prepaid-cut and never
+  suspended for quota by WHMCS (the controller quota still applies if a limit is set).
+- WHMCS admin addon page «دامنه‌های اپراتور» (new tab):
+  - add: domain (checked with domain-check), optional origin IP (proxied @ + www), plan template, note;
+    shows the nameservers to set at the registrar and the NS status.
+  - list: domain, status, NS, SSL, month traffic, plan, note; actions: **manage** (full client app in the
+    admin area, below), NS recheck, purge all, suspend/unsuspend, change plan, delete (type the domain to
+    confirm), **transfer** (§19.2).
+  - **Manage in admin:** the server module's client app (all pages, both languages) is rendered inside
+    the addon page in an admin context. Its API calls go to an addon proxy action that requires a WHMCS
+    admin session with access to this addon plus the addon's CSRF token, and reuses the module's
+    ClientApi whitelist/validation with a synthetic context (domain, the site's own features from the
+    controller, never another site). Admin actions are audited with the admin username.
+  - Operator sites are excluded from the sync report's "orphan" list, OwnerSync, prepaid, overage,
+    storage billing, referral and trial logic, and are counted separately on the dashboard.
+
+### 19.2 Domain transfer (complete move to another owner)
+Directions: client → client, operator → client, client → operator. Reseller sub-sites are transferred
+by their reseller tooling only (422 here, clear message).
+- Controller: `POST /api/v1/sites/{d}/transfer`
+  `{to: {kind: "client"|"operator", client_id?, external_id?}, reset_billing_anchor: bool,
+    revoke_credentials: true, pause_integrations: true, include_related: false, dry_run: false}`
+  - Tenancy check for the new owner (C1); parent/child sites with the old owner block the transfer
+    unless `include_related` (then all of them move together, listed in the response).
+  - In one transaction: owner fields + external_id updated; **customer API keys of the site revoked**
+    (`revoke_credentials`); webhook endpoints and log export disabled and their stored secrets cleared
+    (`pause_integrations`; settings kept so the new owner can re-enable with their own secrets);
+    access-app secret rotated (old sessions end); everything else (DNS records, all config sections,
+    SSL, rules, WAF, functions, storage buckets, analytics and usage history) stays with the site.
+  - `reset_billing_anchor`: sets `Site.billing_since` = now; quota (`refresh_quota`) and the usage
+    reported to WHMCS (`/api/v1/usage`, month bytes) then count from max(month start, billing_since).
+    Used for operator → client so the new customer does not pay for the operator's traffic.
+  - `dry_run` returns what would change (related sites, keys to revoke, integrations to pause).
+  - Audited `site.transfer` {from, to, related, revoked_keys, paused}; webhook `site.transferred` is
+    NOT sent to the old owner's endpoint (integrations are paused first).
+- WHMCS (admin addon, «انتقال دامنه» wizard reachable from operator sites, the Sites page and a button
+  on the admin service page):
+  1. pick the destination client (search) or «اپراتور»;
+  2. **client → client:** the WHMCS service itself moves to the new client — `tblhosting.userid`, its
+     addons (`tblhostingaddons`), and module tables keyed by client; the service keeps its product,
+     billing cycle, next due date, configurable options, prepaid ledger and this month's usage (the
+     whole service moves). Options: move **unpaid** invoices that contain only this service's items
+     (default on); move paid invoices of this service (default off, warning: changes the old client's
+     accounting history); transfer an amount of credit from old to new client (default 0, uses
+     AddCredit/negative credit with descriptions on both sides). Invoices mixing other items are never
+     moved; they are listed.
+  3. **operator → client:** creates a WHMCS service for the client on the chosen product + billing
+     cycle without running the module's Create (the site already exists): status Active, domain,
+     server, next due date chosen by the admin; optional first invoice (default: generate); then
+     transfer with `reset_billing_anchor`.
+  4. **client → operator:** transfer first, then the WHMCS service is set to Cancelled (never
+     Terminate — the module's Terminate must not delete the site; a guard marks the service so a later
+     Terminate skips the controller delete); optional pro-rata credit to the old client (amount entered).
+  5. Preview step (controller `dry_run` + WHMCS changes), explicit confirmation, then execution;
+     failure after the controller step rolls the WHMCS side back in a DB transaction and re-transfers
+     the site back; every step logged (logActivity + controller audit).
+  6. Optional e-mails to old and new client (templates «انتقال دامنه — مبدأ / مقصد», fa/en).
+- Old owner's WHMCS team members lose access automatically (the service is no longer theirs); the
+  client app shows the new owner a one-time banner: «این دامنه به حساب شما منتقل شد — کلید API،
+  وب‌هوک‌ها و ارسال لاگ را دوباره تنظیم کنید».
