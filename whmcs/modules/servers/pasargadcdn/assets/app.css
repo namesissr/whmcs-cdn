@@ -1672,3 +1672,11 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 .pcdn-share-bar .pcdn-admin-badge { white-space: nowrap; }
 .pcdn-shares-table td { vertical-align: middle; }
 .pcdn-shares-table select.pcdn-input { min-width: 140px; }
+/* SPEC §19.3 «انتقال دامنه» (xfer.js) */
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-msg { resize: vertical; min-height: 72px; font-family: inherit; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-revoke { margin: 0; padding-inline-start: 20px; display: flex; flex-direction: column; gap: 4px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-h { margin: 4px 0 6px; font-size: 14px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-agree { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--pc-border); border-radius: 10px; cursor: pointer; background: var(--pc-surface-2); line-height: 1.7; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-agree input { width: 18px; height: 18px; margin-top: 3px; flex: none; accent-color: var(--pc-brand); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-quote { margin: 8px 0; padding: 8px 12px; border-inline-start: 3px solid var(--pc-border); background: var(--pc-surface-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-xfer-table td { overflow-wrap: anywhere; }

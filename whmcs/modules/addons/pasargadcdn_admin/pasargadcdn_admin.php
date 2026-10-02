@@ -35,7 +35,7 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.5.0',
+        'version' => '1.6.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',
@@ -237,6 +237,19 @@ function pasargadcdn_admin_config()
                 'Default' => 'on',
                 'Description' => 'وقتی کسی دعوت مدیریت دامنه را بپذیرد، به مالک سرویس ایمیل «پذیرش دعوت مدیریت دامنه» فرستاده شود',
             ],
+            // SPEC §19.3: customer-initiated domain transfer (client app «انتقال دامنه»)
+            'transfer_customer' => [
+                'FriendlyName' => 'انتقال توسط مشتری',
+                'Type' => 'yesno',
+                'Default' => 'on',
+                'Description' => 'مالک سرویس می‌تواند از برنامهٔ CDN درخواست انتقال دامنه به حساب مشتری دیگری بفرستد؛ با پذیرش گیرنده، همان انتقال کامل مشتری به مشتری انجام می‌شود',
+            ],
+            'transfer_approval' => [
+                'FriendlyName' => 'تأیید مدیر لازم است',
+                'Type' => 'yesno',
+                'Default' => '',
+                'Description' => 'درخواست پذیرفته‌شده تا تأیید یا رد مدیر در زبانهٔ «انتقال دامنه» افزونه منتظر می‌ماند',
+            ],
             'reserved' => [
                 'FriendlyName' => 'دامنه‌های رزرو',
                 'Type' => 'text',
@@ -288,6 +301,8 @@ function pasargadcdn_admin_output($vars)
     require_once __DIR__ . '/lib/Operator.php';
     require_once __DIR__ . '/lib/Transfer.php';
     require_once __DIR__ . '/lib/Sharing.php';
+    require_once __DIR__ . '/lib/CustomerTransfer.php';
+    require_once __DIR__ . '/lib/FeatureEditor.php';
     require_once __DIR__ . '/lib/Admin.php';
     echo PasargadCdn\Admin\Admin::output(is_array($vars) ? $vars : [], $_GET, $_POST,
         strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
@@ -322,6 +337,17 @@ function pasargadcdn_admin_clientarea($vars)
         require_once __DIR__ . '/lib/Data.php';
         require_once __DIR__ . '/lib/Sharing.php';
         return PasargadCdn\Admin\Sharing::clientArea($get, array_filter($_POST, 'is_scalar'), strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')), $clientId) ?? [];
+    }
+    // SPEC §19.3: transfer requests addressed to this client — accept / decline (link of the request e-mail)
+    if (($get['page'] ?? '') === 'transfer') {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/Data.php';
+        require_once __DIR__ . '/lib/Pages.php';
+        require_once __DIR__ . '/lib/Operator.php';
+        require_once __DIR__ . '/lib/Transfer.php';
+        require_once __DIR__ . '/lib/CustomerTransfer.php';
+        PasargadCdn\Admin\Env::loadServerModule();
+        return PasargadCdn\Admin\CustomerTransfer::clientArea($get, array_filter($_POST, 'is_scalar'), strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')), $clientId);
     }
     if (($get['page'] ?? 'pricing') === 'referral') {
         $lang = PasargadCdn\Admin\Pricing::lang($get);

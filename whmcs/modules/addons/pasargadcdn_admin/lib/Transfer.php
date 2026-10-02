@@ -66,6 +66,12 @@ final class Transfer
     public static $failpoint = null;
     /** @var array tests: the last run's steps */
     public static $steps = [];
+    /** @var string SPEC §19.3: who started this run — 'admin' (wizard) | 'client' (customer request, Admin\CustomerTransfer) */
+    private static $initiatedBy = 'admin';
+    /** @var int the customer request being executed (0 = admin wizard) */
+    private static $requestId = 0;
+    /** @var string actor of the log lines ('' = the logged-in admin) */
+    private static $actor = '';
 
     // ------------------------------------------------------------------ source / destination
 
@@ -130,7 +136,7 @@ final class Transfer
 
     public static function defaults(string $dir, array $src): array
     {
-        return ['move_unpaid' => true, 'move_paid' => false, 'credit' => '0', 'include_related' => false, 'email_old' => true, 'email_new' => true, 'keep_shares' => false,
+        return ['move_unpaid' => true, 'move_paid' => false, 'credit' => '0', 'include_related' => false, 'email_old' => true, 'email_new' => true, 'keep_shares' => false, 'drop_overrides' => false,
             'pid' => 0, 'cycle' => 'monthly', 'nextdue' => date('Y-m-d', strtotime('+1 month')), 'invoice' => true, 'gateway' => '',
             'note' => ''];
     }
@@ -142,7 +148,7 @@ final class Transfer
             return in_array((string) ($post[$k] ?? ''), ['1', 'on', 'yes'], true);
         };
         $o = ['move_unpaid' => $b('move_unpaid'), 'move_paid' => $b('move_paid'), 'include_related' => $b('include_related'),
-            'email_old' => $b('email_old'), 'email_new' => $b('email_new'), 'invoice' => $b('invoice'), 'keep_shares' => $b('keep_shares'),
+            'email_old' => $b('email_old'), 'email_new' => $b('email_new'), 'invoice' => $b('invoice'), 'keep_shares' => $b('keep_shares'), 'drop_overrides' => $b('drop_overrides'),
             'credit' => trim(str_replace([',', '٬', ' '], '', strtr(Env::input($post['credit'] ?? '0'), ['۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4',
                 '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9', '٫' => '.']))),
             'pid' => (int) ($post['pid'] ?? 0), 'cycle' => Env::input($post['cycle'] ?? 'monthly'), 'nextdue' => trim(Env::input($post['nextdue'] ?? '')),
@@ -448,6 +454,15 @@ final class Transfer
             $l[] = [$o['keep_shares'] ? 'warn' : 'ok', $o['keep_shares'] ? View::n($nShares) . ' اشتراک / دعوت این دامنه همراه آن نزد مالک جدید می‌ماند.'
                 : View::n($nShares) . ' اشتراک / دعوت این دامنه لغو می‌شود (اعضا بلافاصله دسترسی را از دست می‌دهند).'];
         }
+        // SPEC §21: «امکانات اختصاصی» move with the domain (re-keyed) unless dropped
+        $ov = self::overrides($src);
+        if ($ov) {
+            $l[] = [$o['drop_overrides'] ? 'warn' : 'ok', '<span data-transfer-overrides="' . count($ov) . '">' . ($o['drop_overrides']
+                ? View::n(count($ov)) . ' امکان اختصاصی این دامنه حذف می‌شود (از این پس پلن محصول اعمال می‌شود): '
+                : View::n(count($ov)) . ' امکان اختصاصی این دامنه همراه آن منتقل می‌شود: ') . View::ltr(implode(', ', array_map(function ($k, $v) {
+                    return $k . '=' . (is_bool($v) ? ($v ? 'on' : 'off') : (string) $v);
+                }, array_keys($ov), $ov))) . '</span>'];
+        }
         if ($o['email_old'] && $src['kind'] === 'client') {
             $l[] = ['ok', 'ایمیل «' . self::EMAIL_OLD . '» به مالک قبلی ارسال می‌شود.'];
         }
@@ -489,7 +504,7 @@ final class Transfer
     private static function step(array &$steps, string $tone, string $text, string $domain, int $uid = 0): void
     {
         $steps[] = [$tone, $text];
-        Env::log('domain transfer ' . $domain . ': ' . $text . ' — ' . Env::adminLabel(), $uid);
+        Env::log('domain transfer ' . $domain . ': ' . $text . ' — ' . (self::$actor !== '' ? self::$actor : Env::adminLabel()), $uid);
     }
 
     private static function execute(string $dir, array $src, int $cid, array $o, int $admin): array
@@ -502,6 +517,7 @@ final class Transfer
         $sid = $src['kind'] === 'client' ? (int) $src['svc']->id : 0;
         $ctlDone = null;
         $created = null;
+        $ovDropped = null;
         self::step($steps, 'ok', 'start ' . $dir . ' (' . ($old ? 'client #' . (int) $old->id : 'operator') . ' → ' . ($new ? 'client #' . $cid : 'operator') . ')', $domain);
 
         if ($dir !== 'operator_client') {
@@ -544,11 +560,24 @@ final class Transfer
                     self::step($steps, 'ok', 'shares: ' . $ns . ' ended', $domain, $cid);
                 }
             }
-            Capsule::table(Transfers::TABLE)->insert(['domain' => $domain, 'service_id' => $sid, 'direction' => $dir,
+            // SPEC §21: the domain's feature overrides move with it (service id ↔ operator domain key) or are dropped
+            $ovFrom = $src['kind'] === 'client' ? \PasargadCdn\FeatureOverrides::serviceKey((int) $src['svc']->id) : \PasargadCdn\FeatureOverrides::domainKey($domain);
+            $ovTo = $dir === 'client_operator' ? \PasargadCdn\FeatureOverrides::domainKey($domain) : \PasargadCdn\FeatureOverrides::serviceKey($sid);
+            $nOv = \PasargadCdn\FeatureOverrides::count($ovFrom);
+            if ($nOv > 0 && !empty($o['drop_overrides'])) {
+                $ovDropped = \PasargadCdn\FeatureOverrides::get($ovFrom);
+                \PasargadCdn\FeatureOverrides::drop($ovFrom);
+                self::step($steps, 'ok', 'feature overrides dropped: ' . $nOv, $domain, $cid);
+            } elseif ($nOv > 0 && $ovFrom !== $ovTo) {
+                \PasargadCdn\FeatureOverrides::rekey($ovFrom, $ovTo);
+                self::step($steps, 'ok', 'feature overrides moved: ' . $nOv . ' (' . $ovFrom . ' → ' . $ovTo . ')', $domain, $cid);
+            }
+            Capsule::table(Transfers::TABLE)->insert(Env::onlyColumns(Transfers::TABLE, ['domain' => $domain, 'service_id' => $sid, 'direction' => $dir,
                 'from_client' => $src['kind'] === 'client' ? (int) $src['client'] : 0, 'to_client' => $cid, 'admin_id' => $admin, 'status' => 'done',
                 'guard' => $dir === 'client_operator' ? 1 : 0, 'banner' => $dir === 'client_operator' ? 0 : 1,
                 'detail' => json_encode(['controller' => $ctlDone, 'whmcs' => $detail], JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR),
-                'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]);
+                'initiated_by' => self::$initiatedBy, 'request_id' => self::$requestId,
+                'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]));
             if ($dir !== 'client_operator') {
                 // an older notice of this service (an earlier transfer) is superseded
                 Capsule::table(Transfers::TABLE)->where('service_id', $sid)->where('to_client', '<>', $cid)->update(['banner' => 0]);
@@ -577,10 +606,11 @@ final class Transfer
                 }
             }
             try {
-                Capsule::table(Transfers::TABLE)->insert(['domain' => $domain, 'service_id' => $sid, 'direction' => $dir,
+                Capsule::table(Transfers::TABLE)->insert(Env::onlyColumns(Transfers::TABLE, ['domain' => $domain, 'service_id' => $sid, 'direction' => $dir,
                     'from_client' => $src['kind'] === 'client' ? (int) $src['client'] : 0, 'to_client' => $cid, 'admin_id' => $admin,
                     'status' => $ctlDone !== null ? 'rolled_back' : 'failed', 'guard' => 0, 'banner' => 0,
-                    'detail' => json_encode(['error' => $e->getMessage()], JSON_UNESCAPED_UNICODE), 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]);
+                    'initiated_by' => self::$initiatedBy, 'request_id' => self::$requestId,
+                    'detail' => json_encode(['error' => $e->getMessage()], JSON_UNESCAPED_UNICODE), 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]));
             } catch (\Throwable $e3) {
                 // the ledger is informational here
             }
@@ -589,11 +619,27 @@ final class Transfer
             return [[['bad', View::e('انتقال انجام نشد و تغییرات WHMCS برگردانده شد: ' . $e->getMessage() . '.' . $back)]], ['opts' => $o, 'done' => $steps]];
         }
         self::step($steps, 'ok', 'WHMCS changes committed', $domain, $cid);
+        // SPEC §19.3: an open customer request of the moved service ends (the one being executed is finished by its caller)
+        if ($src['kind'] === 'client' && ($nr = Transfers::cancelRequests((int) $src['svc']->id, 'transferred', self::$requestId)) > 0) {
+            self::step($steps, 'ok', 'customer transfer requests cancelled: ' . $nr, $domain, (int) $src['client']);
+        }
         // after the commit: best-effort extras
         if ($dir === 'client_operator') {
             Operator::remember($domain, null, $admin);
         }
         $flash = [];
+        if ($ovDropped !== null) {
+            // SPEC §21: the dropped overrides are replaced on the controller by the destination's plan / the values before them
+            require_once __DIR__ . '/FeatureEditor.php';
+            \PasargadCdn\FeatureOverrides::reset();
+            $err = FeatureEditor::restoreAfterDrop($domain, $ovDropped, $dir === 'client_operator' ? 0 : $sid);
+            if ($err === null) {
+                self::step($steps, 'ok', 'plan re-sent without the dropped feature overrides', $domain, $cid);
+            } else {
+                self::step($steps, 'warn', 'plan re-send without the dropped feature overrides failed: ' . $err, $domain, $cid);
+                $flash[] = ['warn', 'امکانات اختصاصی حذف شد اما ارسال دوبارهٔ پلن به کنترلر ناموفق بود (' . View::e($err) . ')؛ از صفحهٔ سرویس «تغییر پلن» را دوباره اجرا کنید.'];
+            }
+        }
         $rot = is_array($ctlDone['rotated'] ?? null) ? $ctlDone['rotated'] : [];
         if (!empty($rot['tsig'])) {
             $flash[] = ['warn', 'کلید TSIG این دامنه عوض شد: اگر DNS ثانویهٔ سمت مشتری با این کلید زون را می‌گیرد، رمز جدید باید در آن تنظیم شود (از صفحهٔ «DNS ثانویه»).'];
@@ -614,6 +660,48 @@ final class Transfer
             $msg .= ' سرویس جدید: <a href="' . View::e(Data::serviceUrl($cid, $sid)) . '">#' . View::n($sid) . '</a>.';
         }
         return [array_merge([['ok', $msg]], $flash), ['done' => $steps, 'service' => $sid]];
+    }
+
+    /**
+     * SPEC §19.3: run the §19.2 client → client transfer for an accepted customer request — the SAME execute() path as the
+     * admin wizard, with the customer defaults: unpaid single-service invoices move, paid invoices and credit never move,
+     * shares are revoked, no related sites, no billing-anchor reset, no §19.2 e-mails (the request sends its own result
+     * e-mail). $admin = the approving admin (0 when no approval was needed). Returns [ok, message (plain), steps].
+     */
+    public static function runCustomer(int $sid, int $toClient, int $requestId, int $admin = 0): array
+    {
+        $src = self::source(['service' => $sid]);
+        if (is_string($src)) {
+            return [false, $src, []];
+        }
+        if ((string) $src['svc']->domainstatus !== 'Active') {
+            return [false, 'سرویس فعال نیست.', []];
+        }
+        $dir = self::direction($src, (string) $toClient);
+        if ($dir !== 'client_client') {
+            return [false, is_string($dir) ? $dir : 'جهت انتقال نامعتبر است.', []];
+        }
+        $o = array_merge(self::defaults($dir, $src), ['move_unpaid' => true, 'move_paid' => false, 'credit' => '0', 'include_related' => false,
+            'keep_shares' => false, 'email_old' => false, 'email_new' => false]);
+        self::$initiatedBy = 'client';
+        self::$requestId = $requestId;
+        self::$actor = 'client request #' . $requestId . ($admin > 0 ? ', approved by ' . Env::adminLabel() : '');
+        try {
+            [$flash, $state] = self::execute($dir, $src, $toClient, $o, $admin);
+        } finally {
+            self::$initiatedBy = 'admin';
+            self::$requestId = 0;
+            self::$actor = '';
+        }
+        $ok = ($flash[0][0] ?? '') === 'ok';
+        return [$ok, trim(html_entity_decode(strip_tags((string) ($flash[0][1] ?? '')), ENT_QUOTES, 'UTF-8')), (array) ($state['done'] ?? [])];
+    }
+
+    /** SPEC §21: the feature overrides of a transfer source (field => value). */
+    public static function overrides(array $src): array
+    {
+        $key = $src['kind'] === 'client' ? \PasargadCdn\FeatureOverrides::serviceKey((int) $src['svc']->id) : \PasargadCdn\FeatureOverrides::domainKey((string) $src['domain']);
+        return \PasargadCdn\FeatureOverrides::get($key)['v'];
     }
 
     /** Live shares / pending invites of a domain (SPEC §20). */
@@ -661,7 +749,12 @@ final class Transfer
             '/^e-mail «(.*)» to client #(\d+): sent$/u' => 'ایمیل «$1» برای مشتری #$2 ارسال شد',
             '/^e-mail «(.*)» to client #(\d+): failed — (.*)$/us' => 'ایمیل «$1» برای مشتری #$2 ارسال نشد — $3',
             '/^shares: (\d+) ended$/' => '$1 اشتراک / دعوت این دامنه لغو شد',
+            '/^feature overrides moved: (\d+) \((.*)\)$/' => '$1 امکان اختصاصی همراه دامنه منتقل شد ($2)',
+            '/^feature overrides dropped: (\d+)$/' => '$1 امکان اختصاصی دامنه حذف شد',
+            '/^plan re-sent without the dropped feature overrides$/' => 'پلن بدون امکانات اختصاصی حذف‌شده دوباره به کنترلر ارسال شد',
+            '/^plan re-send without the dropped feature overrides failed: (.*)$/us' => 'ارسال دوبارهٔ پلن بدون امکانات اختصاصی ناموفق بود: $1',
             '/^shares kept: (\d+) moved to the new owner$/' => '$1 اشتراک / دعوت همراه دامنه نزد مالک جدید ماند',
+            '/^customer transfer requests cancelled: (\d+)$/' => '$1 درخواست انتقال مشتری برای این سرویس لغو شد',
         ];
         foreach ($map as $re => $to) {
             if (preg_match($re, $en, $m)) {
@@ -1030,7 +1123,7 @@ final class Transfer
                 if ($recent) {
                     $names = ['client_client' => 'مشتری ← مشتری', 'operator_client' => 'اپراتور ← مشتری', 'client_operator' => 'مشتری ← اپراتور'];
                     $st = ['done' => ['انجام شد', 'good'], 'rolled_back' => ['برگشت داده شد', 'warn'], 'failed' => ['ناموفق', 'bad']];
-                    $hist = '<div class="pcdna-table-wrap"><table class="pcdna-table" data-transfer-history="1"><thead><tr><th>زمان</th><th>دامنه</th><th>جهت</th><th>از</th><th>به</th><th>وضعیت</th></tr></thead><tbody>';
+                    $hist = '<div class="pcdna-table-wrap"><table class="pcdna-table" data-transfer-history="1"><thead><tr><th>زمان</th><th>دامنه</th><th>جهت</th><th>از</th><th>به</th><th>آغازگر</th><th>وضعیت</th></tr></thead><tbody>';
                     foreach ($recent as $t) {
                         $who = function (int $cid) {
                             return $cid > 0 ? '<a href="' . View::e(Data::clientUrl($cid)) . '">#' . View::n($cid) . '</a>' : View::badge('اپراتور', 'violet');
@@ -1038,7 +1131,9 @@ final class Transfer
                         [$sl, $tone] = $st[(string) $t->status] ?? [(string) $t->status, 'muted'];
                         $hist .= '<tr><td>' . View::date((string) $t->created_at, true) . '</td><td>' . View::ltr((string) $t->domain) . '</td><td>'
                             . View::e($names[(string) $t->direction] ?? (string) $t->direction) . '</td><td>' . $who((int) $t->from_client) . '</td><td>'
-                            . $who((int) $t->to_client) . '</td><td>' . View::badge($sl, $tone) . '</td></tr>';
+                            . $who((int) $t->to_client) . '</td><td data-initiated-by="' . View::e((string) ($t->initiated_by ?? 'admin')) . '">'
+                            . ((string) ($t->initiated_by ?? 'admin') === 'client' ? View::badge('درخواست مشتری #' . View::n((int) ($t->request_id ?? 0)), 'violet') : View::badge('مدیر', 'muted'))
+                            . '</td><td>' . View::badge($sl, $tone) . '</td></tr>';
                     }
                     $hist .= '</tbody></table></div>';
                 }
@@ -1046,6 +1141,11 @@ final class Transfer
         } catch (\Throwable $e) {
             $hist = '';
         }
+        // SPEC §19.3: customer requests — the approval queue («تأیید مدیر لازم است») and the latest requests
+        if (!class_exists(__NAMESPACE__ . '\\CustomerTransfer', false)) {
+            require_once __DIR__ . '/CustomerTransfer.php';
+        }
+        $h .= CustomerTransfer::adminCard();
         return $h . View::card('انتقال‌های اخیر', $hist !== '' ? $hist : '<p class="pcdna-muted">هنوز انتقالی انجام نشده است.</p>', '', '', 'history');
     }
 
@@ -1152,6 +1252,12 @@ final class Transfer
         $nShares = self::liveShares($src['domain']);
         $f .= '<div class="pcdn-col-2 pcdna-col-2" data-shares-live="' . $nShares . '">' . Pages::check('keep_shares', $o['keep_shares'], 'اشتراک‌های این دامنه (' . View::n($nShares) . ' عضو / دعوت) نزد مالک جدید بماند')
             . '<small>پیش‌فرض: همهٔ اشتراک‌ها و دعوت‌های در انتظار این دامنه هنگام انتقال لغو می‌شوند (§20.2).</small></div>';
+        $nOv = count(self::overrides($src));
+        if ($nOv > 0) {
+            // SPEC §21: the per-domain feature overrides
+            $f .= '<div class="pcdna-col-2" data-overrides-live="' . $nOv . '">' . Pages::check('drop_overrides', $o['drop_overrides'], 'حذف امکانات اختصاصی این دامنه (' . View::n($nOv) . ' مورد)')
+                . '<small>پیش‌فرض: امکانات اختصاصی همراه دامنه منتقل می‌شوند و روی پلن مالک جدید هم اعمال می‌مانند.</small></div>';
+        }
         if ($src['kind'] === 'client') {
             $f .= '<div>' . Pages::check('email_old', $o['email_old'], 'ایمیل «' . self::EMAIL_OLD . '» به مالک فعلی') . '</div>';
         }
@@ -1201,7 +1307,7 @@ final class Transfer
         $b .= '</ul>';
         $f = '<form method="post" action="' . View::url($q + ['to' => $to]) . '" class="pcdna-form" data-transfer-execute="1">' . self::hiddenSrc($q, $to)
             . '<input type="hidden" name="a" value="transfer_execute">';
-        foreach (['move_unpaid', 'move_paid', 'include_related', 'email_old', 'email_new', 'invoice', 'keep_shares'] as $k) {
+        foreach (['move_unpaid', 'move_paid', 'include_related', 'email_old', 'email_new', 'invoice', 'keep_shares', 'drop_overrides'] as $k) {
             if (!empty($o[$k])) {
                 $f .= '<input type="hidden" name="' . $k . '" value="1">';
             }

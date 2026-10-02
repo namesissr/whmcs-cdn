@@ -173,10 +173,15 @@ final class AddonTraffic
         $row = \pasargadcdn_product_row((int) $svc->pid);
         $co = \pasargadcdn_config_options([(int) $svc->id])[(int) $svc->id] ?? [];
         $plan = \pasargadcdn_plan(['configoption1' => $row['configoption1'] ?? '', 'configoptions' => $co])['bandwidth_limit_gb'];
+        // SPEC §21: an explicit bandwidth override («امکانات اختصاصی») replaces the plan GB; 0 = unlimited (no cap)
+        $ov = \PasargadCdn\FeatureOverrides::bandwidth((int) $svc->id);
+        if ($ov !== null) {
+            $plan = $ov;
+        }
         if ($plan <= 0) {
             return null;
         }
-        $pp = $row ? \pasargadcdn_prepaid($row, $co) : null;
+        $pp = $row ? \PasargadCdn\FeatureOverrides::prepaid((int) $svc->id, \pasargadcdn_prepaid($row, $co)) : null;
         return $pp !== null ? $pp['plan_gb'] + \pasargadcdn_topup_gb((int) $svc->id) : $plan + \pasargadcdn_addon_gb((int) $svc->id);
     }
 

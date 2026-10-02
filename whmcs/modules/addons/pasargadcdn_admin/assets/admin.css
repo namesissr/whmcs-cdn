@@ -614,3 +614,27 @@
   .pcdna .pcdna-op-lang { margin-inline-start: 0; }
 }
 .pcdna .pcdna-xfer-steps .pcdna-xfer-en { display: block; font-size: 11.5px; }
+
+/* ---------- SPEC §21: per-domain feature overrides («امکانات اختصاصی») */
+.pcdna .pcdna-fo-badge { display: inline-block; margin-inline-start: 4px; text-decoration: none; }
+.pcdna .pcdna-fo-badge:hover, .pcdna .pcdna-fo-badge:focus { text-decoration: none; }
+.pcdna .pcdna-fo-table td { vertical-align: top; }
+.pcdna .pcdna-fo-table tr.is-overridden > td { background: var(--a-violet-50); }
+.pcdna .pcdna-fo-table tr.is-overridden > td:first-child { box-shadow: inset -3px 0 0 var(--a-violet); }
+.pcdna .pcdna-fo-table label { font-weight: 600; }
+.pcdna .pcdna-fo-table .pcdna-input { min-width: 0; width: 100%; max-width: 200px; }
+.pcdna .pcdna-fo-table .pcdna-err { display: block; max-width: none; white-space: normal; overflow: visible; }
+.pcdna .pcdna-fo-form .pcdna-form-actions { padding: 12px 16px; }
+.pcdna .pcdna-fo-list .pcdna-small { overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .pcdna .pcdna-fo-table thead, .pcdna .pcdna-fo-list thead { display: none; }
+  .pcdna .pcdna-fo-table, .pcdna .pcdna-fo-table tbody, .pcdna .pcdna-fo-list, .pcdna .pcdna-fo-list tbody { display: block; }
+  .pcdna .pcdna-fo-table tr, .pcdna .pcdna-fo-list tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; padding: 10px 12px; border-bottom: 1px solid var(--a-border); }
+  .pcdna .pcdna-fo-table td, .pcdna .pcdna-fo-list td { display: block; padding: 0; border: 0; min-width: 0; }
+  .pcdna .pcdna-fo-table td:first-child, .pcdna .pcdna-fo-table td:nth-child(3), .pcdna .pcdna-fo-list td:first-child, .pcdna .pcdna-fo-list .pcdna-actions { grid-column: 1 / -1; }
+  .pcdna .pcdna-fo-table td[data-label]::before, .pcdna .pcdna-fo-list td[data-label]::before { content: attr(data-label); display: block; color: var(--a-muted); font-size: 11.5px; font-weight: 600; margin-bottom: 2px; }
+  .pcdna .pcdna-fo-table tr.is-overridden > td { background: none; }
+  .pcdna .pcdna-fo-table tr.is-overridden { background: var(--a-violet-50); box-shadow: inset -3px 0 0 var(--a-violet); }
+  .pcdna .pcdna-fo-table tr.is-overridden > td:first-child { box-shadow: none; }
+  .pcdna .pcdna-fo-table .pcdna-input { max-width: 100%; }
+}

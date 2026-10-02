@@ -20,7 +20,7 @@ final class Admin
 {
     // SPEC §19: «دامنه‌های اپراتور» (operator), its full manager (opmanage) and the «انتقال دامنه» wizard (transfer)
     const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'referrals', 'settings', 'manage', 'api',
-        'operator', 'opmanage', 'transfer', 'shares'];
+        'operator', 'opmanage', 'transfer', 'shares', 'features'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -137,6 +137,12 @@ final class Admin
                 require_once __DIR__ . '/Transfer.php';
                 $body = Transfer::page($get, $state);
                 break;
+            case 'features':
+                // SPEC §21: per-domain feature overrides («امکانات اختصاصی»)
+                require_once __DIR__ . '/Operator.php';
+                require_once __DIR__ . '/FeatureEditor.php';
+                $body = FeatureEditor::page($get, $state);
+                break;
             case 'manage':
                 $body = Pages::manage((int) ($get['service'] ?? 0));
                 break;
@@ -145,7 +151,8 @@ final class Admin
         }
         // After a POST, the browser URL is replaced with the GET URL so a refresh never re-submits.
         $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'id' => $get['id'] ?? null,
-            'service' => in_array($page, ['transfer', 'shares'], true) ? ($get['service'] ?? null) : null, 'domain' => $page === 'transfer' ? ($get['domain'] ?? null) : null,
+            'service' => in_array($page, ['transfer', 'shares', 'features'], true) ? ($get['service'] ?? null) : null,
+            'domain' => in_array($page, ['transfer', 'features'], true) ? ($get['domain'] ?? null) : null,
             'q' => $get['q'] ?? null, 'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
         return Pages::layout($page, $body, $flash, $clean);
     }
@@ -237,9 +244,19 @@ final class Admin
         if (in_array($action, Operator::ACTIONS, true)) {
             return Operator::action($action, $post, $admin);
         }
+        if (in_array($action, ['features_save', 'features_all_on', 'features_clear'], true)) {
+            // SPEC §21: per-domain feature overrides
+            require_once __DIR__ . '/FeatureEditor.php';
+            return FeatureEditor::action($action, $post, $admin);
+        }
         if ($action === 'share_revoke') {
             require_once __DIR__ . '/Sharing.php';
             return [[Sharing::adminRevoke((int) ($post['id'] ?? 0), $admin)], []];
+        }
+        if ($action === 'xfer_approve' || $action === 'xfer_reject') {
+            require_once __DIR__ . '/Transfer.php';
+            require_once __DIR__ . '/CustomerTransfer.php';
+            return [[CustomerTransfer::adminAction($action, (int) ($post['id'] ?? 0), $admin)], []];
         }
         if ($action === 'transfer_preview' || $action === 'transfer_execute') {
             require_once __DIR__ . '/Transfer.php';

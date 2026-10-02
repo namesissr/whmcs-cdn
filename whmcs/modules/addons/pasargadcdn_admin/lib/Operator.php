@@ -7,6 +7,8 @@ use PasargadCdn\ApiException;
 use PasargadCdn\ClientApi;
 use WHMCS\Database\Capsule;
 
+require_once __DIR__ . '/FeatureEditor.php';   // SPEC §21: badges + the template push keep the per-domain overrides
+
 if (class_exists(__NAMESPACE__ . '\\Operator', false)) {
     return;
 }
@@ -87,7 +89,7 @@ final class Operator
         ];
     }
 
-    private static function templateLabel(string $domain, array $site): string
+    public static function templateLabel(string $domain, array $site): string
     {
         $meta = (array) (Env::kvGet(self::KV, [])[$domain] ?? []);
         $t = self::templates();
@@ -187,7 +189,8 @@ final class Operator
                     if (!isset($t[$key])) {
                         return [[['bad', 'قالب پلن نامعتبر است.']], []];
                     }
-                    $api->patch($path . '/plan', $t[$key][1]);
+                    // SPEC §21: the site's «امکانات اختصاصی» stay on top of the new template (which becomes their base)
+                    $api->patch($path . '/plan', FeatureEditor::operatorTemplate($domain, $t[$key][1]));
                     self::remember($domain, $key, $admin);
                     Env::log('operator site ' . $domain . ': plan set to template «' . $key . '» by ' . $who);
                     Pages::reset();
@@ -220,6 +223,7 @@ final class Operator
                     $api->delete($path);
                     self::remember($domain, null, $admin);
                     \PasargadCdn\Shares::removeForDomain($domain);   // SPEC §20.2: a deleted site keeps no shares
+                    \PasargadCdn\FeatureOverrides::drop(\PasargadCdn\FeatureOverrides::domainKey($domain));   // SPEC §21
                     Env::log('operator site ' . $domain . ' deleted from the controller by ' . $who);
                     Pages::reset();
                     return [[['ok', 'سایت اپراتور ' . View::ltr($domain) . ' از کنترلر حذف شد.']], []];
@@ -375,6 +379,9 @@ final class Operator
         foreach (self::templates() as $k => [$label]) {
             $tpl[$k] = $label;
         }
+        \PasargadCdn\FeatureOverrides::preload(array_map(function ($r) {   // SPEC §21 badges: one query
+            return \PasargadCdn\FeatureOverrides::domainKey((string) $r['domain']);
+        }, $sites));
         $t = '<div class="pcdna-table-wrap pcdna-sites-wrap"><table class="pcdna-table pcdna-sites pcdna-op-sites"><thead><tr><th>دامنه</th><th>وضعیت</th><th>NS</th><th>SSL</th>'
             . '<th>ترافیک این ماه</th><th>پلن</th><th>یادداشت</th><th><span class="pcdna-sr">عملیات</span></th></tr></thead><tbody>';
         foreach ($sites as $row) {
@@ -400,7 +407,9 @@ final class Operator
                 . ($st === 'suspended'
                     ? View::postButton($q, 'op_unsuspend', ['domain' => $domain], 'رفع تعلیق', 'pcdna-menu-item', 'تعلیق ' . $domain . ' برداشته شود؟', 'power')
                     : View::postButton($q, 'op_suspend', ['domain' => $domain], 'تعلیق', 'pcdna-menu-item is-danger', 'سایت ' . $domain . ' معلق شود؟ بازدیدکنندگان صفحه تعلیق را می‌بینند.', 'power'))
-                . '<a class="pcdna-menu-item" href="' . View::url(['page' => 'transfer', 'domain' => $domain]) . '">' . View::icon('users') . '<span>انتقال دامنه</span></a>';
+                . '<a class="pcdna-menu-item" href="' . View::url(['page' => 'transfer', 'domain' => $domain]) . '">' . View::icon('users') . '<span>انتقال دامنه</span></a>'
+                // SPEC §21: per-domain feature overrides
+                . '<a class="pcdna-menu-item" href="' . View::url(['page' => 'features', 'domain' => $domain]) . '">' . View::icon('sliders') . '<span>امکانات اختصاصی</span></a>';
             $plan = '<form method="post" action="' . self::url() . '" class="pcdna-form-inline pcdna-op-plan">' . View::csrf()
                 . '<input type="hidden" name="a" value="op_plan"><input type="hidden" name="domain" value="' . View::e($domain) . '">'
                 . View::select('template', $tpl, '', ' aria-label="قالب پلن جدید"')
@@ -419,6 +428,7 @@ final class Operator
                 . '<td data-label="وضعیت">' . Pages::cdnBadge($st) . '</td><td data-label="NS">' . $ns . '</td><td data-label="SSL">' . $ssl . '</td>'
                 . '<td class="pcdna-traffic" data-label="ترافیک این ماه">' . $traffic . '</td>'
                 . '<td data-label="پلن"><span class="pcdna-small">' . View::e(self::templateLabel($domain, $d)) . '</span>'
+                . FeatureEditor::badge(\PasargadCdn\FeatureOverrides::count(\PasargadCdn\FeatureOverrides::domainKey($domain)), ['page' => 'features', 'domain' => $domain])
                 . '<details class="pcdna-op-more"><summary class="pcdna-small">تغییر</summary>' . $plan . '</details></td>'
                 . '<td data-label="یادداشت"><span class="pcdna-op-note-text">' . ($note !== '' ? View::e($note) : '<span class="pcdna-muted">—</span>') . '</span>'
                 . '<details class="pcdna-op-more"><summary class="pcdna-small">ویرایش</summary>' . $noteForm . '</details></td>'

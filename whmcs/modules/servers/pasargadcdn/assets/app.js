@@ -49,8 +49,8 @@
   var READONLY = !!boot.readonly && !ADMIN;
   /** SPEC §20.1: pages a role may change (null = every page); everything else is view-only for the member. */
   var SHARE_WRITE = { viewer: [], dns: ['dns', 'secondary'], editor: null };
-  /** Pages a member never sees: customer API keys, sharing management, the owner's e-mail reports / reseller panel / top-up statement. */
-  var SHARE_HIDE = ['apikeys', 'sharing', 'emailreports', 'reseller', 'statement'];
+  /** Pages a member never sees: customer API keys, sharing management, the customer transfer (§19.3), the owner's e-mail reports / reseller panel / top-up statement. */
+  var SHARE_HIDE = ['apikeys', 'sharing', 'xfer', 'emailreports', 'reseller', 'statement'];
   function shareLocked(id) {
     if (!SHARE) return false;
     var w = SHARE_WRITE.hasOwnProperty(SHARE.role) ? SHARE_WRITE[SHARE.role] : [];
@@ -105,7 +105,7 @@
     // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.
     // Wave 10 (SPEC §18.3): monthly PDF/CSV statement and the site's change log (w10.js).
     { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement', 'monthly', 'changes', 'emailreports'] },
-    { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys', 'sharing'] }
+    { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys', 'sharing', 'xfer'] }
   ];
   if (RESELLER) NAV.unshift({ title: t('نمایندگی'), items: ['reseller'] });
   var pages = P.pages = P.pages || {};
@@ -1728,7 +1728,8 @@
     reduced: reduced, updateSaveBar: updateSaveBar, wallet: WALLET, billing: BILL,
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
     reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
-    onLeave: onLeave, share: SHARE, sharing: SHARE || ADMIN ? null : (boot.sharing || null), refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand
+    onLeave: onLeave, share: SHARE, sharing: SHARE || ADMIN ? null : (boot.sharing || null),
+    xfer: SHARE || ADMIN || READONLY ? null : (boot.xfer || null), refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand
   };
 
   // §14.3.7 / §20.1: modules ask A().readonly when they render — read-only team member or a role that cannot change this page

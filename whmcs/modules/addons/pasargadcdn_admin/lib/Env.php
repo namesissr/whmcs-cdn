@@ -374,6 +374,13 @@ final class Env
             \PasargadCdn\Transfers::ensure();
             // SPEC §20: domain sharing
             \PasargadCdn\Shares::ensure();
+            // SPEC §19.3 (1.6.0): customer transfer requests + ledger columns initiated_by / request_id (its e-mail templates
+            // are created on first use, like the §19.2 / §20 ones)
+            require_once __DIR__ . '/CustomerTransfer.php';
+            CustomerTransfer::reset();
+            CustomerTransfer::ensure();
+            // SPEC §21 (1.6.0): per-domain feature overrides
+            \PasargadCdn\FeatureOverrides::ensure();
         }
     }
 

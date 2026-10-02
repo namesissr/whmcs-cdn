@@ -219,9 +219,14 @@ final class Prepaid
             $q->where('h.userid', $userId);
         }
         $out = [];
-        foreach ($q->get(['h.id', 'h.userid', 'h.server', 'h.domain', 'p.id as pid', 'p.configoption1', 'p.overagesenabled',
-            'p.overagesbwlimit', 'p.overagesbwprice', 'p.tax', 'c.currency'])->all() as $r) {
-            $pp = \pasargadcdn_prepaid(['id' => $r->pid] + (array) $r, self::co((int) $r->id));
+        $rows = $q->get(['h.id', 'h.userid', 'h.server', 'h.domain', 'p.id as pid', 'p.configoption1', 'p.overagesenabled',
+            'p.overagesbwlimit', 'p.overagesbwprice', 'p.tax', 'c.currency'])->all();
+        // SPEC §21: a bandwidth override («امکانات اختصاصی») replaces the plan GB (one query for all candidates)
+        \PasargadCdn\FeatureOverrides::preload(array_map(function ($r) {
+            return \PasargadCdn\FeatureOverrides::serviceKey((int) $r->id);
+        }, $rows));
+        foreach ($rows as $r) {
+            $pp = \PasargadCdn\FeatureOverrides::prepaid((int) $r->id, \pasargadcdn_prepaid(['id' => $r->pid] + (array) $r, self::co((int) $r->id)));
             if ($pp !== null) {
                 $r->pp = $pp;
                 $out[(int) $r->id] = $r;
@@ -607,7 +612,7 @@ final class Prepaid
         if (!$r || !Env::isCdnProduct((int) $r->pid)) {
             return null;
         }
-        $pp = \pasargadcdn_prepaid(['id' => $r->pid] + (array) $r, self::co((int) $r->id));
+        $pp = \PasargadCdn\FeatureOverrides::prepaid((int) $r->id, \pasargadcdn_prepaid(['id' => $r->pid] + (array) $r, self::co((int) $r->id)));
         if ($pp === null) {
             return null;
         }
@@ -649,7 +654,7 @@ final class Prepaid
             ->get(['h.id', 'h.userid', 'h.server', 'h.domain', 'p.id as pid', 'p.configoption1', 'p.overagesenabled',
                 'p.overagesbwlimit', 'p.overagesbwprice', 'p.tax', 'c.currency'])->all();
         foreach ($rows as $r) {
-            $pp = \pasargadcdn_prepaid(['id' => $r->pid] + (array) $r, self::co((int) $r->id));
+            $pp = \PasargadCdn\FeatureOverrides::prepaid((int) $r->id, \pasargadcdn_prepaid(['id' => $r->pid] + (array) $r, self::co((int) $r->id)));
             if ($pp === null) {
                 continue;
             }

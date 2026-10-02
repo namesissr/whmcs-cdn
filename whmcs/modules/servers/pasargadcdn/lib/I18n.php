@@ -52,6 +52,7 @@ class I18n
         'ظرفیت اعضای این دامنه پر است؛ با مالک دامنه هماهنگ کنید.' => 'This domain has no room for more members; contact the domain owner.',
         'اپراتور پلتفرم' => 'Platform operator',
         'سرویس یافت نشد.' => 'Service not found.',
+        'انتقال دامنه توسط مشتری فعال نیست.' => 'Customer domain transfers are not enabled.',
         'این زیرسایت به‌دلیل اتمام اعتبار نمایندگی موقتاً قطع است.' => 'This sub-site is temporarily suspended because the reseller credit ran out.',
         'این سرویس فعال نیست.' => 'This service is not active.',
         'حجم درخواست بیش از حد مجاز است.' => 'The request is too large.',

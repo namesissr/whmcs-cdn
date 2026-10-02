@@ -530,7 +530,8 @@ class ClientApi
     const RESELLER_OPS = ['list', 'create', 'delete', 'report', 'brand', 'bulk', 'export'];
     // SPEC §19.2: `transfer` (POST) dismisses the one-time «این دامنه به حساب شما منتقل شد» notice
     // SPEC §20.2: `shares` — the owner page «اشتراک دامنه» (GET list; POST {action: invite|role|revoke})
-    const LOCAL_OPS = ['state', 'onboarding', 'report', 'transfer', 'shares'];
+    // SPEC §19.3: `xfer` — the owner page «انتقال دامنه» (GET state; POST {action: preview|create|cancel}), run by the addon
+    const LOCAL_OPS = ['state', 'onboarding', 'report', 'transfer', 'shares', 'xfer'];
 
     /**
      * Growth local ops (WHMCS-side, per service): GET state → {onboarding, report}; POST onboarding
@@ -562,6 +563,9 @@ class ClientApi
         $sid = (int) $svc->id;
         if ($op === 'shares') {
             return self::sharesOp($method, $svc, $req);
+        }
+        if ($op === 'xfer') {
+            return self::xferOp($method, $svc, $req);
         }
         if (!ServiceState::ensure()) {
             return self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
@@ -602,6 +606,37 @@ class ClientApi
                 : [200, ['report' => ['freq' => $saved['freq'], 'last' => ServiceState::lastReport($sid)]]];
         }
         return self::fail(405, 'متد مجاز نیست.');
+    }
+
+    /** Admin addon libraries needed by the customer transfer (SPEC §19.3); false when the addon is not installed. */
+    public static function loadTransferLibs(): bool
+    {
+        require_once __DIR__ . '/Shares.php';
+        require_once __DIR__ . '/Transfers.php';
+        $lib = dirname(__DIR__, 3) . '/addons/pasargadcdn_admin/lib/';
+        if (!is_file($lib . 'CustomerTransfer.php')) {
+            return false;
+        }
+        foreach (['Env', 'View', 'Data', 'Pages', 'Operator', 'Transfer', 'CustomerTransfer'] as $f) {
+            require_once $lib . $f . '.php';
+        }
+        return true;
+    }
+
+    /**
+     * SPEC §19.3 owner page «انتقال دامنه»: ownership, CSRF and the service product were checked by localOp(); read-only team
+     * users are refused even for reads (api.php marks lop=xfer); shared members never reach here (their proxy drops `lop`).
+     * The request itself (recipient, limits, token, e-mails) lives in the admin addon (Admin\CustomerTransfer).
+     */
+    private static function xferOp(string $method, $svc, array $req): array
+    {
+        if (!empty($req['readonly'])) {
+            return self::fail(403, self::READONLY_DETAIL);
+        }
+        if (!self::loadTransferLibs()) {
+            return self::fail(404, 'انتقال دامنه توسط مشتری فعال نیست.');
+        }
+        return \PasargadCdn\Admin\CustomerTransfer::ownerOp($method, $svc, $req);
     }
 
     /**

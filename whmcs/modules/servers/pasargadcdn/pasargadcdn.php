@@ -24,9 +24,11 @@ require_once __DIR__ . '/lib/Trial.php';
 require_once __DIR__ . '/lib/DomainRules.php';
 require_once __DIR__ . '/lib/Transfers.php';
 require_once __DIR__ . '/lib/Shares.php';
+require_once __DIR__ . '/lib/FeatureOverrides.php';
 
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
+use PasargadCdn\FeatureOverrides;
 use PasargadCdn\I18n;
 use PasargadCdn\Reseller;
 use PasargadCdn\ServiceState;
@@ -117,6 +119,7 @@ function pasargadcdn_ConfigOptions()
  * Products saved before v2 have empty configoption5..14, i.e. every v2
  * feature off / 0 until the admin ticks them; likewise products saved before
  * tunnel mode (configoption15..19 empty) get tunnel off, group "general".
+ * SPEC §21: with a service id (or 'pcdn_operator_domain') the admin's feature overrides are merged on top.
  */
 function pasargadcdn_plan(array $params): array
 {
@@ -233,6 +236,13 @@ function pasargadcdn_plan(array $params): array
     $f['max_tunnel_connections'] = min(1000000, max(0, $f['max_tunnel_connections']));
     $f['tunnel_max_mbps'] = min(100000, max(0, $f['tunnel_max_mbps']));
     unset($f);
+    // SPEC §21: the admin's per-domain overrides («امکانات اختصاصی») of THIS service / operator site win over the product
+    // plan — merged here, the one place every plan is built, so no sending path (Create, ChangePackage, Unsuspend, renew
+    // resync, the addon's pushes, transfers) can bypass them. 'pcdn_plan_base' => true asks for the bare product plan.
+    $key = FeatureOverrides::keyOf($params);
+    if ($key !== '') {
+        $plan = FeatureOverrides::apply($plan, FeatureOverrides::get($key)['v']);
+    }
     return $plan;
 }
 
@@ -367,9 +377,13 @@ function pasargadcdn_SuspendAccount(array $params)
     if (($g = pasargadcdn_transfer_guard($params, 'Suspend')) !== null) {
         return $g;
     }
-    return pasargadcdn_call(function () use ($params) {
+    $r = pasargadcdn_call(function () use ($params) {
         ApiClient::fromParams($params)->post(ApiClient::site(pasargadcdn_domain($params)) . '/suspend');
     });
+    if ($r === 'success') {
+        pasargadcdn_end_xfer_requests($params, 'suspended');
+    }
+    return $r;
 }
 
 function pasargadcdn_UnsuspendAccount(array $params)
@@ -407,8 +421,34 @@ function pasargadcdn_TerminateAccount(array $params)
     });
     if ($r === 'success') {
         pasargadcdn_end_shares($params);
+        pasargadcdn_end_xfer_requests($params, 'terminated');
     }
     return $r;
+}
+
+/** SPEC §19.3: a suspended / terminated service ends its open customer transfer request (the token stops working). */
+function pasargadcdn_end_xfer_requests(array $params, string $why): void
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    if (Transfers::cancelRequests($sid, $why) > 0 && function_exists('logActivity')) {
+        logActivity('Pasargad CDN: customer transfer request of service #' . $sid . ' (' . pasargadcdn_domain($params) . ') cancelled — service ' . $why,
+            (int) ($params['userid'] ?? 0));
+    }
+}
+
+/**
+ * SPEC §19.3: is the owner page «انتقال دامنه» offered? The addon must be active (its settings exist) and installed, and
+ * «انتقال توسط مشتری» on (on by default — absent on an install upgraded in place). [enabled, approval needed]
+ */
+function pasargadcdn_xfer_enabled(): array
+{
+    $s = pasargadcdn_addon_settings();
+    $on = function ($v) {
+        return in_array(strtolower(trim((string) $v)), ['on', '1', 'yes', 'true'], true);
+    };
+    $enabled = $s !== [] && (!array_key_exists('transfer_customer', $s) || $on($s['transfer_customer']))
+        && is_file(dirname(__DIR__, 2) . '/addons/pasargadcdn_admin/lib/CustomerTransfer.php');
+    return [$enabled, $enabled && $on($s['transfer_approval'] ?? '')];
 }
 
 /** SPEC §20.2: terminating a service ends every share / pending invite of it (members lose access at once). */
@@ -723,7 +763,8 @@ function pasargadcdn_wallet(array $params): ?array
         $sid = (int) ($params['serviceid'] ?? 0);
         $co = isset($params['configoptions']) && is_array($params['configoptions']) ? $params['configoptions']
             : (pasargadcdn_config_options([$sid])[$sid] ?? []);
-        $pp = $row ? pasargadcdn_prepaid($row, $co) : null;
+        // SPEC §21: an explicit bandwidth override replaces the plan GB the wallet tops up from
+        $pp = $row ? FeatureOverrides::prepaid($sid, pasargadcdn_prepaid($row, $co)) : null;
         if ($pp === null) {
             return null;
         }
@@ -794,7 +835,7 @@ function pasargadcdn_statement(array $params): ?array
         $row = pasargadcdn_product_row((int) ($params['pid'] ?? $params['packageid'] ?? 0));
         $co = isset($params['configoptions']) && is_array($params['configoptions']) ? $params['configoptions']
             : (pasargadcdn_config_options([$sid])[$sid] ?? []);
-        $pp = $row ? pasargadcdn_prepaid($row, $co) : null;
+        $pp = $row ? FeatureOverrides::prepaid($sid, pasargadcdn_prepaid($row, $co)) : null;   // SPEC §21
         $o = $row ? pasargadcdn_overage($row) : null;
 
         $client = Capsule::table('tblclients')->where('id', (int) ($params['userid'] ?? 0))->first(['currency']);
@@ -997,18 +1038,43 @@ function pasargadcdn_share_field(array $params): array
     return ['اعضای اشتراک دامنه' => implode('<br>', $out) . '<br><a href="addonmodules.php?module=pasargadcdn_admin&amp;page=shares&amp;service=' . $sid . '">مدیریت اشتراک‌ها</a>'];
 }
 
+/**
+ * SPEC §21: «امکانات اختصاصی» on the admin service tab — the overridden fields (badge with their count) and the link to the
+ * addon's editor; [] when the addon is not installed or the domain was handed to the operator.
+ */
+function pasargadcdn_overrides_field(array $params): array
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    if ($sid <= 0 || !is_file(dirname(__DIR__, 2) . '/addons/pasargadcdn_admin/lib/FeatureEditor.php') || Transfers::guarded($sid)) {
+        return [];
+    }
+    $v = FeatureOverrides::get(FeatureOverrides::serviceKey($sid))['v'];
+    $link = '<a class="btn btn-default btn-sm" data-pcdn-overrides="' . $sid . '" href="addonmodules.php?module=pasargadcdn_admin&amp;page=features&amp;service=' . $sid . '">'
+        . ($v ? 'ویرایش امکانات اختصاصی' : 'باز کردن امکان برای این دامنه') . '</a>';
+    if (!$v) {
+        return ['امکانات اختصاصی' => '<span style="color:#777">ندارد — همه امکانات طبق پلن محصول</span> ' . $link];
+    }
+    $list = [];
+    foreach ($v as $f => $val) {
+        $list[] = pasargadcdn_e((strpos($f, 'features.') === 0 ? substr($f, 9) : $f) . ' = ' . (is_bool($val) ? ($val ? 'on' : 'off') : (string) $val));
+    }
+    return ['امکانات اختصاصی' => '<span class="label label-info" style="background:#6532c9" data-pcdn-overrides-count="' . count($v) . '">امکانات اختصاصی (' . count($v) . ')</span> '
+        . '<span dir="ltr" style="font-family:monospace;font-size:12px">' . implode(', ', $list) . '</span><br>' . $link];
+}
+
 function pasargadcdn_AdminServicesTabFields(array $params)
 {
     $transfer = pasargadcdn_transfer_button($params);
+    $overrides = pasargadcdn_overrides_field($params);
     try {
         $s = ApiClient::fromParams($params)->get(ApiClient::site(pasargadcdn_domain($params)));
     } catch (\Throwable $e) {
         return ['Pasargad CDN' => '<span style="color:#c00">' . pasargadcdn_e($e->getMessage()) . '</span>']
-            + ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []);
+            + ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []) + $overrides;
     }
     $h = 'pasargadcdn_e';
     $u = $s['usage_month'] ?? [];
-    return ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []) + pasargadcdn_share_field($params) + [
+    return ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []) + pasargadcdn_share_field($params) + $overrides + [
         'وضعیت CDN' => $h($s['status'] ?? '-'),
         'نیم‌سرورها' => $h(implode(' , ', $s['nameservers'] ?? []))
             . (!empty($s['ns_verified']) ? ' ✅' : ' ⏳ (فعلی: ' . $h(implode(', ', $s['ns_found'] ?? [])) . ')'),
@@ -1162,6 +1228,9 @@ function pasargadcdn_ClientArea(array $params)
     $boot['transfer'] = Transfers::banner($sid, $uid);
     // SPEC §20.2: the owner page «اشتراک دامنه» — owner and owner-side team members with manage rights only
     $boot['sharing'] = $boot['readonly'] ? null : ['enabled' => true];
+    // SPEC §19.3: the owner page «انتقال دامنه» — owner and manage-rights team only, Active, not handed to the operator
+    [$xferOn, $xferApproval] = pasargadcdn_xfer_enabled();
+    $boot['xfer'] = !$boot['readonly'] && $active && $xferOn && !Transfers::guarded($sid) ? ['enabled' => true, 'approval' => $xferApproval] : null;
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base, $lang);
     $noJs = I18n::tr('برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.');
@@ -1225,7 +1294,7 @@ function pasargadcdn_assets(string $base, string $lang = 'fa'): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'waflearn.js', 'w10.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'sharing.js', 'reseller.js', 'app.js'])),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'waflearn.js', 'w10.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'sharing.js', 'xfer.js', 'reseller.js', 'app.js'])),
     ];
 }
 

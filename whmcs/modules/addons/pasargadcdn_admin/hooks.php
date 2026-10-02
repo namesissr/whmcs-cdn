@@ -228,6 +228,21 @@ add_hook('ClientAreaHomepagePanels', 1, function ($panels) {
         } catch (\Throwable $e) {
             // the home page never breaks because of this card
         }
+        // SPEC §19.3: «درخواست انتقال دامنه» — transfers other clients asked to move to this account (accept / decline)
+        try {
+            if (pasargadcdn_admin_xfer_load() && ($card = \PasargadCdn\Admin\CustomerTransfer::homeCard($uid)) !== '') {
+                $en = function_exists('pasargadcdn_lang') && \pasargadcdn_lang([]) === 'en';
+                $panels->addChild('pasargadcdn_transfer_requests', [
+                    'label' => $en ? 'Domain transfer to your account' : 'درخواست انتقال دامنه به حساب شما',
+                    'icon' => 'fa-exchange-alt',
+                    'order' => 238,
+                    'extras' => ['color' => 'orange', 'btn-link' => \PasargadCdn\Admin\CustomerTransfer::ROUTE, 'btn-text' => $en ? 'View and answer' : 'مشاهده و پاسخ'],
+                    'bodyHtml' => $card,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            // the home page never breaks because of this card
+        }
         if (!\PasargadCdn\Admin\Referrals::on()) {
             return;
         }
@@ -336,6 +351,16 @@ add_hook('AfterCronJob', 1, function ($vars) {
             logActivity('Pasargad CDN: share cron hook error: ' . $e->getMessage());
         }
     }
+    // SPEC §19.3: open customer transfer requests past their 7 days → expired, invalid ones cancelled (once a day)
+    try {
+        if (pasargadcdn_admin_xfer_load()) {
+            \PasargadCdn\Admin\CustomerTransfer::onCron();
+        }
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: customer transfer cron hook error: ' . $e->getMessage());
+        }
+    }
     // SPEC §16.8: object-storage charges of the previous month (once, after the month closes)
     try {
         require_once __DIR__ . '/lib/Env.php';
@@ -394,22 +419,71 @@ if (!function_exists('pasargadcdn_admin_shared_links')) {
     }
 }
 
+/** SPEC §19.3: loads the customer-transfer library (false when the server module is missing). */
+if (!function_exists('pasargadcdn_admin_xfer_load')) {
+    function pasargadcdn_admin_xfer_load(): bool
+    {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/Data.php';
+        require_once __DIR__ . '/lib/Pages.php';
+        require_once __DIR__ . '/lib/Operator.php';
+        require_once __DIR__ . '/lib/Transfer.php';
+        require_once __DIR__ . '/lib/CustomerTransfer.php';
+        return \PasargadCdn\Admin\Env::loadServerModule();
+    }
+}
+
+/** SPEC §19.3: menu label «درخواست‌های انتقال دامنه (n)» when transfers wait for this client's answer, else null. */
+if (!function_exists('pasargadcdn_admin_xfer_hint')) {
+    function pasargadcdn_admin_xfer_hint(int $uid): ?string
+    {
+        if ($uid <= 0) {
+            return null;
+        }
+        try {
+            if (!pasargadcdn_admin_xfer_load()) {
+                return null;
+            }
+            $n = \PasargadCdn\Admin\CustomerTransfer::pendingCount($uid);
+            if ($n <= 0) {
+                return null;
+            }
+            return function_exists('pasargadcdn_lang') && \pasargadcdn_lang([]) === 'en' ? 'Domain transfer requests (' . $n . ')'
+                : 'درخواست‌های انتقال دامنه (' . strtr((string) $n, ['0' => '۰', '1' => '۱', '2' => '۲', '3' => '۳', '4' => '۴', '5' => '۵', '6' => '۶', '7' => '۷', '8' => '۸', '9' => '۹']) . ')';
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+}
+
 // SPEC §20.3: «دامنه‌های اشتراکی» under the client-area «Services» menu (only for clients with a share or an invite)
+// SPEC §19.3: «درخواست‌های انتقال دامنه (n)» next to it while transfers wait for this client's answer
 add_hook('ClientAreaPrimaryNavbar', 1, function ($navbar) {
     try {
         if (!is_object($navbar) || !method_exists($navbar, 'getChild')) {
             return;
         }
-        $info = pasargadcdn_admin_shared_links(pasargadcdn_admin_client_id());
-        if ($info === null) {
+        $uid = pasargadcdn_admin_client_id();
+        $items = [];
+        $info = pasargadcdn_admin_shared_links($uid);
+        if ($info !== null) {
+            $items['pasargadcdn-shared-domains'] = ['label' => $info['label'], 'uri' => \PasargadCdn\Admin\Sharing::ROUTE, 'order' => 15];
+        }
+        $xfer = pasargadcdn_admin_xfer_hint($uid);
+        if ($xfer !== null) {
+            $items['pasargadcdn-transfer-requests'] = ['label' => $xfer, 'uri' => \PasargadCdn\Admin\CustomerTransfer::ROUTE, 'order' => 16];
+        }
+        if (!$items) {
             return;
         }
         $services = $navbar->getChild('Services');
-        $item = ['label' => $info['label'], 'uri' => \PasargadCdn\Admin\Sharing::ROUTE, 'order' => 15];
-        if (is_object($services) && method_exists($services, 'addChild')) {
-            $services->addChild('pasargadcdn-shared-domains', $item);
-        } else {
-            $navbar->addChild('pasargadcdn-shared-domains', $item + ['order' => 25]);
+        foreach ($items as $key => $item) {
+            if (is_object($services) && method_exists($services, 'addChild')) {
+                $services->addChild($key, $item);
+            } else {
+                $navbar->addChild($key, ['order' => $item['order'] + 10] + $item);
+            }
         }
     } catch (\Throwable $e) {
         // the menu never breaks because of this item
@@ -428,7 +502,17 @@ add_hook('ClientAreaSecondarySidebar', 1, function ($sidebar) {
         if ($script !== 'clientarea.php' || !in_array($action, ['products', 'services', 'productdetails'], true)) {
             return;
         }
-        $info = pasargadcdn_admin_shared_links(pasargadcdn_admin_client_id());
+        $uid = pasargadcdn_admin_client_id();
+        // SPEC §19.3: transfers waiting for this client's answer
+        $xfer = pasargadcdn_admin_xfer_hint($uid);
+        if ($xfer !== null) {
+            $xbox = $sidebar->addChild('pasargadcdn-transfer-requests', ['label' => $xfer, 'icon' => 'fa-exchange-alt', 'order' => 4]);
+            if (is_object($xbox) && method_exists($xbox, 'addChild')) {
+                $xbox->addChild('pcdn-xfer-open', ['label' => function_exists('pasargadcdn_lang') && \pasargadcdn_lang([]) === 'en'
+                    ? 'View and answer' : 'مشاهده و پاسخ', 'uri' => \PasargadCdn\Admin\CustomerTransfer::ROUTE, 'order' => 1]);
+            }
+        }
+        $info = pasargadcdn_admin_shared_links($uid);
         if ($info === null) {
             return;
         }

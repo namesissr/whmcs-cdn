@@ -50,9 +50,44 @@ class Transfers
                     $t->index('domain', 'mod_pcdn_transfers_domain');
                 });
             }
+            // SPEC §19.3: who started it (admin wizard | client request) and the request it came from (added on upgrade)
+            if (!$schema->hasColumn(self::TABLE, 'initiated_by')) {
+                $schema->table(self::TABLE, function ($t) {
+                    $t->string('initiated_by', 16)->default('admin');
+                });
+            }
+            if (!$schema->hasColumn(self::TABLE, 'request_id')) {
+                $schema->table(self::TABLE, function ($t) {
+                    $t->integer('request_id')->default(0);
+                });
+            }
             return true;
         } catch (\Throwable $e) {
             return false;
+        }
+    }
+
+    /** SPEC §19.3 customer transfer requests (the addon's Admin\CustomerTransfer owns them; the module only cancels). */
+    const REQUESTS = 'mod_pasargadcdn_transfer_requests';
+    const OPEN = ['pending', 'awaiting'];
+
+    /**
+     * The service was suspended / terminated / transferred / cancelled meanwhile: its open customer request ends
+     * (status cancelled + reason). $except keeps the request that is being executed. Returns the count; never throws.
+     */
+    public static function cancelRequests(int $sid, string $reason, int $except = 0): int
+    {
+        if ($sid <= 0) {
+            return 0;
+        }
+        try {
+            $q = Capsule::table(self::REQUESTS)->where('service_id', $sid)->whereIn('status', self::OPEN);
+            if ($except > 0) {
+                $q->where('id', '<>', $except);
+            }
+            return (int) $q->update(['status' => 'cancelled', 'reason' => substr($reason, 0, 64), 'token_hash' => null, 'decided_at' => date('Y-m-d H:i:s')]);
+        } catch (\Throwable $e) {
+            return 0;
         }
     }
 

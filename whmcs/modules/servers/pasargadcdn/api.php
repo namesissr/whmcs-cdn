@@ -84,7 +84,8 @@ $rop = $str($_GET['rop'] ?? '');
     // read; ClientApi refuses every non-GET call for them (server side, whatever the UI shows).
     // Only writes need the decision, so reads (e.g. the 30 s live-analytics poll) skip the lookup.
     // SPEC §20.2: the sharing page (lop=shares) is refused to read-only team users even for reads.
-    'readonly' => ($method !== 'GET' || $str($_GET['lop'] ?? '') === 'shares') && TeamAccess::readonly(),
+    // SPEC §19.3: so is the customer transfer page (lop=xfer).
+    'readonly' => ($method !== 'GET' || in_array($str($_GET['lop'] ?? ''), ['shares', 'xfer'], true)) && TeamAccess::readonly(),
     // SPEC §16.10: the app's language (fa | en) for the error details it shows.
     'lang' => (string) ($_SERVER['HTTP_X_PCDN_LANG'] ?? ''),
 ]);

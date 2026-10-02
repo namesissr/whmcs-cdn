@@ -27,6 +27,8 @@ final class Pages
         'operator' => ['دامنه‌های اپراتور', 'zap'],
         // SPEC §19.2: the transfer wizard (pick a domain, then destination, options, preview)
         'transfer' => ['انتقال دامنه', 'users'],
+        // SPEC §21: per-domain feature overrides
+        'features' => ['امکانات اختصاصی', 'sliders'],
         'edges' => ['نودها', 'server'],
         'plans' => ['پلن‌ها و قیمت‌گذاری', 'tag'],
         'analytics' => ['آنالیتیکس', 'chart'],
@@ -972,6 +974,10 @@ final class Pages
 
         $t = '<div class="pcdna-table-wrap pcdna-sites-wrap"><table class="pcdna-table pcdna-sites"><thead><tr><th>دامنه / سرویس</th><th>مشتری</th>'
             . '<th>WHMCS / سررسید</th><th>وضعیت CDN</th><th>NS</th><th>SSL</th><th>ترافیک این ماه</th><th><span class="pcdna-sr">عملیات</span></th></tr></thead><tbody>';
+        // SPEC §21: «امکانات اختصاصی (n)» badges — one query for the page
+        $foCounts = class_exists('\\PasargadCdn\\FeatureOverrides') ? \PasargadCdn\FeatureOverrides::counts(array_map(function ($r) {
+            return \PasargadCdn\FeatureOverrides::serviceKey((int) $r->id);
+        }, $rows)) : [];
         foreach ($rows as $svc) {
             $sid = (int) $svc->id;
             $site = $usage === null ? false : Data::siteFor($svc, $ix);
@@ -1028,8 +1034,13 @@ final class Pages
             $menu .= '<a class="pcdna-menu-item" href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '">' . View::icon('external') . '<span>صفحه سرویس در WHMCS</span></a>';
             if ($live) {
                 // SPEC §19.2: «انتقال دامنه» to another client or to the operator
-                $menu .= '<a class="pcdna-menu-item" href="' . View::url(['page' => 'transfer', 'service' => $sid]) . '">' . View::icon('users') . '<span>انتقال دامنه</span></a>';
+                $menu .= '<a class="pcdna-menu-item" href="' . View::url(['page' => 'transfer', 'service' => $sid]) . '">' . View::icon('users') . '<span>انتقال دامنه</span></a>'
+                    // SPEC §21: per-domain feature overrides
+                    . '<a class="pcdna-menu-item" href="' . View::url(['page' => 'features', 'service' => $sid]) . '">' . View::icon('sliders') . '<span>امکانات اختصاصی</span></a>';
             }
+            $foN = (int) ($foCounts['service:' . $sid] ?? 0);
+            $foBadge = $foN > 0 ? '<a class="pcdna-fo-badge" href="' . View::url(['page' => 'features', 'service' => $sid]) . '" data-overrides="' . $foN . '" title="این دامنه امکانات اختصاصی دارد (جدا از پلن محصول)">'
+                . View::badge('امکانات اختصاصی (' . View::n($foN) . ')', 'violet') . '</a>' : '';
             $tunnel = '';
             if ($det && !empty($det['plan']['features']['tunnel'])) {
                 $tc = (array) ($det['config']['tunnel'] ?? []);
@@ -1047,7 +1058,8 @@ final class Pages
             $t .= '<tr data-service="' . $sid . '"><td class="pcdna-domain-cell"><a class="pcdna-domain" href="' . self::manageUrl($sid) . '">' . View::ltr($domain !== '' ? $domain : '—') . '</a>'
                 . '<div class="pcdna-small pcdna-muted"><a href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '" title="صفحه سرویس در WHMCS">#' . View::n($sid) . '</a> · '
                 . View::e($svc->product) . '</div>' . ($tunnel !== '' ? '<div class="pcdna-tn-line">' . $tunnel . '</div>' : '')
-                . ($suggest !== '' ? '<div class="pcdna-tn-line">' . $suggest . '</div>' : '') . '</td>'
+                . ($suggest !== '' ? '<div class="pcdna-tn-line">' . $suggest . '</div>' : '')
+                . ($foBadge !== '' ? '<div class="pcdna-tn-line">' . $foBadge . '</div>' : '') . '</td>'
                 . '<td class="pcdna-client" data-label="مشتری"><a href="' . View::e(Data::clientUrl((int) $svc->userid)) . '">' . View::e(Data::clientName($svc)) . '</a></td>'
                 . '<td data-label="WHMCS / سررسید">' . self::whmcsBadge((string) $svc->domainstatus) . '<div class="pcdna-small pcdna-muted pcdna-nowrap" title="سررسید بعدی">' . View::e(View::date($svc->nextduedate)) . '</div></td>'
                 . '<td data-label="وضعیت CDN">' . $cdnCell . '</td><td data-label="NS">' . $ns . '</td><td data-label="SSL">' . $ssl . '</td><td class="pcdna-traffic" data-label="ترافیک این ماه">' . $traffic . '</td>'
