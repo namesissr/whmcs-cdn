@@ -1593,3 +1593,659 @@ operator can override any of them for one domain without changing the product.
 - Transfers (§19): overrides move with the domain (service id re-keyed / operator domain key moved);
   the transfer wizard shows them in the preview with an option to drop them.
 - Billing: overrides never create invoices; storage_gb / addon traffic billing keep their own rules.
+
+## 22. Wave 13: tunnel (VPN-over-CDN) speed and stability
+
+**Hard constraint (applies to every item below, like §15).** Nothing in this wave may have as its
+purpose or main effect evading filtering/blocking, hiding or rotating node IP addresses, reducing a
+detection/filter rate, traffic obfuscation or fragmentation tricks, or choosing/recommending nodes by
+"what is not blocked". Node selection stays health/load/capacity driven. The synthetic probe (§22.3)
+tests the node's **own** health (its nginx, TLS, proxy path, CPU) against a platform test origin over
+loopback or an operator-run echo origin — never reachability from user networks, ISPs or countries.
+The speed test (§15.6) and every new page never expose node IPs. Client guides (§22.11) recommend
+stability settings only (keepalive, mux, protocol choice); they never recommend fragment/noise/padding
+options, SNI tricks or address lists. Reviewers reject any PR that crosses this line.
+
+Scope: make long-lived tunnel sessions survive node maintenance and config churn, detect and route
+around a node whose tunnel path is broken, fail over between customer origins, and explain drops.
+Everything stays buildable and testable without real ISPs: controller tests on SQLite, edge unit tests
+with fake `/proc`/`/proc/sys` and `nginx -t` (real nginx where CI has it), WHMCS `php -l` + harness.
+
+**Alembic:** one new revision **`0022`** (`0022_tunnel_stability.py`, `down_revision = "0021"`), idempotent
+like 0021 (inspect existing columns first; `_KW` with `sqlite_autoincrement` for `sites`). Contents in
+§22.13.
+
+### 22.0 Audit summary (what exists today)
+| # | item | exists | main gap |
+|---|---|---|---|
+| 1 | drain mode | `Edge.enabled=false` (maintenance: withdraws from DNS at once); install.sh `--upgrade` reloads nginx gracefully; draining worker generations are already counted (`heartbeat.count_draining_workers`) | no "drain then upgrade" flow, no refusal of NEW tunnel connections, no API/button/flag |
+| 2 | fewer reloads | F5 coalescing (`RELOAD_DEBOUNCE`=5, `RELOAD_MIN_INTERVAL`=120, ×2 back-pressure while > 2×nproc generations drain), F20 identical-tree skip, F21 foreign-group defer (`FOREIGN_DEFER`=900); `worker_shutdown_timeout` 1h (install.sh `--shutdown-timeout`); heartbeat `metrics.draining_workers`, `sock_tcp`, `sock_tw` | controller **drops** `draining_workers`/`sock_*` (`routes_edge.Metrics` ignores unknown keys); no reload counters; no hard upper bound on total deferral; WST not RAM/role aware; no memory guard |
+| 3 | synthetic tunnel probe | controller probe of `http://<ip>/__pcdn/health` (§8.1, `job_probe`), PowerDNS `ifurlup` | nothing exercises a WS/gRPC session through the node's own nginx; no "tunnel degraded" state |
+| 4 | multi-origin per path | `TunnelPath.pool` → section `pools` (gated by plan `load_balancer`/`max_pools`; ≤20 origins, `backup`, `weighted`/`ip_hash`), njs `tunnelUpstream` with rendezvous affinity for xhttp/h2 (F1), keepalive upstreams for IP members (F11), njs HTTP health (`pcdn_hc`, `checkOrigin`) | VPN origins rarely answer an HTTP health check (only `health.path`/`expect` HTTP via `ngx.fetch`); no TCP check; no inline origins on a path; no plan limit `max_tunnel_origins`; WHMCS UI only via the LB pools page |
+| 5 | timeout alignment | site `tunnel.idle_timeout` (60..86400, default 3600) → `proxy/grpc_read/send_timeout`, `client_body_timeout`; tunnel hosts `keepalive_timeout 600s`, `keepalive_time 6h`, `send_timeout min(idle,300)`; listeners `so_keepalive=120s:30s:4` | per-path override missing; the client app and the checker (`tcheck.js`) never show or compare these values |
+| 6 | kernel tuning | install.sh `/etc/sysctl.d/999-pcdn.conf` (fq, bbr/cubic, somaxconn 65535, backlog, rmem/wmem max 64 MB fixed, `tcp_notsent_lowat` 131072, keepalive, conntrack 1M + hashsize, F30 verify-with-warning), `LimitNOFILE=1048576`, `worker_rlimit_nofile 524288` | not RAM-scaled (64 MB buffers on a 1 GB node), not re-verified at runtime, not reported/visible |
+| 7 | upstream keepalive | `upstream pcdn_tn_*` blocks with `keepalive TUNNEL_KEEPALIVE` (64), `keepalive_time 1h` for **IP-literal** origins of xhttp/grpc/h2 (and pool members) | host-name origins are resolved per request (`$pcdn_tn_target` + resolver) → no reuse; no reuse metric |
+| 8 | faster TLS | ACME certs are already ECDSA P-256 (`ssl.py --keylength ec-256`); `ssl_session_cache shared:pcdn_ssl:50m`, `ssl_session_timeout 1d`; `ssl_session_tickets off` | no cross-node resumption (tickets off, per-node cache), no RSA fallback cert, no OCSP stapling |
+| 9 | HTTP/3 | node capability `http3` (nginx ≥ 1.25.1 + `--with-http_v3_module`, install.sh `--http3`), per-site `ssl.http3` (default true), `listen … quic` + `Alt-Svc` | no per-node admin switch; the controller/client app never tell the customer whether every node of their group speaks h3, so an h3 client config is a gamble |
+| 10 | capacity-weighted DNS | `capacity_mbps` per edge, load shedding with hysteresis (`update_shed`, `rebalance_pool_shed`), selectors `random`/`all`/`hashed`/`first`/`pickclosest`, tunnel sites `TUNNEL_LUA_SELECTOR=all` | every advertised address has equal weight |
+| 11 | client-app guide | tutorials (`tutorials.js`) incl. a generic mux tip; link/config generator (`tunnel.js tunnelConfig`) | nothing derived from the site's paths + edge timeouts; no per-app recommended values |
+| 12 | "why did it drop?" | §15.1 `abnormal` (error-log based), `errors` (connect failures), §15.4 origin down | no classification of session ends; reload/drain/idle cuts are invisible |
+
+### 22.1 Node drain before upgrade/restart
+**States** (controller `Edge.drain_state`): `""` (none) → `draining` → `drained` → `""`.
+- **DNS**: an edge whose `drain_state` ∈ {`draining`,`drained`} is left out of every zone answer
+  (`dnsbuild.dns_edges`, after the group filter), with the same fail-open rule as shed: never empty a
+  group+region pool (if every edge of that pool would be out, the draining ones stay in). The drain flag
+  is part of `scheduler.edge_dns_state` (`d1`/`d0`) so the next `job_edges` tick rewrites zones; the drain
+  endpoints also call `sync_all_dns` immediately (like `PATCH /edges/{id}`). A draining edge is also left
+  out of `shield_peers`.
+- **Refusing new tunnel connections** happens on the node only after a DNS grace so clients with a fresh
+  answer are never refused: `refuse_after = started_at + PROXIED_TTL + 30 s`. From then on, a tunnel
+  request that is the **first request on its client connection** (`$connection_requests = 1`) gets
+  `503` with `Retry-After: 30` and `Connection: close`. Not refused: requests on existing connections
+  (upgraded WS/HTTPUpgrade sessions are never re-checked; new gRPC/h2 streams on an existing HTTP/2
+  connection; xhttp POSTs — `$pcdn_tn_isget = 0` — are never refused, like fair share), and all
+  non-tunnel web traffic (short requests, still served). Implemented as a njs flag, **not** a reload: the
+  agent sets `drain=1|0` on its existing localhost call (`/__pcdn/fair?hot=…&drain=1`, stored in the
+  `pcdn_fair` dict under key `drain`, expires with the zone timeout 180 s → fail open if the agent stops)
+  and `tunnel_loc` renders `if ($pcdn_tn_drain) { return 503; }` right after the fair-share line
+  (`js_set $pcdn_tn_drain pcdn.tunnelDrain`: `"1"` only when the flag is set AND `$connection_requests == 1`
+  AND not an xhttp POST). These 503s are rejections (never session ends) and count as §15.1
+  `errors.edge`. Capability flag `capabilities.drain: true` tells the controller the agent enforces it.
+- **Drained**: the agent reports `drained` when, for 2 consecutive checks (every 10 s while draining),
+  ESTABLISHED client connections on the public ports (`metrics.connections` source) ≤ `DRAIN_IDLE_CONNS`
+  (agent.conf, default 10, 0..100000), or when `until` is reached. The controller also flips to
+  `drained` when `now ≥ drain_until`.
+- **Auto-undrain safety**: a drain is cleared automatically (alert `edge_drain_stuck:<id>`, audit
+  `edge.undrain` by `system`) `DRAIN_MAX_HOLD_MINUTES` (controller env, default 120, 10..1440) after
+  `drain_until`, so a forgotten drain never keeps a node out of DNS forever.
+- **Who drains**: the admin (panel button / admin API) or the edge itself (`bootstrap.sh/install.sh
+  --upgrade --drain`, edge token). An edge-initiated drain may only drain itself.
+- **Refusal (409)**: when draining would leave the edge's group+region with no online, enabled,
+  non-shed, non-draining edge: `{"detail": "last_edge"}` — the admin may pass `force: true`; the edge
+  endpoint has no force.
+
+**Controller API (A)**
+- `POST /api/v1/edges/{id}/drain` body `{"minutes": 15, "reason": "upgrade"?, "force": false}`
+  (minutes 1..120, default `DRAIN_DEFAULT_MINUTES`=15; reason ≤ 64 printable chars, default `"admin"`)
+  → `200 {"ok": true, "dns_failed": n, "edge": <edge_to_dict>}`; 404 unknown edge; 409 `last_edge`;
+  409 `{"detail": "already_draining"}` when draining (re-POST with a different `minutes` while draining
+  only extends/shortens `drain_until`: allowed, 200). Audit `edge.drain` {minutes, reason, force}.
+- `DELETE /api/v1/edges/{id}/drain` → `200 {"ok": true, "dns_failed": n, "edge": …}` (idempotent;
+  audit `edge.undrain`).
+- `POST /edge/v1/drain` (edge token) body `{"action": "start", "minutes": 15, "reason": "upgrade"}` |
+  `{"action": "stop"}` → `200 {"state": "draining"|"", "until": iso|null, "refuse_after": iso|null}`;
+  409 `last_edge`; 422 on bad input. Rate limit: ≤ 10 calls/min/edge (429).
+- `edge_to_dict` gains `"drain": {"state": ""|"draining"|"drained", "since": iso|null, "until": iso|null,
+  "by": "admin"|"edge"|null, "reason": str|null, "conns": int|null}` (`conns` from the latest heartbeat).
+- Every drain start/stop/auto-drained transition writes an `edge_events` row (§22.13).
+
+**Edge config (controller → edge)**: `node.drain = {"state": ""|"draining"|"drained",
+"refuse_after": iso|null, "until": iso|null}` (only the requesting edge's own state; `{"state": ""}`
+when none). Changing it changes the config version, but the agent treats a `node.drain`-only change as
+**agent-side only** (it is not rendered into nginx; see §22.2 "non-rendered keys"), so it never reloads.
+
+**Heartbeat (edge → controller)**: `"drain": {"state": ""|"draining"|"drained", "conns": int,
+"since": iso|null}`. Controller: `draining` + edge reports `drained` → `drained`.
+
+**Agent / bootstrap (B)**
+- `pcdn-agent drain --minutes N [--reason R] [--wait] [--timeout S]`: POST `/edge/v1/drain` start, set
+  the local flag at `refuse_after`, with `--wait` poll every 10 s printing `connections` until drained or
+  `until` (+ `--timeout`, default minutes×60+60), exit 0 when drained/until reached, 3 on `last_edge`
+  (message printed in English + Persian), 2 on other errors. `pcdn-agent undrain` → action stop + flag 0.
+  The CLI talks to the controller directly (same `Controller` class) and writes `state["drain"]`
+  (`{"state","since","until","refuse_after","by":"edge","upgrade":true|false}`) into the agent state file
+  under the state-file lock the loop already uses (the running agent picks it up on its next tick).
+- `bootstrap.sh` and `install.sh` accept `--drain` and `--drain=<minutes>` (1..120, default 15), valid
+  only with `--upgrade` (error otherwise). bootstrap forwards it. install.sh, **before** touching nginx
+  or the agent: if `/usr/local/bin/pcdn-agent` (installed agent) supports `drain` (`pcdn-agent drain
+  --help` exits 0), run `pcdn-agent drain --minutes N --reason upgrade --wait`; exit code 3 → abort the
+  upgrade with the message «این آخرین نود فعال گروه است؛ بدون --drain به‌روزرسانی کنید» / "this is the
+  last active node of its group; upgrade without --drain"; any other failure → warn and continue without
+  drain. An installed agent too old for `drain` → warn and continue (old → new upgrade path).
+- After the upgrade the new agent **undrains automatically** only when the drain was an upgrade drain
+  (`state["drain"]["upgrade"] = true`) and, after restart, (a) its first config apply succeeded and (b)
+  the first local tunnel probe (§22.3) passed or is unsupported; then `POST /edge/v1/drain {"action":
+  "stop"}` and flag 0. An admin drain is never auto-undrained by the agent.
+- `--drain` never changes `worker_shutdown_timeout`: sessions still on the node at `until` follow the
+  graceful reload (they keep running in the old worker generation up to WST).
+
+**WHMCS admin (C)**: Nodes page row: badge «در حال تخلیه (تا HH:MM)» / «تخلیه شد»; row menu «تخلیه برای
+به‌روزرسانی…» (dialog: minutes 1..120, default 15; shows the 409 `last_edge` reason «آخرین نود فعال این
+گروه/منطقه است» with a «با این حال تخلیه کن» force checkbox) and «لغو تخلیه». Node detail: `drain`
+block with `conns`. Admin actions go through the addon's existing PATCH-style Admin.php handlers
+(CSRF + admin auth), audited in the WHMCS activity log.
+
+**Tests**: A — drain DNS exclusion + fail-open per group/region, 409 last_edge vs force, edge endpoint
+self-only + rate limit, auto `drained` at until, auto-undrain after max hold (+ alert), config
+`node.drain` shape, `edge_dns_state` changes, heartbeat transition, shield peers exclusion.
+B — njs drain predicate (first request only, xhttp POST exempt, flag expiry), rendered `if
+($pcdn_tn_drain)` line, CLI exit codes with a fake controller, upgrade-drain auto-undrain conditions,
+`bash -n` + an install.sh arg-parsing test (`--drain` without `--upgrade` fails; `--drain=0` fails).
+C — `php -l`, harness: button → controller call, 409 force flow, badge rendering.
+
+### 22.2 Fewer nginx reloads
+Keep F5/F20/F21 as they are and add:
+- **Hard upper bound**: `RELOAD_MAX_WAIT` (agent.conf, default 900 s, 60..3600): a pending version older
+  than this is applied on the next poll regardless of back-pressure doubling or F21 foreign deferral
+  (back-pressure may still double `RELOAD_MIN_INTERVAL`, capped at `RELOAD_MAX_WAIT`).
+- **Non-rendered keys**: the agent already computes the rendered-tree digest (F20). The following config
+  keys are consumed agent-side only and MUST NOT influence the rendered tree: `node.drain`,
+  `node.probe`, `node.dns_weight` (informational) — so a change of only those keys is F20-skipped (no
+  reload). Unit test: two bodies differing only in these keys give the same `tree_digest`.
+- **Ticket-key rotation** (§22.8) changes a global file and therefore reloads once per rotation (≤ 1/day
+  by default); documented.
+- **worker_shutdown_timeout**: install.sh `--shutdown-timeout auto` becomes the default: RAM < 4 GiB →
+  `30m`; 4–8 GiB → `2h`; ≥ 8 GiB → `4h`; `--role tunnel` adds nothing extra (RAM is the limit). An explicit
+  value (`--shutdown-timeout 1h`) wins and is stored as `SHUTDOWN_TIMEOUT=<value>` in agent.conf so
+  `--upgrade` keeps it; `--upgrade` of an edge without that line keeps the value in nginx.conf (no silent
+  change of an operator's existing WST). Never seconds-only values < 60 (rejected: hard cut).
+- **Memory guard** (agent): when `mem_pct ≥ MEM_GUARD_PCT` (agent.conf, default 92, 50..99, 0 = off) for 2
+  consecutive heartbeats AND shutting-down workers exist, send `SIGTERM` to the **oldest** shutting-down
+  worker (lowest start time from `/proc/<pid>/stat`), at most one per 60 s; log WARN; record
+  `{"t", "pid"}` into `state["forced_shutdowns"]` (≤ 200, 48 h) for §22.12 classification
+  (`node_reload`). Never touches the master or current-generation workers.
+- **Metrics** in the heartbeat (new object, B emits, A stores):
+  `"reloads": {"count_1h": int, "count_24h": int, "last_at": iso|null, "coalesced_1h": int,
+  "pending_s": int, "deferred": bool, "wst_s": int|null, "forced_shutdowns_24h": int}` where
+  `coalesced_1h` = config versions seen but superseded before being applied, `pending_s` = age of the
+  pending version (0 when none), `wst_s` = `worker_shutdown_timeout` parsed from `NGINX_CONF`
+  (`1h`/`30m`/`600s`/`600` forms; null when absent). The agent keeps `state["reload_times"]`
+  (epoch seconds of successful reloads, last 48 h, ≤ 500) — also used by §22.12.
+- **Controller (A)**: `routes_edge.Metrics` gains optional `draining_workers: int|None (0..100000)`,
+  `sock_tcp`, `sock_tw: int|None (0..10^9)`; `Heartbeat.reloads` (model above; malformed → ignored, never
+  422); stored on `Edge.reload_stats` (Text JSON); exposed in `edge_to_dict["reloads"]` and in the
+  `/metrics` Prometheus output as `pcdn_edge_reloads_1h{edge}`, `pcdn_edge_draining_workers{edge}`.
+  Alert `edge_reload_storm:<id>` when `count_1h > 12` for 3 consecutive heartbeats (resolves when ≤ 6),
+  `edge_draining_pileup:<id>` when `draining_workers > 4 × cpus` for 5 heartbeats.
+- **WHMCS admin (C)**: Node detail shows «تعداد بارگذاری مجدد در ساعت/۲۴ ساعت», «نسل‌های در حال تخلیه»,
+  «مهلت خاموشی کارگرها (WST)», «تغییرات ادغام‌شده».
+- **Tests**: B — RELOAD_MAX_WAIT forcing apply under back-pressure/F21, digest invariance for non-rendered
+  keys, WST parser, memory-guard victim selection with a fake `/proc` (never the newest generation,
+  rate-limited), reload counters. A — Metrics/reloads acceptance (+ malformed ignored), alert hysteresis,
+  `/metrics` lines. install.sh: `--shutdown-timeout auto` table via a testable function (RAM from a fake
+  `/proc/meminfo` path variable) in `edge/tests/test_install_agent.py`.
+
+### 22.3 Synthetic tunnel probe per node
+**What it tests**: the node's own public listener, TLS, worker health and tunnel proxy path. Every
+`PROBE_INTERVAL` (agent.conf, default 60 s, 30..600; `PROBE_ENABLED=yes|no`, default yes) a background
+thread of the agent (never blocking the main loop; total budget 10 s) runs:
+- **WS probe**: TCP connect to `127.0.0.1:HTTPS_PORT`, TLS with SNI `probe.pcdn.invalid` (self-signed
+  probe certificate, verification skipped), `GET /__pcdn_probe/ws` with `Upgrade: websocket`, then
+  3 × 1 KiB random binary messages echoed back byte-identically, then `down:<PROBE_BYTES>` →
+  the origin sends that many bytes (download), then one upload of `PROBE_BYTES` → the origin answers
+  `up:<n>`. `PROBE_BYTES` default 262144 (16384..4194304).
+- **gRPC probe** (only when `curl` with HTTP/2 is present: `curl -V` lists `HTTP2`): `curl --http2
+  -sk --resolve probe.pcdn.invalid:<port>:127.0.0.1 -X POST -H 'content-type: application/grpc' -H
+  'te: trailers' --data-binary @<5-byte grpc frame> https://probe.pcdn.invalid:<port>/__pcdn_probe/grpc`
+  expecting HTTP 200 and a body of exactly `PROBE_BYTES` (download), with `-w` timings for setup.
+  Otherwise the gRPC probe is `"unsupported"`.
+- Metrics per probe: `setup_ms` (connect → 101/first response header), `echo_ok`, `down_kbps`,
+  `up_kbps` (ws only), `error` (≤ 120 chars, no addresses).
+- A probe **fails** when it errors, the echo mismatches, or `setup_ms > 3000`.
+
+**Nginx side (B)**: `http.conf` gains a probe server on the public HTTPS listener(s) (plain
+`listen <https-port> ssl;` lines like a site, no options) with `server_name probe.pcdn.invalid`,
+`ssl_certificate /etc/pcdn/probe/probe.crt` (agent-generated with `openssl req -x509 -newkey ec -pkeyopt
+ec_paramgen_curve:P-256 -days 3650 -subj /CN=probe.pcdn.invalid`, 0600 key, outside the swapped tree like
+the speed file; no openssl → probe disabled and reported `unsupported`), `allow 127.0.0.0/8; allow ::1;
+deny all;` (public clients get 403 and nothing is logged as usage: `access_log off`), and two locations
+rendered with the **same `tunnel_loc` code path** a customer `ws` / `grpc` tunnel path uses (so the probe
+exercises the real directives), pointing to:
+- `PROBE_ECHO_PORT` (default 8092): a loopback WS echo origin served by a daemon thread of the agent
+  (`pcdn_agent/probe.py`, stdlib only; HTTP/1.1 upgrade, RFC 6455 frames, `down:`/`up:` commands, max
+  4 MiB per command, 16 concurrent connections, idle 30 s);
+- `PROBE_H2C_PORT` (default 8093): a loopback nginx `listen 127.0.0.1:<port> http2;` server (h2c prior
+  knowledge) answering any method with `200`, `content-type: application/grpc`, `add_trailer grpc-status
+  0 always;` and a body of `PROBE_BYTES` bytes of the speed-test file (`error_page 405 =200` to an
+  internal location so POST works with the static module).
+Both ports join `internal_ports()` (origin guard allow-list, `proxy_bind` INTERNAL_SRC) and the probe
+locations never count toward site usage, fair share, limit_conn or §15.1 telemetry (`$pcdn_tp` empty).
+- **Controller-provided origin** (optional): `node.probe = {"origin": {"host": "<ip or name>", "port":
+  int, "tls": bool} | null, "interval": 30..600}` from controller env `TUNNEL_PROBE_ORIGIN`
+  (`host:port[:tls]`, empty = local). When set, the WS probe location proxies there instead of the local
+  echo port (the gRPC probe stays local). The operator runs that echo origin with `pcdn-agent
+  echo-origin --listen 0.0.0.0:<port>` (same protocol). Never a customer origin.
+
+**Heartbeat**: `"tunnel_probe": {"at": iso, "ok": bool, "ws": {"ok": bool, "setup_ms": int|null,
+"echo_ok": bool, "down_kbps": int|null, "up_kbps": int|null, "error": str|null} | {"unsupported": true},
+"grpc": {… same without up_kbps …} | {"unsupported": true}, "consecutive_fail": int}` — `ok` = every
+supported probe passed (no supported probe → field omitted entirely). Capability flag
+`capabilities.tunnel_probe: true`.
+
+**Controller (A)**:
+- `Heartbeat.tunnel_probe` (malformed → ignored). `Edge.tunnel_probe` (Text JSON, latest),
+  `Edge.tunnel_probe_fail` / `tunnel_probe_ok` (consecutive counters), `Edge.tunnel_degraded` (bool,
+  default false), `Edge.tunnel_degraded_since`.
+- Hysteresis: `ok=false` → fail+1, ok=0; `ok=true` → ok+1, fail=0. Degraded after
+  `TUNNEL_PROBE_FAIL_CHECKS` (env, default 3, 1..20) failing reports; recovered after
+  `TUNNEL_PROBE_OK_CHECKS` (default 5) ok reports AND ≥ 10 min degraded. A heartbeat without
+  `tunnel_probe` changes nothing (old agents are never degraded); stale metrics (offline) don't count.
+- DNS: a degraded edge is left out of the answers of **tunnel sites only** (`dnsbuild.is_tunnel_site`);
+  web sites keep it. Budget: in each group+region pool, at most `floor(n × TUNNEL_DEGRADED_MAX_FRACTION)`
+  (env, default 0.5) edges are withdrawn for degradation (most-recently degraded first stay in), and the
+  pool is never emptied (fail-open). Part of `edge_dns_state` (`t1`/`t0`).
+- Alert `edge_tunnel_degraded:<id>` «مسیر تونل نود X خراب است (پروب داخلی)» opens on degradation,
+  resolves on recovery; `edge_events` rows `degraded`/`recovered`.
+- `edge_to_dict["tunnel_probe"] = {"degraded": bool, "since": iso|null, "last": <heartbeat object>|null}`.
+- Overview `GET /api/v1/overview` gains `tunnel_degraded: [edge names]`.
+
+**WHMCS admin (C)**: node list column «پروب تونل» (✓ / ✗ degraded since / «پشتیبانی نمی‌شود» / «—» old
+agent), detail: setup ms, down/up kbps per probe, last error. Nothing for clients.
+
+**Tests**: B — echo origin protocol (python client ↔ thread), WS probe against a real nginx in
+`edge/tests/test_tunnel_speed_e2e.py` (skipped without nginx), gRPC probe skipped when curl lacks HTTP2,
+403 for non-loopback, `internal_ports` includes the probe ports, probe server renders and passes `nginx -t`.
+A — hysteresis counters, DNS exclusion only for tunnel sites, budget + fail-open, alert open/resolve,
+old-agent heartbeat untouched.
+
+### 22.4 Multiple origins per tunnel path with failover
+**Section `tunnel` (controller schema, A)** — `TunnelPath` gains:
+```json
+{"id": "grpc1", "path": "/svc", "protocol": "grpc",
+ "origins": [{"address": "203.0.113.10", "port": 8443, "tls": false, "sni": null, "verify": false,
+              "weight": 1, "backup": false}, {"address": "203.0.113.11", "port": 8443, "backup": true}],
+ "balance": "failover", "health": {"type": "tcp", "interval": 10, "timeout": 3,
+                                   "path": "/", "expect": "2xx,3xx,4xx"},
+ "idle_timeout": null}
+```
+- At most one of `origin` / `origins` / `pool` (422 «برای هر مسیر تونل فقط یکی از origin، origins یا pool
+  را تعیین کنید»). `origins`: 2..10 items (`TunnelPathOrigin` = `TunnelOrigin` + `weight` 1..100 default 1
+  + `backup` default false); all items must share `tls` and `verify` (422 «همه‌ی مبدأهای یک مسیر باید
+  تنظیم TLS یکسان داشته باشند»); `sni` must be null or identical; at least one non-backup item;
+  (address, port) unique.
+- `balance`: `failover` (default: the first non-backup item is primary; implemented by sending every item
+  after the first as `backup: true` to the edge *unless* the customer set explicit backups, in which case
+  their flags are kept and `weighted` among primaries), `round_robin` (`weighted` over non-backup items),
+  `sticky_ip` (`ip_hash` over non-backup items). xhttp/h2 keep F1 rendezvous affinity in every mode.
+- `health.type`: `tcp` (default for `origins`) or `http` (the existing HTTP check; `path`/`expect`
+  validated like `Health`). `interval` 5..300 (10), `timeout` 1..30 (3), must be `< interval`.
+- Plan: **`max_tunnel_origins`** (DEFAULT_FEATURES 1, `Features` `Field(1, ge=1, le=10)`,
+  `FeaturesIn` `ge=1, le=10`): `len(origins) > max` → 403 PermissionError «حداکثر {n} مبدأ برای هر مسیر
+  تونل در پلن شما مجاز است». With the default 1 no path can use `origins` (current behaviour). Paths
+  with `pool` keep the existing `load_balancer`/`max_pools` gate. Stored data with more origins than a
+  downgraded plan allows: `tunnel_for_edge` sends the first `max_tunnel_origins` items (a 1 → the path is
+  sent with `origin` only).
+- Section `pools` `Health` gains `type: Literal["http","tcp"] = "http"` (existing pools unchanged).
+- `section_warnings`: `round_robin` on an xhttp/h2 path is fine (rendezvous); warn when `health.type =
+  http` and protocol is grpc («بیشتر سرورهای gRPC به درخواست HTTP معمولی پاسخ ۲xx نمی‌دهند؛ نوع بررسی
+  را tcp بگذارید»).
+
+**Edge config (controller → edge)**: per path, exactly as stored plus, for backward compatibility,
+`origin` set to the first non-backup item when `origins` is present (old agents serve the primary only, no
+failover — documented). New key on the path: `"origins"`, `"balance"`, `"health"` (null when absent).
+Capability `capabilities.tunnel_multi_origin: true` from new agents; the admin node list flags nodes
+without it while any site uses `origins`.
+
+**Edge (B)**: `norm_tunnel` builds, for a path with valid `origins`, an internal pool named
+`tn.<path id>` (the dot keeps it out of the customer pool namespace `[a-z0-9_-]`): `method` from balance
+(`failover`/`round_robin` → `weighted` with backup flags as sent, `sticky_ip` → `ip_hash`), `protocol`
+from `tls`, origins (`hp`, `weight`, `backup`, keepalive `up` for IP literals as F11), `health` with
+`type`. The path then renders exactly like a `pool` path (`$pcdn_tn_pool`, `tunnelUpstream`), with
+`proxy_ssl_name`/`grpc_ssl_name` = the shared `sni` or `$host`. The internal pool is added to the site's
+pools passed to `site_js` (njs `pick()` unchanged). `proxy_next_upstream error timeout` + tries 2 already
+retry a failed connect on another member for a NEW session; established sessions are never moved.
+- **TCP health (agent)**: a daemon thread checks every pool origin whose `health.type = tcp` (internal and
+  customer pools): `socket.create_connection(hp, timeout)` every `interval`, at most 64 concurrent,
+  `ORIGIN_TCP_HEALTH=yes|no` (default yes). Results are pushed to nginx with `POST
+  http://127.0.0.1:<HTTP_PORT>/__pcdn/hc` (localhost-only location, njs `hcSet`, body `{"<site>|<pool>|<hp>":
+  <consecutive fails>}`, ≤ 4096 keys per call) into the existing `pcdn_hc` dict; njs `health()` skips pools
+  with `type = tcp`. Failures count like HTTP ones (`HC_FALL`). If the agent stops, entries age out
+  (dict timeout 3600 s; `isUp` treats a missing entry as up → fail open). The origin guard still applies
+  (the agent never connects to blocked/private addresses: it reuses `origin_hp_allowed`).
+- Telemetry: §15.1 counters stay per path id; the per-edge quality table is unchanged.
+
+**WHMCS client (C)**: tunnel path editor (`tunnel.js`): when `max_tunnel_origins > 1`, «سرورهای مبدأ»
+list (add/remove/reorder, port, weight, «پشتیبان» toggle), «روش توزیع»: «جایگزینی خودکار (اصلی/پشتیبان)»
+/ «چرخشی» / «ثابت برای هر IP کاربر», «بررسی سلامت»: «اتصال TCP (پیشنهادی)» / «HTTP». With
+`max_tunnel_origins = 1` show an upsell hint («برای چند سرور مبدأ پلن را ارتقا دهید»). The link/config
+generator and the checker (§15.7) treat every origin's port as a valid listen port. Admin
+FeatureEditor/Pricing gain `max_tunnel_origins` («حداکثر مبدأ هر مسیر تونل» / "Origins per tunnel path");
+product configurable option «Tunnel Origins» (number, sent only when the product has it, like «Max
+Functions»).
+
+**Tests**: A — schema (exclusivity, 2..10, tls/verify/sni uniformity, unique, ≥1 primary), plan limit 403,
+downgrade truncation in `tunnel_for_edge` + `origin` compatibility field, pools `health.type`, origin guard
+filtering of `origins` members (blocked members dropped; a path left with 0 members dropped).
+B — internal pool build (balance → method/backup), render (`set $pcdn_tn_pool "tn.grpc1"`), njs pick with
+tcp-health dict entries, TCP checker with a local listening/closed socket, `/__pcdn/hc` refuses
+non-loopback, e2e failover: primary port closed → new WS session lands on backup, established session on
+primary untouched until it closes. C — editor round trip, upsell state, `php -l`.
+
+### 22.5 Keepalive / idle timeout alignment
+- `TunnelPath.idle_timeout: int | None` (60..86400; null = the site's `idle_timeout`). Edge renders the
+  effective value per path (all places `tunnel["idle_timeout"]` is used in `tunnel_loc`); `send_timeout`
+  stays `min(idle, 300)`. Old agents ignore the key (site value applies).
+- Edge timer constants become one documented contract (B keeps them in `render/site.py`, A mirrors them in
+  `tunnel.py` `EDGE_TUNNEL_TIMERS`; a controller test pins the values and the edge has a matching golden
+  test): `client_idle_s` 600 (`keepalive_timeout`, tunnel hosts), `max_connection_age_s` 21600
+  (`keepalive_time`), `h2_max_streams` 512, `tcp_keepalive` `{"idle_s":120,"interval_s":30,"count":4}`,
+  `connect_timeout_s` = `TUNNEL_CONNECT_TIMEOUT` default 10.
+- Recommended client keepalive per path: `k = max(10, min(60, floor(min(path_idle, client_idle_s) / 3)))`
+  seconds (default config → 60 s; idle 60 → 20 s). Warn when a client/server keepalive or ping interval
+  `≥ path_idle − 5` («فاصله‌ی keepalive از مهلت بیکاری لبه بیشتر است؛ اتصال بیکار قبل از ping قطع می‌شود»)
+  and when an origin-side idle timeout `< k` («سرور شما اتصال بیکار را زودتر از ping کلاینت می‌بندد»).
+- Served by `GET …/tunnel/profile` (§22.11) — `paths[].idle_timeout_s`, `read_timeout_s`,
+  `send_timeout_s`, `recommended.keepalive_s`, plus `edge` timers.
+- **Checker (`tcheck.js`, C)**: `ctx.paths[i]` gains `idle_timeout_s` and `keepalive_s` (from the profile;
+  when the profile endpoint is missing → no timeout findings). New findings (codes): `timeout.ws_heartbeat`
+  (Xray `wsSettings.heartbeatPeriod`), `timeout.grpc_idle` (Xray `grpcSettings.idle_timeout` /
+  `health_check_timeout`; sing-box grpc `idle_timeout`/`ping_timeout`), `timeout.xmux_keepalive` (Xray
+  `xhttpSettings.extra.xmux.hKeepAlivePeriod`), `timeout.origin_idle` (sing-box inbound/transport
+  `idle_timeout` below `k`), each `warning` with the recommended value; `info` «مهلت بیکاری لبه برای این
+  مسیر: N ثانیه» per matched path. TCP-level `sockopt.tcpKeepAlive*` are reported as `info` only (they do
+  not keep an idle tunnel stream alive through the edge).
+- Client app tunnel page shows per path «مهلت بیکاری: …، keepalive پیشنهادی: …».
+- **Tests**: A — profile values (site/path idle, recommended formula edge cases); B — per-path idle
+  rendering; C — tcheck unit cases (node-runnable, in the harness) for each finding code.
+
+### 22.6 Kernel / network tuning profile
+- `pcdn-agent tune [--write|--check]` (B, `pcdn_agent/tuning.py`): computes the profile from
+  `/proc/meminfo` (MemTotal) and `os.cpu_count()`:
+  | RAM | `rmem_max`/`wmem_max`, tcp_rmem/tcp_wmem max | `nf_conntrack_max` | `tcp_notsent_lowat` |
+  |---|---|---|---|
+  | < 2 GiB | 8 MiB | 262144 | 131072 |
+  | 2–8 GiB | 32 MiB | 524288 | 131072 |
+  | ≥ 8 GiB | 64 MiB (today's value) | 1048576 (today's) | 131072 |
+  `--write` writes `/etc/sysctl.d/999-pcdn-mem.conf` (sorts after `999-pcdn.conf`, overrides only these
+  keys) and runs `sysctl -p` on it; `--check` prints JSON. install.sh calls `pcdn-agent tune --write`
+  after writing `999-pcdn.conf` (idempotent; the static heredoc stays as the base). `TUNE_PROFILE=auto|off`
+  (agent.conf, default auto; off → no 999-pcdn-mem.conf, removed if present).
+- **Verification** (agent, every hour and at start; cheap reads under `PROC_SYS` = `/proc/sys`,
+  overridable for tests): expected vs actual for every key of both files, `tcp_congestion_control` (and
+  that `bbr` is in `tcp_available_congestion_control` when TCP_CC=bbr), `default_qdisc`, the qdisc actually
+  on the default interface (`tc qdisc show dev <iface>` when `tc` exists; else `null`), nginx master
+  `Max open files` from `/proc/<master pid>/limits`, `somaxconn`.
+- **Heartbeat**: `"tuning": {"profile": "auto"|"off", "ram_mb": int, "ok": bool, "cc": str|null,
+  "qdisc": str|null, "nofile": int|null, "mismatches": [{"key": str, "want": str, "have": str}]}`
+  (≤ 20 mismatches, values ≤ 64 chars). Stored as `Edge.tuning` (Text JSON), `edge_to_dict["tuning"]`.
+  Alert `edge_tuning:<id>` (info severity) while `ok=false` for ≥ 3 heartbeats.
+- **WHMCS admin (C)**: node detail «تنظیمات هسته»: ✓ or the mismatch list, CC/qdisc/nofile.
+- **Tests**: B — profile table, writer idempotence, checker with a fake `/proc/sys` tree and fake limits
+  file, heartbeat shape; A — acceptance/storage/alert.
+
+### 22.7 Persistent upstream connections (edge → origin)
+- Keep F11 (IP-literal keepalive upstreams). New: on nodes whose nginx supports `server … resolve` in
+  `upstream` (open-source nginx ≥ 1.27.3; capability `upstream_resolve`, parsed in `parse_nginx_v`), a
+  host-name origin of an xhttp/grpc/h2 path (single `origin`, `origins` members and pool members) gets
+  `upstream pcdn_tn_<sid>_h<n> { zone pcdn_tn_<sid>_h<n> 64k; server <host>:<port> resolve max_fails=0;
+  keepalive <TUNNEL_KEEPALIVE>; keepalive_timeout 300s; keepalive_requests 1000000; keepalive_time 1h; }`
+  instead of request-time resolution (needs the http-level `resolver`, which exists; on IPv6-capable nodes
+  the per-location `resolver … valid=300s` stays). Older nginx: unchanged behaviour.
+- WS/HTTPUpgrade connections cannot be reused (upgraded) — unchanged, documented.
+- **Reuse metric**: usage `tunnel.paths[<id>]` gains `reused_n` = tunnel requests whose `uct` is exactly
+  `"0.000"` (connection ready in < 1 ms: reused keepalive connection, or a same-host origin). Documented as
+  an approximation. Controller stores it (TUNNEL_PATH_COUNTERS) and `/tunnel/quality` paths gain
+  `reuse_pct = 100 × reused_n / connect_n` (null without data).
+- Capability flag `capabilities.upstream_resolve: bool` (admin visibility).
+- **Tests**: B — capability parsing (1.27.2 false / 1.27.3 true), render with/without, `nginx -t` where the
+  CI nginx supports it (skip otherwise), `reused_n` counting; A — counter merge + `reuse_pct`.
+
+### 22.8 Faster TLS
+**Session tickets shared across nodes (A + B)**
+- Controller env `TLS_TICKETS=on|off` (default **off** → nginx keeps `ssl_session_tickets off`, today's
+  behaviour) and `TLS_TICKET_ROTATE_HOURS` (default 24, 6..168).
+- Keys: 80 random bytes each (`secrets.token_bytes(80)`, nginx AES-256 format). The leader job keeps three
+  keys `next`, `current`, `previous` in the `state` table under `tls_tickets`, value **encrypted with
+  `crypto.encrypt`** (refused to enable — logged once at startup, tickets stay off — when no
+  `DATA_ENCRYPTION_KEY` is configured). Rotation every period: `previous ← current`, `current ← next`,
+  `next ← new`, `rotated_at = now`; the dropped key is overwritten (no history kept). HA-safe: only the
+  leader rotates, under a row lock / compare-and-set on `rotated_at`.
+- Edge config `node.tls_tickets = {"id": "<8 hex of sha256(current)>", "keys": ["<b64 current>",
+  "<b64 next>", "<b64 previous>"]}` or `null` when off. Order matters: nginx encrypts with the first key and
+  decrypts with all, so a node that has not yet fetched a promotion still decrypts tickets made with the
+  new current key (it already had it as `next`).
+- Edge (B): writes `tickets/0.key` … `tickets/2.key` (raw 80 bytes, base64-decoded; length checked; mode
+  0600, `tickets/` added to the 0600 list in `write_tree`) and renders at http level
+  `ssl_session_tickets on; ssl_session_ticket_key <dir>/tickets/0.key; …1.key; …2.key;` in place of
+  `ssl_session_tickets off;` (base template placeholder `{{SSL_TICKETS}}`). `null`/invalid → `off`, files
+  removed. `tickets/*` is a GLOBAL file (F21: applied at once; one reload per rotation). QUIC uses the same
+  keys.
+- **Secret handling**: keys never appear in logs, audit entries, error messages, `/metrics`, admin API
+  responses, `edge_to_dict`, node logs shipping (`nodelogs` must not read `tickets/`), or WHMCS. The config
+  version hash includes them (unavoidable) — the version string is a SHA-256 and reveals nothing. Tests
+  assert the key bytes are absent from captured logs and from `GET /api/v1/edges`.
+**Certificates**
+- ACME certificates stay ECDSA P-256. Optional RSA fallback: env `ACME_DUAL_RSA=false` (default). When true,
+  `ssl.issue` also issues an RSA-2048 certificate for the same names (`--keylength 2048`, acme.sh dir
+  `<domain>` instead of `<domain>_ecc`) into new columns `sites.ssl_cert_rsa`, `sites.ssl_key_rsa`
+  (key encrypted like `ssl_key`, property `ssl_key_rsa`); a failed RSA issuance never fails the ECDSA one
+  (logged, retried at renewal). Custom uploads are unchanged (the key type is reported).
+- Edge config `ssl` (per site): `{"cert", "key", "cert_rsa"?: str, "key_rsa"?: str, "ocsp": bool}`. The edge
+  writes `certs/<sid>.rsa.crt|.rsa.key` (0600 key, part of `cert_digests`) and renders a second
+  `ssl_certificate`/`ssl_certificate_key` pair (nginx picks by client support). Old agents ignore the extra
+  keys (ECDSA only).
+- **OCSP stapling**: controller sets `ssl.ocsp = true` only when the leaf certificate has an OCSP responder
+  URL in its AIA extension and the chain includes the issuer (Let's Encrypt certificates issued since 2025
+  carry no OCSP URL → false). Edge renders `ssl_stapling on; ssl_stapling_verify on;
+  ssl_trusted_certificate <CA_BUNDLE>;` in that server only.
+- Site dict (`site_to_dict` → client app SSL page) gains `ssl_key_type`: `"ecdsa-p256"|"ecdsa-p384"|"rsa-2048"|
+  "rsa-<n>"|null` and `ssl_dual_rsa: bool`.
+- **Tests**: A — key rotation order, encryption at rest (stored value has the `enc:v1:` prefix), leader-only,
+  off without DATA_ENCRYPTION_KEY, config block shape, absence in logs/admin API, AIA detection with test
+  certificates (fixtures in `controller/tests/fixtures`), dual RSA failure isolation (fake acme runner).
+  B — ticket files (length, mode), render on/off, `nginx -t` with ticket keys, dual cert render + `nginx -t`,
+  stapling render; logs never contain key material.
+
+### 22.9 HTTP/3 (QUIC) for XHTTP clients
+- Exists: capability `http3`, install.sh `--http3`, per-site `ssl.http3` (default true), `listen … quic`,
+  `Alt-Svc`. Tunnel locations already inherit the server's QUIC listener; only **xhttp** can run over
+  HTTP/3 (nginx does not carry WebSocket or gRPC over HTTP/3).
+- New per-node switch: `Edge.http3_enabled` (bool, default true; `EdgePatch.http3_enabled`). Edge config
+  `node.http3: bool`; the agent renders QUIC only when `caps.http3 and node.http3 is not False` (default
+  server and every site). Old agents ignore it (no switch).
+- `GET …/tunnel/profile` → `"http3": {"site": bool (ssl.http3 effective, false without SSL), "nodes":
+  int (online edges serving the site), "nodes_h3": int (of those: capability http3 AND http3_enabled),
+  "available": bool (site AND nodes > 0 AND nodes_h3 == nodes)}` and per path `"http3": bool`
+  (= available AND protocol xhttp). The client app offers an «HTTP/3» variant of the xhttp link/config
+  (`alpn=h3`) **only when `available`**; otherwise it explains «همه‌ی نودهای این سرویس هنوز HTTP/3 ندارند».
+- WHMCS admin: per-node «HTTP/3» toggle (disabled with a tooltip when the capability is missing) and a
+  group summary «HTTP/3: m از n نود».
+- Docs: firewall must allow UDP/<https-port> (`--harden-net` rate limits it per source; unchanged).
+- **Tests**: A — counts/availability (mixed group → false), PATCH http3_enabled, config `node.http3`;
+  B — render gate (caps × node flag), `nginx -t` only where an h3 nginx exists (skip in CI);
+  C — xhttp h3 variant hidden unless available.
+
+### 22.10 Capacity-weighted DNS
+- Controller env `DNS_WEIGHTS=off|capacity` (default **off** = today's equal weights).
+- Edge weight (computed per pool = group + region + family, in `dnsbuild`): base `b = capacity_mbps`, or
+  the median of the pool's known capacities when 0 (or 100 when none is known); load factor from a
+  hysteresis level stored in `Edge.dns_weight_level` (0 = 1.0, 1 = 0.5, 2 = 0.25): level up at
+  `edge_load_percent ≥ 70` (→1) / `≥ 85` (→2) for 2 consecutive reports, down when `< 60` / `< 75` for 3
+  reports (shed at `EDGE_SHED_PERCENT` still removes the edge entirely). `w = b × factor`, normalised to
+  integer levels `q = max(1, round(4 × w / max_w))` (1..4) — quantised so heartbeats don't rewrite zones;
+  `q` per edge is part of `edge_dns_state` (`w<q>`). An edge's additional addresses share its `q`.
+- Rendering (`_pick`): `random` → `pickwrandom({{q,'ip'},…})`; `hashed` → `pickwhashed({{q,'ip'},…})`;
+  with `EDGE_PROBE` (ifurlup) on — ifurlup has no weighted selector — the candidate list repeats each address
+  `q` times (selector `random`/`hashed` then picks proportionally among the up ones); `all`/`first`/
+  `pickclosest` ignore weights. Tunnel sites (`TUNNEL_LUA_SELECTOR=all`) keep
+  returning every up address exactly as today (no answer truncation or sampling: limiting which node
+  addresses a resolver sees is out of scope under the hard constraint). Equal `q` everywhere
+  → output identical to today's.
+- `edge_to_dict["dns_weight"] = {"level": 0|1|2, "q": int|null}` (null when DNS_WEIGHTS=off); node
+  config `node.dns_weight` (informational, non-rendered key, §22.2).
+- **Tests** (A): weights from capacities/median/unknown, hysteresis levels, quantisation stability (small
+  load changes → no state change), rendered Lua for each selector with/without EDGE_PROBE, equal weights →
+  byte-identical to today, fail-open interplay with shed/drain/degraded.
+
+### 22.11 Client-app guide (recommended settings per app)
+- `GET /api/v1/sites/{domain}/tunnel/profile` (client, site owner/collaborator with view) and
+  `GET /capi/v1/tunnel/profile` (scope stats) →
+```json
+{"edge": {"client_idle_s": 600, "max_connection_age_s": 21600, "h2_max_streams": 512,
+          "tcp_keepalive": {"idle_s": 120, "interval_s": 30, "count": 4}, "connect_timeout_s": 10},
+ "http3": {"site": true, "nodes": 4, "nodes_h3": 4, "available": true},
+ "paths": [{"id": "grpc1", "path": "/svc", "protocol": "grpc", "idle_timeout_s": 3600,
+            "read_timeout_s": 3600, "send_timeout_s": 300, "origins": 2, "balance": "failover",
+            "http3": false,
+            "recommended": {"keepalive_s": 60, "mux": "off", "xmux": null,
+                            "grpc": {"idle_timeout_s": 60, "health_check_timeout_s": 20,
+                                     "permit_without_stream": false},
+                            "ws_heartbeat_s": null}}]}
+```
+  404 when the plan has no `tunnel`. Values are computed by the controller (`tunnel.py`): mux `off` for
+  grpc/xhttp/h2, `"low"` (concurrency 4–8) for ws/httpupgrade; `xmux` for xhttp = `{"max_concurrency":
+  "16-32", "c_max_reuse_times": 0, "h_max_request_times": "600-900", "h_max_reusable_secs": "1800-3000",
+  "h_keepalive_period_s": keepalive_s}`; grpc idle = keepalive_s; ws heartbeat = keepalive_s (Xray ≥ 25).
+  No Persian text in this endpoint.
+- **WHMCS (C)** new page «تنظیمات پیشنهادی برنامه‌ها» (`assets/tguide.js`, pure data + render; i18n via t()
+  and `i18n-en.js`): pick app (v2rayNG, v2rayN, Streisand — Xray core; Hiddify, NekoBox, sing-box —
+  sing-box core) and path → the exact settings with the app's own field names, e.g. v2rayNG «Mux:
+  خاموش»، xhttp «XMUX» extra JSON, gRPC «idle_timeout = 60»; sing-box `multiplex.enabled=false`,
+  grpc `idle_timeout: "60s"`, `ping_timeout: "20s"`. Protocol advice: «برای پایداری gRPC یا XHTTP را
+  ترجیح دهید؛ WebSocket روی شبکه‌های ناپایدار زودتر قطع می‌شود» and the app↔protocol support table kept in
+  one data object in `tguide.js` (xhttp only for Xray-core apps). The generated vless link/config
+  (`tunnel.js tunnelConfig`) embeds the recommended values where the share-link format supports them
+  (xhttp `extra` xmux, grpc `mode=gun`); the sing-box outbound JSON gets `idle_timeout`/`ping_timeout`.
+  Never fragment/noise/padding options (hard constraint); the existing Hiddify «Fragment خاموش» hint stays.
+- capi parity: `cli`/terraform untouched this wave (no write surface).
+- **Tests**: A — profile shape, 404 without plan tunnel, collaborator viewer access, capi scope;
+  C — guide data covers 6 apps × protocols, unsupported combos explained, i18n keys present in en.
+
+### 22.12 "Why did my connection drop?" report
+**Edge (B)**: the usage item's `tunnel.paths[<id>]` gains
+`"ends": {"normal": n, "idle_timeout": n, "origin": n, "node_reload": n, "node_drain": n, "other": n}`
+— counts of **accepted** tunnel sessions that ended in that host-hour (the same population as
+`sessions`). Classification, first match wins:
+1. `node_drain`: session started before a drain start recorded in `state["drain"]`/`state["drain_log"]`
+   (≤ 50 entries, 48 h) and ended within [drain until − 3 s, drain until + 120 s] or after the drain
+   started while the agent was restarting for an upgrade drain.
+2. `node_reload`: session started (`t − rt`) before a reload R in `state["reload_times"]` and ended within
+   ±5 s of `R + wst_s` (forced end of the old worker generation), or within ±5 s of a `forced_shutdowns`
+   entry (§22.2 memory guard).
+3. `idle_timeout`: matched by an nginx error-log line of that host+path containing `timed out` (`upstream
+   timed out` / `client timed out`, attributed like §15.8).
+4. `origin`: matched by the other §15.8 abnormal error-log lines (reset / prematurely closed). (`abnormal`
+   itself stays as defined in §15.8: idle + origin.)
+5. `other`: edge-generated 5xx after acceptance.
+6. `normal`: everything else (the app or the customer's server closed the session; 499 for grpc/xhttp).
+Error-log matches are counted per host+path and subtracted from the access-log `normal` bucket (never
+below 0) — documented approximation. Old agents omit `ends`.
+**Controller (A)**:
+- `TunnelPathUsage.ends` (model, keys above, unknown keys dropped) merged like `errors`;
+  `TUNNEL_END_KEYS` constant.
+- `GET /api/v1/sites/{domain}/tunnel/drops?hours=24` (1..744) and `GET /capi/v1/tunnel/drops` →
+```json
+{"hours": 24, "total": 120,
+ "reasons": {"normal": 80, "idle_timeout": 20, "origin": 10, "node_reload": 6, "node_drain": 3, "other": 1},
+ "rejected": {"limit": 4, "origin_refused": 2, "origin_timeout": 0},
+ "paths": [{"id": "grpc1", "total": 70, "reasons": {...}, "top": "idle_timeout" | null}],
+ "series": [{"t": "<hour ISO>", "normal": 3, "idle_timeout": 1, "origin": 0, "node_reload": 0,
+             "node_drain": 0, "other": 0}],
+ "maintenance": [{"t": "<ISO>", "kind": "drain" | "upgrade"}],
+ "plan": {"over_quota_since": iso | null, "suspended": bool},
+ "top": "idle_timeout" | null, "has_data": true}
+```
+  `top` = the largest non-`normal` reason when it is ≥ 5 % of `total` (else null). `rejected` sums
+  §15.1 `errors.limit` and origin connect failures (reconnect attempts that did not get in). `maintenance`:
+  `edge_events` drain/upgrade rows of edges that served the site in the window — **no node names or
+  IPs**. `plan` from the site's current status/quota (no history needed). `has_data=false` when no
+  hour of the window carries `ends` (pre-wave-13 agents) (the page then says «گزارش دلیل قطع پس از به‌روزرسانی نودها در دسترس است»).
+- **WHMCS client (C)**: in «کیفیت تونل», a section «چرا اتصال من قطع شد؟»: donut/bars by reason, hourly
+  stacked series, per-path top reason, and one plain-Persian explanation per reason (en via i18n):
+  - `normal`: «برنامه‌ی شما یا سرور شما اتصال را بست (عادی).»
+  - `idle_timeout`: «اتصال مدتی بی‌استفاده ماند و پس از مهلت بیکاری بسته شد؛ keepalive برنامه را طبق
+    «تنظیمات پیشنهادی» کم کنید یا مهلت بیکاری مسیر را بیشتر کنید.»
+  - `origin`: «سرور شما (Xray/sing-box) اتصال را قطع کرد یا ری‌استارت شد؛ لاگ سرور را بررسی کنید.»
+  - `node_reload`: «یک نود هنگام اعمال تنظیمات جدید، اتصال‌های بسیار طولانی را پس از مهلت مجاز بست؛ برنامه
+    خودکار دوباره وصل می‌شود.»
+  - `node_drain`: «نود برای به‌روزرسانی برنامه‌ریزی‌شده تخلیه شد؛ اتصال‌های جدید به نودهای دیگر رفتند.»
+  - `other`: «خطای داخلی لبه؛ اگر تکرار شد با پشتیبانی تماس بگیرید.»
+  - `rejected.limit`: «تلاش‌های اتصال دوباره به سقف اتصال پلن یا سهم منصفانه‌ی نود خورد.»
+  - `plan.over_quota_since`: «ترافیک ماهانه‌ی سرویس تمام شده است.»
+  `ClientApi::ROUTES` GET adds `tunnel/drops`, `tunnel/profile`; `QUERY['tunnel/drops'] = ['hours' => same
+  regex as tunnel/quality]`. Hidden when the endpoint 404s (older controller), like §15.7 detection.
+- **Tests**: B — each classification rule with synthetic log lines + state (reload windows, drain windows,
+  forced shutdowns, error-log matches), subtraction never negative, `ends` absent for non-tunnel lines.
+  A — merge, aggregation, `top` threshold, `maintenance` without node identity, `has_data`, capi scope,
+  old usage without `ends`. C — rendering with/without data, i18n coverage.
+
+### 22.13 Data model (migration `0022`, A)
+- `edges`: `drain_state` String(10) NOT NULL default `""`; `drain_started_at`, `drain_until` DateTime NULL;
+  `drain_by` String(8) NULL; `drain_reason` String(64) NULL; `drain_conns` Integer NULL;
+  `reload_stats` Text NULL; `tunnel_probe` Text NULL; `tunnel_probe_fail` Integer NOT NULL default 0;
+  `tunnel_probe_ok` Integer NOT NULL default 0; `tunnel_degraded` Boolean NOT NULL default false;
+  `tunnel_degraded_since` DateTime NULL; `tuning` Text NULL; `http3_enabled` Boolean NOT NULL default true;
+  `dns_weight_level` Integer NOT NULL default 0.
+- `sites`: `ssl_cert_rsa` Text NULL, `ssl_key_rsa` Text NULL (encrypted at rest; `encrypt-secrets`/
+  `rotate-key` in `manage.py` cover it).
+- new table `edge_events`: `id` PK, `edge_id` FK edges ON DELETE CASCADE (index), `at` DateTime (index),
+  `kind` String(16) (`drain_start`|`drain_end`|`drained`|`degraded`|`recovered`|`upgrade`), `data` Text
+  JSON (≤ 2 KB; never IPs or secrets). Pruned after 90 days by the existing prune job.
+- TLS ticket keys live in `state` (`tls_tickets`, encrypted) — no column.
+- `test_migrations` upgrade/downgrade on SQLite and PostgreSQL; downgrade drops the new columns/table.
+
+### 22.14 Backward compatibility
+- **New controller, old agents**: new config keys are ignored by old agents (`node.drain`, `node.probe`,
+  `node.http3`, `node.tls_tickets`, `ssl.cert_rsa`/`key_rsa`/`ocsp`, path `origins`/`balance`/`health`/
+  `idle_timeout`); multi-origin paths still carry `origin` = primary (no failover, documented); heartbeat
+  without the new objects leaves the new columns untouched (never degraded, drain state only controller-
+  driven: DNS exclusion still works for an admin drain, the node just does not refuse new connections).
+- **Old controller, new agent**: unknown heartbeat fields are ignored by the old `Heartbeat` model; usage
+  `ends`/`reused_n` are dropped by the old `TunnelPathUsage` (unknown keys ignored, no 422);
+  `POST /edge/v1/drain` 404 → `pcdn-agent drain` exits 2 and install.sh continues the upgrade **without**
+  drain (warning). Missing `node.*` keys mean: no drain, probe local, http3 per capability, tickets off.
+- **WHMCS with an old controller**: `tunnel/profile` / `tunnel/drops` 404 → pages/sections hidden; edge
+  dict without `drain`/`tunnel_probe` → columns show «—»; drain buttons hidden when `edge.drain` is absent.
+- All new plan features default to today's behaviour (`max_tunnel_origins` 1); all new platform switches
+  default off (`TLS_TICKETS`, `DNS_WEIGHTS`, `ACME_DUAL_RSA`). Probe and TCP
+  health are on by default on the edge but only affect DNS for tunnel sites through the hysteresis + budget.
+
+### 22.15 Docs to update
+- A: `docs/API.md` (drain endpoints, edge dict fields, tunnel/profile, tunnel/drops, PATCH http3_enabled,
+  capi), `docs/NODES.md` + `docs/OPERATIONS.md` (drain runbook, degraded probe, weights, ticket rotation),
+  `docs/MONITORING.md` (new alerts and metrics), `docs/SECURITY.md` (ticket keys: forward-secrecy trade-off,
+  encryption at rest, rotation, never logged), `docs/UPGRADE.md` (new section «۱۱) موج ۱۳ — پایداری و
+  سرعت تونل»: migration 0022, recommended `bootstrap.sh --upgrade --drain`, env switches and their
+  defaults), `CHANGELOG.md`.
+- B: `docs/EDGE.md` (drain flag + CLI, reload metrics/RELOAD_MAX_WAIT/memory guard/WST auto, probe server +
+  echo origin + ports, TCP health, tuning profile, upstream resolve keepalive, ticket files, dual cert/OCSP,
+  `ends` classification, new agent.conf keys table).
+- C: `docs/WHMCS.md` (node drain/probe/tuning/HTTP3 in the admin panel, multi-origin editor, guide page,
+  drops report, product option «Tunnel Origins», feature override key).
+
+### 22.16 Work split (three agents in parallel, disjoint files)
+| agent | owns | must not touch |
+|---|---|---|
+| **A — controller** | `controller/**` (models, migration `0022`, sections.py, routes_admin/edge/tunnel/capi, services, dnsbuild, scheduler, tunnel.py, tunnel_quality.py, alerts, ssl.py, crypto/manage, tests), `docs/API.md`, `docs/NODES.md`, `docs/OPERATIONS.md`, `docs/MONITORING.md`, `docs/SECURITY.md`, `docs/UPGRADE.md`, `CHANGELOG.md` | edge/, whmcs/ |
+| **B — edge** | `edge/**` (pcdn_agent incl. new `probe.py`, `tuning.py`, drain/hc/tcp-health code, render, njs `pcdn.js`, `pcdn-base.conf`, install.sh, bootstrap.sh, tests), `tests/integration/**` if needed, `docs/EDGE.md` | controller/, whmcs/ |
+| **C — WHMCS** | `whmcs/**` (tunnel.js, tunnelq.js, tcheck.js, new tguide.js, i18n-en.js, ClientApi.php, pasargadcdn.php option, admin addon Pages/Admin/FeatureEditor/Pricing/admin.js), `docs/WHMCS.md` | controller/, edge/ |
+**Cross-boundary contracts** (frozen by this section; any change goes through the SPEC first):
+1. Edge config (A emits, B consumes): `node.drain`, `node.probe`, `node.http3`, `node.tls_tickets`,
+   `node.dns_weight`; per-site `ssl.cert_rsa`, `ssl.key_rsa`, `ssl.ocsp`; tunnel path `origins`, `balance`,
+   `health`, `idle_timeout` (+ compatibility `origin`); pools `health.type`.
+2. Heartbeat (B emits, A consumes): `drain`, `tunnel_probe`, `reloads`, `tuning`,
+   `metrics.draining_workers|sock_tcp|sock_tw`, capabilities `tunnel_probe`, `tunnel_multi_origin`,
+   `upstream_resolve`, `drain` (bool: agent supports drain).
+3. Usage (B emits, A consumes): `tunnel.paths[id].ends`, `tunnel.paths[id].reused_n`.
+4. Edge API (A serves, B calls): `POST /edge/v1/drain`.
+5. Admin/client API (A serves, C calls): `POST|DELETE /api/v1/edges/{id}/drain`, `PATCH /api/v1/edges/{id}`
+   `http3_enabled`, `edge_to_dict` fields `drain`, `reloads`, `tunnel_probe`, `tuning`, `http3_enabled`,
+   `dns_weight`; `GET …/tunnel/profile`, `GET …/tunnel/drops`; section schema (§22.4/§22.5); plan feature
+   `max_tunnel_origins`; `/tunnel/quality` `reuse_pct`; site dict `ssl_key_type`, `ssl_dual_rsa`.
+Each agent tests its side against fixtures written from these shapes (A: fake heartbeats/usage bodies;
+B: fake controller config bodies + a fake `/edge/v1/drain`; C: harness stubs of the controller answers),
+so no agent waits for another. Integration (`tests/integration`, B) adds one docker-compose scenario
+when available: drain an edge → it leaves the zone, a new WS session is refused only after the grace,
+undrain restores it.
+
+### 22.17 Summary
+- Alembic revision: **`0022`** (down_revision `0021`).
+- New plan feature: **`max_tunnel_origins`** (default 1, 1..10). New section fields: tunnel path `origins`,
+  `balance`, `health`, `idle_timeout`; pools `health.type`.
+- New edge config keys: `node.drain`, `node.probe`, `node.http3`, `node.tls_tickets`, `node.dns_weight`,
+  `ssl.cert_rsa`, `ssl.key_rsa`, `ssl.ocsp`, path `origins`/`balance`/`health`/`idle_timeout`.
+- New heartbeat fields: `drain`, `tunnel_probe`, `reloads`, `tuning`, `metrics.draining_workers`/`sock_tcp`/
+  `sock_tw` (now stored), capabilities `drain`, `tunnel_probe`, `tunnel_multi_origin`, `upstream_resolve`;
+  usage `tunnel.paths[id].ends`, `reused_n`.
+- New endpoints: `POST|DELETE /api/v1/edges/{id}/drain`, `POST /edge/v1/drain`,
+  `GET /api/v1/sites/{d}/tunnel/profile`, `GET /api/v1/sites/{d}/tunnel/drops`,
+  `GET /capi/v1/tunnel/profile`, `GET /capi/v1/tunnel/drops`; `PATCH /api/v1/edges/{id}` gains
+  `http3_enabled`.
+- New controller env: `DRAIN_DEFAULT_MINUTES`, `DRAIN_MAX_HOLD_MINUTES`, `TUNNEL_PROBE_FAIL_CHECKS`,
+  `TUNNEL_PROBE_OK_CHECKS`, `TUNNEL_DEGRADED_MAX_FRACTION`, `TUNNEL_PROBE_ORIGIN`, `TLS_TICKETS`,
+  `TLS_TICKET_ROTATE_HOURS`, `ACME_DUAL_RSA`, `DNS_WEIGHTS`. New agent.conf keys:
+  `RELOAD_MAX_WAIT`, `MEM_GUARD_PCT`, `SHUTDOWN_TIMEOUT`, `DRAIN_IDLE_CONNS`, `PROBE_ENABLED`, `PROBE_INTERVAL`,
+  `PROBE_BYTES`, `PROBE_ECHO_PORT`, `PROBE_H2C_PORT`, `ORIGIN_TCP_HEALTH`, `TUNE_PROFILE`, `PROC_SYS`.
+- Ownership: A = `controller/**` + API/NODES/OPERATIONS/MONITORING/SECURITY/UPGRADE docs + CHANGELOG;
+  B = `edge/**` + `tests/integration/**` + `docs/EDGE.md`; C = `whmcs/**` + `docs/WHMCS.md`.
