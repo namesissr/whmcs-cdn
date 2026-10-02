@@ -264,6 +264,8 @@ function pasargadcdn_admin_output($vars)
     require_once __DIR__ . '/lib/Pages.php';
     require_once __DIR__ . '/lib/OwnerSync.php';
     require_once __DIR__ . '/lib/Referrals.php';
+    require_once __DIR__ . '/lib/Operator.php';
+    require_once __DIR__ . '/lib/Transfer.php';
     require_once __DIR__ . '/lib/Admin.php';
     echo PasargadCdn\Admin\Admin::output(is_array($vars) ? $vars : [], $_GET, $_POST,
         strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
@@ -308,7 +310,7 @@ function pasargadcdn_admin_sidebar($vars)
 {
     $link = htmlspecialchars((string) ($vars['modulelink'] ?? 'addonmodules.php?module=pasargadcdn_admin'), ENT_QUOTES, 'UTF-8');
     $items = ['dashboard' => 'داشبورد', 'sites' => 'سایت‌ها', 'edges' => 'نودها', 'plans' => 'پلن‌ها و قیمت‌گذاری',
-        'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'resellers' => 'نمایندگان', 'events' => 'رویدادهای امنیتی',
+        'operator' => 'دامنه‌های اپراتور', 'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'resellers' => 'نمایندگان', 'events' => 'رویدادهای امنیتی',
         'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'referrals' => 'معرفی‌ها', 'settings' => 'تنظیمات و سلامت'];
     $h = '<span class="header"><i class="fas fa-bolt"></i> CDN پاسارگاد</span><ul class="menu" dir="rtl" style="text-align:right">';
     foreach ($items as $page => $label) {

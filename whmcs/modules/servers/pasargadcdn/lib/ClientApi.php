@@ -51,6 +51,10 @@ if (class_exists(__NAMESPACE__ . '\\ClientApi', false)) {
  * and writes are allowed whatever the WHMCS status is; every admin write is
  * recorded with logActivity().
  *
+ * Operator context (SPEC §19.1, admin mode + 'context' => ['domain', 'server']): the addon's «دامنه‌های اپراتور»
+ * manager. No WHMCS service: the domain and server come from the addon's session-bound context of ONE operator
+ * site (checked against the controller's owner_kind), never from the request; same whitelist and validation.
+ *
  * Reseller mode (SPEC §10.5, 'reseller_site_id' > 0): the same whitelist, CSRF,
  * query rules and proxy, but the domain is resolved from the reseller's OWN
  * sub-site row (mod_pasargadcdn_reseller_sites) keyed by (id, userid). A reseller
@@ -206,7 +210,9 @@ class ClientApi
      *   'admin_id' => WHMCS admin id (admin mode only — set by the addon, never from input),
      *   'readonly' => true for a WHMCS user without the manage-products permission (TeamAccess, §14.3.7):
      *                 every non-GET call is refused with 403 before anything else happens,
-     *   'lang' => 'fa' | 'en' — language of the error details (§16.10; ignored in admin mode),
+     *   'lang' => 'fa' | 'en' — language of the error details (§16.10; ignored in admin mode except the operator context),
+     *   'context' => SPEC §19.1 operator context ['domain' => ..., 'server' => tblservers row] (admin addon only),
+     *   'admin_user' => the admin's username for the activity log (admin mode),
      * ]
      * @param callable|null $clientFactory fn(array $serverParams): ApiClient (tests)
      * @return array [http status, response array]
@@ -218,7 +224,9 @@ class ClientApi
 
         $adminId = (int) ($req['admin_id'] ?? 0);
         $admin = $adminId > 0;
-        I18n::$current = !$admin && ($req['lang'] ?? '') === 'en' ? 'en' : 'fa';
+        // SPEC §19.1: the operator-site manager (admin 'context') renders the app in either language
+        $hasCtx = array_key_exists('context', $req);
+        I18n::$current = (!$admin || $hasCtx) && ($req['lang'] ?? '') === 'en' ? 'en' : 'fa';
         if (!$admin && (int) ($req['client_id'] ?? 0) <= 0) {
             return self::fail(401, 'لطفاً دوباره وارد حساب کاربری شوید.');
         }
@@ -246,6 +254,20 @@ class ClientApi
         }
         if (!self::allowed($method, $path)) {
             return self::fail(404, 'مسیر نامعتبر است.');
+        }
+
+        // SPEC §19.1 operator context (admin addon «دامنه‌های اپراتور» → manage): a synthetic context bound to ONE
+        // operator domain and its server, built server-side by the addon (Admin\Operator::apiContext — never from
+        // request input; api.php never passes 'context'). Same whitelist, CSRF, query and body rules as every
+        // other mode; admin-only, every write audited with the admin's name.
+        if ($hasCtx) {
+            $ctx = $req['context'];
+            if (!$admin || !is_array($ctx) || !is_string($ctx['domain'] ?? null) || !is_object($ctx['server'] ?? null)) {
+                return self::fail(404, 'سرویس یافت نشد.');
+            }
+            $domain = \pasargadcdn_domain(['domain' => $ctx['domain']]);
+            $svc = (object) ['id' => 0, 'userid' => 0, 'domain' => $domain];
+            return self::proxy($method, $path, $domain, $ctx['server'], $req, true, $adminId, $svc, $clientFactory);
         }
 
         // Reseller mode (SPEC §10.5): manage one of the logged-in client's OWN sub-sites.
@@ -381,12 +403,12 @@ class ClientApi
         } catch (\Throwable $e) {
             self::log($method . ' ' . $target, $e->getMessage());
             if ($admin && $method !== 'GET') {
-                self::adminLog($adminId, $method, $path, $svc, 'failed: controller unreachable');
+                self::adminLog($adminId, $method, $path, $svc, 'failed: controller unreachable', (string) ($req['admin_user'] ?? ''));
             }
             return self::fail(502, 'اتصال به سرور CDN برقرار نشد.');
         }
         if ($admin && $method !== 'GET') {
-            self::adminLog($adminId, $method, $path, $svc, 'HTTP ' . $code);
+            self::adminLog($adminId, $method, $path, $svc, 'HTTP ' . $code, (string) ($req['admin_user'] ?? ''));
         }
         if ($code >= 500 || $code < 200 || ($code >= 300 && $code < 400)) {
             self::log($method . ' ' . $target, 'HTTP ' . $code);
@@ -436,7 +458,8 @@ class ClientApi
     }
 
     const RESELLER_OPS = ['list', 'create', 'delete', 'report', 'brand', 'bulk', 'export'];
-    const LOCAL_OPS = ['state', 'onboarding', 'report'];
+    // SPEC §19.2: `transfer` (POST) dismisses the one-time «این دامنه به حساب شما منتقل شد» notice
+    const LOCAL_OPS = ['state', 'onboarding', 'report', 'transfer'];
 
     /**
      * Growth local ops (WHMCS-side, per service): GET state → {onboarding, report}; POST onboarding
@@ -489,6 +512,11 @@ class ClientApi
             }
             $saved = ServiceState::saveOnboarding($sid, $patch);
             return $saved === null ? self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.') : [200, ['onboarding' => $saved]];
+        }
+        if ($op === 'transfer') {
+            require_once __DIR__ . '/Transfers.php';
+            return Transfers::dismiss($sid, (int) ($req['client_id'] ?? 0)) ? [200, ['ok' => true]]
+                : self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
         }
         if ($op === 'report') {
             $freq = is_string($data['freq'] ?? null) ? $data['freq'] : '';
@@ -1087,12 +1115,16 @@ class ClientApi
         return [$code, ['detail' => I18n::tr($detail)]];
     }
 
-    private static function adminLog(int $adminId, string $method, string $path, $svc, string $result): void
+    private static function adminLog(int $adminId, string $method, string $path, $svc, string $result, string $user = ''): void
     {
         if (function_exists('logActivity')) {
-            // Path and service facts only — request bodies (certificates, keys) are never logged.
-            logActivity(sprintf('Pasargad CDN [admin #%d, full management]: %s %s on service #%d (%s) — %s',
-                $adminId, $method, $path === '' ? '/' : $path, (int) $svc->id, (string) $svc->domain, $result), (int) $svc->userid);
+            // Path and service facts only — request bodies (certificates, keys) are never logged. The admin's
+            // username (addon: tbladmins) is added when known; an operator site (SPEC §19.1) has no service.
+            $user = (string) preg_replace('/[^\p{L}\p{N}._@ -]/u', '', $user);
+            $on = (int) $svc->id > 0 ? sprintf('service #%d (%s)', (int) $svc->id, (string) $svc->domain)
+                : sprintf('operator site %s', (string) $svc->domain);
+            logActivity(sprintf('Pasargad CDN [admin #%d%s, full management]: %s %s on %s — %s',
+                $adminId, $user !== '' ? ' ' . $user : '', $method, $path === '' ? '/' : $path, $on, $result), (int) $svc->userid);
         }
     }
 

@@ -22,6 +22,7 @@ require_once __DIR__ . '/lib/TeamAccess.php';
 require_once __DIR__ . '/lib/ServiceState.php';
 require_once __DIR__ . '/lib/Trial.php';
 require_once __DIR__ . '/lib/DomainRules.php';
+require_once __DIR__ . '/lib/Transfers.php';
 
 use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
@@ -29,6 +30,7 @@ use PasargadCdn\I18n;
 use PasargadCdn\Reseller;
 use PasargadCdn\ServiceState;
 use PasargadCdn\TeamAccess;
+use PasargadCdn\Transfers;
 use PasargadCdn\Trial;
 use WHMCS\Database\Capsule;
 
@@ -338,8 +340,31 @@ function pasargadcdn_refused_text(string $domain, string $detail): string
         . 'را اجرا کنید (سایت‌های قدیمی بدون مالک ثبت شده‌اند) و دوباره «Create» را بزنید؛ وگرنه به مشتری اطلاع دهید که مالکیت دامنه را تأیید کند.';
 }
 
+/**
+ * SPEC §19.2: a service whose domain was transferred to the operator (client → operator) no longer owns the
+ * site — the module never suspends, changes or deletes it on the controller. null = not guarded, else the
+ * module command result.
+ */
+function pasargadcdn_transfer_guard(array $params, string $command): ?string
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    if (!Transfers::guarded($sid)) {
+        return null;
+    }
+    if (function_exists('logActivity')) {
+        logActivity('Pasargad CDN: ' . $command . ' of service #' . $sid . ' (' . pasargadcdn_domain($params)
+            . ') skipped on the controller — the domain was transferred to the operator', (int) ($params['userid'] ?? 0));
+    }
+    // Terminate only finishes the WHMCS side (the site stays with the operator); anything else is refused.
+    return $command === 'Terminate' ? 'success'
+        : 'دامنه این سرویس به اپراتور منتقل شده است؛ سایت روی CDN دیگر متعلق به این سرویس نیست و تغییری روی آن اعمال نشد.';
+}
+
 function pasargadcdn_SuspendAccount(array $params)
 {
+    if (($g = pasargadcdn_transfer_guard($params, 'Suspend')) !== null) {
+        return $g;
+    }
     return pasargadcdn_call(function () use ($params) {
         ApiClient::fromParams($params)->post(ApiClient::site(pasargadcdn_domain($params)) . '/suspend');
     });
@@ -347,6 +372,9 @@ function pasargadcdn_SuspendAccount(array $params)
 
 function pasargadcdn_UnsuspendAccount(array $params)
 {
+    if (($g = pasargadcdn_transfer_guard($params, 'Unsuspend')) !== null) {
+        return $g;
+    }
     return pasargadcdn_call(function () use ($params) {
         $api = ApiClient::fromParams($params);
         $site = ApiClient::site(pasargadcdn_domain($params));
@@ -361,6 +389,10 @@ function pasargadcdn_UnsuspendAccount(array $params)
 
 function pasargadcdn_TerminateAccount(array $params)
 {
+    // SPEC §19.2: never delete a site that was handed to the operator
+    if (($g = pasargadcdn_transfer_guard($params, 'Terminate')) !== null) {
+        return $g;
+    }
     return pasargadcdn_call(function () use ($params) {
         try {
             ApiClient::fromParams($params)->delete(ApiClient::site(pasargadcdn_domain($params)));
@@ -374,6 +406,9 @@ function pasargadcdn_TerminateAccount(array $params)
 
 function pasargadcdn_ChangePackage(array $params)
 {
+    if (($g = pasargadcdn_transfer_guard($params, 'ChangePackage')) !== null) {
+        return $g;
+    }
     return pasargadcdn_call(function () use ($params) {
         $api = ApiClient::fromParams($params);
         $site = ApiClient::site(pasargadcdn_domain($params));
@@ -909,16 +944,35 @@ function pasargadcdn_adminRequestSsl(array $params)
     });
 }
 
+/**
+ * SPEC §19.2: «انتقال دامنه» button of the admin service page — opens the addon's transfer wizard for this service
+ * (only while the addon is active; the wizard itself re-checks everything). '' when the addon is not installed.
+ */
+function pasargadcdn_transfer_button(array $params): string
+{
+    $sid = (int) ($params['serviceid'] ?? 0);
+    if ($sid <= 0 || !is_file(dirname(__DIR__, 2) . '/addons/pasargadcdn_admin/lib/Transfer.php')) {
+        return '';
+    }
+    if (Transfers::guarded($sid)) {
+        return '<span style="color:#777">دامنه این سرویس به اپراتور منتقل شده است.</span>';
+    }
+    return '<a class="btn btn-default btn-sm" data-pcdn-transfer="' . $sid . '" href="addonmodules.php?module=pasargadcdn_admin&amp;page=transfer&amp;service='
+        . $sid . '">انتقال دامنه به مشتری دیگر / اپراتور</a>';
+}
+
 function pasargadcdn_AdminServicesTabFields(array $params)
 {
+    $transfer = pasargadcdn_transfer_button($params);
     try {
         $s = ApiClient::fromParams($params)->get(ApiClient::site(pasargadcdn_domain($params)));
     } catch (\Throwable $e) {
-        return ['Pasargad CDN' => '<span style="color:#c00">' . pasargadcdn_e($e->getMessage()) . '</span>'];
+        return ['Pasargad CDN' => '<span style="color:#c00">' . pasargadcdn_e($e->getMessage()) . '</span>']
+            + ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []);
     }
     $h = 'pasargadcdn_e';
     $u = $s['usage_month'] ?? [];
-    return [
+    return ($transfer !== '' ? ['انتقال دامنه' => $transfer] : []) + [
         'وضعیت CDN' => $h($s['status'] ?? '-'),
         'نیم‌سرورها' => $h(implode(' , ', $s['nameservers'] ?? []))
             . (!empty($s['ns_verified']) ? ' ✅' : ' ⏳ (فعلی: ' . $h(implode(', ', $s['ns_found'] ?? [])) . ')'),
@@ -1068,6 +1122,8 @@ function pasargadcdn_ClientArea(array $params)
     $boot['trial'] = Trial::boot(['serviceid' => $sid, 'pid' => (int) ($params['pid'] ?? $params['packageid'] ?? 0),
         'currency' => (int) ($params['clientsdetails']['currency'] ?? 0)]);
     $boot['growth'] = pasargadcdn_growth_boot($sid);
+    // SPEC §19.2: one-time notice for the new owner of a transferred domain (until dismissed — local op `transfer`)
+    $boot['transfer'] = Transfers::banner($sid, $uid);
     $base = pasargadcdn_module_url();
     $assets = pasargadcdn_assets($base, $lang);
     $noJs = I18n::tr('برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.');

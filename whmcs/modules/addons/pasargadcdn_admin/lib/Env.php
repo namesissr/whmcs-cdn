@@ -370,6 +370,8 @@ final class Env
             \PasargadCdn\ServiceState::ensure();
             \PasargadCdn\Trial::ensure();
             \PasargadCdn\Reseller::ensureExtras();
+            // SPEC §19.2: domain-transfer ledger (Terminate guard + new-owner notice)
+            \PasargadCdn\Transfers::ensure();
         }
     }
 
@@ -563,6 +565,53 @@ final class Env
     public static function adminId(): int
     {
         return (int) ($_SESSION['adminid'] ?? 0);
+    }
+
+    /** Username of the logged-in admin (tbladmins), for the activity log; '' when unknown. */
+    public static function adminName(): string
+    {
+        $id = self::adminId();
+        if ($id <= 0) {
+            return '';
+        }
+        if (!array_key_exists('admin_name:' . $id, self::$memo)) {
+            try {
+                self::$memo['admin_name:' . $id] = (string) Capsule::table('tbladmins')->where('id', $id)->value('username');
+            } catch (\Throwable $e) {
+                self::$memo['admin_name:' . $id] = '';
+            }
+        }
+        return self::$memo['admin_name:' . $id];
+    }
+
+    /** "admin #1 (username)" for log lines. */
+    public static function adminLabel(): string
+    {
+        $n = self::adminName();
+        return 'admin #' . self::adminId() . ($n !== '' ? ' (' . $n . ')' : '');
+    }
+
+    /**
+     * SPEC §19: the logged-in admin's role has access to this addon. WHMCS already refuses addonmodules.php for a role
+     * without access; this re-checks it for the operator proxy / transfer actions: tbladdonmodules (module, 'access') is the
+     * comma-separated list of role ids. No stored list (tests, very old installs) → WHMCS's own gate is the only one.
+     */
+    public static function adminHasAccess(): bool
+    {
+        $id = self::adminId();
+        if ($id <= 0) {
+            return false;
+        }
+        try {
+            $row = Capsule::table('tbladdonmodules')->where('module', self::MODULE)->where('setting', 'access')->first(['value']);
+            if (!$row) {
+                return true;
+            }
+            $role = (int) Capsule::table('tbladmins')->where('id', $id)->value('roleid');
+            return $role > 0 && in_array((string) $role, array_map('trim', explode(',', (string) $row->value)), true);
+        } catch (\Throwable $e) {
+            return true;
+        }
     }
 
     /** Session CSRF token of this addon (separate from WHMCS's own token). */

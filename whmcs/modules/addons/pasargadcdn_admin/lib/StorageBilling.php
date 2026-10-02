@@ -168,6 +168,10 @@ final class StorageBilling
             self::$report['errors'][] = $domain . ': month not complete on the controller';
             return false;
         }
+        if (($site['owner_kind'] ?? null) === 'operator') {
+            self::$report['skipped'][] = $domain . ': operator site';   // SPEC §19.1: never billed
+            return true;
+        }
         if ($ext === '' || !ctype_digit($ext)) {
             self::$report['skipped'][] = $domain . ': not a WHMCS service';
             return true; // reseller sub-sites etc. — the reseller ledger is separate

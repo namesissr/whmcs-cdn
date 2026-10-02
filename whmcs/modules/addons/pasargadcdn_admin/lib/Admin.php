@@ -18,7 +18,9 @@ if (class_exists(__NAMESPACE__ . '\\Admin', false)) {
  */
 final class Admin
 {
-    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'referrals', 'settings', 'manage', 'api'];
+    // SPEC §19: «دامنه‌های اپراتور» (operator), its full manager (opmanage) and the «انتقال دامنه» wizard (transfer)
+    const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'referrals', 'settings', 'manage', 'api',
+        'operator', 'opmanage', 'transfer'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -118,6 +120,19 @@ final class Admin
             case 'settings':
                 $body = Pages::settings();
                 break;
+            case 'operator':
+                require_once __DIR__ . '/Operator.php';
+                $body = Operator::page($get, $state);
+                break;
+            case 'opmanage':
+                require_once __DIR__ . '/Operator.php';
+                $body = Operator::manage(Env::input($get['domain'] ?? ''), (string) ($get['lang'] ?? ''));
+                break;
+            case 'transfer':
+                require_once __DIR__ . '/Operator.php';
+                require_once __DIR__ . '/Transfer.php';
+                $body = Transfer::page($get, $state);
+                break;
             case 'manage':
                 $body = Pages::manage((int) ($get['service'] ?? 0));
                 break;
@@ -126,6 +141,7 @@ final class Admin
         }
         // After a POST, the browser URL is replaced with the GET URL so a refresh never re-submits.
         $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'id' => $get['id'] ?? null,
+            'service' => $page === 'transfer' ? ($get['service'] ?? null) : null, 'domain' => $page === 'transfer' ? ($get['domain'] ?? null) : null,
             'q' => $get['q'] ?? null, 'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
         return Pages::layout($page, $body, $flash, $clean);
     }
@@ -134,6 +150,11 @@ final class Admin
 
     public static function api(array $get, string $method): array
     {
+        if (array_key_exists('op', $get)) {
+            // SPEC §19.1: the operator-site manager — a session-bound context, never a service id
+            require_once __DIR__ . '/Operator.php';
+            return Operator::api($get, $method);
+        }
         $sid = is_string($get['service'] ?? null) ? $get['service'] : '';
         $id = is_string($get['id'] ?? null) ? $get['id'] : '';
         if ($sid === '' || $sid !== $id) {
@@ -163,6 +184,7 @@ final class Admin
             'session_csrf' => (string) ($_SESSION['pasargadcdn_admin_csrf'] ?? ''),
             'client_id' => 0,
             'admin_id' => Env::adminId(),
+            'admin_user' => Env::adminName(),
         ], self::$apiFactory);
     }
 
@@ -171,7 +193,7 @@ final class Admin
     /** @var string|null tests: request body */
     public static $body = null;
 
-    private static function readBody(int $max): string
+    public static function readBody(int $max): string
     {
         if (self::$body !== null) {
             return self::$body;
@@ -207,6 +229,14 @@ final class Admin
     public static function action(string $page, string $action, array $post): array
     {
         $admin = Env::adminId();
+        require_once __DIR__ . '/Operator.php';
+        if (in_array($action, Operator::ACTIONS, true)) {
+            return Operator::action($action, $post, $admin);
+        }
+        if ($action === 'transfer_preview' || $action === 'transfer_execute') {
+            require_once __DIR__ . '/Transfer.php';
+            return Transfer::action($action, $post, $admin);
+        }
         switch ($action) {
             case 'purge':
             case 'nscheck':

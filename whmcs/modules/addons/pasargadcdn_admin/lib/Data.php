@@ -4,6 +4,9 @@ namespace PasargadCdn\Admin;
 
 use WHMCS\Database\Capsule;
 
+// SPEC §19.1 (before the guard: the class below is bound at compile time, so the guard always returns)
+require_once __DIR__ . '/Operator.php';
+
 if (class_exists(__NAMESPACE__ . '\\Data', false)) {
     return;
 }
@@ -231,7 +234,9 @@ final class Data
     {
         $ix = ['ext' => [], 'domain' => []];
         foreach ($sites as $s) {
-            if (!is_array($s) || empty($s['domain'])) {
+            // SPEC §19.1: operator (platform-owned) sites never belong to a WHMCS service — not matched, not orphans,
+            // not owner-synced, not billed
+            if (!is_array($s) || empty($s['domain']) || self::isOperator($s)) {
                 continue;
             }
             $ix['domain'][strtolower((string) $s['domain'])] = $s;
@@ -327,6 +332,66 @@ final class Data
             }
         }
         return false;
+    }
+
+    // ------------------------------------------------------------------ SPEC §19.1 operator sites
+
+    /** A controller site dict / list row of the operator (owner_kind = operator). */
+    public static function isOperator($site): bool
+    {
+        return is_array($site) && ($site['owner_kind'] ?? null) === 'operator';
+    }
+
+    /**
+     * Domains of the operator's sites on the addon's controller (lower-case => true), memoised per request; [] when
+     * the controller is unreachable or predates SPEC §19 (rows without owner_kind are never taken as operator sites,
+     * so an older controller that ignores ?owner= cannot hide customer sites). Used to drop operator sites from
+     * listings that carry no owner_kind (GET /api/v1/usage).
+     */
+    public static function operatorDomains(): array
+    {
+        if (Env::memoHas('operator_domains')) {
+            return Env::memoGet('operator_domains');
+        }
+        $out = [];
+        try {
+            foreach ((array) Env::api(10)->get(Operator::LIST) as $s) {
+                if (self::isOperator($s) && is_string($s['domain'] ?? null)) {
+                    $out[strtolower($s['domain'])] = true;
+                }
+            }
+        } catch (\Throwable $e) {
+            $out = [];
+        }
+        Env::memoSet('operator_domains', $out);
+        return $out;
+    }
+
+    /** $sites without the operator's (by owner_kind, or by domain when $opDomains is given). */
+    public static function withoutOperator(array $sites, array $opDomains = []): array
+    {
+        return array_values(array_filter($sites, function ($s) use ($opDomains) {
+            return is_array($s) && !self::isOperator($s) && !isset($opDomains[strtolower((string) ($s['domain'] ?? ''))]);
+        }));
+    }
+
+    /** Client search for the transfer wizard: #id, e-mail, name or company (≤ 20 rows). */
+    public static function clients(string $q, int $limit = 20): array
+    {
+        $q = trim($q);
+        if ($q === '') {
+            return [];
+        }
+        $cols = ['id', 'firstname', 'lastname', 'companyname', 'email', 'currency', 'credit', 'status'];
+        $num = ltrim($q, '#');
+        if (ctype_digit($num)) {
+            return Capsule::table('tblclients')->where('id', (int) $num)->get($cols)->all();
+        }
+        $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+        return Capsule::table('tblclients')->where(function ($w) use ($like) {
+            $w->where('email', 'like', $like)->orWhere('firstname', 'like', $like)->orWhere('lastname', 'like', $like)
+                ->orWhere('companyname', 'like', $like);
+        })->orderBy('id')->limit($limit)->get($cols)->all();
     }
 
     /** domain => service row, for linking controller data back to WHMCS. */

@@ -3574,5 +3574,15 @@ window.PCDN_I18N_EN = {
   'ورود موفق (۲۴ ساعت)': 'Sign-ins (24 h)',
   'تلاش ناموفق (۲۴ ساعت)': 'Failed attempts (24 h)',
   'کد ارسال‌شده (۲۴ ساعت)': 'Codes sent (24 h)',
-  'فقط ۱۰٬۰۰۰ مورد آخر نمایش داده می‌شود؛ بازهٔ کوتاه‌تری انتخاب کنید یا CSV را دریافت کنید.': 'Only the latest 10,000 entries are shown; pick a shorter period or download the CSV.'
+  'فقط ۱۰٬۰۰۰ مورد آخر نمایش داده می‌شود؛ بازهٔ کوتاه‌تری انتخاب کنید یا CSV را دریافت کنید.': 'Only the latest 10,000 entries are shown; pick a shorter period or download the CSV.',
+  // SPEC §19 — operator domains / domain transfer
+  'کلید API': 'API keys',
+  'متوجه شدم': 'Got it',
+  'ذخیره ممکن نشد؛ دوباره تلاش کنید.': 'Could not save; please try again.',
+  'این دامنه به حساب شما منتقل شد — کلید API، وب‌هوک‌ها و ارسال لاگ را دوباره تنظیم کنید': 'This domain was transferred to your account — set up API keys, webhooks and log shipping again',
+  'کلیدهای API مالک قبلی باطل شده‌اند و وب‌هوک‌ها و ارسال لاگ تا تنظیم دوباره با کلیدها و آدرس‌های خودتان متوقف هستند. بقیه تنظیمات، رکوردهای DNS، SSL و آمار سایت بدون تغییر منتقل شده‌اند.': 'The previous owner\'s API keys were revoked, and webhooks and log shipping stay paused until you set them up again with your own keys and addresses. All other settings, DNS records, SSL and the site\'s statistics moved unchanged.',
+  'بازگشت به دامنه‌های اپراتور': 'Back to operator domains',
+  'حالت مدیر — دامنهٔ اپراتور': 'Admin mode — operator domain',
+  'سایت اپراتور': 'Operator site',
+  '. بدون سرویس WHMCS و بدون صورت‌حساب؛ تغییرات شما با نام مدیر در گزارش فعالیت WHMCS ثبت می‌شود.': '. No WHMCS service and never billed; your changes are recorded in the WHMCS activity log under your admin name.'
 };

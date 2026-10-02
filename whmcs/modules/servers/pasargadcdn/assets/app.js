@@ -44,6 +44,8 @@
   // §14.3.7 team access: a WHMCS user without the manage-products permission gets a read-only app
   // (api.php refuses their writes with 403 regardless; this only keeps the UI honest).
   var READONLY = !!boot.readonly && !ADMIN;
+  // SPEC §19.2: the domain was just transferred to this account — one-time notice until dismissed (local op `transfer`).
+  var TRANSFER = boot.transfer && typeof boot.transfer === 'object' && !ADMIN ? boot.transfer : null;
   function money(v) {
     v = Number(v) || 0;
     return (v >= 100 ? num(Math.round(v)) : num(Math.round(v * 100) / 100)) + (WALLET && WALLET.currency ? ' ' + WALLET.currency : '');
@@ -472,6 +474,7 @@
     var id = S.page, p = page(id);
     var banner = null, adminBar = ADMIN ? adminBanner() : (RSITE ? resellerSubBanner() : null);
     var roBar = READONLY ? readonlyBanner() : null;
+    var xferBar = TRANSFER && !RSITE ? transferBanner() : null;
     if (!S.active) banner = P.alertBox('warning', [h('strong', { text: t('این سرویس فعال نیست. ') }), t('اطلاعات فقط قابل مشاهده است و امکان تغییر تنظیمات وجود ندارد.')], { icon: 'lock' });
     else if (S.site.status === 'suspended') banner = P.alertBox('danger', t('این سرویس در CDN معلق است و بازدیدکنندگان صفحه تعلیق را می‌بینند.'));
     else if (S.site.status === 'over_quota' && WALLET) banner = P.alertBox('danger', [
@@ -482,7 +485,7 @@
     else if (S.site.status === 'over_quota') banner = P.alertBox('danger', [h('strong', { text: t('ترافیک ماهانه تمام شده است. ') }), t('برای ادامه سرویس‌دهی، پلن را ارتقا دهید. '),
       h('a', { href: UPGRADE_URL, className: 'pcdn-link', text: t('ارتقای پلن') })]);
     var trialBar = GROWTH && id !== 'overview' ? GROWTH.trialBanner() : null;
-    append(mainEl, [adminBar, roBar, banner, trialBar, pageHead(p, id)]);
+    append(mainEl, [adminBar, roBar, xferBar, banner, trialBar, pageHead(p, id)]);
     var body = h('div', { className: 'pcdn-page', 'data-panel': id });
     mainEl.appendChild(body);
     if (locked(id)) append(body, upgradePanel(p));
@@ -492,11 +495,44 @@
     updateSaveBar();
   }
 
+  /** SPEC §19.2: shown to the new owner after a domain transfer, on every page, until «متوجه شدم». */
+  function transferBanner() {
+    var links = [['apikeys', t('کلید API')], ['webhooks', t('وب‌هوک‌ها')], ['logs', t('ارسال لاگ')]].filter(function (x) { return available(x[0]); })
+      .map(function (x) {
+        return h('a', { className: 'pcdn-btn pcdn-btn-secondary pcdn-btn-sm', href: '#pcdn=' + x[0], 'data-ro-ok': '1',
+          onclick: function (e) { e.preventDefault(); go(x[0]); } }, h('span', { text: x[1] }));
+      });
+    var dismiss = READONLY ? null : h('button', { type: 'button', className: 'pcdn-btn pcdn-btn-ghost pcdn-btn-sm pcdn-xfer-dismiss', 'data-ro-ok': '1',
+      onclick: function () {
+        dismiss.disabled = true;
+        api('POST', '', {}, { lop: 'transfer' }).then(function (res) {
+          if (!res.ok) { dismiss.disabled = false; P.toast((res.data && typeof res.data.detail === 'string' && res.data.detail) || t('ذخیره ممکن نشد؛ دوباره تلاش کنید.'), 'error'); return; }
+          TRANSFER = null;
+          var bar = mainEl.querySelector('[data-transfer]');
+          if (bar && bar.parentNode) bar.parentNode.removeChild(bar);
+        });
+      } }, h('span', { text: t('متوجه شدم') }));
+    return h('div', { className: 'pcdn-alert pcdn-alert-info pcdn-xfer-banner', role: 'note', 'data-transfer': '1' }, icon('info'),
+      h('div', { className: 'pcdn-alert-body' },
+        h('strong', { text: t('این دامنه به حساب شما منتقل شد — کلید API، وب‌هوک‌ها و ارسال لاگ را دوباره تنظیم کنید') }),
+        h('p', { text: t('کلیدهای API مالک قبلی باطل شده‌اند و وب‌هوک‌ها و ارسال لاگ تا تنظیم دوباره با کلیدها و آدرس‌های خودتان متوقف هستند. بقیه تنظیمات، رکوردهای DNS، SSL و آمار سایت بدون تغییر منتقل شده‌اند.') }),
+        h('div', { className: 'pcdn-banner-actions' }, links.concat([dismiss]))));
+  }
+
   function adminBanner() {
     var links = [];
     if (ADMIN.serviceUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.serviceUrl), 'data-ro-ok': '1', text: t('صفحه سرویس در WHMCS') }));
     if (ADMIN.clientUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.clientUrl), 'data-ro-ok': '1', text: t('پروفایل مشتری') }));
-    if (ADMIN.backUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.backUrl), 'data-ro-ok': '1', text: t('بازگشت به فهرست سایت‌ها') }));
+    if (ADMIN.backUrl) links.push(h('a', { className: 'pcdn-link', href: String(ADMIN.backUrl), 'data-ro-ok': '1',
+      text: ADMIN.operator ? t('بازگشت به دامنه‌های اپراتور') : t('بازگشت به فهرست سایت‌ها') }));
+    // SPEC §19.1: an operator (platform-owned) site — no WHMCS service, no client, never billed
+    if (ADMIN.operator) {
+      return h('div', { className: 'pcdn-admin-bar', role: 'note', 'data-admin-mode': '1', 'data-operator': '1' },
+        h('span', { className: 'pcdn-admin-badge' }, icon('shieldCheck'), h('span', { text: t('حالت مدیر — دامنهٔ اپراتور') })),
+        h('span', { className: 'pcdn-admin-text', text: t('سایت اپراتور ') + (S.site && S.site.domain ? S.site.domain : '') +
+          (ADMIN.note ? ' — ' + String(ADMIN.note) : '') + t('. بدون سرویس WHMCS و بدون صورت‌حساب؛ تغییرات شما با نام مدیر در گزارش فعالیت WHMCS ثبت می‌شود.') }),
+        h('span', { className: 'pcdn-admin-links' }, links));
+    }
     return h('div', { className: 'pcdn-admin-bar', role: 'note', 'data-admin-mode': '1' },
       h('span', { className: 'pcdn-admin-badge' }, icon('shieldCheck'), h('span', { text: t('حالت مدیر') })),
       h('span', { className: 'pcdn-admin-text', text: t('سرویس #') + SID + (ADMIN.client ? ' — ' + ADMIN.client : '') +

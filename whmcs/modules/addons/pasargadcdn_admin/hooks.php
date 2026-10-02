@@ -138,7 +138,8 @@ add_hook('ClientAreaPage', 1, function ($vars) {
 
 add_hook('AfterShoppingCartCheckout', 1, function ($vars) {
     $order = is_array($vars) ? (int) ($vars['OrderID'] ?? 0) : 0;
-    if ($order <= 0) {
+    // SPEC §19.2: the order of an operator → client domain transfer (AddOrder by the wizard) is no referral sale
+    if ($order <= 0 || (class_exists('\\PasargadCdn\\Admin\\Transfer', false) && \PasargadCdn\Admin\Transfer::$creating)) {
         return;
     }
     try {

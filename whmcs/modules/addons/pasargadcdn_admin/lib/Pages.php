@@ -6,6 +6,9 @@ use PasargadCdn\ApiClient;
 use PasargadCdn\ApiException;
 use WHMCS\Database\Capsule;
 
+// SPEC §19.1 (before the guard: the class below is bound at compile time, so the guard always returns)
+require_once __DIR__ . '/Operator.php';
+
 if (class_exists(__NAMESPACE__ . '\\Pages', false)) {
     return;
 }
@@ -20,6 +23,8 @@ final class Pages
     const TABS = [
         'dashboard' => ['داشبورد', 'dashboard'],
         'sites' => ['سایت‌ها', 'globe'],
+        // SPEC §19.1: the platform's own domains (no WHMCS service)
+        'operator' => ['دامنه‌های اپراتور', 'zap'],
         'edges' => ['نودها', 'server'],
         'plans' => ['پلن‌ها و قیمت‌گذاری', 'tag'],
         'analytics' => ['آنالیتیکس', 'chart'],
@@ -85,7 +90,7 @@ final class Pages
             . self::serverChip() . '</header>';
         $h .= '<nav class="pcdna-tabs" aria-label="بخش‌های مدیریت CDN">';
         foreach (self::TABS as $id => [$label, $icon]) {
-            $cur = $id === $page || ($page === 'manage' && $id === 'sites');
+            $cur = $id === $page || (in_array($page, ['manage', 'transfer'], true) && $id === 'sites') || ($page === 'opmanage' && $id === 'operator');
             $h .= '<a class="pcdna-tab' . ($cur ? ' is-active' : '') . '" href="' . View::url(['page' => $id]) . '"'
                 . ($cur ? ' aria-current="page"' : '') . '>' . View::icon($icon) . '<span>' . View::e($label) . '</span></a>';
         }
@@ -165,7 +170,21 @@ final class Pages
         return $out;
     }
 
-    private static function ok(array $r): bool
+    /** SPEC §19.1: lower-case operator domains => true from a fetch() result of Operator::LIST ([] when unavailable). */
+    public static function operatorSet(array $r): array
+    {
+        $out = [];
+        if (self::ok($r)) {
+            foreach ((array) $r['data'] as $x) {
+                if (Data::isOperator($x) && is_string($x['domain'] ?? null)) {
+                    $out[strtolower($x['domain'])] = true;
+                }
+            }
+        }
+        return $out;
+    }
+
+    public static function ok(array $r): bool
     {
         return ($r['code'] ?? 0) >= 200 && ($r['code'] ?? 0) < 300 && is_array($r['data'] ?? null);
     }
@@ -183,13 +202,13 @@ final class Pages
 
     // ------------------------------------------------------------------ shared bits
 
-    private static function whmcsBadge(string $s): string
+    public static function whmcsBadge(string $s): string
     {
         [$t, $tone] = self::WHMCS_STATUS[$s] ?? [$s, 'muted'];
         return View::badge($t, $tone);
     }
 
-    private static function cdnBadge(?string $s): string
+    public static function cdnBadge(?string $s): string
     {
         if ($s === null) {
             return View::badge('روی CDN نیست', 'bad-soft');
@@ -198,7 +217,7 @@ final class Pages
         return View::badge($t, $tone);
     }
 
-    private static function manageUrl(int $sid): string
+    public static function manageUrl(int $sid): string
     {
         return View::url(['page' => 'manage', 'service' => $sid]);
     }
@@ -320,9 +339,13 @@ final class Pages
         }
         $na = '<span class="pcdna-muted">—</span>';
         $h .= '<div class="pcdna-kpis">';
+        // SPEC §19.1: operator sites are counted separately (they are platform sites, not customers')
+        $opN = isset($ov['sites']['by_owner']['operator']) ? (int) $ov['sites']['by_owner']['operator']
+            : ($sites !== null ? count(array_filter($sites, [Data::class, 'isOperator'])) : 0);
         $h .= View::kpi('globe', 'brand', 'سایت‌های روی CDN', $ov ? View::n($ov['sites']['total'] ?? 0) : $na,
-            $ov ? View::n($by['active'] ?? 0) . ' فعال · ' . View::n($by['pending_ns'] ?? 0) . ' در انتظار NS · '
-                . View::n(($by['suspended'] ?? 0) + ($by['over_quota'] ?? 0)) . ' متوقف' : 'داده کنترلر در دسترس نیست');
+            ($ov ? View::n($by['active'] ?? 0) . ' فعال · ' . View::n($by['pending_ns'] ?? 0) . ' در انتظار NS · '
+                . View::n(($by['suspended'] ?? 0) + ($by['over_quota'] ?? 0)) . ' متوقف' : 'داده کنترلر در دسترس نیست')
+            . ($opN ? '<br><a href="' . View::url(['page' => 'operator']) . '" data-operator-count="' . $opN . '">' . View::n($opN) . ' دامنهٔ اپراتور (بدون صورت‌حساب)</a>' : ''));
         $eOn = (int) ($ov['edges']['online'] ?? 0);
         $eEn = (int) ($ov['edges']['enabled'] ?? 0);
         $h .= View::kpi('server', $ov && $eOn > 0 && $eOn >= $eEn ? 'ok' : 'bad', 'نودهای آنلاین',
@@ -394,17 +417,26 @@ final class Pages
 
         // top sites + latest events
         $byDomain = Data::servicesByDomain();
+        $opDomains = [];
+        foreach ((array) $sites as $x) {
+            if (Data::isOperator($x)) {
+                $opDomains[strtolower((string) $x['domain'])] = true;
+            }
+        }
         $top = '';
         if ($ov && !empty($ov['top_sites'])) {
             $top .= '<div class="pcdna-table-wrap"><table class="pcdna-table"><thead><tr><th>دامنه</th><th>ترافیک</th><th>درخواست</th><th></th></tr></thead><tbody>';
             $max = max(1, (float) ($ov['top_sites'][0]['bytes'] ?? 1));
             foreach (array_slice($ov['top_sites'], 0, 10) as $s) {
-                $svc = $byDomain[strtolower((string) ($s['domain'] ?? ''))] ?? null;
+                $isOp = isset($opDomains[strtolower((string) ($s['domain'] ?? ''))]);
+                $svc = $isOp ? null : ($byDomain[strtolower((string) ($s['domain'] ?? ''))] ?? null);
                 $top .= '<tr><td>' . View::ltr($s['domain'] ?? '?') . '</td><td class="pcdna-num">' . View::bytes($s['bytes'] ?? 0)
                     . View::meter((float) ($s['bytes'] ?? 0) / $max, 'brand') . '</td><td class="pcdna-num">' . View::n($s['requests'] ?? 0) . '</td><td class="pcdna-actions">'
                     . ($svc ? '<a class="pcdna-btn pcdna-btn-sm" href="' . self::manageUrl((int) $svc->id) . '">مدیریت</a>'
                         . '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::e(Data::serviceUrl((int) $svc->userid, (int) $svc->id))
-                        . '" title="صفحه سرویس در WHMCS">#' . (int) $svc->id . '</a>' : View::badge('بدون سرویس', 'muted'))
+                        . '" title="صفحه سرویس در WHMCS">#' . (int) $svc->id . '</a>'
+                        : ($isOp ? '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'opmanage', 'domain' => strtolower((string) $s['domain'])]) . '">مدیریت</a>'
+                            . View::badge('اپراتور', 'violet') : View::badge('بدون سرویس', 'muted')))
                     . '</td></tr>';
             }
             $top .= '</tbody></table></div>';
@@ -850,8 +882,12 @@ final class Pages
         $usage = null;
         if ($ping['ok']) {
             $up = '/api/v1/usage?month=' . gmdate('Y-m');
-            $r = self::fetch([$up]);
+            $r = self::fetch([$up, Operator::LIST]);
             $usage = self::ok($r[$up]) ? (array) ($r[$up]['data']['sites'] ?? []) : null;
+            // SPEC §19.1: operator sites belong to no service (the usage rows carry no owner_kind)
+            if ($usage !== null) {
+                $usage = Data::withoutOperator($usage, self::operatorSet($r[Operator::LIST]));
+            }
         }
         $ix = Data::siteIndex($usage ?? []);
 
@@ -986,6 +1022,10 @@ final class Pages
                 $menu .= View::postButton($q, 'create', ['service' => $sid], 'ساخت روی CDN (ModuleCreate)', 'pcdna-menu-item', 'سایت ' . $domain . ' روی کنترلر ساخته شود؟', 'plus');
             }
             $menu .= '<a class="pcdna-menu-item" href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '">' . View::icon('external') . '<span>صفحه سرویس در WHMCS</span></a>';
+            if ($live) {
+                // SPEC §19.2: «انتقال دامنه» to another client or to the operator
+                $menu .= '<a class="pcdna-menu-item" href="' . View::url(['page' => 'transfer', 'service' => $sid]) . '">' . View::icon('users') . '<span>انتقال دامنه</span></a>';
+            }
             $tunnel = '';
             if ($det && !empty($det['plan']['features']['tunnel'])) {
                 $tc = (array) ($det['config']['tunnel'] ?? []);
@@ -1983,7 +2023,7 @@ final class Pages
         return $h;
     }
 
-    private static function check(string $name, bool $on, string $label): string
+    public static function check(string $name, bool $on, string $label): string
     {
         return '<label class="pcdna-check"><input type="checkbox" name="' . View::e($name) . '" value="1"' . ($on ? ' checked' : '') . '><span>' . View::e($label) . '</span></label>';
     }
@@ -2052,7 +2092,12 @@ final class Pages
             return [[], [], $month, $ping];
         }
         $path = '/api/v1/usage?month=' . rawurlencode($month);
-        $r = self::fetch([$path])[$path];
+        $all = self::fetch([$path, Operator::LIST]);
+        $r = $all[$path];
+        // SPEC §19.1: operator sites are no client's usage (not in the per-client report / CSV)
+        if (self::ok($r)) {
+            $r['data']['sites'] = Data::withoutOperator((array) ($r['data']['sites'] ?? []), self::operatorSet($all[Operator::LIST]));
+        }
         if (!self::ok($r)) {
             return [[], [], $month, ['ok' => false, 'code' => $r['code'], 'error' => (string) $r['error'], 'ms' => 0, 'data' => []]];
         }
