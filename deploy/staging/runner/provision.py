@@ -6,7 +6,10 @@ For every NAME=IPv4 in STAGING_EDGES this does what an operator does in the pane
   * when the edge already exists but its token file is gone: POST /api/v1/edges/{id}/rotate-token
     and GET /api/v1/edges/install for the one-liner,
 and writes {name, id, token, install} to TOKENS_DIR/NAME.json (0600) for that edge container, which
-runs the one-liner. TOKENS_DIR/.done marks completion (the runner's healthcheck).
+runs the one-liner. The one-liner carries the token in the environment
+(`... | sudo PCDN_EDGE_TOKEN=edge_... bash -s -- --controller ...`, never `--token`); a one-liner of
+another shape is refused here already, so a controller change shows up in the runner log.
+TOKENS_DIR/.done marks completion (the runner's healthcheck).
 """
 
 import json
@@ -84,6 +87,8 @@ def main():
             install = api("GET", f"/api/v1/edges/install?{q}")["command"]
             doc = {"name": name, "id": e["id"], "token": tok, "install": install}
             print(f"provision: rotated the token of {name} (id {e['id']})", flush=True)
+        if f"| sudo PCDN_EDGE_TOKEN={doc['token']} bash -s -- " not in doc["install"]:
+            sys.exit(f"provision: unexpected install one-liner shape for {name} (token not in PCDN_EDGE_TOKEN)")
         write_token(name, doc)
     open(done, "w").close()
     print("provision: done", flush=True)

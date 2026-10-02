@@ -281,9 +281,9 @@ def delete_record(record_id: int, request: Request, key: ApiKey = Depends(requir
 
 
 @router.get("/config/{section}")
-def read_section(section: str, key: ApiKey = Depends(resolve_key)):
+def read_section(section: str, response: Response, key: ApiKey = Depends(resolve_key)):
     check_scope(key, section_scope(section))
-    return read_section_of(_site(key), section)
+    return read_section_of(_site(key), section, response)
 
 
 @router.put("/config/{section}")

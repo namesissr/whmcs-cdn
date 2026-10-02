@@ -305,8 +305,9 @@ overrides a later operator edit.
 The controller serves the secret-free edge tree so a node is brought up with one command:
 
 ```
-curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- \
-    --controller https://<controller> --token edge_xxx [--region home|global] [--role general|tunnel] ...
+curl -fsSL https://<controller>/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=edge_xxx bash -s -- \
+    --controller https://<controller> [--region home|global] [--role general|tunnel] ...
+# token also via --token-file F or a no-echo prompt; --token still works; https only unless --insecure-http
 ```
 
 `edge/bootstrap.sh` downloads `GET /edge/bundle.tar.gz` (a gzip tar of `edge/` built on the fly

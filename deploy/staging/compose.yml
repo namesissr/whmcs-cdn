@@ -44,8 +44,13 @@ x-edge-env: &edge-env
   # the one-liner from the controller says https://<CONTROLLER_DOMAIN>; staging serves plain HTTP
   CONTROLLER_PUBLIC_URL: https://controller:8000
   TOKENS_DIR: /staging/tokens
-  # extra install.sh flags (passed through bootstrap.sh): no country DB download, no IPv6 in docker
-  EDGE_INSTALL_FLAGS: "--no-geoip --no-ipv6 --no-avif"
+  # extra bootstrap.sh / install.sh flags: --insecure-http (bootstrap.sh refuses the plain-http
+  # controller URL above without it), no country DB download, no IPv6 in docker
+  EDGE_INSTALL_FLAGS: "--insecure-http --no-geoip --no-ipv6 --no-avif"
+  # origin guard (agent + nftables pcdn_origin_guard): the staging network is where the origin, MinIO
+  # and the Docker DNS-named services live, so it is listed as an allowed "private" origin network
+  # (read by load_config() as ORIGIN_PRIVATE_ALLOW, also while install.sh renders the guard ruleset)
+  PCDN_ORIGIN_PRIVATE_ALLOW: ${STAGING_NET:-11.200.0}.0/24
   # agent cadence for tests (production defaults: 20 / 60 / 60 / 120 / 5 s); read by load_config()
   PCDN_POLL_INTERVAL: "2"
   PCDN_HEARTBEAT_INTERVAL: "10"

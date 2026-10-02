@@ -201,7 +201,7 @@ curl -X POST https://cdn-api.pasargadmizban.com/api/v1/edges \
 
 ```bash
 git clone <this-repo> /opt/pcdn && cd /opt/pcdn/edge
-sudo ./install.sh --controller https://cdn-api.pasargadmizban.com --token edge_xxxxxxxx
+sudo PCDN_EDGE_TOKEN=edge_xxxxxxxx ./install.sh --controller https://cdn-api.pasargadmizban.com
 # اگر سرور IPv6 ندارد:  --no-ipv6        اندازه کش هر سایت:  --cache-size 50g
 ```
 

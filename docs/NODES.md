@@ -38,9 +38,12 @@
 پس از ساخت نود در پنل و گرفتن توکن، روی سرور نود این تک‌دستور را اجرا کنید:
 
 ```bash
-curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- \
-    --controller https://<controller> --token edge_xxxxxxxx
+curl -fsSL https://<controller>/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=edge_xxxxxxxx bash -s -- \
+    --controller https://<controller>
 ```
+
+توکن از متغیر محیطی `PCDN_EDGE_TOKEN` خوانده می‌شود تا در فهرست پروسه‌ها (`ps`) دیده نشود؛ `--token`
+هنوز پشتیبانی می‌شود. اتصال به کنترلر فقط با https مجاز است مگر `--insecure-http` بدهید.
 
 `bootstrap.sh` بسته را از کنترلر دانلود می‌کند، باز می‌کند و `install.sh` را با همان پرچم‌ها اجرا
 می‌کند. پرچم‌های قابل انتقال:
@@ -139,7 +142,7 @@ curl -s -H "Authorization: Bearer $ADMIN_API_KEY" \
 
 ```bash
 curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- \
-    --controller https://<controller> --token edge_xxxxxxxx --upgrade
+    --controller https://<controller> --upgrade
 ```
 
 نسخه‌ی بسته‌ی درحال‌اجرا را عامل در heartbeat گزارش می‌دهد (`bundle_version`) و کنترلر آن را با نسخه‌ی

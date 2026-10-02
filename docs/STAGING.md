@@ -91,13 +91,22 @@ poll هر ۲ ثانیه، heartbeat هر ۱۰، گزارش مصرف هر ۵، و
    نود از قبل وجود داشته باشد ولی فایل توکنش نباشد، توکن با `rotate-token` چرخانده می‌شود.
 2. کانتینر نود (`deploy/staging/edge/entrypoint.sh`) منتظر فایل توکن خودش می‌ماند و **همان تک‌دستور**
    را اجرا می‌کند:
-   `curl -fsSL <controller>/edge/bootstrap.sh | bash -s -- --controller <controller> --token edge_... --region global --role general`
-   یعنی `bootstrap.sh` بستهٔ `GET /edge/bundle.tar.gz` را از کنترلر می‌گیرد، نسخهٔ `GET /edge/version` را
-   ثبت می‌کند و `install.sh` واقعی را اجرا می‌کند. فقط سه تفاوت عمدی دارد:
+   `curl -fsSL <controller>/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=edge_... bash -s -- --controller <controller> --region global --role general`
+   (توکن در **محیط** `PCDN_EDGE_TOKEN` است، نه پرچم `--token`، تا در `ps` / `/proc/<pid>/cmdline` دیده
+   نشود). یعنی `bootstrap.sh` بستهٔ `GET /edge/bundle.tar.gz` را از کنترلر می‌گیرد، نسخهٔ `GET /edge/version` را
+   ثبت می‌کند و `install.sh` واقعی را اجرا می‌کند. فقط این تفاوت‌های عمدی را دارد:
    - آدرس `https://<CONTROLLER_DOMAIN>` به `http://controller:8000` تبدیل می‌شود (در staging جلوی
-     کنترلر TLS/Caddy نیست)؛
-   - `sudo` حذف می‌شود (کانتینر root است و `sudo` متغیرهای `PCDN_*` را پاک می‌کرد)؛
-   - پرچم‌های `--no-geoip --no-ipv6 --no-avif` (متغیر `EDGE_INSTALL_FLAGS`) اضافه می‌شوند.
+     کنترلر TLS/Caddy نیست)؛ برای همین پرچم `--insecure-http` لازم است (`bootstrap.sh` بدون آن آدرس
+     `http://` کنترلر را رد می‌کند)؛
+   - `sudo` حذف می‌شود (کانتینر root است و `sudo` متغیرهای `PCDN_*` را پاک می‌کرد)؛ توکن از تک‌دستور
+     جدا و به‌صورت `PCDN_EDGE_TOKEN` به `bash` داده می‌شود (همان کاری که `sudo PCDN_EDGE_TOKEN=… bash`
+     می‌کند) و در لاگ کانتینر `edge_<redacted>` چاپ می‌شود. `provision.py` تک‌دستوری با شکل دیگر (مثلاً
+     با `--token`) را رد می‌کند؛
+   - پرچم‌های `--insecure-http --no-geoip --no-ipv6 --no-avif` (متغیر `EDGE_INSTALL_FLAGS`) اضافه می‌شوند؛
+   - `PCDN_ORIGIN_PRIVATE_ALLOW=<STAGING_NET>.0/24` (پیش‌فرض `11.200.0.0/24`) در محیط نود است: نگهبان
+     مبدأ (origin guard) لبه — هم بررسی عامل و هم جدول nftables `pcdn_origin_guard` که `install.sh` با
+     همین مقدار می‌سازد — شبکهٔ staging را (مبدأ `.80`، MinIO `.90`، نام‌های DNS داکر) به‌عنوان شبکهٔ
+     خصوصی مجاز مبدأ می‌پذیرد. روی سرور واقعی همین تنظیم `ORIGIN_PRIVATE_ALLOW=` در `/etc/pcdn/agent.conf` است.
 3. پس از نصب، nginx (daemon) بالا است و `pcdn-agent` در پیش‌زمینه به‌عنوان فرایند اصلی کانتینر اجرا
    می‌شود (معادل `pcdn-agent.service`). عامل کانفیگ را از `/edge/v1/config` می‌کشد، heartbeat می‌فرستد و
    کنترلر پس از نخستین heartbeat نود را وارد DNS می‌کند.
@@ -123,6 +132,7 @@ image-filter، brotli، stream و python3-pil) **از قبل در تصویر** �
 | systemd | وجود ندارد؛ `deploy/staging/edge/systemctl` (shim) فراخوانی‌ها را ترجمه می‌کند: `nginx` ← اجرای daemon / `nginx -s reload`، `pcdn-imaged` ← اجرا در پس‌زمینه (بدون sandbox سیستم‌دی)، `pcdn-agent` ← بی‌اثر (entrypoint اجرایش می‌کند)، بقیه (تایمرهای GeoIP، `pcdn-guard`، `pcdn-fn`) ← بی‌اثر با پیام |
 | sysctl / modprobe / `tc qdisc` / conntrack | `install.sh` خودش شکست آن‌ها را تحمل می‌کند (`|| true`)؛ در کانتینر بدون امتیاز اعمال نمی‌شوند |
 | nftables (`--harden-net`) | نصب نمی‌شود (پیش‌فرض خاموش) |
+| نگهبان مبدأ (origin guard، nftables) | `install.sh` نصبش را امتحان می‌کند؛ در کانتینر بدون `CAP_NET_ADMIN`، `nft` معمولاً رد می‌کند و نصب با هشدار رد می‌شود (`ORIGIN_GUARD=no`)؛ بررسی آدرس مبدأ در خود عامل با `PCDN_ORIGIN_PRIVATE_ALLOW` همچنان فعال است |
 | توابع لبه (`--functions`) | نصب نمی‌شود (Landlock/seccomp/DynamicUser نیاز به systemd دارند) |
 | GeoIP | `--no-geoip`: پایگاه کشور دانلود نمی‌شود؛ قوانین کشوری fail-open هستند |
 | IPv6 | `--no-ipv6` |

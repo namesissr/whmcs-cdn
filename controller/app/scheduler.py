@@ -489,9 +489,38 @@ def job_security_audit(db, now: datetime | None = None, force: bool = False):
                            + "\n".join(f"• {p} ⊃ {c}" for p, c in pairs[:20]), "warning")
     else:
         alerts.resolve_alert("nested_sites", "دیگر سایت تودرتو با مالک متفاوتی وجود ندارد.")
+    unsafe = check_unsafe_regex(db)
     _set_state(db, "security_audit:last_run", now.isoformat())
     db.commit()
-    return {"blocked": blocked, "nested": pairs}
+    return {"blocked": blocked, "nested": pairs, "unsafe_regex": unsafe}
+
+
+def check_unsafe_regex(db) -> list[str]:
+    """One alert listing the sites with stored firewall / transform / redirect rules whose regex fails
+    today's safety check (saved before the check existed: back-references, chained wide quantifiers
+    such as a.*b.*c). Those rules are left out of the edge config (services.build_edge_config) and
+    skipped by the edges, so the customer's rule silently does nothing until it is fixed. Lists only
+    domains, sections and rule counts (no rule contents, no secrets)."""
+    from . import sections
+
+    lines = []
+    for site in db.scalars(select(Site).order_by(Site.domain)):
+        try:
+            bad = sections.unsafe_regex_rules(sections.all_config(site))
+        except Exception:  # noqa: BLE001 - one broken site must not stop the audit
+            log.exception("unsafe-regex audit failed for %s", site.domain)
+            continue
+        if bad:
+            lines.append(f"• {site.domain}: " + "، ".join(f"{k} ({len(v)})" for k, v in sorted(bad.items())))
+    if lines:
+        alerts.raise_alert("unsafe_regex", "قاعده‌های با عبارت منظم ناامن",
+                           "این سایت‌ها قاعده‌ای دارند که عبارت منظمش بررسی ایمنی امروز را رد می‌کند (پیش از "
+                           "آن ذخیره شده)؛ این قاعده‌ها به لبه‌ها فرستاده نمی‌شوند و تا مشتری آن‌ها را اصلاح "
+                           "نکند کاری انجام نمی‌دهند:\n" + "\n".join(lines[:50])
+                           + (f"\n… و {len(lines) - 50} سایت دیگر" if len(lines) > 50 else ""), "warning")
+    else:
+        alerts.resolve_alert("unsafe_regex", "دیگر قاعده‌ای با عبارت منظم ناامن ذخیره نشده است.")
+    return lines
 
 
 def job_capacity(db, now: datetime | None = None, force: bool = False):

@@ -513,10 +513,10 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
                 if members:
                     pools.append(dict(p, origins=members))
             cfg["pools"] = dict(cfg["pools"], pools=pools)
-        # H2: a firewall rule stored before the regex safety check existed is not sent while one of
-        # its regex conditions fails that check (dropping only the condition would widen the rule)
-        cfg["firewall"] = dict(cfg["firewall"], rules=[r for r in cfg["firewall"]["rules"]
-                                                       if sections.firewall_rule_safe(r)])
+        # H2: a firewall / transform / redirect rule stored before today's regex safety check is not
+        # sent while one of its regexes fails that check (dropping only the condition would widen the
+        # rule); the edges skip such a rule too. The scheduler alerts on them (check_unsafe_regex).
+        cfg = sections.drop_unsafe_regex_rules(cfg)
         for key, feat in (("firewall", "max_firewall_rules"), ("ratelimit", "max_ratelimit_rules"),
                           ("pagerules", "max_page_rules"), ("transform", "max_transform_rules"),
                           ("redirects", "max_redirects")):

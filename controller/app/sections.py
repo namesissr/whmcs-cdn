@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import warnings
 from typing import Literal
 from urllib.parse import quote
 
@@ -267,13 +268,7 @@ class Condition(Strict):
             if self.op == "regex":
                 # H2: the edge runs this on every request of the site (njs, header / UA / path);
                 # same safety checks as transform / redirect regexes (length, nesting, ambiguity)
-                if _stored(info):
-                    try:
-                        re.compile(self.value)
-                    except re.error as e:
-                        raise ValueError(f"عبارت منظم نامعتبر: {e}") from None
-                else:
-                    _safe_regex(self.value)
+                _regex_of(self.value, info)
             if self.field == "header":
                 if not self.name or not re.match(HEADER_NAME_RE, self.name):
                     raise ValueError("نام هدر لازم است")
@@ -800,12 +795,25 @@ def _country_codes(v: list[str]) -> list[str]:
     return out
 
 
-# --- regular-expression safety (transform rewrite_path, regex redirects) ---------------------------
-# The edges evaluate these patterns (PCRE) on every request, so a pattern with catastrophic
-# backtracking would be a self-inflicted DoS. Python's own parser gives us the pattern tree; a
-# quantified group that itself contains a quantifier is rejected unless a mandatory character the
-# inner quantifiers can never consume separates the repetitions (e.g. `(?:/[a-z]+)*` is fine,
-# `(a+)+`, `(a|a)+`, `(.*/)+` are not). Back-references and conditionals are rejected outright.
+# --- regular-expression safety (firewall regex conditions, transform rewrite_path, regex redirects)
+# The edges evaluate these patterns (PCRE / PCRE2 behind njs: backtracking engines) on every
+# request, on values the visitor chooses, so a pattern with catastrophic or high-degree polynomial
+# backtracking would be a self-inflicted DoS. This is a faithful port of the edge's own check
+# (edge/pcdn-agent.py regex_unsafe, which re-checks every customer regex and SKIPS an unsafe one):
+# keeping both verdicts identical means a customer gets a 422 here at save time instead of a rule
+# that the edge silently drops (controller/tests/test_regex_parity.py loads the agent and compares).
+#   * no back-references / conditionals;
+#   * no quantified group that itself contains a quantifier unless a mandatory character the inner
+#     quantifiers can never consume separates the repetitions (`(a+)+`, `(.*a)*`, `(\w+\s?)*` are
+#     rejected, `(?:/[a-z]+)*` is fine), and no repeated alternation whose alternatives can start
+#     alike (`(a|ab)*`);
+#   * at most REGEX_MAX_UNBOUNDED unbounded quantifiers;
+#   * polynomial backtracking bounded: wide quantifiers (unbounded, or bounded above
+#     REGEX_WIDE_REPEAT) that follow each other without a separating mandatory character form a
+#     chain; its length, plus one for an unanchored pattern (every start position is tried), must
+#     stay <= REGEX_MAX_DEGREE (`a.*b.*c`, `Mozilla.*Windows.*Chrome`, `^/(.*)/(.*)/(.*)x$` are 3).
+# Character sets are compared case-insensitively (njs compiles firewall regexes with `i`, nginx
+# page-rule locations are `~*`) over a fixed sample of code points, exactly as the edge does.
 
 try:  # Python 3.11+
     from re import _constants as _sre_c
@@ -814,9 +822,14 @@ except ImportError:  # pragma: no cover - older Pythons
     import sre_constants as _sre_c
     import sre_parse as _sre_p
 
-_REPEAT_OPS = {_sre_c.MAX_REPEAT, _sre_c.MIN_REPEAT}
-_POSSESSIVE = getattr(_sre_c, "POSSESSIVE_REPEAT", None)
+REGEX_MAX_DEGREE = 2    # edge REGEX_MAX_DEGREE
+REGEX_WIDE_REPEAT = 32  # edge REGEX_WIDE_REPEAT: `{n,m}` with m >= this counts as wide
+
+_REPEAT_OPS = {_sre_c.MAX_REPEAT, _sre_c.MIN_REPEAT} | (
+    {_sre_c.POSSESSIVE_REPEAT} if hasattr(_sre_c, "POSSESSIVE_REPEAT") else set())
 _ATOMIC = getattr(_sre_c, "ATOMIC_GROUP", None)
+# characters tried when testing whether two character sets overlap (edge _RX_SAMPLE)
+_RX_SAMPLE = list(range(0x20, 0x7f)) + [0x09, 0x0a, 0xa0, 0xe9, 0x627, 0x6cc, 0x4e00]
 
 
 class _RegexUnsafe(ValueError):
@@ -824,7 +837,7 @@ class _RegexUnsafe(ValueError):
 
 
 def _children(op, av) -> list:
-    if op in _REPEAT_OPS or (_POSSESSIVE is not None and op == _POSSESSIVE):
+    if op in _REPEAT_OPS:
         return [av[2]]
     if op == _sre_c.SUBPATTERN:
         return [av[-1]]
@@ -840,10 +853,9 @@ def _children(op, av) -> list:
 def _category_has(cat, c: int) -> bool:
     ch = chr(c)
     word = ch.isalnum() or ch == "_"
-    table = {_sre_c.CATEGORY_DIGIT: ch.isdigit(), _sre_c.CATEGORY_NOT_DIGIT: not ch.isdigit(),
-             _sre_c.CATEGORY_SPACE: ch.isspace(), _sre_c.CATEGORY_NOT_SPACE: not ch.isspace(),
-             _sre_c.CATEGORY_WORD: word, _sre_c.CATEGORY_NOT_WORD: not word}
-    return table.get(cat, True)  # unknown category: assume it overlaps
+    return {_sre_c.CATEGORY_DIGIT: ch.isdigit(), _sre_c.CATEGORY_NOT_DIGIT: not ch.isdigit(),
+            _sre_c.CATEGORY_SPACE: ch.isspace(), _sre_c.CATEGORY_NOT_SPACE: not ch.isspace(),
+            _sre_c.CATEGORY_WORD: word, _sre_c.CATEGORY_NOT_WORD: not word}.get(cat, True)
 
 
 def _in_item_has(item, c: int) -> bool:
@@ -858,20 +870,33 @@ def _in_item_has(item, c: int) -> bool:
 
 
 def _char_pred(op, av):
-    """Predicate "can this one-character element match code point c", or None for other ops."""
-    if op == _sre_c.LITERAL:
-        return lambda c: c == av
-    if op == _sre_c.NOT_LITERAL:
-        return lambda c: c != av
+    """Predicate "can this one-character element match code point c" (case-insensitive), or None
+    for any other element."""
     if op == _sre_c.ANY:
         return lambda c: True
-    if op == _sre_c.IN:
+    if op == _sre_c.LITERAL:
+        def base(c):
+            return c == av
+    elif op == _sre_c.NOT_LITERAL:
+        def base(c):
+            return c != av
+    elif op == _sre_c.IN:
         items = list(av)
         neg = bool(items) and items[0][0] == _sre_c.NEGATE
         items = items[1:] if neg else items
-        return lambda c: (not any(_in_item_has(i, c) for i in items)) if neg else any(
-            _in_item_has(i, c) for i in items)
-    return None
+
+        def base(c):
+            hit = any(_in_item_has(i, c) for i in items)
+            return not hit if neg else hit
+    else:
+        return None
+
+    def pred(c):
+        if base(c):
+            return True
+        ch = chr(c)
+        return any(base(ord(x)) for x in (ch.lower(), ch.upper()) if len(x) == 1 and x != ch)
+    return pred
 
 
 def _consumable(sub) -> list:
@@ -886,46 +911,38 @@ def _consumable(sub) -> list:
     return out
 
 
-def _separators(sub) -> list[set[int]]:
-    """Mandatory one-character elements at the top of `sub` (inside plain groups too), as small
-    explicit character sets; elements with a large/unknown set are not usable as separators."""
+def _separators(sub) -> list:
+    """Mandatory one-character elements at the top of `sub` (plain groups too), as predicates."""
     out = []
     for op, av in sub:
-        if op == _sre_c.LITERAL:
-            out.append({av})
-        elif op == _sre_c.IN and av and av[0][0] != _sre_c.NEGATE:
-            chars: set[int] = set()
-            for iop, iav in av:
-                if iop == _sre_c.LITERAL:
-                    chars.add(iav)
-                elif iop == _sre_c.RANGE and iav[1] - iav[0] <= 256:
-                    chars.update(range(iav[0], iav[1] + 1))
-                else:
-                    chars = set()
-                    break
-            if chars:
-                out.append(chars)
+        if op in (_sre_c.LITERAL, _sre_c.IN):
+            out.append(_char_pred(op, av))
         elif op == _sre_c.SUBPATTERN:
             out.extend(_separators(av[-1]))
     return out
 
 
-def _repeats(sub, depth=0):
+def _overlap(a: list, b: list) -> bool:
+    return any(any(p(c) for p in a) and any(q(c) for q in b) for c in _RX_SAMPLE)
+
+
+def _repeats(sub):
     """(lo, hi, body) of every quantifier inside `sub`, recursively."""
     for op, av in sub:
-        if op in _REPEAT_OPS or (_POSSESSIVE is not None and op == _POSSESSIVE):
+        if op in _REPEAT_OPS:
             yield av
         for child in _children(op, av):
-            yield from _repeats(child, depth + 1)
+            yield from _repeats(child)
 
 
 def _ambiguous(body) -> bool:
+    """A repeated `body` holding an inner quantifier and no separator the inner ones never consume."""
     inner = [r for r in _repeats(body) if r[1] > 1]
     if not inner:
         return False
     preds = [p for r in inner for p in _consumable(r[2])]
     for sep in _separators(body):
-        if not any(p(c) for c in sep for p in preds):
+        if not any(sep(c) and any(p(c) for p in preds) for c in _RX_SAMPLE):
             return False  # a character the inner quantifiers never consume splits the repetitions
     return True
 
@@ -936,13 +953,12 @@ def _first_preds(sub) -> tuple[list, bool]:
     for op, av in sub:
         p = _char_pred(op, av)
         if p is not None:
-            preds.append(p)
-            return preds, False
+            return preds + [p], False
         if op in (_sre_c.AT, _sre_c.ASSERT, _sre_c.ASSERT_NOT):
             continue  # zero-width
         if op == _sre_c.SUBPATTERN:
             fp, nullable = _first_preds(av[-1])
-        elif op in _REPEAT_OPS or (_POSSESSIVE is not None and op == _POSSESSIVE):
+        elif op in _REPEAT_OPS:
             fp, nullable = _first_preds(av[2])
             nullable = nullable or av[0] == 0
         elif op == _sre_c.BRANCH:
@@ -957,10 +973,6 @@ def _first_preds(sub) -> tuple[list, bool]:
         if not nullable:
             return preds, False
     return preds, True
-
-
-# characters tried when testing whether two alternatives can start alike
-_OVERLAP_SAMPLE = list(range(0x20, 0x7f)) + [0x0a, 0xa0, 0xe9, 0x627, 0x6cc, 0x4e00]
 
 
 def _quantified_alternations(v: str) -> list[list[str]]:
@@ -1000,7 +1012,7 @@ def _quantified_alternations(v: str) -> list[list[str]]:
                 hi = 0
             if hi > 1 and bars:
                 body = start + 1
-                pre = re.match(r"\?(?:[:=!>|]|<[=!]|[a-zA-Z-]+:)", v[body:i])
+                pre = re.match(r"\?(?:[:=!>|]|<[=!]|[a-zA-Z-]+:|P<\w+>)", v[body:i])
                 body += pre.end() if pre else 0
                 parts, prev = [], body
                 for b in bars:
@@ -1017,23 +1029,51 @@ def _overlapping_alternatives(parts: list[str]) -> bool:
     for part in parts:
         try:
             preds, nullable = _first_preds(_sre_p.parse(part))
-        except Exception:  # noqa: BLE001 - not parseable on its own: do not judge it
-            return False
+        except Exception:  # noqa: BLE001 - not parseable on its own: assume the worst (as the edge)
+            return True
         if nullable:
             return True  # an empty alternative inside a repeat
         firsts.append(preds)
-    for a in range(len(firsts)):
-        for b in range(a + 1, len(firsts)):
-            if any(any(p(c) for p in firsts[a]) and any(p(c) for p in firsts[b]) for c in _OVERLAP_SAMPLE):
-                return True
-    return False
+    return any(_overlap(firsts[a], firsts[b]) for a in range(len(firsts)) for b in range(a + 1, len(firsts)))
+
+
+def _chain(sub, chain: list, length: int, state: dict) -> tuple[list, int]:
+    """Walk `sub` as a sequence, carrying the current chain of wide quantifiers (the predicates of
+    what they consume, and how many); state["degree"] keeps the longest chain seen (edge _rx_chain)."""
+    for op, av in sub:
+        if op in _REPEAT_OPS and (av[1] == _sre_c.MAXREPEAT or av[1] >= REGEX_WIDE_REPEAT):
+            preds = _consumable(av[2]) or [lambda c: True]
+            if chain and _overlap(chain, preds):
+                chain, length = chain + preds, length + 1
+            else:
+                chain, length = list(preds), 1
+            state["degree"] = max(state["degree"], length)
+            _chain(av[2], [], 0, state)  # a body with its own inner quantifier: _ambiguous
+        elif op in _REPEAT_OPS:  # optional / small bounded repeat: its body continues the sequence
+            for _ in range(max(1, min(av[1], 3))):
+                chain, length = _chain(av[2], chain, length, state)
+        elif op == _sre_c.SUBPATTERN:
+            chain, length = _chain(av[-1], chain, length, state)
+        elif _ATOMIC is not None and op == _ATOMIC:
+            chain, length = _chain(av, chain, length, state)
+        elif op == _sre_c.BRANCH:
+            # any alternative may be the one taken: the union of what they leave, the longest chain
+            outs = [_chain(b, list(chain), length, state) for b in av[1]]
+            chain, length = [p for c2, _ in outs for p in c2], max([l2 for _, l2 in outs] + [0])
+        elif op in (_sre_c.ASSERT, _sre_c.ASSERT_NOT):
+            _chain(av[1], [], 0, state)  # runs at each position on its own
+        else:
+            p = _char_pred(op, av)
+            if p is not None and chain and not any(p(c) and any(q(c) for q in chain) for c in _RX_SAMPLE):
+                chain, length = [], 0  # a mandatory character the chain never consumes splits it
+    return chain, length
 
 
 def _check_tree(sub, state: dict):
     for op, av in sub:
         if op in (_sre_c.GROUPREF, _sre_c.GROUPREF_EXISTS):
             raise _RegexUnsafe("ارجاع به گروه (مثل \\1) و شرط در عبارت منظم مجاز نیست")
-        if op in _REPEAT_OPS or (_POSSESSIVE is not None and op == _POSSESSIVE):
+        if op in _REPEAT_OPS:
             lo, hi, body = av
             if hi == _sre_c.MAXREPEAT:
                 state["unbounded"] += 1
@@ -1044,57 +1084,145 @@ def _check_tree(sub, state: dict):
             _check_tree(child, state)
 
 
-def _safe_regex(v: str | None) -> re.Pattern:
-    """Compile a customer regex after the safety checks; raises ValueError (Persian)."""
+def _safe_regex(v: str | None, nginx: bool = False) -> re.Pattern:
+    """Compile a customer regex after the safety checks; raises ValueError (Persian). Same verdict as
+    the edge's regex_unsafe (edge/pcdn-agent.py). nginx: the pattern is rendered into the nginx
+    config (regex redirects, rewrite_path), where the edge only accepts printable ASCII and the
+    syntax PCRE shares with Python (edge pcre_regex)."""
     if not isinstance(v, str) or not v:
         raise ValueError("عبارت منظم (regex) لازم است")
     if len(v) > REGEX_MAX_LEN:
         raise ValueError(f"عبارت منظم حداکثر {REGEX_MAX_LEN} کاراکتر می‌تواند باشد")
-    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in v):
+    if any(ch.isspace() or ord(ch) < 0x20 or 0x7f <= ord(ch) < 0xa0 for ch in v):
         raise ValueError("عبارت منظم نباید فاصله یا کاراکتر کنترلی داشته باشد (برای فاصله از \\s یا %20 "
                          "استفاده کنید)")
+    if nginx:
+        if not re.match(r"^[\x21-\x7e]+$", v):
+            raise ValueError("این عبارت منظم فقط کاراکترهای ASCII (بدون فاصله) می‌پذیرد؛ لبه‌ها عبارت منظم "
+                             "مسیر با حروف غیرلاتین را اجرا نمی‌کنند")
+        if re.search(r"\\[NuUlL]", v) or any(set(m.group(1)) - set("imsx-")
+                                              for m in re.finditer(r"\(\?([A-Za-z-]+)[:)]", v)):
+            raise ValueError("این عبارت منظم نحوی دارد که لبه‌ها (PCRE) پشتیبانی نمی‌کنند (\\N، \\u، \\U، "
+                             "\\l، \\L یا پرچمی جز i، m، s، x)")
     if "(?P" in v:
         raise ValueError("گروه نام‌دار پایتونی (?P<...>) پشتیبانی نمی‌شود؛ از گروه معمولی (...) و $1..$9 "
                          "استفاده کنید")
     try:
-        compiled = re.compile(v)
-    except re.error as e:
+        with warnings.catch_warnings():  # FutureWarning on "[[" / "--" etc.: not ours to report
+            warnings.simplefilter("ignore")
+            compiled = re.compile(v)
+            tree = _sre_p.parse(v)
+    except (re.error, RecursionError, OverflowError, ValueError, TypeError) as e:
         raise ValueError(f"عبارت منظم نامعتبر: {e}") from None
+    state = {"unbounded": 0, "degree": 0}
     try:
-        tree = _sre_p.parse(v)
-    except Exception:  # noqa: BLE001 - internal parser unavailable/changed: use the string heuristic
-        tree = None
-    if tree is not None:
-        state = {"unbounded": 0}
-        try:
-            _check_tree(tree, state)
-        except _RegexUnsafe as e:
-            raise ValueError(str(e)) from None
+        _check_tree(tree, state)
         if state["unbounded"] > REGEX_MAX_UNBOUNDED:
-            raise ValueError(f"عبارت منظم بیش از {REGEX_MAX_UNBOUNDED} کمیت‌سنج نامحدود (* یا +) دارد؛ "
-                             "آن را ساده کنید")
+            raise _RegexUnsafe(f"عبارت منظم بیش از {REGEX_MAX_UNBOUNDED} کمیت‌سنج نامحدود (* یا +) دارد؛ "
+                               "آن را ساده کنید")
         if any(_overlapping_alternatives(parts) for parts in _quantified_alternations(v)):
-            raise ValueError("عبارت منظم گروه تکرارشونده‌ای دارد که گزینه‌هایش با یک کاراکتر شروع می‌شوند "
-                             "(مثل (a|ab)+) و ممکن است بسیار کند اجرا شود؛ آن را ساده کنید")
-    elif re.search(r"\([^()]*[*+}][^()]*\)[*+{]", v) or re.search(r"\\[1-9]", v):
-        raise ValueError("عبارت منظم کمیت‌سنج تودرتو یا ارجاع به گروه دارد و ممکن است بسیار کند اجرا شود")
+            raise _RegexUnsafe("عبارت منظم گروه تکرارشونده‌ای دارد که گزینه‌هایش با یک کاراکتر شروع می‌شوند "
+                               "(مثل (a|ab)+) و ممکن است بسیار کند اجرا شود؛ آن را ساده کنید")
+        _chain(tree, [], 0, state)
+    except _RegexUnsafe as e:
+        raise ValueError(str(e)) from None
+    except RecursionError:
+        raise ValueError("عبارت منظم بیش از حد تودرتو است؛ آن را ساده کنید") from None
+    if state["degree"] + (0 if v.startswith("^") else 1) > REGEX_MAX_DEGREE:
+        raise ValueError(
+            "عبارت منظم چند کمیت‌سنج باز (مثل .* یا .+) پشت سر هم دارد (مثل a.*b.*c) و ممکن است روی "
+            "ورودی بلند بسیار کند اجرا شود؛ لبه‌ها چنین قاعده‌ای را اجرا نمی‌کنند. تعداد .* ها را کم کنید، "
+            "به‌جای .* از مجموعهٔ محدودتری مثل [^/]* استفاده کنید یا عبارت را با ^ لنگر بزنید")
     return compiled
 
 
-@functools.lru_cache(maxsize=4096)
-def regex_safe(v: str) -> bool:
-    """True when `v` passes _safe_regex (cached: the edge config build checks stored rules)."""
+def _regex_of(v, info: ValidationInfo | None, nginx: bool = False) -> re.Pattern:
+    """A customer regex of a section being validated: the full safety check on a write; stored data
+    (context STORED) only has to compile, so a rule saved before a check was added keeps parsing
+    (and is shown with a warning) instead of the whole section falling back to its default. The
+    edge config build drops such rules (unsafe_regex_rules) and the edges skip them too."""
+    if not _stored(info):
+        return _safe_regex(v, nginx=nginx)
+    if not isinstance(v, str) or not v:
+        raise ValueError("عبارت منظم (regex) لازم است")
     try:
-        _safe_regex(v)
-        return True
-    except ValueError:
-        return False
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return re.compile(v)
+    except (re.error, RecursionError, OverflowError, ValueError) as e:
+        raise ValueError(f"عبارت منظم نامعتبر: {e}") from None
+
+
+@functools.lru_cache(maxsize=4096)
+def regex_problem(v: str, nginx: bool = False) -> str | None:
+    """Why `v` fails _safe_regex (Persian), or None when it passes (cached: the edge config build
+    checks stored rules on every poll)."""
+    try:
+        _safe_regex(v, nginx=nginx)
+        return None
+    except ValueError as e:
+        return str(e)
+
+
+def regex_safe(v: str, nginx: bool = False) -> bool:
+    """True when `v` passes _safe_regex."""
+    return regex_problem(v, nginx) is None
 
 
 def firewall_rule_safe(rule: dict) -> bool:
     """A stored firewall rule whose regex conditions all pass the safety check (H2)."""
     return all(regex_safe(c["value"]) for c in rule.get("conditions") or []
                if c.get("op") == "regex" and isinstance(c.get("value"), str))
+
+
+def transform_rule_safe(rule: dict) -> bool:
+    """A stored transform rule whose rewrite_path regexes all pass the safety check (the whole rule
+    is dropped: its other actions may only make sense together with the rewrite)."""
+    return all(regex_safe(a["regex"], nginx=True) for a in rule.get("actions") or []
+               if a.get("type") == "rewrite_path" and isinstance(a.get("regex"), str))
+
+
+def redirect_rule_safe(rule: dict) -> bool:
+    """A stored redirect rule whose regex source passes the safety check."""
+    return rule.get("match") != "regex" or not isinstance(rule.get("source"), str) or regex_safe(
+        rule["source"], nginx=True)
+
+
+_RULE_SAFE = {"firewall": firewall_rule_safe, "transform": transform_rule_safe, "redirects": redirect_rule_safe}
+
+
+def unsafe_regex_rules(cfg: dict) -> dict[str, list[str]]:
+    """{section: [rule id, ...]} of the stored rules (firewall / transform / redirects) whose regex
+    fails today's safety check, for the edge config build (dropped), the per-site warnings and the
+    scheduler alert. `cfg` is all_config(site) (or any dict holding those sections)."""
+    out: dict[str, list[str]] = {}
+    for name, ok in _RULE_SAFE.items():
+        bad = [str(r.get("id")) for r in (cfg.get(name) or {}).get("rules") or [] if not ok(r)]
+        if bad:
+            out[name] = bad
+    return out
+
+
+def drop_unsafe_regex_rules(cfg: dict) -> dict:
+    """`cfg` with the firewall / transform / redirect rules whose regex fails the safety check
+    removed (the edges would skip them anyway; dropping only a condition would widen a rule)."""
+    out = dict(cfg)
+    for name, ok in _RULE_SAFE.items():
+        if name in out:
+            out[name] = dict(out[name], rules=[r for r in out[name]["rules"] if ok(r)])
+    return out
+
+
+def regex_rule_warnings(site, name: str) -> list[str]:
+    """Persian warnings for stored rules of section `name` whose regex the edges refuse to run."""
+    if name not in _RULE_SAFE:
+        return []
+    ids = unsafe_regex_rules({name: get_section(site, name)}).get(name)
+    if not ids:
+        return []
+    return [f"عبارت منظم این قاعده‌ها دیگر بررسی ایمنی را رد نمی‌کند و لبه‌ها آن‌ها را اجرا نمی‌کنند: "
+            f"{'، '.join(ids)}. عبارت منظم را ساده کنید (مثلاً کمیت‌سنج‌های باز پشت سر هم مثل a.*b.*c "
+            f"یا ارجاع به گروه مثل \\1) و دوباره ذخیره کنید."]
 
 
 def _check_refs(text: str, groups: int, allowed: bool):
@@ -1160,9 +1288,9 @@ class TransformAction(Strict):
     replacement: str | None = None
 
     @model_validator(mode="after")
-    def _check(self):
+    def _check(self, info: ValidationInfo):
         if self.type == "rewrite_path":
-            groups = _safe_regex(self.regex).groups
+            groups = _regex_of(self.regex, info, nginx=True).groups
             rep = self.replacement
             if not rep or len(rep) > 1024 or not REWRITE_RE.match(rep) or rep.startswith("//"):
                 raise ValueError("مسیر جایگزین (replacement) باید با / شروع شود (مثل /new/$1) و فقط "
@@ -1273,9 +1401,9 @@ class RedirectRule(Strict):
     preserve_query: bool = False
 
     @model_validator(mode="after")
-    def _check(self):
+    def _check(self, info: ValidationInfo):
         if self.match == "regex":
-            compiled = _safe_regex(self.source)
+            compiled = _regex_of(self.source, info, nginx=True)
             self.target = _redirect_target(self.target, compiled.groups)
             loop = (self.target.startswith("/") and "$" not in self.target
                     and compiled.search(self.target.split("?", 1)[0].split("#", 1)[0]) is not None)

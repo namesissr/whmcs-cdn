@@ -55,12 +55,18 @@ def read_config(domain: str, db: Session = Depends(get_db)):
 
 # section handlers factored so the admin and customer APIs share identical validation/logic
 
-def read_section_of(site: Site, section: str) -> dict:
+def read_section_of(site: Site, section: str, response: Response | None = None) -> dict:
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
     value = sections.get_section(site, section)
     if section == "functions":  # + output-only code_bytes / sha256 per item (SPEC §16.9)
         value = sections.functions_view(value)
+    # stored rules whose regex fails today's safety check (the edges do not run them): surfaced the
+    # same way as the write warnings, so the body stays the stored section
+    if response is not None:
+        warnings = sections.regex_rule_warnings(site, section)
+        if warnings:
+            response.headers["X-Pcdn-Warnings"] = json.dumps(warnings)
     return value
 
 
@@ -153,8 +159,8 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
 
 
 @router.get("/sites/{domain}/config/{section}")
-def read_section(domain: str, section: str, db: Session = Depends(get_db)):
-    return read_section_of(get_site(db, domain), section)
+def read_section(domain: str, section: str, response: Response, db: Session = Depends(get_db)):
+    return read_section_of(get_site(db, domain), section, response)
 
 
 @router.put("/sites/{domain}/config/{section}")

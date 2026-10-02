@@ -658,7 +658,7 @@ text Persian; controller code English with Persian log strings where the module 
 - **One-command install.** `edge/bootstrap.sh` is a tiny remote installer: given `--controller <url>`
   and `--token edge_xxx`, it downloads the edge bundle from the controller, unpacks it and runs
   `install.sh` with the same flags. Target one-liner:
-  `curl -fsSL https://<controller>/edge/bootstrap.sh | sudo bash -s -- --controller https://<controller> --token edge_xxx`
+  `curl -fsSL https://<controller>/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=edge_xxx bash -s -- --controller https://<controller>` (token via env since wave 9; `--token` still accepted)
   It passes through `--region home|global`, `--role general|tunnel` (maps to the edge group),
   `--cache-size`, `--http-port`, `--https-port`, `--no-ipv6`, `--no-geoip`, `--upgrade`.
 - **Controller serves the (secret-free) bundle.** `GET /edge/bootstrap.sh` returns the bootstrap

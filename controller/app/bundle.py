@@ -11,6 +11,7 @@ hash identically) and is reported by the agent so the panel can flag out-of-date
 import hashlib
 import io
 import os
+import shlex
 import tarfile
 
 from .config import settings
@@ -114,10 +115,12 @@ def base_url() -> str:
 
 def install_command(token: str, region: str | None = None, role: str | None = None,
                     extra: str = "") -> str:
-    """The copy-paste one-command install for a node with this one-time token (SPEC §11.1)."""
+    """The copy-paste one-command install for a node with this one-time token (SPEC §11.1). The
+    token travels in the environment (PCDN_EDGE_TOKEN, read by edge/bootstrap.sh), not on bash's
+    argv, so it is not visible to other local users in ps / /proc/<pid>/cmdline while it installs."""
     base = base_url()
-    cmd = (f"curl -fsSL {base}/edge/bootstrap.sh | sudo bash -s -- "
-           f"--controller {base} --token {token}")
+    cmd = (f"curl -fsSL {base}/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN={shlex.quote(token)} bash -s -- "
+           f"--controller {base}")
     if region in _VALID_REGION:
         cmd += f" --region {region}"
     if role in _VALID_ROLE:

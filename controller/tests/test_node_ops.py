@@ -138,7 +138,8 @@ def test_batch_create(client):
     for e in edges:
         assert e["token"].startswith("edge_")
         assert e["region"] == "home" and e["group"] == "tunnel"
-        assert "--token " + e["token"] in e["install"]
+        assert "| sudo PCDN_EDGE_TOKEN=" + e["token"] + " bash -s -- " in e["install"]
+        assert "--token" not in e["install"]
         assert "--region home" in e["install"] and "--role tunnel" in e["install"]
 
 
@@ -179,7 +180,11 @@ def test_install_oneliner_endpoint(client, monkeypatch):
     cmd = r.json()["command"]
     assert cmd.startswith("curl -fsSL https://cdn-api.example.com/edge/bootstrap.sh")
     assert "--controller https://cdn-api.example.com" in cmd
-    assert "--token edge_xyz" in cmd and "--region home" in cmd and "--role tunnel" in cmd
+    assert cmd == ("curl -fsSL https://cdn-api.example.com/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=edge_xyz "
+                   "bash -s -- --controller https://cdn-api.example.com --region home --role tunnel")
+    # the token is passed via the environment (not bash's argv) and shell-quoted
+    r = client.get("/api/v1/edges/install", params={"token": "edge_x; id"})
+    assert "PCDN_EDGE_TOKEN='edge_x; id' bash" in r.json()["command"]
 
 
 # ---------------------------------------------------------------- public bundle routes (§11.1)
