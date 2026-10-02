@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from conftest import modules_available, nginx_conf
+from conftest import modules_available, nginx_conf, TEST_ORIGIN_ALLOW
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("agent_6d_e2e", HERE.parent / "pcdn-agent.py")
@@ -156,10 +156,10 @@ def env(tmp_path_factory):
     origin = serve(OriginH)
     A = {"address": "127.0.0.1", "port": origin.server_address[1]}
     dead = {"address": "127.0.0.1", "port": free_port()}
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
-        "ACCESS_LOG": str(tmp / "access.log"), "ERROR_LOG": str(tmp / "error.log"),
+        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "FN_USAGE_LOG": str(tmp / "fn-usage.log"), "ERROR_LOG": str(tmp / "error.log"),
         "PAGES_DIR": str(HERE.parent / "pages"), "NJS_FILE": str(HERE.parent / "njs/pcdn.js"),
         "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"), "GEOIP_DB": str(tmp / "none.mmdb"),
         "RESOLVER": "127.0.0.1", "NGINX_USER": "root", "LISTEN_IPV6": "no", "HTTP_PORT": str(free_port()),

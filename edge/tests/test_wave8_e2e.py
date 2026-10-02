@@ -19,7 +19,7 @@ import http.server
 
 import pytest
 
-from conftest import MODULES_DIR, modules_available, nginx_conf
+from conftest import modules_available, MODULES_DIR, nginx_conf, TEST_ORIGIN_ALLOW
 from test_perf_e2e import Node, agent, free_port, wait_for
 
 pytestmark = pytest.mark.skipif(
@@ -150,15 +150,41 @@ def l4_entry(sid, domain, app, proto, port, oport, **kw):
                  "ip_allow": [], "idle_timeout": 30}, **kw)
 
 
+def l4_ports(cfg, names):
+    """Distinct ports inside L4_PORT_RANGE (render_l4 skips an app outside it), free for TCP and UDP
+    on all addresses (nginx binds *:port) and not one of the node's own ports. A plain free_port()
+    comes from the kernel's ephemeral range (here up to 65535), which may lie above the L4 range."""
+    import random
+    lo, hi = agent.l4_port_range(cfg)
+    own = {int(cfg[k]) for k in ("HTTP_PORT", "HTTPS_PORT", "RESIZE_PORT", "IMAGE_PORT") if cfg.get(k)}
+    rnd, out = random.Random(), {}
+    for name in names:
+        for _ in range(1000):
+            p = rnd.randint(lo, hi)
+            if p in own or p in out.values():
+                continue
+            try:
+                for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                    with socket.socket(socket.AF_INET, kind) as s:
+                        s.bind(("0.0.0.0", p))
+            except OSError:
+                continue
+            out[name] = p
+            break
+        else:
+            raise RuntimeError("no free port in L4_PORT_RANGE")
+    return out
+
+
 @pytest.fixture(scope="module")
 def env(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("w8")
     origin, tcp, udp = Origin(), TcpEcho(), UdpEcho()
     op = origin.port
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
-        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"),
+        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "FN_USAGE_LOG": str(tmp / "fn-usage.log"),
         "PAGES_DIR": str(HERE.parent / "pages"), "NJS_FILE": str(HERE.parent / "njs/pcdn.js"),
         "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"), "GEOIP_DB": str(tmp / "none.mmdb"),
         "RESOLVER": "127.0.0.1", "NGINX_USER": "root", "LISTEN_IPV6": "no", "HTTP_PORT": str(free_port()),
@@ -171,7 +197,7 @@ def env(tmp_path_factory):
                     + f"include {cfg['NGINX_DIR']}/l4/*.conf;\n")          # what install.sh adds
     cfg.update(NGINX_CONF=str(conf), NGINX_TEST_CMD=f"nginx -t -q -c {conf}", NGINX_RELOAD_CMD=f"nginx -s reload -c {conf}")
     assert agent.l4_ready(cfg)
-    ports = {k: free_port() for k in ("tcp", "deny", "pp", "udp")}
+    ports = l4_ports(cfg, ("tcp", "deny", "pp", "udp"))
     node = Node(cfg, conf, tmp)
     node.ports, node.origin, node.tcp, node.udp = ports, origin, tcp, udp
     node.config = {"sites": [

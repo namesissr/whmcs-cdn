@@ -71,6 +71,27 @@ function reOrNull(src, flags) {
     try { return new RegExp(src, flags); } catch (e) { return null; }
 }
 
+// Customer regexes (security review H2). pcdn-agent re-checks every one before it reaches sites.js
+// (regex_unsafe: length, nested quantifiers, overlapping repeated alternatives, polynomial chains)
+// and skips unsafe rules; this is the backstop for anything that slips past it: a length cap, no
+// back-references, no repeated single quantified atom such as (a+)+ / (.*)* / ([a-z]+)* (a subset of
+// what the agent rejects, so both agree), at most RE_INPUT_MAX characters of a value are tested,
+// and a PCRE2 match-limit error counts as "no match" instead of failing the whole verdict.
+const RE_SRC_MAX = 256, RE_INPUT_MAX = 1024;   // pcdn-agent REGEX_MAX_LEN / REGEX_INPUT_MAX_NJS
+const RE_NESTED = /\((?:\?:)?(?:\.|\\[dDwWsS]|\[(?:\\.|[^\]\\])*\]|[^()\\|*+?{}\[\]])[*+]\)(?:[*+]|\{(?:\d*,|0*[2-9]|0*[1-9]\d))/;
+
+function custRe(src) {
+    src = String(src === null || src === undefined ? '' : src);
+    if (!src || src.length > RE_SRC_MAX || /\\[1-9]/.test(src) || RE_NESTED.test(src)) return null;
+    return reOrNull(src, 'i');
+}
+
+function rxTest(re, v, cap) {
+    v = String(v);
+    if (cap && v.length > cap) v = v.substring(0, cap);
+    try { return re.test(v); } catch (e) { return false; }
+}
+
 // ------------------------------------------------------------------ IP / CIDR
 
 function ip4(s) {
@@ -376,8 +397,9 @@ function compileCond(c) {
     } else {
         let one;
         if (op === 'regex') {
-            const res = vals.map(function (v) { return reOrNull(v, 'i'); }).filter(Boolean);
-            one = function (v) { return res.some(function (re) { return re.test(v); }); };
+            const res = vals.map(custRe);
+            if (res.some(function (re) { return !re; })) return null;   // unsafe / invalid: rule skipped
+            one = function (v) { return res.some(function (re) { return rxTest(re, v, RE_INPUT_MAX); }); };
         } else if (STRING_OPS[op]) {
             const fn = STRING_OPS[op], lv = vals.map(function (v) { return v.toLowerCase(); });
             one = function (v) { v = v.toLowerCase(); return lv.some(function (x) { return fn(v, x); }); };
@@ -414,7 +436,7 @@ function prepSite(id, s) {
     P.fwDefault = fw.default_action === 'block' ? 'block' : 'allow';
     P.fwRules = (fw.rules || []).filter(function (r) { return r.enabled !== false; }).map(function (r) {
         return { id: clean(r.id), action: r.action, conds: (r.conditions || []).map(compileCond) };
-    });
+    }).filter(function (r) { return r.conds.every(Boolean); });
 
     const hl = s.hotlink || {};
     P.hotlink = hl.enabled ? {
@@ -752,7 +774,7 @@ function rateLimit(ctx, site) {
     const crawler = ctx.verifiedBot && site.bots && site.bots.allowVerified;
     for (let i = 0; i < site.rl.length; i++) {
         const rule = site.rl[i];
-        if (!rule.re || !rule.re.test(ctx.path)) continue;
+        if (!rule.re || !rxTest(rule.re, ctx.path)) continue;
         if (rule.methods.length && rule.methods.indexOf(ctx.method) < 0) continue;
         if (crawler && rule.action !== 'block') continue;
         const bkey = 'b:' + site.id + ':' + rule.id + ':' + ctx.ipStr;
@@ -813,13 +835,13 @@ function wafTargets(ctx) {
 }
 
 function wafExcluded(w, id, path) {
-    return w.excl.some(function (e) { return (e.id === 0 || e.id === id) && (!e.re || e.re.test(path)); });
+    return w.excl.some(function (e) { return (e.id === 0 || e.id === id) && (!e.re || rxTest(e.re, path)); });
 }
 
 function waf(ctx, site) {
     const w = site.waf;
     if (w.mode !== 'block' && w.mode !== 'detect') return null;
-    if (w.off.some(function (re) { return re.test(ctx.path); })) return null;
+    if (w.off.some(function (re) { return rxTest(re, ctx.path); })) return null;
     let hit = 0;
     for (let i = 0; i < w.proto.length && !hit; i++) {
         const pr = w.proto[i];
@@ -857,7 +879,7 @@ function bodyNeed(r) {
         if ((w.mode !== 'block' && w.mode !== 'detect') || r.variables.pcdn_wafskip) return '';
         if (m !== 'POST' && m !== 'PUT' && m !== 'PATCH') return '';
         const uri = String(r.uri);
-        if (uri.indexOf('/__pcdn/') === 0 || inTunnel(site, uri) || w.off.some(function (re) { return re.test(uri); })) return '';
+        if (uri.indexOf('/__pcdn/') === 0 || inTunnel(site, uri) || w.off.some(function (re) { return rxTest(re, uri); })) return '';
         const n = bodyLen(r);
         if (n < 1 || n > BODY_CAP) return '';
         if (w.body.xmlrpc && m === 'POST' && uri === '/xmlrpc.php') return '1';

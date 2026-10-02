@@ -21,6 +21,7 @@ import subprocess
 import time
 
 import pytest
+from conftest import TEST_ORIGIN_ALLOW
 
 HERE = pathlib.Path(__file__).resolve().parent
 EDGE = HERE.parent
@@ -59,7 +60,7 @@ def item(fid="hello", route="/api/", code="function handleRequest(r){return new 
 
 
 def cfg_for(tmp, **over):
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({"FUNCTIONS": "yes", "NGINX_CAPS": {"modules": ["njs"], "nginx": "1.24.0"},
                 "NJS_FILE": str(EDGE / "njs/pcdn.js"), "BASE_TEMPLATE": str(EDGE / "nginx/pcdn-base.conf"),
                 "NGINX_DIR": str(tmp / "pcdn"), "FN_DIR": str(tmp / "fn"), "FN_STATUS": str(tmp / "status.json"),

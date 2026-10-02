@@ -3,6 +3,9 @@
 #
 #   sudo ./install.sh --controller https://cdn-api.pasargadmizban.com --token edge_xxxxx
 #
+# The token may instead come from the environment (PCDN_EDGE_TOKEN, what bootstrap.sh uses, so it never
+# shows up in `ps`) or from a file (--token-file /root/edge.token).
+#
 # Uses the distribution nginx (1.24) with the distro dynamic modules:
 #   libnginx-mod-http-js (njs >= 0.8.1), -geoip2, -image-filter, -brotli-filter
 # or, with --http3, nginx.org mainline (HTTP/3 + QUIC) with the nginx.org modules (njs,
@@ -39,6 +42,17 @@
 #                      Needs Landlock in the kernel (Ubuntu 24.04: yes). The node reports edge_functions
 #                      only while pcdn-fn's sandbox self-test passes.
 #   --no-functions     remove pcdn-fn (service, bundle, sockets); --upgrade keeps the installed state
+#   --no-origin-guard  do not install the origin guard. DEFAULT ON (also on --upgrade of an edge that
+#                      predates it): nftables table inet pcdn_origin_guard rejects the nginx workers'
+#                      connections to loopback / private (RFC1918) / link-local (169.254.169.254 cloud
+#                      metadata) / CGNAT / ULA / multicast / reserved addresses and to the host's own
+#                      addresses, so a customer origin host name resolving there cannot reach this host's
+#                      services or the provider's internal network. Only the nginx worker user is
+#                      judged (agent, pcdn-fn, pcdn-imaged, apt: untouched); DNS to RESOLVER and the
+#                      edge's own loopback services stay allowed. Customers' origins inside a private
+#                      network: list it in ORIGIN_PRIVATE_ALLOW=10.1.0.0/16,... in agent.conf, then run
+#                      --upgrade. --origin-guard re-installs it; --upgrade keeps the installed state.
+#   --insecure-http    accept a plain http:// controller URL (isolated test networks only)
 # L4 proxy (SPEC §16.4): the stream module is installed (libnginx-mod-stream / built into nginx.org) and
 # nginx.conf includes /etc/nginx/pcdn/l4/*.conf at the main context. Open L4_PORT_RANGE (default
 # 20000-29999, TCP and UDP) in the host / provider firewall. Images v2: python3-pil + service
@@ -46,7 +60,6 @@
 set -euo pipefail
 
 CONTROLLER=""
-TOKEN=""
 REGION=""
 ROLE=""
 IPV6=yes
@@ -64,12 +77,20 @@ SHUTDOWN_TIMEOUT=1h
 HARDEN_NET=""  # yes | no ("" = not given: no, or the installed GUARD value on --upgrade)
 AVIF=""        # yes | no ("" = not given: yes, or the installed value on --upgrade)
 FUNCTIONS=""   # yes | no ("" = not given: no, or the installed value on --upgrade)
+ORIGIN_GUARD="" # yes | no ("" = not given: yes, or the installed value on --upgrade; yes when it predates it)
+INSECURE_HTTP=no
+OG_NEW=no      # yes: an --upgrade turns the origin guard on for the first time (upgrade note at the end)
+TOKEN="${PCDN_EDGE_TOKEN:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --controller) CONTROLLER="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
+    --token-file) TOKEN="$(tr -d ' \t\r\n' < "$2")"; shift 2 ;;
+    --insecure-http) INSECURE_HTTP=yes; shift ;;
+    --origin-guard) ORIGIN_GUARD=yes; shift ;;
+    --no-origin-guard) ORIGIN_GUARD=no; shift ;;
     --region) REGION="$2"; shift 2 ;;
     --role) ROLE="$2"; shift 2 ;;
     --no-ipv6) IPV6=no; shift ;;
@@ -116,10 +137,15 @@ if [ "$UPGRADE" = yes ]; then
   if [ -z "${AVIF:-}" ]; then v="$(conf AVIF)"; case "$v" in yes|no) AVIF="$v" ;; esac; fi
   # SPEC §16.9 edge functions stay as installed unless --functions / --no-functions says otherwise
   if [ -z "${FUNCTIONS:-}" ]; then v="$(conf FUNCTIONS)"; case "$v" in yes|no) FUNCTIONS="$v" ;; esac; fi
+  # the origin guard stays as installed; an edge from before it (no ORIGIN_GUARD line) gets it (default on)
+  if [ -z "${ORIGIN_GUARD:-}" ]; then
+    v="$(conf ORIGIN_GUARD)"
+    case "$v" in yes|no) ORIGIN_GUARD="$v" ;; *) OG_NEW=yes ;; esac
+  fi
   # kept across --upgrade: log-export tunables (SPEC §14.3.2) and the wave-7 node settings an operator
   # may have added (SPEC §15.2 fair-share capacity / share, §15.6 speed-test node name / file)
   # and the wave-8 settings (SPEC §16.3 GUARD_* values, §16.4 L4_*, §16.6 IMAGE*/IMAGED)
-  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS))=' \
+  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS)|ORIGIN_PRIVATE_ALLOW|INTERNAL_SRC)=' \
     /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
@@ -127,7 +153,15 @@ HTTP3="${HTTP3:-no}"
 HARDEN_NET="${HARDEN_NET:-no}"
 AVIF="${AVIF:-yes}"
 FUNCTIONS="${FUNCTIONS:-no}"
-[ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || { echo "usage: $0 --controller URL --token TOKEN"; exit 1; }
+ORIGIN_GUARD="${ORIGIN_GUARD:-yes}"
+[ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || {
+  echo "usage: $0 --controller URL --token TOKEN (or PCDN_EDGE_TOKEN=... / --token-file FILE)"; exit 1; }
+case "$CONTROLLER" in
+  https://*) ;;
+  *) if [ "$INSECURE_HTTP" = yes ]; then echo "warning: plain-http controller URL $CONTROLLER (--insecure-http)"
+     else echo "warning: the controller URL $CONTROLLER is not https:// - the edge token and every config pull" \
+       "travel unencrypted (bootstrap.sh refuses this without --insecure-http)"; fi ;;
+esac
 [ -f /etc/debian_version ] || { echo "only Ubuntu 24.04 (or a Debian derivative with njs >= 0.8.1) is supported"; exit 1; }
 case "$HTTP_PORT$HTTPS_PORT" in *[!0-9]*) echo "ports must be numeric"; exit 1 ;; esac
 . /etc/os-release
@@ -352,7 +386,8 @@ if [ -n "$KEEP_CONF" ]; then printf '%s\n' "$KEEP_CONF" >> /etc/pcdn/agent.conf;
 # >>> pcdn wave8 conf (edge/tests/test_agent.py runs this)
 # SPEC §16.3 / §16.6 install choices (read back by --upgrade) and the SSH ports the guard never limits
 # (detected from sshd unless the operator set GUARD_SSH_PORTS)
-printf 'GUARD=%s\nAVIF=%s\nFUNCTIONS=%s\n' "$HARDEN_NET" "$AVIF" "${FUNCTIONS:-no}" >> /etc/pcdn/agent.conf
+printf 'GUARD=%s\nAVIF=%s\nFUNCTIONS=%s\nORIGIN_GUARD=%s\n' "$HARDEN_NET" "$AVIF" "${FUNCTIONS:-no}" \
+  "${ORIGIN_GUARD:-yes}" >> /etc/pcdn/agent.conf
 if ! grep -q '^GUARD_SSH_PORTS=' /etc/pcdn/agent.conf; then
   SSH_PORTS="$( (sshd -T 2>/dev/null || true) | awk '$1 == "port" {print $2}' | sort -un | tr '\n' ' ' | sed 's/ *$//')"
   echo "GUARD_SSH_PORTS=${SSH_PORTS:-22}" >> /etc/pcdn/agent.conf
@@ -512,6 +547,42 @@ elif [ -f "$GUARD_UNIT" ] || [ -f /etc/pcdn/guard.nft ]; then
 fi
 # <<< pcdn guard
 
+# >>> pcdn origin guard (default on, removable with --no-origin-guard)
+OG_UNIT=/etc/systemd/system/pcdn-origin-guard.service
+if [ "$ORIGIN_GUARD" = yes ]; then
+  echo "==> origin guard (nftables table pcdn_origin_guard: no nginx connections to internal addresses)"
+  command -v nft >/dev/null 2>&1 || apt-get install -y -q nftables || true
+  og_uid="$(id -u "$NGINX_USER" 2>/dev/null || echo 0)"
+  if [ "$og_uid" != 0 ] && command -v nft >/dev/null 2>&1 \
+     && PCDN_CONFIG=/etc/pcdn/agent.conf /usr/bin/python3 /usr/local/bin/pcdn-agent origin-guard \
+          > /etc/pcdn/origin-guard.nft.new \
+     && nft -c -f /etc/pcdn/origin-guard.nft.new; then
+    mv -f /etc/pcdn/origin-guard.nft.new /etc/pcdn/origin-guard.nft
+    chmod 644 /etc/pcdn/origin-guard.nft
+    install -m 644 "$HERE/systemd/pcdn-origin-guard.service" "$OG_UNIT"
+    systemctl daemon-reload
+    systemctl enable pcdn-origin-guard >/dev/null
+    if systemctl restart pcdn-origin-guard; then
+      echo "    origin guard active (nginx user $NGINX_USER, uid $og_uid); private origins: ORIGIN_PRIVATE_ALLOW"
+      echo "    in /etc/pcdn/agent.conf, then --upgrade; remove with --no-origin-guard"
+    else
+      echo "warning: the origin guard did not load (see journalctl -u pcdn-origin-guard)"
+    fi
+  else
+    rm -f /etc/pcdn/origin-guard.nft.new
+    sed -i 's/^ORIGIN_GUARD=yes$/ORIGIN_GUARD=no/' /etc/pcdn/agent.conf
+    echo "warning: the origin guard is NOT installed (no nftables, nginx runs as root, or nft rejected the"
+    echo "         ruleset): IP-literal origins are still checked, host names resolving to internal addresses are not"
+  fi
+elif [ -f "$OG_UNIT" ] || [ -f /etc/pcdn/origin-guard.nft ]; then
+  echo "==> removing the origin guard"
+  systemctl disable --now pcdn-origin-guard >/dev/null 2>&1 || true
+  nft delete table inet pcdn_origin_guard 2>/dev/null || true
+  rm -f "$OG_UNIT" /etc/pcdn/origin-guard.nft /etc/pcdn/origin-guard.nft.new
+  systemctl daemon-reload
+fi
+# <<< pcdn origin guard
+
 # >>> pcdn functions (SPEC §16.9; opt-in, removable)
 FN_UNIT=/etc/systemd/system/pcdn-fn.service
 NGINX_GROUP="$(id -gn "$NGINX_USER" 2>/dev/null || echo www-data)"
@@ -612,6 +683,14 @@ if [ "$HTTP3" = yes ]; then
   echo
   echo "HTTP/3: allow UDP/$HTTPS_PORT (QUIC) in the host firewall and any provider security group,"
   echo "        e.g. 'ufw allow $HTTPS_PORT/udp' — TCP/$HTTPS_PORT alone keeps clients on HTTP/2."
+fi
+if [ "$OG_NEW" = yes ] && grep -q '^ORIGIN_GUARD=yes$' /etc/pcdn/agent.conf; then
+  echo
+  echo "UPGRADE NOTE: the origin guard is now ON (security fix). nginx no longer connects to loopback,"
+  echo "  private (10/8, 172.16/12, 192.168/16), CGNAT, link-local / metadata, ULA or multicast addresses,"
+  echo "  and sites whose origin IS such an address are skipped. If your customers' origins live in your"
+  echo "  own private network, add ORIGIN_PRIVATE_ALLOW=<cidr>[,<cidr>...] to /etc/pcdn/agent.conf and run"
+  echo "  --upgrade again; to opt out entirely: --upgrade --no-origin-guard."
 fi
 L4R="$(sed -n 's/^L4_PORT_RANGE=//p' /etc/pcdn/agent.conf | tail -1)"
 L4R="${L4R:-20000-29999}"

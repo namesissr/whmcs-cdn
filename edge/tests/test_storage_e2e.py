@@ -24,7 +24,7 @@ import http.server
 
 import pytest
 
-from conftest import modules_available, nginx_conf
+from conftest import modules_available, nginx_conf, TEST_ORIGIN_ALLOW
 from test_perf_e2e import Node, agent, free_port, self_signed, wait_for
 
 pytestmark = pytest.mark.skipif(shutil.which("nginx") is None or not modules_available(),
@@ -197,10 +197,10 @@ def env(tmp_path_factory):
     crt, key = self_signed(tmp, "s3.test")
     bucket, plain = Bucket(str(crt), str(key), jpeg() if Image else b"\xff\xd8"), Plain()
     dns = DNS({"s3.test", "wrong.test"})
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
-        "ACCESS_LOG": str(tmp / "access.log"), "PAGES_DIR": str(agent.HERE) + "/pages",
+        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "FN_USAGE_LOG": str(tmp / "fn-usage.log"), "PAGES_DIR": str(agent.HERE) + "/pages",
         "NJS_FILE": str(agent.HERE) + "/njs/pcdn.js", "BASE_TEMPLATE": str(agent.HERE) + "/nginx/pcdn-base.conf",
         "GEOIP_DB": str(tmp / "none.mmdb"), "RESOLVER": f"127.0.0.1:{dns.port}", "NGINX_USER": "root",
         "LISTEN_IPV6": "no", "HTTP_PORT": str(free_port()), "HTTPS_PORT": str(free_port()),

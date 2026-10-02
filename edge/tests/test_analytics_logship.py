@@ -12,6 +12,7 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from conftest import TEST_ORIGIN_ALLOW
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("agent_6d", HERE.parent / "pcdn-agent.py")
@@ -23,11 +24,11 @@ SITE_SECRET = "ab" * 32
 
 
 def make_cfg(tmp_path, **over):
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "CONTROLLER_URL": "http://127.0.0.1:9", "EDGE_TOKEN": TOKEN,
         "NGINX_DIR": str(tmp_path / "pcdn"), "CACHE_DIR": str(tmp_path / "cache"),
-        "STATE_FILE": str(tmp_path / "state.json"), "ACCESS_LOG": str(tmp_path / "access.log"),
+        "STATE_FILE": str(tmp_path / "state.json"), "ACCESS_LOG": str(tmp_path / "access.log"), "L4_ACCESS_LOG": str(tmp_path / "l4.log"), "FN_USAGE_LOG": str(tmp_path / "fn-usage.log"),
         "ERROR_LOG": str(tmp_path / "error.log"), "BUNDLE_VERSION_FILE": str(tmp_path / "bundle.version"),
         "PAGES_DIR": str(HERE.parent / "pages"), "NJS_FILE": str(HERE.parent / "njs/pcdn.js"),
         "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"), "GEOIP_DB": str(tmp_path / "missing.mmdb"),

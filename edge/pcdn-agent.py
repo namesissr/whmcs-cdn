@@ -13,6 +13,8 @@ events. Standard library only, so it runs on any stock Debian/Ubuntu python3.
     pcdn-agent imaged     loopback image transformer (images v2, service pcdn-imaged)
     pcdn-agent guard [--synproxy]
                           print the nftables host guard ruleset (install.sh --harden-net)
+    pcdn-agent origin-guard
+                          print the nftables origin guard ruleset (install.sh, default on)
 """
 
 import collections
@@ -32,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import warnings
 from datetime import datetime, timezone
 
 log = logging.getLogger("pcdn-agent")
@@ -205,6 +208,19 @@ DEFAULTS = {
     "FN_STATUS": "/run/pcdn-fn/status.json",
     "FN_USAGE_LOG": "/var/log/pcdn-fn/usage.log",
     "FN_WALL_MS": "5000",
+    # Origin address policy (security review: customer origins on internal addresses). Render time:
+    # IP-literal origins must be public unless covered by ORIGIN_PRIVATE_ALLOW (CIDRs, comma/space
+    # separated; e.g. the provider's own private network where its customers' origins live).
+    # Connect time: install.sh renders `pcdn-agent origin-guard` into /etc/pcdn/origin-guard.nft
+    # (table inet pcdn_origin_guard; ORIGIN_GUARD=yes by default, --no-origin-guard removes it):
+    # the nginx workers' (NGINX_USER) connections to loopback / private / link-local / CGNAT / ULA /
+    # multicast / reserved addresses are rejected, except DNS to RESOLVER, ORIGIN_PRIVATE_ALLOW, the
+    # shield peers and the edge's own loopback services, which nginx reaches from INTERNAL_SRC
+    # (proxy_bind) so a customer origin resolving to 127.0.0.1 cannot reach them.
+    "ORIGIN_PRIVATE_ALLOW": "",
+    "ORIGIN_GUARD": "no",
+    "ORIGIN_GUARD_FILE": "/etc/pcdn/origin-guard.nft",
+    "INTERNAL_SRC": "127.0.0.2",
 }
 
 STATIC_EXT = "css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|bmp|woff|woff2|ttf|eot|otf|mp4|webm|mp3|ogg|pdf|zip|gz|rar|7z|txt|xml|json"
@@ -225,7 +241,8 @@ IP_LITERAL = re.compile(r"^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])$")
 TUNNEL_PROTOCOLS = ("ws", "httpupgrade", "grpc", "xhttp", "h2")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
                "transfer-encoding", "upgrade", "host", "content-length",
-               "x-pcdn-shield"}  # SPEC §14.1: the shield hop header is reserved for the edge itself
+               "x-pcdn-shield",  # SPEC §14.1: the shield hop header is reserved for the edge itself
+               "x-pcdn-origin", "x-pcdn-mtls"}   # the resizer's internal fetch URL / client-cert token
 FW_ACTIONS = {"allow", "block", "challenge", "captcha", "log"}
 FW_FIELDS = {"ip", "country", "path", "host", "query", "user_agent", "referer", "method", "header"}
 FW_OPS = {"eq", "ne", "contains", "not_contains", "starts_with", "ends_with", "regex", "in", "not_in"}
@@ -275,10 +292,22 @@ def _int(v, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
-def wildcard_re(pattern: str) -> str:
+def wildcard_re(pattern: str, js: bool = False) -> str:
     """Page-rule style pattern ('*' = anything, including '/') -> anchored regex source.
-    re.escape output is valid in PCRE and in JS (non-unicode) regexes."""
-    return "^" + "".join(".*" if c == "*" else re.escape(c) for c in pattern) + "$"
+    re.escape output is valid in PCRE and in JS (non-unicode) regexes.
+    One '*' (the usual "/blog/*") stays the plain `^/blog/.*$`. With more, `^/.*a.*a.*b$` would
+    backtrack polynomially (PCRE2 hits its match limit on a 2 kB path, on every request), so each
+    middle segment is matched at its LEFTMOST occurrence without backtracking into it - an atomic
+    group `(?>.*?seg)` for PCRE (nginx), `(?=(.*?seg))\\N` for JS (njs has no atomic groups) - and
+    only the last segment backtracks (`.*last$`): linear, and the same strings match (the earliest
+    occurrence of each middle segment always leaves the most room for the rest)."""
+    segs = re.sub(r"\*+", "*", pattern).split("*")
+    if len(segs) <= 2:
+        return "^" + "".join(".*" if c == "*" else re.escape(c) for c in pattern) + "$"
+    out = "^" + re.escape(segs[0])
+    for i, seg in enumerate(segs[1:-1], 1):
+        out += f"(?=(.*?{re.escape(seg)}))\\{i}" if js else f"(?>.*?{re.escape(seg)})"
+    return out + ".*" + re.escape(segs[-1]) + "$"
 
 
 def _sec(site: dict, name: str) -> dict:
@@ -717,7 +746,14 @@ def render_resizer(cfg: dict) -> str:
     def loc(head, body):
         return [f"    location {head} {{"] + ["        " + x for x in body] + ["    }"]
 
-    srv = ["server {", f"    listen 127.0.0.1:{port};", "    server_name _;", "    access_log off;"]
+    # the origin guard admits loopback-service connections only from INTERNAL_SRC: the resizer binds
+    # it for the transformer and for a loopback fetch URL (a storage host's fetch server; only the
+    # edge sets X-Pcdn-Origin, visitors' copies are dropped before any origin), nothing else
+    src = internal_src(cfg)
+    out.append(f"map $http_x_pcdn_origin $pcdn_rz_bind {{\n    default \"\";\n"
+               f"    \"~^http://127\\\\.0\\\\.0\\\\.1:\" {src};\n}}")
+    srv = ["server {", f"    listen 127.0.0.1:{port};", "    server_name _;", "    access_log off;",
+           "    proxy_bind $pcdn_rz_bind;"]
     srv += ["    " + x for x in common]
     srv += loc("/", ['if ($http_x_pcdn_origin = "") { return 404; }',
                      # the original is fetched without the resize / transform args ($uri, not a
@@ -730,7 +766,7 @@ def render_resizer(cfg: dict) -> str:
             srv += loc("^~ /__pcdn_rz/crop/", ["internal;", "rewrite ^/__pcdn_rz/crop(/.*)$ $1 break;"]
                        + filt_lines("crop") + ["proxy_pass $http_x_pcdn_origin;"])
     # originals: the v2 mode without dimensions, and the transformer's own fetches (loopback only)
-    srv += loc("^~ /__pcdn_rz/src/", ["allow 127.0.0.1;", "allow ::1;", "deny all;",
+    srv += loc("^~ /__pcdn_rz/src/", ["allow 127.0.0.1;", f"allow {src};", "allow ::1;", "deny all;",
                                       'if ($http_x_pcdn_origin = "") { return 404; }',
                                       "rewrite ^/__pcdn_rz/src(/.*)$ $1 break;", "proxy_pass $http_x_pcdn_origin;"])
     if v2:
@@ -746,7 +782,7 @@ def render_resizer(cfg: dict) -> str:
             "proxy_set_header X-Pcdn-Q $http_x_pcdn_q;", "proxy_set_header X-Pcdn-Mtls $http_x_pcdn_mtls;",
             'proxy_set_header Accept-Encoding "";', "proxy_connect_timeout 2s;", "proxy_read_timeout 60s;",
             "proxy_intercept_errors on;", f"error_page 413 415 500 502 503 504 = {fb};",
-            f"proxy_pass http://127.0.0.1:{iport};"])
+            f"proxy_bind {src};", f"proxy_pass http://127.0.0.1:{iport};"])
         # fallbacks: short-lived in the site cache (X-Accel-Expires), so the real variant replaces
         # them once the transformer is back
         if filt:
@@ -766,6 +802,133 @@ def _legacy_sections(site: dict) -> tuple[dict, dict]:
     sslo = site.get("ssl_options") if isinstance(site.get("ssl_options"), dict) else {
         "force_https": bool(site.get("force_https")), "origin_protocol": site.get("origin_protocol") or "http"}
     return cache, sslo
+
+
+# ----------------------------------------------------------------- origin address policy
+# Customers choose origin addresses (proxied record targets, pool members, tunnel path origins, L4
+# origins, storage endpoints). An origin on loopback, a private / link-local (169.254.169.254
+# metadata) / CGNAT / multicast / reserved address would make this edge connect to its own local
+# services or the provider's internal network on the customer's behalf. Two layers:
+#   * render time (here): an IP-literal origin must be globally routable - the same rules as the
+#     controller's netguard.is_public_ip (mirrored, not imported: the edge is standalone) - unless
+#     the operator's ORIGIN_PRIVATE_ALLOW (CIDRs, agent.conf) covers it; otherwise it is skipped
+#     with a warning. Numeric host names that the resolver library would read as an IPv4 address
+#     ("127.1", "2130706433", "0x7f.1") count as IP literals;
+#   * connect time (host names, DNS rebinding): the nftables table inet pcdn_origin_guard
+#     (render_origin_guard, install.sh, default on) rejects the nginx workers' connections to
+#     those ranges, with the same allow-list.
+ORIGIN_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+ORIGIN_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+
+
+def _v4_public(ip: ipaddress.IPv4Address) -> bool:
+    return bool(ip.is_global and not (ip.is_multicast or ip.is_reserved or ip.is_loopback or ip.is_link_local
+                                     or ip.is_private or ip.is_unspecified or ip in ORIGIN_CGNAT))
+
+
+def _embedded_v4(ip: ipaddress.IPv6Address) -> list:
+    out = []
+    if ip.sixtofour is not None:
+        out.append(ip.sixtofour)
+    if ip.teredo is not None:
+        out.extend(ip.teredo)
+    if any(ip in net for net in ORIGIN_NAT64):
+        out.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return out
+
+
+def is_public_ip(value) -> bool:
+    """True only for a globally routable unicast address (mirror of controller/app/netguard.py)."""
+    if "%" in str(value):  # scoped (link-local) address
+        return False
+    try:
+        ip = ipaddress.ip_address(str(value).strip("[]"))
+    except ValueError:
+        return False
+    if ip.version == 4:
+        return _v4_public(ip)
+    if ip.ipv4_mapped is not None:  # ::ffff:a.b.c.d connects to a.b.c.d
+        return _v4_public(ip.ipv4_mapped)
+    if not ip.is_global or ip.is_multicast or ip.is_reserved or ip.is_loopback or ip.is_link_local \
+            or ip.is_private or ip.is_unspecified or ip.is_site_local:
+        return False
+    return all(_v4_public(v4) for v4 in _embedded_v4(ip))
+
+
+def origin_private_allow(cfg: dict) -> list:
+    """ORIGIN_PRIVATE_ALLOW: the operator's CIDRs where non-public origins are permitted (for
+    providers whose customers' origins sit in the same private network). Invalid entries ignored."""
+    nets = []
+    for n in re.split(r"[\s,]+", str((cfg or {}).get("ORIGIN_PRIVATE_ALLOW") or "").strip()):
+        try:
+            nets.append(ipaddress.ip_network(n.split("%")[0], strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _literal_ip(host: str):
+    """The address an origin host string denotes when it is an IP literal (also the numeric forms
+    inet_aton / getaddrinfo accept: "127.1", "2130706433", "0x7f000001"), else None."""
+    h = str(host or "").strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    try:
+        return ipaddress.ip_address(h.split("%")[0])
+    except ValueError:
+        pass
+    if re.match(r"^(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3}$", h):
+        try:
+            return ipaddress.IPv4Address(socket.inet_aton(h))
+        except OSError:
+            return None
+    return None
+
+
+def origin_host_allowed(host: str, cfg: dict) -> bool:
+    """False for an IP-literal origin that is not globally routable and not in ORIGIN_PRIVATE_ALLOW.
+    Host names pass (they are guarded at connect time by the nftables origin guard)."""
+    ip = _literal_ip(host)
+    if ip is None:
+        return True
+    if "%" not in str(host) and is_public_ip(str(ip)):
+        return True
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip.version == n.version and ip in n for n in origin_private_allow(cfg))
+
+
+def origin_hp_allowed(hp: str, cfg: dict) -> bool:
+    """origin_host_allowed for "host:port" / "[v6]:port"."""
+    return origin_host_allowed(str(hp).rsplit(":", 1)[0], cfg)
+
+
+def guard_pools(pools: dict, cfg: dict, sid) -> dict:
+    """Pools with every origin the address policy refuses removed (warned); a pool left without
+    origins stays (its hosts answer 502, as for a pool whose members are all down)."""
+    out = {}
+    for name, p in pools.items():
+        keep = [o for o in p["origins"] if origin_hp_allowed(o["hp"], cfg)]
+        for o in p["origins"]:
+            if o not in keep:
+                log.warning("site %s: pool %s origin %s skipped: not a public address (ORIGIN_PRIVATE_ALLOW)",
+                            sid, name, o["hp"])
+        out[name] = dict(p, origins=keep)
+    return out
+
+
+def guard_tunnel(tunnel: dict | None, cfg: dict, sid) -> dict | None:
+    """The tunnel section without the paths whose origin the address policy refuses (warned)."""
+    if not tunnel:
+        return tunnel
+    paths = []
+    for p in tunnel["paths"]:
+        if p["origin"] and not origin_hp_allowed(p["origin"]["hp"], cfg):
+            log.warning("site %s: tunnel path %s skipped: origin %s is not a public address (ORIGIN_PRIVATE_ALLOW)",
+                        sid, p["path"], p["origin"]["hp"])
+            continue
+        paths.append(p)
+    return dict(tunnel, paths=paths) if paths else None
 
 
 def resolve_origin(host: dict, pools: dict, default_proto: str):
@@ -957,7 +1120,7 @@ def page_rules(site: dict) -> list:
         pat = str(r.get("pattern") or "")
         if r.get("enabled") is False or not SAFE_PATTERN.match(pat):
             continue
-        rules.append(dict(r, _re=wildcard_re(pat)))
+        rules.append(dict(r, _re=wildcard_re(pat), _jre=wildcard_re(pat, js=True)))
     return rules
 
 
@@ -1070,10 +1233,335 @@ def _hvar(name: str) -> str:
     return "$http_" + name.lower().replace("-", "_")
 
 
-def pcre_regex(src, max_len: int = 512):
-    """A customer regex that PCRE (nginx) will run: printable ASCII, compiles in Python, and none of
-    the Python-only syntax PCRE rejects (\\N \\u \\U \\l \\L escapes, inline flags other than imsx).
-    Returns the compiled Python pattern (for its group count) or None."""
+# --- customer regex safety (security review H2, edge side) ----------------------------------------
+# nginx (PCRE) and njs (PCRE2 behind a JS front end) are backtracking engines and run customer
+# regexes on every request, on values the visitor chooses. The controller validates them too, but
+# the edge re-checks every customer regex before rendering it (an older / buggy controller must not
+# be able to stall the nginx workers every tenant shares) and SKIPS an unsafe one with a warning:
+#   * length <= REGEX_MAX_LEN, printable characters only;
+#   * no back-references / conditionals;
+#   * no quantified group that itself contains a quantifier unless a mandatory character the inner
+#     quantifiers can never consume separates the repetitions (`(a+)+`, `(.*a)*`, `(\w+\s?)*` are
+#     rejected, `(?:/[a-z]+)*` is fine), and no repeated alternation whose alternatives can start
+#     alike (`(a|ab)*`): exponential backtracking (mirrors controller/app/sections.py _safe_regex);
+#   * polynomial backtracking bounded: wide quantifiers (unbounded, or bounded above
+#     REGEX_WIDE_REPEAT) that follow each other without a separating mandatory character form a
+#     chain; its length, plus one for an unanchored pattern (every start position is tried), is the
+#     degree of the worst case and must stay <= REGEX_MAX_DEGREE (`a.*b.*c`: 3, rejected - a PCRE2
+#     match of `a.*a.*b$` over 2000 bytes was measured at 18 s); at most REGEX_MAX_UNBOUNDED;
+# and the input is capped where the edge evaluates customer regexes: njs tests at most the first
+# REGEX_INPUT_MAX_NJS characters of a value, nginx skips the regex redirect / rewrite maps for
+# request paths longer than REGEX_INPUT_MAX_PATH ($pcdn_rxlong in render_http).
+REGEX_MAX_LEN = 256
+REGEX_MAX_UNBOUNDED = 10
+REGEX_MAX_DEGREE = 2
+REGEX_WIDE_REPEAT = 32
+REGEX_INPUT_MAX_NJS = 1024     # must match RE_INPUT_MAX in njs/pcdn.js
+REGEX_INPUT_MAX_PATH = 2048
+
+try:  # Python 3.11+
+    from re import _constants as _sre_c
+    from re import _parser as _sre_p
+except ImportError:  # pragma: no cover - older Pythons
+    import sre_constants as _sre_c
+    import sre_parse as _sre_p
+
+_REPEAT_OPS = {_sre_c.MAX_REPEAT, _sre_c.MIN_REPEAT} | (
+    {_sre_c.POSSESSIVE_REPEAT} if hasattr(_sre_c, "POSSESSIVE_REPEAT") else set())
+_ATOMIC = getattr(_sre_c, "ATOMIC_GROUP", None)
+# characters tried when testing whether two character sets overlap (case-folded both ways: njs
+# compiles firewall regexes with the `i` flag, nginx page-rule locations are `~*`)
+_RX_SAMPLE = list(range(0x20, 0x7f)) + [0x09, 0x0a, 0xa0, 0xe9, 0x627, 0x6cc, 0x4e00]
+
+
+class _RxUnsafe(ValueError):
+    pass
+
+
+def _rx_children(op, av) -> list:
+    if op in _REPEAT_OPS:
+        return [av[2]]
+    if op == _sre_c.SUBPATTERN:
+        return [av[-1]]
+    if op == _sre_c.BRANCH:
+        return list(av[1])
+    if op in (_sre_c.ASSERT, _sre_c.ASSERT_NOT):
+        return [av[1]]
+    if _ATOMIC is not None and op == _ATOMIC:
+        return [av]
+    return []
+
+
+def _rx_cat(cat, c: int) -> bool:
+    ch = chr(c)
+    word = ch.isalnum() or ch == "_"
+    return {_sre_c.CATEGORY_DIGIT: ch.isdigit(), _sre_c.CATEGORY_NOT_DIGIT: not ch.isdigit(),
+            _sre_c.CATEGORY_SPACE: ch.isspace(), _sre_c.CATEGORY_NOT_SPACE: not ch.isspace(),
+            _sre_c.CATEGORY_WORD: word, _sre_c.CATEGORY_NOT_WORD: not word}.get(cat, True)
+
+
+def _rx_in_item(item, c: int) -> bool:
+    op, av = item
+    if op == _sre_c.LITERAL:
+        return c == av
+    if op == _sre_c.RANGE:
+        return av[0] <= c <= av[1]
+    if op == _sre_c.CATEGORY:
+        return _rx_cat(av, c)
+    return True
+
+
+def _rx_pred(op, av):
+    """Predicate "can this one-character element match code point c" (case-insensitive), or None
+    for any other element."""
+    if op == _sre_c.ANY:
+        return lambda c: True
+    if op == _sre_c.LITERAL:
+        def base(c):
+            return c == av
+    elif op == _sre_c.NOT_LITERAL:
+        def base(c):
+            return c != av
+    elif op == _sre_c.IN:
+        items = list(av)
+        neg = bool(items) and items[0][0] == _sre_c.NEGATE
+        items = items[1:] if neg else items
+
+        def base(c):
+            hit = any(_rx_in_item(i, c) for i in items)
+            return not hit if neg else hit
+    else:
+        return None
+
+    def pred(c):
+        if base(c):
+            return True
+        ch = chr(c)
+        return any(base(ord(x)) for x in (ch.lower(), ch.upper()) if len(x) == 1 and x != ch)
+    return pred
+
+
+def _rx_consumable(sub) -> list:
+    """Predicates of every single-character element anywhere inside `sub`."""
+    out = []
+    for op, av in sub:
+        p = _rx_pred(op, av)
+        if p is not None:
+            out.append(p)
+        for child in _rx_children(op, av):
+            out.extend(_rx_consumable(child))
+    return out
+
+
+def _rx_separators(sub) -> list:
+    """Mandatory one-character elements at the top of `sub` (plain groups too), as predicates."""
+    out = []
+    for op, av in sub:
+        if op in (_sre_c.LITERAL, _sre_c.IN):
+            out.append(_rx_pred(op, av))
+        elif op == _sre_c.SUBPATTERN:
+            out.extend(_rx_separators(av[-1]))
+    return out
+
+
+def _rx_overlap(a: list, b: list) -> bool:
+    return any(any(p(c) for p in a) and any(q(c) for q in b) for c in _RX_SAMPLE)
+
+
+def _rx_repeats(sub):
+    for op, av in sub:
+        if op in _REPEAT_OPS:
+            yield av
+        for child in _rx_children(op, av):
+            yield from _rx_repeats(child)
+
+
+def _rx_ambiguous(body) -> bool:
+    """A repeated `body` holding an inner quantifier and no separator the inner ones never consume."""
+    inner = [r for r in _rx_repeats(body) if r[1] > 1]
+    if not inner:
+        return False
+    preds = [p for r in inner for p in _rx_consumable(r[2])]
+    for sep in _rx_separators(body):
+        if not any(sep(c) and any(p(c) for p in preds) for c in _RX_SAMPLE):
+            return False
+    return True
+
+
+def _rx_first(sub) -> tuple[list, bool]:
+    """Predicates for the first character `sub` can consume, and whether `sub` can match empty."""
+    preds: list = []
+    for op, av in sub:
+        p = _rx_pred(op, av)
+        if p is not None:
+            return preds + [p], False
+        if op in (_sre_c.AT, _sre_c.ASSERT, _sre_c.ASSERT_NOT):
+            continue
+        if op == _sre_c.SUBPATTERN:
+            fp, nullable = _rx_first(av[-1])
+        elif op in _REPEAT_OPS:
+            fp, nullable = _rx_first(av[2])
+            nullable = nullable or av[0] == 0
+        elif op == _sre_c.BRANCH:
+            fp, nullable = [], False
+            for b in av[1]:
+                bp, bn = _rx_first(b)
+                fp += bp
+                nullable = nullable or bn
+        else:
+            return preds + [lambda c: True], False
+        preds += fp
+        if not nullable:
+            return preds, False
+    return preds, True
+
+
+def _rx_alternations(v: str) -> list[list[str]]:
+    """Alternatives of every group of the raw pattern that is repeated more than once (`(a|ab)+`
+    -> [["a", "ab"]]): Python's parser merges alternatives, PCRE backtracks through each one."""
+    out, stack, i, n, in_class = [], [], 0, len(v), False
+    while i < n:
+        ch = v[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = ch != "]"
+            i += 1
+            continue
+        if ch == "[":
+            in_class, i = True, i + 1
+            if v[i:i + 1] == "^":
+                i += 1
+            if v[i:i + 1] == "]":
+                i += 1
+            continue
+        if ch == "(":
+            stack.append((i, []))
+        elif ch == "|" and stack:
+            stack[-1][1].append(i)
+        elif ch == ")" and stack:
+            start, bars = stack.pop()
+            rest = v[i + 1:]
+            m = re.match(r"\{(\d*)(,?)(\d*)\}", rest)
+            if rest[:1] in ("*", "+"):
+                hi = 2
+            elif m:
+                hi = int(m.group(3)) if m.group(3) else (2 if m.group(2) else int(m.group(1) or 0))
+            else:
+                hi = 0
+            if hi > 1 and bars:
+                body = start + 1
+                pre = re.match(r"\?(?:[:=!>|]|<[=!]|[a-zA-Z-]+:|P<\w+>)", v[body:i])
+                body += pre.end() if pre else 0
+                parts, prev = [], body
+                for b in bars:
+                    parts.append(v[prev:b])
+                    prev = b + 1
+                parts.append(v[prev:i])
+                out.append(parts)
+        i += 1
+    return out
+
+
+def _rx_alts_overlap(parts: list[str]) -> bool:
+    firsts = []
+    for part in parts:
+        try:
+            preds, nullable = _rx_first(_sre_p.parse(part))
+        except Exception:  # noqa: BLE001 - not parseable on its own: assume the worst
+            return True
+        if nullable:
+            return True   # an empty alternative inside a repeat
+        firsts.append(preds)
+    return any(_rx_overlap(firsts[a], firsts[b]) for a in range(len(firsts)) for b in range(a + 1, len(firsts)))
+
+
+def _rx_chain(sub, chain: list, length: int, state: dict) -> tuple[list, int]:
+    """Walk `sub` as a sequence, carrying the current chain of wide quantifiers (the predicates of
+    what they consume, and how many); state["degree"] keeps the longest chain seen."""
+    for op, av in sub:
+        if op in _REPEAT_OPS and (av[1] == _sre_c.MAXREPEAT or av[1] >= REGEX_WIDE_REPEAT):
+            preds = _rx_consumable(av[2]) or [lambda c: True]
+            if chain and _rx_overlap(chain, preds):
+                chain, length = chain + preds, length + 1
+            else:
+                chain, length = list(preds), 1
+            state["degree"] = max(state["degree"], length)
+            _rx_chain(av[2], [], 0, state)   # a body with its own inner quantifier: _rx_ambiguous
+        elif op in _REPEAT_OPS:   # optional / small bounded repeat: its body continues the sequence
+            for _ in range(max(1, min(av[1], 3))):
+                chain, length = _rx_chain(av[2], chain, length, state)
+        elif op == _sre_c.SUBPATTERN:
+            chain, length = _rx_chain(av[-1], chain, length, state)
+        elif _ATOMIC is not None and op == _ATOMIC:
+            chain, length = _rx_chain(av, chain, length, state)
+        elif op == _sre_c.BRANCH:
+            # any alternative may be the one taken: the union of what they leave, the longest chain
+            outs = [_rx_chain(b, list(chain), length, state) for b in av[1]]
+            chain, length = [p for c2, _ in outs for p in c2], max([l2 for _, l2 in outs] + [0])
+        elif op in (_sre_c.ASSERT, _sre_c.ASSERT_NOT):
+            _rx_chain(av[1], [], 0, state)   # runs at each position on its own
+        else:
+            p = _rx_pred(op, av)
+            if p is not None and chain and not any(p(c) and any(q(c) for q in chain) for c in _RX_SAMPLE):
+                chain, length = [], 0   # a mandatory character the chain never consumes splits it
+    return chain, length
+
+
+def regex_unsafe(src, max_len: int = REGEX_MAX_LEN, ascii_only: bool = True) -> str | None:
+    """Why the customer regex `src` must not run on this edge, or None when it may. Never raises.
+    ascii_only: printable ASCII only (regexes rendered into the nginx config)."""
+    if not isinstance(src, str) or not src:
+        return "empty"
+    if len(src) > max_len:
+        return f"longer than {max_len} characters"
+    if any(ord(ch) < 0x20 or 0x7f <= ord(ch) < 0xa0 for ch in src) or (
+            ascii_only and not re.match(r"^[\x20-\x7e]+$", src)):
+        return "control or non-ASCII characters"
+    try:
+        with warnings.catch_warnings():   # FutureWarning on "[[" / "--" etc.: not ours to report
+            warnings.simplefilter("ignore")
+            re.compile(src)
+            tree = _sre_p.parse(src)
+    except (re.error, RecursionError, OverflowError, ValueError, TypeError) as e:
+        return f"does not compile ({e})"
+    state = {"unbounded": 0, "degree": 0}
+
+    def walk(sub):
+        for op, av in sub:
+            if op in (_sre_c.GROUPREF, _sre_c.GROUPREF_EXISTS):
+                raise _RxUnsafe("back-reference or conditional")
+            if op in _REPEAT_OPS:
+                if av[1] == _sre_c.MAXREPEAT:
+                    state["unbounded"] += 1
+                if av[1] > 1 and _rx_ambiguous(av[2]):
+                    raise _RxUnsafe("nested quantifier (catastrophic backtracking)")
+            for child in _rx_children(op, av):
+                walk(child)
+    try:
+        walk(tree)
+        if state["unbounded"] > REGEX_MAX_UNBOUNDED:
+            return f"more than {REGEX_MAX_UNBOUNDED} unbounded quantifiers"
+        if any(_rx_alts_overlap(parts) for parts in _rx_alternations(src)):
+            return "repeated group whose alternatives start alike (catastrophic backtracking)"
+        _rx_chain(tree, [], 0, state)
+    except _RxUnsafe as e:
+        return str(e)
+    except RecursionError:
+        return "too deeply nested"
+    anchored = src.startswith("^")
+    if state["degree"] + (0 if anchored else 1) > REGEX_MAX_DEGREE:
+        return (f"{state['degree']} chained wide quantifiers{'' if anchored else ' in an unanchored pattern'}"
+                " (polynomial backtracking)")
+    return None
+
+
+def pcre_regex(src, max_len: int = REGEX_MAX_LEN):
+    """A customer regex that PCRE (nginx) will run: printable ASCII, compiles in Python, none of
+    the Python-only syntax PCRE rejects (\\N \\u \\U \\l \\L escapes, inline flags other than imsx)
+    and safe to backtrack over (regex_unsafe). Returns the compiled Python pattern (for its group
+    count), or None (with a warning naming the reason for an unsafe one)."""
     if not isinstance(src, str) or not 0 < len(src) <= max_len or not re.match(r"^[\x20-\x7e]+$", src):
         return None
     if re.search(r"\\[NuUlL]", src):
@@ -1081,6 +1569,10 @@ def pcre_regex(src, max_len: int = 512):
     for m in re.finditer(r"\(\?([A-Za-z-]+)[:)]", src):
         if set(m.group(1)) - set("imsx-"):
             return None
+    why = regex_unsafe(src, max_len)
+    if why:
+        log.warning("customer regex %r skipped: %s", src[:80], why)
+        return None
     try:
         return re.compile(src)
     except (re.error, RecursionError, OverflowError, ValueError):
@@ -1187,7 +1679,13 @@ def redirect_maps(sid: int, rules: list[dict], tunnel_prefixes=()) -> tuple[list
         guards = ['    "~^/__pcdn/" "";\n']
         if tunnel_prefixes:
             guards.append(f"    {_qre('~^(?:' + '|'.join(re.escape(p) for p in tunnel_prefixes) + ')')} \"\";\n")
-        maps.append(f"map $pcdn_path $pcdn_rdc_{sid} {{\n    default \"\";\n" + "".join(guards)
+        if any(r["match"] == "regex" for r in before):
+            # customer regexes never run on an over-long path ($pcdn_rxlong, security review H2)
+            maps.append(f'map $pcdn_rxlong $pcdn_rdc_{sid} {{\n    1 "";\n    default $pcdn_rdcx_{sid};\n}}')
+            rdc_var = f"pcdn_rdcx_{sid}"
+        else:
+            rdc_var = f"pcdn_rdc_{sid}"
+        maps.append(f"map $pcdn_path ${rdc_var} {{\n    default \"\";\n" + "".join(guards)
                     + "".join(f'    {_qre(k)} "{val}";\n' for k, val in ordered) + "}")
         rdc = f"$pcdn_rdc_{sid}"
     if rde and rdc:
@@ -1532,6 +2030,10 @@ def render_l4(config: dict, cfg: dict, reserved_extra: tuple = ()) -> dict:
         servers = []
         for a in norm_l4(site):
             key = (a["protocol"], a["port"])
+            if not origin_hp_allowed(a["target"], cfg):
+                log.warning("site %s: L4 app %s skipped: origin %s is not a public address (ORIGIN_PRIVATE_ALLOW)",
+                            site.get("id"), a["id"], a["target"])
+                continue
             if (not lo <= a["port"] <= hi or a["port"] in reserved or key in taken or key in busy
                     or count >= L4_APPS_MAX):
                 log.warning("site %s: L4 app %s (%s/%d) skipped (outside %d-%d, reserved, taken or in use by "
@@ -1839,15 +2341,23 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
     fw = _sec(site, "firewall")
     rules = []
     for r in fw.get("rules") or []:
+        if not isinstance(r, dict):
+            continue
         rid = str(r.get("id") or "").lower()
         if r.get("enabled") is False or not SAFE_ID.match(rid) or r.get("action") not in FW_ACTIONS:
             continue
         conds = []
         for c in r.get("conditions") or []:
-            if c.get("field") not in FW_FIELDS or c.get("op") not in FW_OPS:
+            if not isinstance(c, dict) or c.get("field") not in FW_FIELDS or c.get("op") not in FW_OPS:
                 break
             val = c.get("value")
             val = [str(x) for x in val] if isinstance(val, list) else str(val if val is not None else "")
+            if c["op"] == "regex":   # security review H2: re-checked on the edge, unsafe -> rule skipped
+                why = next((w for w in (regex_unsafe(x, ascii_only=False) for x in (val if isinstance(val, list) else [val]))
+                            if w), None)
+                if why:
+                    log.warning("site %s: firewall rule %s skipped: unsafe regex (%s)", site.get("id"), rid, why)
+                    break
             cond = {"field": c["field"], "op": c["op"], "value": val}
             if c["field"] == "header":
                 if not SAFE_HEADER.match(str(c.get("name") or "")):
@@ -1863,7 +2373,7 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         rid, pat = str(r.get("id") or "").lower(), str(r.get("path") or "/*")
         if r.get("enabled") is False or not SAFE_ID.match(rid) or not SAFE_PATTERN.match(pat):
             continue
-        rl.append({"id": rid, "path_re": wildcard_re(pat),
+        rl.append({"id": rid, "path_re": wildcard_re(pat, js=True),
                    "methods": [str(m).upper() for m in r.get("methods") or [] if re.match(r"^[A-Za-z]{1,16}$", str(m))],
                    "requests": _int(r.get("requests"), 10, 1, 1000000), "period": _int(r.get("period"), 60, 1, 3600),
                    "action": r.get("action") if r.get("action") in ("block", "challenge", "captcha") else "block",
@@ -1875,7 +2385,7 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         path = e.get("path")
         if path and not SAFE_PATTERN.match(str(path)):
             continue
-        excl.append({"rule_id": _int(e.get("rule_id"), 0, 0, 99999999), "path_re": wildcard_re(path) if path else None})
+        excl.append({"rule_id": _int(e.get("rule_id"), 0, 0, 99999999), "path_re": wildcard_re(path, js=True) if path else None})
 
     hl, dd, im = _sec(site, "hotlink"), _sec(site, "ddos"), _sec(site, "image")
     # SPEC §14.2 additions appear only when used, so sites without them keep a byte-identical entry
@@ -1910,7 +2420,7 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
                      "paranoia": _int(waf.get("paranoia"), 1, 1, 3),
                      "groups": [g for g in (waf.get("groups") or []) if g in WAF_GROUPS],
                      "exclusions": excl,
-                     "off_paths": [r["_re"] for r in page_rules(site) if r.get("waf") is False]},
+                     "off_paths": [r["_jre"] for r in page_rules(site) if r.get("waf") is False]},
                     **({"packs": packs} if packs else {})),
         "pools": pools,
         "image": dict({"enabled": bool(im.get("enabled")), "quality": _int(im.get("quality"), 85, 1, 100),
@@ -2032,7 +2542,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 seen_cut.add(cp)
                 cut_paths.append(cp)
     cache, sslo = _legacy_sections(site)
-    pools = norm_pools(site)
+    pools = guard_pools(norm_pools(site), cfg, sid)
     origin_proto = "https" if sslo.get("origin_protocol") == "https" else "http"
     cache_on = bool(cache.get("enabled"))
     level = "aggressive" if cache.get("level") == "aggressive" else "standard"
@@ -2223,6 +2733,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     # never forwarded to an origin, also on a node that is no longer a shield while edges still
     # send it hops (config propagation lag)
     base_req.append(("X-Pcdn-Shield", '""'))
+    # the edge's internal resizer headers never reach an origin either: an origin that is (or resolves
+    # to) the loopback resizer must not get a visitor-chosen fetch URL or client-certificate token
+    base_req += [("X-Pcdn-Origin", '""'), ("X-Pcdn-Mtls", '""')]
 
     # transform request headers: start from the static headers.request value (or the edge's own
     # value for a base header, or the visitor's header) and apply the rules in order
@@ -2257,7 +2770,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         nxt = '""'
         for j, (f, a) in reversed(list(enumerate(rewrites))):
             rep = a["replacement"] + ("$pcdn_args_amp" if "?" in a["replacement"] else "$is_args$args")
-            out.append(f"map $pcdn_path $pcdn_tfr_{sid}_{j} {{\n    default {nxt};\n"
+            # the customer regex never runs on an over-long path ($pcdn_rxlong, security review H2)
+            out.append(f"map $pcdn_rxlong $pcdn_tfr_{sid}_{j} {{\n    1 {nxt};\n    default $pcdn_tfx_{sid}_{j};\n}}")
+            out.append(f"map $pcdn_path $pcdn_tfx_{sid}_{j} {{\n    default {nxt};\n"
                        f"    {_qre('~' + a['regex'])} \"{rep}\";\n}}")
             src, hit = (f"${f}", "1") if f else ("$pcdn_shield_ok", "0")
             out.append(f"map {src} $pcdn_tfu_{sid}_{j} {{\n    {hit} $pcdn_tfr_{sid}_{j};\n    default {nxt};\n}}")
@@ -2273,6 +2788,10 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     for hi, h in enumerate(site.get("hosts") or []):
         if isinstance(h, dict) and isinstance(h.get("origin"), dict) and "storage" in h["origin"]:
             st = norm_storage_origin(h["origin"])
+            if st and not origin_host_allowed(st["host"], cfg):
+                log.warning("site %s: storage origin %s skipped: not a public address (ORIGIN_PRIVATE_ALLOW)",
+                            sid, st["host"])
+                st = None
             if st:
                 stor_of[hi] = dict(st, var=f"$pcdn_sref_{sid}_{len(stor_of)}")
     stor_path = stor_bad = stor_badp = None
@@ -2445,7 +2964,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     valid_hosts = []
 
     # --- tunnel mode (SPEC §7): per-site http-context parts
-    tunnel = norm_tunnel(site, pools)
+    tunnel = guard_tunnel(norm_tunnel(site, pools), cfg, sid)
     fallback = tunnel["fallback"] if tunnel else "origin"
     image_on = image_on and fallback == "origin"  # decoy / 404 sites never fetch origin content
     webp_on = webp_on and fallback == "origin"
@@ -2845,6 +3364,10 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         name = str(host["name"]).lower()
         st = stor_of.get(hi)
         res = (st["proto"], None, st["hp"]) if st else resolve_origin(host, pools, origin_proto)
+        if res is not None and res[2] is not None and not origin_hp_allowed(res[2], cfg):
+            log.warning("site %s: host %r skipped: origin %s is not a public address (ORIGIN_PRIVATE_ALLOW)",
+                        sid, name, res[2])
+            continue
         if not SAFE_NAME.match(name) or res is None:
             log.warning("skipping unsafe host entry %r -> %s", name, storage_log_repr(host.get("origin")))
             continue
@@ -2992,7 +3515,9 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 adds.append("add_header Vary Accept;")
             # a storage origin: the resizer fetches originals through this host's loopback storage
             # server (storage_fetch_server), which adds the bucket's Host / Referer / path prefix
-            L = L + loc_common(["Set-Cookie"], adds, hdrs=proxy_hdrs, guard=False) + [
+            img_hdrs = [x for x in proxy_hdrs if not x.startswith(("proxy_set_header X-Pcdn-Origin ",
+                                                                   "proxy_set_header X-Pcdn-Mtls "))]
+            L = L + loc_common(["Set-Cookie"], adds, hdrs=img_hdrs, guard=False) + [
                 f"proxy_set_header X-Pcdn-Origin http://127.0.0.1:{sport_sto};" if st else
                 "proxy_set_header X-Pcdn-Origin $pcdn_proto://$pcdn_target;",
                 "proxy_set_header X-Pcdn-W $pcdn_img_w;",
@@ -3004,7 +3529,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 meta["mtls_resizer"] = (tok, mtls_pair)
             else:          # never let a visitor's own X-Pcdn-Mtls header reach the resizer
                 L.append('proxy_set_header X-Pcdn-Mtls "";')
-            L.append(f"proxy_pass http://127.0.0.1:{resize_port}{tf_uri};")
+            # from INTERNAL_SRC: the origin guard admits only that source to the loopback services
+            L += [f"proxy_bind {internal_src(cfg)};", f"proxy_pass http://127.0.0.1:{resize_port}{tf_uri};"]
             s += ["    location ^~ /__pcdn/img/ {"] + ["        " + x for x in L] + ["    }"]
 
         if fn_live:
@@ -5347,6 +5873,164 @@ def render_guard(cfg: dict, synproxy: bool = False, allow: tuple | None = None, 
     return "\n".join(out) + "\n"
 
 
+# ----------------------------------------------------------------- origin guard (connect time)
+
+ORIGIN_GUARD_TABLE = "pcdn_origin_guard"
+# destinations a customer origin may never make the nginx workers connect to (is_public_ip == False)
+ORIGIN_DENY4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+                "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+                "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4")
+ORIGIN_DENY6 = ("::/127", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32",
+                "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8")
+
+
+def _origin_deny6() -> list[str]:
+    """ORIGIN_DENY6 plus the IPv6 forms that embed a denied IPv4 address (NAT64 64:ff9b::/96 and
+    6to4 2002::/16), as netguard.is_public_ip judges them."""
+    out = list(ORIGIN_DENY6)
+    for n in ORIGIN_DENY4:
+        v4 = ipaddress.ip_network(n)
+        out.append(str(ipaddress.ip_network((int(ipaddress.ip_address("64:ff9b::")) | int(v4.network_address),
+                                             96 + v4.prefixlen))))
+        out.append(str(ipaddress.ip_network(((0x2002 << 112) | (int(v4.network_address) << 80), 16 + v4.prefixlen))))
+    return out
+
+
+def _resolver_endpoints(cfg: dict) -> tuple[list, list]:
+    """RESOLVER as nftables (address, port) pairs (port 53 unless given): ([v4], [v6])."""
+    v4, v6 = [], []
+    for tok in str(cfg.get("RESOLVER") or "").split():
+        m = re.match(r"^\[([0-9a-fA-F:.]+)\](?::(\d{1,5}))?$", tok) or re.match(r"^([0-9.]+)(?::(\d{1,5}))?$", tok) \
+            or re.match(r"^([0-9a-fA-F:]+)()$", tok)
+        if not m:
+            continue
+        try:
+            ip = ipaddress.ip_address(m.group(1))
+        except ValueError:
+            continue
+        port = int(m.group(2)) if m.group(2) and 0 < int(m.group(2)) < 65536 else 53
+        (v4 if ip.version == 4 else v6).append((ip.compressed, port))
+    return sorted(set(v4)), sorted(set(v6))
+
+
+def internal_src(cfg: dict) -> str:
+    """INTERNAL_SRC: the loopback source address nginx binds when it calls the edge's own loopback
+    services (127.0.0.0/8 but never 127.0.0.1, the address an origin resolving to loopback uses)."""
+    try:
+        ip = ipaddress.IPv4Address(str(cfg.get("INTERNAL_SRC") or ""))
+    except ValueError:
+        return "127.0.0.2"
+    return str(ip) if ip in ipaddress.ip_network("127.0.0.0/8") and str(ip) != "127.0.0.1" else "127.0.0.2"
+
+
+def internal_ports(cfg: dict) -> list[int]:
+    """The edge's own loopback services the nginx workers connect to: the image resizer (an nginx
+    server), the image transformer (pcdn-imaged) and the object-storage fetch server (nginx)."""
+    return sorted({_int(cfg.get(k), d, 1, 65535) for k, d in
+                   (("RESIZE_PORT", 8089), ("IMAGE_PORT", 8090), ("STORAGE_FETCH_PORT", 8091))})
+
+
+def nginx_uid(cfg: dict) -> int | None:
+    import pwd
+    try:
+        return pwd.getpwnam(str(cfg.get("NGINX_USER") or "www-data")).pw_uid
+    except (KeyError, TypeError):
+        return None
+
+
+def render_origin_guard(cfg: dict, uid: int | None = None) -> str:
+    """nftables ruleset for the connect-time origin guard (install.sh, default on), table inet
+    pcdn_origin_guard, loaded atomically like pcdn_guard. Only sockets of the nginx worker user
+    (meta skuid) are judged, and of those only the first packet of an OUTGOING connection: a TCP
+    SYN without ACK (connect()), or a new UDP flow from a non-listening port. The agent, pcdn-fn,
+    pcdn-imaged, package updates and everything else run as other users and are never touched.
+    Accepted first: DNS to RESOLVER, the edge's loopback services reached from INTERNAL_SRC,
+    ORIGIN_PRIVATE_ALLOW and the shield peers (set peers4/peers6, kept in sync by the agent);
+    then connections to loopback / private / link-local / CGNAT / ULA / multicast / reserved
+    addresses or to any address of this host are rejected (TCP reset / ICMP: nginx answers 502)."""
+    uid = nginx_uid(cfg) if uid is None else uid
+    if uid is None or uid == 0:
+        raise ValueError("origin guard: NGINX_USER must be an existing non-root user")
+    r4, r6 = _resolver_endpoints(cfg)
+    a4, a6 = [], []
+    for n in origin_private_allow(cfg):
+        (a4 if n.version == 4 else a6).append(str(n))
+    ports = ", ".join(str(p) for p in internal_ports(cfg))
+    https_port = _int(cfg.get("HTTPS_PORT"), 443, 1, 65535)
+    shield_port = _int(cfg.get("SHIELD_HTTPS_PORT") or cfg.get("HTTPS_PORT"), 443, 1, 65535)
+    lo, hi = l4_port_range(cfg)
+
+    def iset(name, typ, elems):
+        body = f"    set {name} {{\n        type {typ}\n        flags interval\n        auto-merge\n"
+        if elems:
+            body += "        elements = { " + ", ".join(elems) + " }\n"
+        return body + "    }"
+
+    out = ["# pcdn origin guard — generated by `pcdn-agent origin-guard`, do not edit.",
+           "# The nginx workers may not connect to internal addresses on a customer's behalf (origin",
+           "# host names resolving to loopback / private / metadata addresses). Allow private origins with",
+           "# ORIGIN_PRIVATE_ALLOW in /etc/pcdn/agent.conf, then re-run install.sh --upgrade.",
+           f"# Remove with: install.sh --upgrade --no-origin-guard (or: nft delete table inet {ORIGIN_GUARD_TABLE})",
+           f"table inet {ORIGIN_GUARD_TABLE} {{}}", f"delete table inet {ORIGIN_GUARD_TABLE}",
+           f"table inet {ORIGIN_GUARD_TABLE} {{",
+           iset("deny4", "ipv4_addr", list(ORIGIN_DENY4)), iset("deny6", "ipv6_addr", _origin_deny6()),
+           iset("allow4", "ipv4_addr", a4), iset("allow6", "ipv6_addr", a6),
+           "    set peers4 {\n        type ipv4_addr\n    }", "    set peers6 {\n        type ipv6_addr\n    }",
+           "    chain output {", "        type filter hook output priority filter; policy accept;",
+           f"        meta skuid != {uid} accept",
+           # only connect(): replies to visitors (also visitors on private networks) pass
+           "        meta l4proto tcp tcp flags & (syn | ack) != syn accept",
+           # replies of the QUIC listener / L4 UDP apps (their own listening ports)
+           f"        meta l4proto udp udp sport {{ {(str(https_port) + ', ') if not lo <= https_port <= hi else ''}{lo}-{hi} }} accept",
+           "        meta l4proto udp ct state != new accept",
+           "        meta l4proto != { tcp, udp } accept"]
+    for ip, port in r4:
+        out.append(f"        ip daddr {ip} meta l4proto {{ tcp, udp }} th dport {port} accept")
+    for ip, port in r6:
+        out.append(f"        ip6 daddr {ip} meta l4proto {{ tcp, udp }} th dport {port} accept")
+    out += [f"        ip saddr {internal_src(cfg)} ip daddr 127.0.0.1 tcp dport {{ {ports} }} accept",
+            "        ip daddr @allow4 accept", "        ip6 daddr @allow6 accept",
+            f"        ip daddr @peers4 tcp dport {shield_port} accept",
+            f"        ip6 daddr @peers6 tcp dport {shield_port} accept"]
+    for match in ("ip daddr @deny4", "ip6 daddr @deny6", "fib daddr type local"):
+        out += [f"        meta l4proto tcp {match} counter reject with tcp reset",
+                f"        {match} counter reject"]
+    out += ["    }", "}"]
+    return "\n".join(out) + "\n"
+
+
+def origin_guard_installed(cfg: dict) -> bool:
+    return str(cfg.get("ORIGIN_GUARD") or "").lower() == "yes" and os.path.isfile(
+        cfg.get("ORIGIN_GUARD_FILE") or "/etc/pcdn/origin-guard.nft")
+
+
+def sync_origin_guard_peers(cfg: dict, st: dict, peers: list, force: bool = False, run=subprocess.run) -> bool:
+    """Keep the origin guard's shield-peer sets equal to the shield peers that are not public
+    (public ones pass the guard anyway). Re-applied when they change and every 10 minutes (the
+    guard service may have reloaded the table). Best effort; True when nft was run successfully."""
+    if not origin_guard_installed(cfg):
+        return False
+    want = sorted({p.strip("[]") for p in peers or [] if not is_public_ip(p)})
+    now = time.time()
+    if not force and want == st.get("og_peers") and now - st.get("og_peers_at", 0) < 600:
+        return False
+    v4 = [p for p in want if ":" not in p]
+    v6 = [p for p in want if ":" in p]
+    script = (f"flush set inet {ORIGIN_GUARD_TABLE} peers4\nflush set inet {ORIGIN_GUARD_TABLE} peers6\n"
+              + (f"add element inet {ORIGIN_GUARD_TABLE} peers4 {{ {', '.join(v4)} }}\n" if v4 else "")
+              + (f"add element inet {ORIGIN_GUARD_TABLE} peers6 {{ {', '.join(v6)} }}\n" if v6 else ""))
+    try:
+        p = run(["nft", "-f", "-"], input=script, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("origin guard: cannot update the shield peers: %s", e)
+        return False
+    if p.returncode != 0:
+        log.warning("origin guard: cannot update the shield peers: %s", (p.stderr or "").strip()[:200])
+        return False
+    st["og_peers"], st["og_peers_at"] = want, now
+    return True
+
+
 class Controller:
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/")
@@ -5513,6 +6197,11 @@ class Agent:
                 st.pop("video_hosts", None)
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
+        try:   # origin guard: private shield peers stay reachable (agent-side only, never rendered)
+            sh = norm_shield(body)
+            st["shield_peers"] = sh["peers"] if sh else []
+        except Exception as e:  # noqa: BLE001
+            log.error("shield peer update failed: %s", e)
         try:   # SPEC §16.9: the pcdn-fn code bundle (before the nginx tree: code precedes its route)
             sync_functions(body, cfg, st)
         except Exception as e:  # noqa: BLE001
@@ -5546,8 +6235,8 @@ class Agent:
             log.info("applied config %s (%d sites)", version[:12], len(body.get("sites", [])))
             self._report(version, None)
 
-        if first_boot or bool(body.get("urgent")):   # bootstrap / security-relevant: apply at once
-            return apply_now()
+        if first_boot or bool(body.get("urgent")) or self._origin_guard_needs_bind(root):
+            return apply_now()   # bootstrap / security-relevant / the origin guard just installed: at once
 
         # F5 coalescing: hold a freshly-seen version until it settles (unchanged across two polls) or
         # has been pending for RELOAD_MIN_INTERVAL, and never reload more often than that interval.
@@ -5741,12 +6430,29 @@ class Agent:
         if lines:
             self.ctl.call("POST", "/edge/v1/logs", {"lines": lines})
 
+    def _origin_guard_needs_bind(self, root: str) -> bool:
+        """The origin guard is installed but nginx still runs a tree from before INTERNAL_SRC
+        (proxy_bind): its loopback-service hops would be rejected until the next apply, so the
+        upgrade applies at once instead of waiting for the reload coalescing."""
+        if not origin_guard_installed(self.cfg):
+            return False
+        try:
+            with open(os.path.join(root, "http.conf")) as f:
+                text = f.read()
+        except OSError:
+            return False
+        return "$pcdn_rz_bind" not in text and "no image resizer" not in text
+
     def tick(self):
         for step in (self.sync_config, self.sync_purges):
             try:
                 step()
             except Exception as e:  # noqa: BLE001
                 log.error("%s failed: %s", step.__name__, e)
+        try:
+            sync_origin_guard_peers(self.cfg, self.state, self.state.get("shield_peers") or [])
+        except Exception as e:  # noqa: BLE001 - never let the guard sync break the loop
+            log.error("origin guard peer sync failed: %s", e)
         if time.time() - self.last_heartbeat >= int(self.cfg.get("HEARTBEAT_INTERVAL") or 60):
             try:
                 self.heartbeat()
@@ -5800,6 +6506,13 @@ def main():
         return
     if cmd == "guard":    # SPEC §16.3: print the nftables ruleset (install.sh --harden-net)
         sys.stdout.write(render_guard(cfg, synproxy="--synproxy" in sys.argv[2:]))
+        return
+    if cmd == "origin-guard":   # print the connect-time origin guard ruleset (install.sh)
+        try:
+            sys.stdout.write(render_origin_guard(cfg))
+        except ValueError as e:
+            log.error("%s", e)
+            sys.exit(1)
         return
     if not cfg["CONTROLLER_URL"] or not cfg["EDGE_TOKEN"]:
         log.error("CONTROLLER_URL and EDGE_TOKEN must be set in /etc/pcdn/agent.conf")

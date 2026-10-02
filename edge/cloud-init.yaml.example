@@ -21,8 +21,9 @@ write_files:
       REGION="global"        # home | global
       ROLE="general"         # general | tunnel
       CACHE_SIZE="10g"
-      curl -fsSL "$CONTROLLER/edge/bootstrap.sh" | bash -s -- \
-        --controller "$CONTROLLER" --token "$TOKEN" \
+      # the token goes through the environment, not the command line (`ps` shows argv)
+      curl -fsSL --proto '=https' "$CONTROLLER/edge/bootstrap.sh" | PCDN_EDGE_TOKEN="$TOKEN" bash -s -- \
+        --controller "$CONTROLLER" \
         --region "$REGION" --role "$ROLE" --cache-size "$CACHE_SIZE"
 
 runcmd:

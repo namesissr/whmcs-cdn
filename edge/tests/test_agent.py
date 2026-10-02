@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 import pytest
+from conftest import TEST_ORIGIN_ALLOW
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("agent", HERE.parent / "pcdn-agent.py")
@@ -16,12 +17,12 @@ spec.loader.exec_module(agent)
 
 
 def make_cfg(tmp_path, **over):
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp_path / "pcdn"),
         "CACHE_DIR": str(tmp_path / "cache"),
         "STATE_FILE": str(tmp_path / "state.json"),
-        "ACCESS_LOG": str(tmp_path / "access.log"),
+        "ACCESS_LOG": str(tmp_path / "access.log"), "L4_ACCESS_LOG": str(tmp_path / "l4.log"), "FN_USAGE_LOG": str(tmp_path / "fn-usage.log"),
         "ERROR_LOG": str(tmp_path / "error.log"),
         "BUNDLE_VERSION_FILE": str(tmp_path / "bundle.version"),
         "PAGES_DIR": str(HERE.parent / "pages"),
@@ -1081,7 +1082,7 @@ def test_nginx_capabilities_probed_once(tmp_path, monkeypatch):
     fake.chmod(0o755)
     (tmp_path / "mods").mkdir()
     (tmp_path / "mods/ngx_http_js_module.so").write_bytes(b"")
-    cfg = dict(agent.DEFAULTS, NGINX_BIN=str(fake), NGINX_MODULES_DIR=str(tmp_path / "mods"))
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW, NGINX_BIN=str(fake), NGINX_MODULES_DIR=str(tmp_path / "mods"))
     for _ in range(3):
         c = agent.nginx_capabilities(cfg)
     assert calls.read_text().count("x") == 1                      # once per agent start
@@ -1579,7 +1580,9 @@ def test_redirect_rules_render(tmp_path):
     assert '"/About" "/About 308/about";' in h and '"/k" "/k 301/kept$is_args$args";' in h
     assert "/about\" " not in h and "/never" not in text and "/off" not in text and "/p/1/x" not in h
     assert 'map "$pcdn_path $pcdn_rdh_7" $pcdn_rde_7 {\n    default "";\n    "~^(\\\\S+) \\\\1 (.+)$" $2;\n}' in text
-    c = text.split("map $pcdn_path $pcdn_rdc_7 {", 1)[1].split("\n}", 1)[0]
+    # with a regex rule the ordered map is only evaluated for paths up to 2048 bytes (security review H2)
+    assert 'map $pcdn_rxlong $pcdn_rdc_7 {\n    1 "";\n    default $pcdn_rdcx_7;\n}' in text
+    c = text.split("map $pcdn_path $pcdn_rdcx_7 {", 1)[1].split("\n}", 1)[0]
     lines = [x.strip() for x in c.strip().splitlines()]
     assert lines == ['default "";', '"~^/__pcdn/" "";', '"~^/about$" "302/x";',
                      '"~^/blog/" "302https://b.example/?s=1$pcdn_args_amp#top";',
@@ -1646,9 +1649,12 @@ def test_transform_rules_render(tmp_path):
     assert "map $pcdn_tf_7_1 $pcdn_tq_7_2_0 {\n    1 \"t\";\n    default \"s\";\n}" in text   # static value as base
     assert "map $pcdn_tf_7_1 $pcdn_tq_7_3_0 {\n    1 \"\";\n    default $http_cookie;\n}" in text
     # rewrite_path: regex on the raw path, first matching rule wins, never on a shield hop
-    assert ('map $pcdn_path $pcdn_tfr_7_0 {\n    default $pcdn_tfu_7_1;\n    "~^/api/(.*)$" "/v2/$1$is_args$args";\n}'
+    assert ('map $pcdn_path $pcdn_tfx_7_0 {\n    default $pcdn_tfu_7_1;\n    "~^/api/(.*)$" "/v2/$1$is_args$args";\n}'
             in text)
-    assert 'map $pcdn_path $pcdn_tfr_7_1 {\n    default "";\n    "~^/q/(\\\\d+)$" "/item?id=$1$pcdn_args_amp";\n}' in text
+    assert 'map $pcdn_path $pcdn_tfx_7_1 {\n    default "";\n    "~^/q/(\\\\d+)$" "/item?id=$1$pcdn_args_amp";\n}' in text
+    # ... evaluated only for paths up to 2048 bytes (security review H2)
+    assert 'map $pcdn_rxlong $pcdn_tfr_7_0 {\n    1 $pcdn_tfu_7_1;\n    default $pcdn_tfx_7_0;\n}' in text
+    assert 'map $pcdn_rxlong $pcdn_tfr_7_1 {\n    1 "";\n    default $pcdn_tfx_7_1;\n}' in text
     assert "map $pcdn_tf_7_1 $pcdn_tfu_7_0 {\n    1 $pcdn_tfr_7_0;\n    default $pcdn_tfu_7_1;\n}" in text
     assert "map $pcdn_shield_ok $pcdn_tfu_7_1 {\n    0 $pcdn_tfr_7_1;\n    default \"\";\n}" in text
     srv = text.split("server {", 1)[1]

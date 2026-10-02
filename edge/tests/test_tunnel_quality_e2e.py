@@ -16,7 +16,7 @@ import urllib.request
 
 import pytest
 
-from conftest import modules_available, nginx_conf
+from conftest import modules_available, nginx_conf, TEST_ORIGIN_ALLOW
 from test_nginx_e2e import Edge, Origin, agent, free_port, make_mmdb, self_signed, site, wait_for
 from tunnel_kit import (DATA, END_HEADERS, GOAWAY, HEADERS, PING, PREFACE, SETTINGS, ACK, H2Client,
                         H2Origin, TunnelOrigin, connect, h2_frame, h2_read, hpack_literal, read_exact, read_until,
@@ -167,10 +167,10 @@ def tq(tmp_path_factory):
     web, to, h2o, so, h2r = Origin("WEB"), TunnelOrigin(), H2Origin(), ScriptedOrigin(), H2Reset()
     bh_sock, bh_port, bh_fill = blackhole()
     dead = free_port()   # nothing listens: connection refused
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
-        "ACCESS_LOG": str(tmp / "access.log"), "PAGES_DIR": str(agent.HERE) + "/pages",
+        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "FN_USAGE_LOG": str(tmp / "fn-usage.log"), "PAGES_DIR": str(agent.HERE) + "/pages",
         "NJS_FILE": str(agent.HERE) + "/njs/pcdn.js", "BASE_TEMPLATE": str(agent.HERE) + "/nginx/pcdn-base.conf",
         "GEOIP_DB": str(tmp / "country.mmdb"), "RESOLVER": "127.0.0.1", "NGINX_USER": "root", "LISTEN_IPV6": "no",
         "HTTP_PORT": str(free_port()), "HTTPS_PORT": str(free_port()), "RESIZE_PORT": str(free_port()),

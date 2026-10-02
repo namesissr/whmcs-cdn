@@ -96,6 +96,17 @@ const out = cases.map(c => {
     rules: T.WAF_RULES.filter(r => r.k).map(r => [r.id, r.k, r.pl, r.t, r.re.source]),
     fn: T.WAF_PACK_FN.map(r => [r.id, r.k, r.pl]), body: T.WAF_BODY_XMLRPC.map(r => [r.id, r.pl, r.re.source]),
     versions: T.WAF_PACK_VERSION };
+  if (c.kind === 'timed') {   // worst verdict time over [prefix, unit, count, suffix] values put in c.field
+    let worst = 0, v = null;
+    c.inputs.forEach(x => {
+      const s = x[0] + x[1].repeat(x[2]) + x[3];
+      const extra = c.field === 'path' ? {} : { headers: { [c.field]: s } };
+      const r = req(c.site, c.field === 'path' ? s : '/', '', extra);
+      const t0 = process.hrtime.bigint(); v = m.verdict(r); const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+      if (ms > worst) worst = ms;
+    });
+    return { worst: worst, v: v };
+  }
   if (c.kind === 'redos') {
     // worst case time of every pack / bot / body regex over adversarial inputs (backtracking engine)
     const res = T.WAF_RULES.filter(r => r.k).map(r => r.re).concat(T.WAF_BODY_XMLRPC.map(r => r.re),
@@ -596,3 +607,80 @@ def test_fair_share_admission(tmp_path):
     res = run(tmp_path, [{"kind": "fairset", "hot": "25"}, {"kind": "fairset", "hot": "0"},
                          {"kind": "fairset", "hot": "x"}, {"kind": "fairset", "hot": "101"}])
     assert [x["hot"] for x in res] == [25, None, None, None]
+
+
+# ----------------------------------------------------------------- customer regexes (security review H2)
+
+def _agent():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_njs_h2", HERE.parent / "pcdn-agent.py")
+    a = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(a)
+    return a
+
+
+# the worst patterns the edge still accepts (degree 2: one wide quantifier unanchored, or two anchored)
+BORDERLINE = ["Mozilla.*Chrome", "^/(.*)/(.*)$", ".*\\.php$", "foo[^/]*/bar.*", "^(.*)a(.*)b$", "a.*b$",
+              "x[a-z]*y[0-9]*", "^.*a.*$"]
+ADVERSARIAL = [[p, u, 50000, s] for p in ("", "/") for u in ("a", "/", "ab", "a/", " ", "x", ".", "Mozilla", "foo")
+               for s in ("", "!", "b!", "\n")]
+
+
+def test_customer_firewall_regexes_are_bounded(tmp_path):
+    """Every regex the edge accepts, on 50 kB adversarial values (V8: no PCRE match limit, no
+    required-character shortcut - the slower engine): njs tests at most RE_INPUT_MAX characters."""
+    a = _agent()
+    for p in BORDERLINE:
+        assert a.regex_unsafe(p, ascii_only=False) is None, p
+    def rules(field, name=None):
+        return [{"id": f"r{i}", "action": "block", "conditions": [dict({"field": field, "op": "regex", "value": p},
+                                                                       **({"name": name} if name else {}))]}
+                for i, p in enumerate(BORDERLINE)]
+    build(tmp_path, {"1": site(firewall={"default_action": "allow", "rules": rules("user_agent")}),
+                     "2": site(firewall={"default_action": "allow", "rules": rules("header", "X-Probe")}),
+                     "3": site(firewall={"default_action": "allow", "rules": rules("path")})})
+    res = run(tmp_path, [{"kind": "timed", "site": "1", "field": "User-Agent", "inputs": ADVERSARIAL},
+                         {"kind": "timed", "site": "2", "field": "X-Probe", "inputs": ADVERSARIAL},
+                         {"kind": "timed", "site": "3", "field": "path", "inputs": [["/"] + x[1:] for x in ADVERSARIAL]}])
+    for r in res:
+        assert r["worst"] < 100, res   # all 8 rules on one request
+    # semantics kept below the cap
+    assert run(tmp_path, [{"kind": "verdict", "site": "1", "uri": "/", "extra": {"headers": {"User-Agent": "Mozilla/5 Chrome/1"}}},
+                          {"kind": "verdict", "site": "1", "uri": "/", "extra": {"headers": {"User-Agent": "curl/8"}}}]) \
+        == ["block:firewall:r0", "ok"]
+
+
+def test_unsafe_regexes_never_reach_njs_and_njs_backstop(tmp_path):
+    a = _agent()
+    unsafe = ["^(a+)+$", "(a|aa)*c", "(.*a){12}", "^(\\w+\\s?)*$", "a.*a.*b", "Mozilla.*Windows.*Chrome", "x" * 300]
+    for p in unsafe:
+        assert a.regex_unsafe(p, ascii_only=False), p
+    fw = {"default_action": "allow", "rules": [
+        {"id": f"u{i}", "action": "block", "conditions": [{"field": "user_agent", "op": "regex", "value": p}]}
+        for i, p in enumerate(unsafe)] + [
+        {"id": "good", "action": "block", "conditions": [{"field": "user_agent", "op": "regex", "value": "^evil"}]}]}
+    js = a.site_js({"id": 1, "domain": "x.test", "firewall": fw}, [], {}, {})
+    assert [r["id"] for r in js["firewall"]["rules"]] == ["good"]
+    # a sites.js that still carries them (older agent): njs drops what its backstop sees
+    # (length, back-references, a repeated single quantified atom) and caps the rest
+    build(tmp_path, {"1": site(firewall=fw)})
+    res = run(tmp_path, [
+        {"kind": "verdict", "site": "1", "uri": "/", "extra": {"headers": {"User-Agent": "a" * 30}}},
+        {"kind": "verdict", "site": "1", "uri": "/", "extra": {"headers": {"User-Agent": "evil/1"}}},
+        {"kind": "timed", "site": "1", "field": "User-Agent", "inputs": [["", "a", 25, "!"], ["", "\t", 25, "!"]]}])
+    # ^(a+)+$ is dropped by the backstop (it would match); (.*a){12} is beyond it and still runs
+    assert res[0] == "block:firewall:u2" and res[1] == "block:firewall:good"
+    assert res[2]["worst"] < 100
+
+
+def test_multi_star_wildcards_are_linear_in_njs(tmp_path):
+    a = _agent()
+    pats = ["/*a*a*a*a*a*b", "/*/*/*/*/*x", "/api/*/v*/*.json"]
+    rl = [{"id": f"r{i}", "path_re": a.wildcard_re(p, js=True), "methods": [], "requests": 1000000, "period": 60,
+           "action": "block", "blockSeconds": 60} for i, p in enumerate(pats)]
+    waf = {"mode": "block", "groups": [], "exclusions": [{"rule_id": 0, "path_re": a.wildcard_re("/*a*a*a*b", js=True)}],
+           "off_paths": [a.wildcard_re("/*b*b*b*c", js=True)]}
+    build(tmp_path, {"1": site(ratelimit=rl, waf=waf)})
+    inputs = [["/", u, 50000, s] for u in ("a", "/", "ab", "b", "a/") for s in ("", "b!", "x!", "c!")]
+    res = run(tmp_path, [{"kind": "timed", "site": "1", "field": "path", "inputs": inputs}])
+    assert res[0]["worst"] < 100, res

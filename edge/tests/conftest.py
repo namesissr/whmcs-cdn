@@ -11,6 +11,12 @@ MODULES = ["ngx_http_js_module.so", "ngx_http_geoip2_module.so", "ngx_http_image
            "ngx_http_brotli_filter_module.so"]
 
 
+# The test origins listen on loopback (and some fixtures use documentation / private addresses):
+# operators allow such origins with ORIGIN_PRIVATE_ALLOW, the tests do the same
+TEST_ORIGIN_ALLOW = ("127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 192.0.2.0/24 198.51.100.0/24 "
+                     "203.0.113.0/24 2001:db8::/32 fc00::/7")
+
+
 def modules_available() -> bool:
     return all(os.path.exists(os.path.join(MODULES_DIR, m)) for m in MODULES)
 
