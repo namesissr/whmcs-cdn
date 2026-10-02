@@ -446,3 +446,30 @@ add_hook('ClientAreaSecondarySidebar', 1, function ($sidebar) {
         // the sidebar never breaks because of this box
     }
 });
+
+// SPEC §20.3: a «دامنه‌های اشتراکی» box on top of «My Services» (clientarea.php?action=services|products). The box is
+// rendered server-side and moved above the services table by a tiny script (works with the standard templates;
+// with an unknown template it stays where the footer is, still visible).
+add_hook('ClientAreaFooterOutput', 1, function ($vars) {
+    try {
+        $script = basename((string) ($_SERVER['SCRIPT_NAME'] ?? ''));
+        $action = (string) ($_GET['action'] ?? '');
+        if ($script !== 'clientarea.php' || !in_array($action, ['services', 'products'], true)) {
+            return '';
+        }
+        $uid = pasargadcdn_admin_client_id();
+        if (pasargadcdn_admin_shared_links($uid) === null) {
+            return '';
+        }
+        $box = \PasargadCdn\Admin\Sharing::servicesBox($uid);
+        if ($box === '') {
+            return '';
+        }
+        return '<div id="pcdn-shared-services-holder">' . $box . '</div><script>(function(){var b=document.getElementById("pcdn-shared-services");'
+            . 'if(!b)return;var t=document.getElementById("tableServicesList")||document.querySelector(".table-container table, table.table-list, .main-content table");'
+            . 'var anchor=t?(t.closest(".table-container")||t.closest(".dataTables_wrapper")||t):(document.querySelector(".main-content")||document.querySelector("#main-body"));'
+            . 'if(!anchor)return;if(t){anchor.parentNode.insertBefore(b,anchor);}else{anchor.insertBefore(b,anchor.firstChild);}})();</script>';
+    } catch (\Throwable $e) {
+        return '';
+    }
+});

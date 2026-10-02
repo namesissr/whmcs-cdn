@@ -403,6 +403,39 @@ final class Sharing
         return $h . '</ul></div>';
     }
 
+    /**
+     * «دامنه‌های اشتراکی» box placed at the top of the client's «My Services» page (a shared domain is not a WHMCS
+     * service of the member, so the services table itself cannot list it). '' when the client has none.
+     */
+    public static function servicesBox(int $clientId): string
+    {
+        $m = self::mine($clientId);
+        if (!$m['active'] && !$m['pending']) {
+            return '';
+        }
+        $en = self::lang() === 'en';
+        $h = '<div class="card panel panel-default pcdn-shared-services" id="pcdn-shared-services" dir="' . ($en ? 'ltr' : 'rtl') . '" style="margin-bottom:20px">'
+            . '<div class="card-header panel-heading"><h3 class="card-title panel-title" style="margin:0;font-size:16px">'
+            . self::e(self::tx('دامنه‌های اشتراکی', 'Shared domains')) . '</h3></div><div class="card-body panel-body">'
+            . '<p class="text-muted small" style="margin-top:0">' . self::e(self::tx('این دامنه‌ها را دیگران با شما به اشتراک گذاشته‌اند؛ صورت‌حساب و مالکیت آن‌ها نزد مالک است.',
+                'Other accounts shared these domains with you; billing and ownership stay with the owner.')) . '</p>';
+        if ($m['active']) {
+            $h .= '<div class="table-responsive"><table class="table table-list" style="margin-bottom:0"><thead><tr><th>' . self::e(self::tx('دامنه', 'Domain')) . '</th><th>'
+                . self::e(self::tx('نقش شما', 'Your role')) . '</th><th>' . self::e(self::tx('مالک', 'Owner')) . '</th><th></th></tr></thead><tbody>';
+            foreach ($m['active'] as $r) {
+                $h .= '<tr data-shared-row="' . (int) $r->id . '"><td dir="ltr"><strong>' . self::e($r->domain) . '</strong></td><td>' . self::roleBadge((string) $r->role) . '</td><td>'
+                    . self::e(Shares::ownerName($r)) . '</td><td><a class="btn btn-primary btn-sm" data-manage="1" href="' . self::e(self::ROUTE . '&share=' . (int) $r->id) . '">'
+                    . self::e(self::tx('مدیریت', 'Manage')) . '</a></td></tr>';
+            }
+            $h .= '</tbody></table></div>';
+        }
+        if ($m['pending']) {
+            $h .= '<p style="margin:10px 0 0"><a class="btn btn-default btn-sm" href="' . self::e(self::ROUTE) . '">'
+                . self::e(self::tx(count($m['pending']) . ' دعوت در انتظار پذیرش — مشاهده', count($m['pending']) . ' pending invitation(s) — view')) . '</a></p>';
+        }
+        return $h . '</div></div>';
+    }
+
     /** «دعوت به مدیریت دامنه» card body for the client-area home ('' when nothing is pending). */
     public static function homeCard(int $clientId): string
     {

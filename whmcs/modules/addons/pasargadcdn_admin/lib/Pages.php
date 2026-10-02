@@ -25,6 +25,8 @@ final class Pages
         'sites' => ['سایت‌ها', 'globe'],
         // SPEC §19.1: the platform's own domains (no WHMCS service)
         'operator' => ['دامنه‌های اپراتور', 'zap'],
+        // SPEC §19.2: the transfer wizard (pick a domain, then destination, options, preview)
+        'transfer' => ['انتقال دامنه', 'users'],
         'edges' => ['نودها', 'server'],
         'plans' => ['پلن‌ها و قیمت‌گذاری', 'tag'],
         'analytics' => ['آنالیتیکس', 'chart'],
@@ -92,7 +94,7 @@ final class Pages
             . self::serverChip() . '</header>';
         $h .= '<nav class="pcdna-tabs" aria-label="بخش‌های مدیریت CDN">';
         foreach (self::TABS as $id => [$label, $icon]) {
-            $cur = $id === $page || (in_array($page, ['manage', 'transfer'], true) && $id === 'sites') || ($page === 'opmanage' && $id === 'operator');
+            $cur = $id === $page || ($page === 'manage' && $id === 'sites') || ($page === 'opmanage' && $id === 'operator');
             $h .= '<a class="pcdna-tab' . ($cur ? ' is-active' : '') . '" href="' . View::url(['page' => $id]) . '"'
                 . ($cur ? ' aria-current="page"' : '') . '>' . View::icon($icon) . '<span>' . View::e($label) . '</span></a>';
         }

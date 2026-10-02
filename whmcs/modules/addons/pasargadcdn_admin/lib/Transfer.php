@@ -943,13 +943,18 @@ final class Transfer
     public static function page(array $get, array $state): string
     {
         $in = ['service' => (int) ($get['service'] ?? 0), 'domain' => Env::input($get['domain'] ?? '')];
-        $back = '<p class="pcdna-back"><a href="' . View::url(['page' => $in['service'] > 0 ? 'sites' : 'operator']) . '">→ بازگشت</a></p>';
         if (!Env::adminHasAccess()) {
-            return $back . View::alert('bad', 'نقش مدیریتی شما به این ماژول دسترسی ندارد.');
+            return View::alert('bad', 'نقش مدیریتی شما به این ماژول دسترسی ندارد.');
         }
         if (!empty($state['done'])) {
+            $back = '<p class="pcdna-back"><a href="' . View::url(['page' => 'transfer']) . '">→ انتقال دامنهٔ دیگر</a></p>';
             return $back . self::doneCard($state['done'], (int) ($state['service'] ?? 0));
         }
+        // the «انتقال دامنه» tab itself: pick the domain to move, plus the recent transfers
+        if ($in['service'] <= 0 && $in['domain'] === '') {
+            return self::startPage(Env::input($get['q'] ?? ''));
+        }
+        $back = '<p class="pcdna-back"><a href="' . View::url(['page' => 'transfer']) . '">→ بازگشت به انتقال دامنه</a></p>';
         $ping = Pages::ping();
         if (!$ping['ok']) {
             return $back . Pages::ctlError($ping);
@@ -977,6 +982,71 @@ final class Transfer
             return $h . self::previewCard($state['preview'], $src, $q, $to, $o);
         }
         return $h . self::optionsCard($dir, $src, $cid, $q, $to, $o);
+    }
+
+    /** Start of the wizard: search a CDN service or an operator domain to move, and the latest transfers. */
+    private static function startPage(string $term): string
+    {
+        $intro = '<p class="pcdna-muted">یک دامنه را با همهٔ تنظیمات، سرویس WHMCS، فاکتورها و مصرفش به مشتری دیگر یا به «اپراتور» منتقل کنید. '
+            . 'ابتدا دامنه را جستجو کنید؛ قبل از اجرا پیش‌نمایش کامل تغییرات نمایش داده می‌شود.</p>';
+        $f = '<form method="get" action="' . View::e((string) (parse_url(View::$link, PHP_URL_PATH) ?: 'addonmodules.php')) . '" class="pcdna-filters" role="search" data-transfer-source="1">'
+            . '<input type="hidden" name="module" value="' . View::e(Env::MODULE) . '"><input type="hidden" name="page" value="transfer">'
+            . '<label class="pcdna-search">' . View::icon('search') . '<input type="search" name="q" class="pcdna-input" value="' . View::e($term)
+            . '" placeholder="دامنه، #شناسهٔ سرویس، نام یا ایمیل مشتری" aria-label="جستجوی دامنه برای انتقال"></label>'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('search') . '<span>جستجو</span></button></form>';
+        if ($term !== '') {
+            [$rows] = Data::services(['q' => $term], 1, 25);
+            $ops = [];
+            foreach (array_keys(Data::operatorDomains()) as $d) {
+                if (stripos($d, $term) !== false) {
+                    $ops[] = $d;
+                }
+            }
+            if (!$rows && !$ops) {
+                $f .= '<p class="pcdna-muted" data-transfer-none="1">دامنه‌ای پیدا نشد.</p>';
+            } else {
+                $f .= '<div class="pcdna-table-wrap"><table class="pcdna-table" data-transfer-sources="1"><thead><tr><th>دامنه</th><th>مالک</th><th>سرویس</th><th>وضعیت</th><th></th></tr></thead><tbody>';
+                foreach ($rows as $r) {
+                    $live = in_array((string) $r->domainstatus, ['Active', 'Suspended'], true);
+                    $f .= '<tr data-source-service="' . (int) $r->id . '"><td>' . View::ltr((string) $r->domain) . '</td><td><a href="' . View::e(Data::clientUrl((int) $r->userid)) . '">'
+                        . View::e(self::clientName($r)) . '</a></td><td>#' . View::n((int) $r->id) . ' · ' . View::e((string) $r->product) . '</td><td>'
+                        . Pages::whmcsBadge((string) $r->domainstatus) . '</td><td class="pcdna-actions">'
+                        . ($live ? '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-primary" href="' . View::url(['page' => 'transfer', 'service' => (int) $r->id]) . '">انتقال</a>'
+                            : View::badge('فقط سرویس فعال یا معلق', 'muted')) . '</td></tr>';
+                }
+                foreach ($ops as $d) {
+                    $f .= '<tr data-source-operator="' . View::e($d) . '"><td>' . View::ltr($d) . '</td><td>' . View::badge('اپراتور', 'violet') . '</td><td>—</td><td>—</td>'
+                        . '<td class="pcdna-actions"><a class="pcdna-btn pcdna-btn-sm pcdna-btn-primary" href="' . View::url(['page' => 'transfer', 'domain' => $d]) . '">انتقال</a></td></tr>';
+                }
+                $f .= '</tbody></table></div>';
+            }
+        }
+        $h = View::card('انتقال دامنه — انتخاب دامنه', $intro . $f, '', '', 'users');
+        // recent transfers (ledger)
+        $hist = '';
+        try {
+            if (Transfers::ensure()) {
+                $recent = Capsule::table(Transfers::TABLE)->orderBy('id', 'desc')->limit(20)->get()->all();
+                if ($recent) {
+                    $names = ['client_client' => 'مشتری ← مشتری', 'operator_client' => 'اپراتور ← مشتری', 'client_operator' => 'مشتری ← اپراتور'];
+                    $st = ['done' => ['انجام شد', 'good'], 'rolled_back' => ['برگشت داده شد', 'warn'], 'failed' => ['ناموفق', 'bad']];
+                    $hist = '<div class="pcdna-table-wrap"><table class="pcdna-table" data-transfer-history="1"><thead><tr><th>زمان</th><th>دامنه</th><th>جهت</th><th>از</th><th>به</th><th>وضعیت</th></tr></thead><tbody>';
+                    foreach ($recent as $t) {
+                        $who = function (int $cid) {
+                            return $cid > 0 ? '<a href="' . View::e(Data::clientUrl($cid)) . '">#' . View::n($cid) . '</a>' : View::badge('اپراتور', 'violet');
+                        };
+                        [$sl, $tone] = $st[(string) $t->status] ?? [(string) $t->status, 'muted'];
+                        $hist .= '<tr><td>' . View::date((string) $t->created_at, true) . '</td><td>' . View::ltr((string) $t->domain) . '</td><td>'
+                            . View::e($names[(string) $t->direction] ?? (string) $t->direction) . '</td><td>' . $who((int) $t->from_client) . '</td><td>'
+                            . $who((int) $t->to_client) . '</td><td>' . View::badge($sl, $tone) . '</td></tr>';
+                    }
+                    $hist .= '</tbody></table></div>';
+                }
+            }
+        } catch (\Throwable $e) {
+            $hist = '';
+        }
+        return $h . View::card('انتقال‌های اخیر', $hist !== '' ? $hist : '<p class="pcdna-muted">هنوز انتقالی انجام نشده است.</p>', '', '', 'history');
     }
 
     private static function sourceCard(array $src): string
