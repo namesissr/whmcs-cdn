@@ -1,0 +1,26 @@
+# Blackbox exporter modules used by the pcdn-probe* jobs in prometheus.yml.
+modules:
+  # plain HTTPS reachability (/healthz, /status.json, the separate status page, extra URLs)
+  http_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: true
+      follow_redirects: true
+      valid_status_codes: []        # 2xx
+      fail_if_ssl: false
+      fail_if_not_ssl: false
+      tls_config:
+        insecure_skip_verify: false
+
+  # GET /healthz/deep: 200 with {"status": "ok", ...}; 503 with "degraded"/"down" fails the probe
+  http_deep_health:
+    prober: http
+    timeout: 15s
+    http:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: true
+      valid_status_codes: [200]
+      fail_if_body_not_matches_regexp:
+        - '"status"\s*:\s*"ok"'

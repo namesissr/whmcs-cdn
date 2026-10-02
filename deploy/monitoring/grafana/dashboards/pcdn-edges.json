@@ -1,0 +1,1316 @@
+{
+  "uid": "pcdn-edges",
+  "title": "Pasargad CDN — Edges",
+  "description": "Edge availability, load, capacity and uptime. Per-edge panels: Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md.",
+  "tags": [
+    "pcdn",
+    "edges"
+  ],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "group",
+        "label": "Edge group",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "pcdn-prometheus"
+        },
+        "query": {
+          "query": "label_values(pcdn_api_edge_enabled, group)",
+          "refId": "group"
+        },
+        "definition": "label_values(pcdn_api_edge_enabled, group)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "sort": 1,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": [
+        "pcdn"
+      ],
+      "asDropdown": true,
+      "title": "Pasargad CDN",
+      "includeVars": false,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "row",
+      "title": "Platform counts (controller /metrics)",
+      "collapsed": false,
+      "id": 1,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Online",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_edges_online)",
+          "legendFormat": "__auto",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "red"
+              },
+              {
+                "value": 1,
+                "color": "green"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Registered",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_edges_total)",
+          "legendFormat": "__auto",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Enabled",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_api_edges_enabled)",
+          "legendFormat": "__auto",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "stat",
+      "title": "Shed",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_edges_shed)",
+          "legendFormat": "__auto",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Failing probe",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_edges_probe_failing)",
+          "legendFormat": "__auto",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "red"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "With last_error",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_api_edges_with_errors)",
+          "legendFormat": "__auto",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "Online vs registered",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(pcdn_edges_total)",
+          "legendFormat": "registered",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "B",
+          "expr": "sum(pcdn_edges_online)",
+          "legendFormat": "online",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "C",
+          "expr": "sum(pcdn_api_edges_enabled)",
+          "legendFormat": "enabled (bridge)",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Per edge (api-bridge)",
+      "collapsed": false,
+      "id": 9,
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "table",
+      "title": "Edges",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_edge_online{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "B",
+          "expr": "pcdn_api_edge_shed{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "C",
+          "expr": "100 * (pcdn_api_edge_tx_mbps{group=~\"$group\"} > pcdn_api_edge_rx_mbps{group=~\"$group\"} or pcdn_api_edge_rx_mbps{group=~\"$group\"}) / (pcdn_api_edge_capacity_mbps{group=~\"$group\"} > 0)",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "D",
+          "expr": "pcdn_api_edge_tx_mbps{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "E",
+          "expr": "pcdn_api_edge_rx_mbps{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "F",
+          "expr": "pcdn_api_edge_capacity_mbps{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "G",
+          "expr": "pcdn_api_edge_connections{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "H",
+          "expr": "pcdn_api_edge_load1{group=~\"$group\"} / pcdn_api_edge_cpus{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "I",
+          "expr": "pcdn_api_edge_uptime_24h_percent{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "J",
+          "expr": "pcdn_api_edge_uptime_30d_percent{group=~\"$group\"}",
+          "legendFormat": "__auto",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "capacity used %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "uptime 24h %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "uptime 30d %"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "load1 / cpu"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md.",
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "bridge": true
+            },
+            "renameByName": {
+              "Value #A": "online",
+              "Value #B": "shed",
+              "Value #C": "capacity used %",
+              "Value #D": "tx Mbps",
+              "Value #E": "rx Mbps",
+              "Value #F": "capacity Mbps",
+              "Value #G": "connections",
+              "Value #H": "load1 / cpu",
+              "Value #I": "uptime 24h %",
+              "Value #J": "uptime 30d %"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Capacity used % (max of rx/tx vs capacity_mbps)",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "100 * (pcdn_api_edge_tx_mbps{group=~\"$group\"} > pcdn_api_edge_rx_mbps{group=~\"$group\"} or pcdn_api_edge_rx_mbps{group=~\"$group\"}) / (pcdn_api_edge_capacity_mbps{group=~\"$group\"} > 0)",
+          "legendFormat": "{{edge}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Above ~100% the controller sheds the edge from DNS. Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput tx (Mbps)",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_edge_tx_mbps{group=~\"$group\"}",
+          "legendFormat": "{{edge}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Mbits",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_edge_connections{group=~\"$group\"}",
+          "legendFormat": "{{edge}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "Load per CPU",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 31,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_edge_load1{group=~\"$group\"} / pcdn_api_edge_cpus{group=~\"$group\"}",
+          "legendFormat": "{{edge}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "Uptime 24h %",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_edge_uptime_24h_percent{group=~\"$group\"}",
+          "legendFormat": "{{edge}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "Online (1 = heartbeat fresh)",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 39,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_edge_online{group=~\"$group\"}",
+          "legendFormat": "{{edge}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "row",
+      "title": "Edge groups — 3-day p95 vs capacity (SPEC §15.5)",
+      "collapsed": false,
+      "id": 17,
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "bargauge",
+      "title": "Capacity used (p95, 3 days)",
+      "id": 18,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_group_capacity_used_percent{group=~\"$group\"}",
+          "legendFormat": "{{group}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 70,
+                "color": "orange"
+              },
+              {
+                "value": 85,
+                "color": "red"
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    },
+    {
+      "type": "timeseries",
+      "title": "p95 vs capacity (Mbps)",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pcdn-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 48,
+        "w": 16,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "A",
+          "expr": "pcdn_api_group_p95_mbps{group=~\"$group\"}",
+          "legendFormat": "{{group}} p95",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pcdn-prometheus"
+          },
+          "refId": "B",
+          "expr": "pcdn_api_group_capacity_mbps{group=~\"$group\"}",
+          "legendFormat": "{{group}} capacity",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Mbits",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Needs the optional api-bridge profile (json-exporter over the admin API). Without it these panels show 'No data'. See docs/MONITORING.md."
+    }
+  ]
+}

@@ -1,0 +1,357 @@
+# Pasargad CDN — alert rules. Every expression uses only series that really exist:
+#   pcdn_*        controller GET /metrics (controller/app/routes_metrics.py, SPEC §13.1)
+#   probe_*       blackbox exporter (pcdn-probe / pcdn-probe-deep jobs)
+#   pcdn_api_*    optional admin-API bridge (json-exporter, compose profile api-bridge)
+# Label `source` lets Alertmanager mute metric-derived alerts while the controller is unreachable.
+# Validate: promtool check rules prometheus/rules/*.yml && promtool test rules prometheus/tests/*.yml
+groups:
+  - name: pcdn-controller
+    rules:
+      - alert: PcdnControllerDown
+        expr: probe_success{job="pcdn-probe", probe="healthz"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          source: probe
+        annotations:
+          summary: "کنترلر از بیرون در دسترس نیست"
+          description: "GET {{ $labels.instance }} از میزبان مانیتورینگ ۲ دقیقه است پاسخ موفق نمی‌دهد (Caddy، کنترلر یا شبکه)."
+          runbook: docs/DISASTER_RECOVERY.md
+
+      - alert: PcdnControllerScrapeFailing
+        expr: up{job="pcdn-controller"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          source: probe
+        annotations:
+          summary: "دریافت /metrics از کنترلر شکست می‌خورد"
+          description: "Prometheus نمی‌تواند {{ $labels.instance }}/metrics را بخواند. اگر PcdnControllerDown هم فعال نیست، METRICS_TOKEN را در هر دو طرف بررسی کنید (پاسخ 401)."
+
+      - alert: PcdnControllerMetricsAbsent
+        expr: absent(up{job="pcdn-controller"})
+        for: 10m
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "هیچ هدف pcdn-controller تعریف نشده است"
+          description: "file_sd خالی است؛ CONTROLLER_URL در .env مانیتورینگ را بررسی کنید."
+
+      - alert: PcdnControllerMetricsIncomplete
+        expr: up{job="pcdn-controller"} == 1 unless on(instance) pcdn_edges_total
+        for: 10m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "/metrics پاسخ می‌دهد ولی شمارش نودها ندارد"
+          description: "بلوک‌های /metrics جداگانه شکست می‌خورند (معمولاً دیتابیس). لاگ کنترلر (pcdn.metrics) را ببینید."
+
+      - alert: PcdnDeepHealthDegraded
+        expr: probe_success{job="pcdn-probe-deep"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "‏/healthz/deep وضعیت ok ندارد"
+          description: "‏{{ $labels.instance }} پاسخ degraded/down یا 503 می‌دهد. بدنهٔ JSON (فیلد warnings) را ببینید."
+
+      - alert: PcdnControllerProbeErrorRatioHigh
+        expr: 1 - avg_over_time(probe_success{job="pcdn-probe", component="controller"}[15m]) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "بیش از ۲۰٪ پروب‌های کنترلر در ۱۵ دقیقهٔ اخیر شکست خورده‌اند"
+          description: "‏{{ $labels.instance }}: {{ $value | humanizePercentage }} خطا. ناپایداری شبکه یا بار زیاد کنترلر."
+
+      - alert: PcdnControllerTlsExpiring
+        expr: (probe_ssl_earliest_cert_expiry{job=~"pcdn-probe.*"} - time()) < 14 * 86400
+        for: 1h
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "گواهی TLS {{ $labels.instance }} کمتر از ۱۴ روز اعتبار دارد"
+          description: "تمدید خودکار Caddy را بررسی کنید (پورت 80/443 و DNS)."
+
+      - alert: PcdnSchedulerStalled
+        expr: pcdn_scheduler_last_run_age_seconds > 600
+        for: 2m
+        labels:
+          severity: critical
+          source: metrics
+        annotations:
+          summary: "زمان‌بند کنترلر بیش از ۱۰ دقیقه است اجرا نشده"
+          description: "هیچ رهبری (leader) کارهای زمان‌بندی‌شده را اجرا نمی‌کند: DNS، پروب نودها، هشدارها و پشتیبان متوقف‌اند."
+
+      - alert: PcdnSchedulerJobFailing
+        # the metric's own `job` label collides with the scrape job and arrives as `exported_job`
+        expr: pcdn_scheduler_job_last_run_age_seconds > 900 and on(instance) pcdn_scheduler_last_run_age_seconds < 600
+        for: 5m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "کار زمان‌بندی‌شدهٔ {{ $labels.exported_job }} مدتی است موفق نشده"
+          description: "زمان‌بند کار می‌کند ولی {{ $labels.exported_job }} بیش از ۱۵ دقیقه است بدون خطا تمام نشده است. لاگ کنترلر را ببینید."
+
+  - name: pcdn-edges
+    rules:
+      - alert: PcdnEdgesAllOffline
+        expr: pcdn_edges_online == 0 and pcdn_edges_total > 0
+        for: 2m
+        labels:
+          severity: critical
+          source: metrics
+        annotations:
+          summary: "هیچ نود لبه‌ای آنلاین نیست"
+          description: "همهٔ نودهای فعال heartbeat نفرستاده‌اند. اتصال نودها به کنترلر را بررسی کنید (docs/NODES.md)."
+          runbook: docs/NODES.md
+
+      - alert: PcdnEdgesOffline
+        expr: pcdn_edges_online < max_over_time(pcdn_edges_online[1h])
+        for: 5m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "تعداد نودهای آنلاین کمتر از بیشینهٔ یک ساعت اخیر است"
+          description: "اکنون {{ $value }} نود آنلاین است. با پروفایل api-bridge، هشدار PcdnEdgeOffline نام نود را هم می‌گوید."
+
+      - alert: PcdnEdgesProbeFailing
+        expr: pcdn_edges_probe_failing > 0
+        for: 10m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "{{ $value }} نود heartbeat دارند ولی پروب سلامت را رد می‌کنند"
+          description: "nginx/پورت 443 این نودها از بیرون پاسخ نمی‌دهد (SPEC §8.1)."
+
+      - alert: PcdnEdgesShed
+        expr: pcdn_edges_shed > 0
+        for: 15m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "{{ $value }} نود به‌علت بار زیاد از DNS خارج شده‌اند (load shedding)"
+          description: "ظرفیت شبکه زیر فشار است؛ نود اضافه کنید یا capacity_mbps را بازبینی کنید."
+
+  - name: pcdn-dns-ssl
+    rules:
+      - alert: PcdnDnsSyncStale
+        expr: pcdn_dns_last_sync_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "DNS بیش از ۱۵ دقیقه است همگام نشده"
+          description: "PowerDNS را بررسی کنید (pdns_down / dns_sync در هشدارهای کنترلر)."
+
+      - alert: PcdnDnsSyncErrors
+        expr: pcdn_dns_sync_errors > 0
+        for: 10m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "{{ $value }} خطای باز همگام‌سازی DNS / PowerDNS"
+          description: "جزئیات در هشدارهای باز کنترلر (پنل WHMCS یا GET /api/v1/alerts)."
+
+      - alert: PcdnCertificatesFailed
+        expr: pcdn_ssl_certificates{status="failed"} > 0
+        for: 1h
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "صدور گواهی SSL برای {{ $value }} سایت شکست خورده است"
+          description: "معمولاً DNS سایت هنوز به CDN اشاره نمی‌کند یا محدودیت Let's Encrypt. پنل مدیریت سایت‌ها را ببینید."
+
+      - alert: PcdnCertificatesFailedRising
+        expr: delta(pcdn_ssl_certificates{status="failed"}[1h]) >= 5
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "در یک ساعت اخیر {{ $value }} گواهی جدید شکست خورده است"
+          description: "شکست گروهی صدور گواهی: ACME، DNS یا دسترسی پورت 80 نودها را بررسی کنید."
+
+      - alert: PcdnCertificatesExpiring
+        expr: pcdn_ssl_certs_expiring > 0
+        for: 6h
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "{{ $value }} گواهی در بازهٔ ALERT_CERT_DAYS منقضی می‌شود و تمدید نشده"
+          description: "تمدید خودکار باید زودتر انجام می‌شد؛ کار job_ssl و لاگ acme را بررسی کنید."
+
+  - name: pcdn-backup-queues
+    rules:
+      - alert: PcdnBackupStale
+        expr: pcdn_backup_last_success_age_seconds > 26 * 3600
+        for: 15m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "آخرین پشتیبان موفق {{ $value | humanizeDuration }} پیش بوده است"
+          description: "پشتیبان روزانه اجرا نشده یا شکست خورده است (docs/OPERATIONS.md §۳)."
+          runbook: docs/OPERATIONS.md
+
+      - alert: PcdnBackupVeryStale
+        expr: pcdn_backup_last_success_age_seconds > 50 * 3600
+        for: 15m
+        labels:
+          severity: critical
+          source: metrics
+        annotations:
+          summary: "بیش از دو روز است پشتیبان موفقی گرفته نشده"
+          description: "بدون پشتیبان تازه، بازیابی از فاجعه داده از دست می‌دهد (docs/DISASTER_RECOVERY.md)."
+
+      - alert: PcdnBackupNeverSucceeded
+        expr: up{job="pcdn-controller"} == 1 unless on(instance) pcdn_backup_last_success_age_seconds
+        for: 1d
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "کنترلر هیچ پشتیبان موفقی ثبت نکرده است"
+          description: "BACKUP_ENABLED=false است یا هر بار شکست می‌خورد. اگر پشتیبان را آگاهانه جای دیگری می‌گیرید این هشدار را silence کنید."
+
+      - alert: PcdnWebhookBacklog
+        expr: pcdn_webhook_deliveries{status="pending"} > 500
+        for: 30m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "{{ $value }} تحویل وب‌هوک در صف مانده است"
+          description: "کارگرهای تحویل وب‌هوک عقب افتاده‌اند یا مقصدها کند/خاموش‌اند."
+
+      - alert: PcdnWebhookFailuresRising
+        expr: delta(pcdn_webhook_deliveries{status="failed"}[1h]) > 50
+        labels:
+          severity: info
+          source: metrics
+        annotations:
+          summary: "{{ $value }} تحویل وب‌هوک در یک ساعت اخیر شکست قطعی خورده است"
+          description: "معمولاً مقصد مشتری خاموش است؛ اگر همه‌گیر است، دسترسی خروجی کنترلر را بررسی کنید."
+
+      - alert: PcdnLogExportBacklog
+        expr: pcdn_log_export_pending_records > 1e6 and deriv(pcdn_log_export_pending_records[1h]) > 0
+        for: 1h
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "صف خروجی لاگ ({{ $value }} رکورد) در حال رشد است"
+          description: "آپلود لاگ به باکت مشتریان عقب افتاده؛ تکه‌های قدیمی‌تر از ۷۲ ساعت دور ریخته می‌شوند (SPEC §14.3.2)."
+
+      - alert: PcdnControllerCriticalAlertsOpen
+        expr: pcdn_active_alerts_by_severity{severity="critical"} > 0
+        for: 15m
+        labels:
+          severity: info
+          source: metrics
+        annotations:
+          summary: "کنترلر {{ $value }} هشدار بحرانی باز دارد"
+          description: "کنترلر خودش این‌ها را از تلگرام/ایمیل خودش فرستاده است؛ این یادآوری مستقل از کانال‌های کنترلر است."
+
+  - name: pcdn-status-page
+    rules:
+      - alert: PcdnStatusPageDown
+        expr: probe_success{job="pcdn-probe", component="status_page"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "صفحهٔ وضعیت عمومی ({{ $labels.instance }}) در دسترس نیست"
+          description: "میزبان جداگانهٔ deploy/status را بررسی کنید."
+
+      - alert: PcdnPublicStatusJsonDown
+        expr: probe_success{job="pcdn-probe", probe="status_json"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "‏/status.json کنترلر پاسخ نمی‌دهد"
+          description: "صفحهٔ وضعیت جداگانه آخرین وضعیت شناخته‌شده را نشان می‌دهد تا این برطرف شود."
+
+  # only evaluated when the api-bridge profile is enabled (otherwise these series do not exist)
+  - name: pcdn-api-bridge
+    rules:
+      - alert: PcdnApiBridgeFailing
+        expr: up{job=~"pcdn-api-.*"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          source: probe
+        annotations:
+          summary: "پل admin-API (json-exporter) داده نمی‌گیرد"
+          description: "PCDN_ADMIN_API_KEY یا پروفایل api-bridge را بررسی کنید ({{ $labels.job }})."
+
+      - alert: PcdnEdgeOffline
+        expr: pcdn_api_edge_online == 0 and on(edge_id) pcdn_api_edge_enabled == 1
+        for: 5m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "نود {{ $labels.edge }} ({{ $labels.group }}) آفلاین است"
+          description: "این نود فعال است ولی در EDGE_OFFLINE_SECONDS اخیر heartbeat نفرستاده است."
+
+      - alert: PcdnEdgeLoadHigh
+        expr: |
+          (
+            (pcdn_api_edge_tx_mbps > pcdn_api_edge_rx_mbps or pcdn_api_edge_rx_mbps)
+            / (pcdn_api_edge_capacity_mbps > 0)
+          ) * 100 > 85
+        for: 15m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "نود {{ $labels.edge }} روی {{ $value | printf \"%.0f\" }}٪ ظرفیت کار می‌کند"
+          description: "بیش از ۱۵ دقیقه بالای ۸۵٪ capacity_mbps؛ shedding خودکار نزدیک است."
+
+      - alert: PcdnGroupCapacityHigh
+        expr: pcdn_api_group_capacity_used_percent > 80
+        for: 2h
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "گروه {{ $labels.group }}: p95 سه‌روزه {{ $value }}٪ ظرفیت است"
+          description: "برای گروه {{ $labels.group }} نود اضافه کنید (SPEC §15.5)."
+
+      - alert: PcdnEdgeUptimeLow
+        expr: pcdn_api_edge_uptime_24h_percent < 95 and on(edge_id) pcdn_api_edge_enabled == 1
+        for: 30m
+        labels:
+          severity: info
+          source: metrics
+        annotations:
+          summary: "دسترس‌پذیری ۲۴ ساعتهٔ نود {{ $labels.edge }} {{ $value }}٪ است"
+          description: "نود ناپایدار است (قطع‌ووصل heartbeat یا پروب)."
+
+      - alert: PcdnErrorRatioHigh
+        expr: |
+          pcdn_api_24h_status_requests_5xx
+            / (pcdn_api_24h_requests > 1000) > 0.05
+        for: 30m
+        labels:
+          severity: warning
+          source: metrics
+        annotations:
+          summary: "نسبت پاسخ‌های 5xx در ۲۴ ساعت اخیر {{ $value | humanizePercentage }} است"
+          description: "پنجرهٔ غلتان ۲۴ ساعته در کل پلتفرم؛ مبدأهای مشتری یا نودها را بررسی کنید."

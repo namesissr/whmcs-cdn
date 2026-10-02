@@ -1,0 +1,17 @@
+# Same-host variant: scrape the controller over the control plane's Docker network instead of
+# HTTPS. Not recommended for alerting (if that host dies, so does its monitoring), but useful as a
+# second, internal Prometheus or on a single-server lab.
+#
+#   CONTROLLER_URL=http://controller:8000      # in .env
+#   MAIN_STACK_NETWORK=whmcs-cdn_default       # `docker network ls` on the control-plane host
+#   docker compose -f docker-compose.yml -f same-host.override.yml up -d
+services:
+  prometheus:
+    networks: [default, pcdn]
+  json-exporter:
+    networks: [default, pcdn]
+
+networks:
+  pcdn:
+    external: true
+    name: ${MAIN_STACK_NETWORK:-whmcs-cdn_default}

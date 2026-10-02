@@ -1,0 +1,105 @@
+# Pasargad CDN documentation site.
+#   pip install -r docs-site/requirements.txt
+#   mkdocs serve            # http://127.0.0.1:8000
+#   mkdocs build --strict   # -> docs-site/_build/
+# Pages are read from docs/ unchanged; docs-site/ holds the site-only pages, CSS and hooks.
+site_name: مستندات CDN پاسارگاد
+site_description: راه‌اندازی، عملیات و API شبکهٔ توزیع محتوای پاسارگاد میزبان
+site_url: ""
+repo_url: https://github.com/namesissr/whmcs-cdn
+repo_name: namesissr/whmcs-cdn
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: docs-site/_build
+use_directory_urls: true
+strict: true
+
+extra:
+  repo_branch: main        # used by docs-site/hooks.py for links that leave docs/
+  # Broken links inside docs/*.md, corrected at build time (docs-site/hooks.py) instead of editing
+  # the source. Remove an entry once the source is fixed (the hook warns about unused entries).
+  link_fixes:
+    - page: DISASTER_RECOVERY.md
+      from: "#۷-تأیید-اینکه-پشتیبانها-واقعاً-قابلبازیاناند"   # typo: «قابلبازیان»
+      to: "#۷-تأیید-اینکه-پشتیبانها-واقعاً-قابلبازیابیاند"
+
+theme:
+  name: material
+  language: fa
+  direction: rtl
+  font: false              # no Google Fonts: builds and pages work offline / on restricted networks
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      toggle:
+        icon: material/weather-night
+        name: حالت تیره
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      toggle:
+        icon: material/weather-sunny
+        name: حالت روشن
+
+extra_css:
+  - stylesheets/rtl.css
+
+hooks:
+  - docs-site/hooks.py
+
+plugins:
+  - search:
+      separator: '[\s\-،؛.]+'
+
+markdown_extensions:
+  - toc:
+      permalink: true
+      # slugify is set by docs-site/hooks.py (on_config) to GitHub's algorithm, so the Persian
+      # anchors written for GitHub (OPERATIONS.md#۲-هشدار-تلگرام-و-ایمیل) resolve here too
+  - tables
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: false
+  - pymdownx.inlinehilite
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - خانه: index.md
+  - شروع کار:
+      - راه‌اندازی (README): getting-started.md
+      - معماری: ARCHITECTURE.md
+      - به‌روزرسانی: UPGRADE.md
+  - عملیات:
+      - راهنمای عملیات: OPERATIONS.md
+      - پایش و هشدار: MONITORING.md
+      - محیط Staging و آزمون E2E: STAGING.md
+  - نودها:
+      - عملیات نودها: NODES.md
+      - Edge node (v2): EDGE.md
+  - WHMCS: WHMCS.md
+  - API، CLI و Terraform:
+      - API مشتری: API.md
+      - ابزار خط فرمان: CLI.md
+      - Terraform: TERRAFORM.md
+      - قرارداد داخلی (SPEC): SPEC.md
+  - امنیت: SECURITY.md
+  - بازیابی از فاجعه: DISASTER_RECOVERY.md
+  - آزمون بار: LOADTEST.md
+  - فضای ذخیره‌سازی: STORAGE.md

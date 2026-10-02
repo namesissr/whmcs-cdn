@@ -1,0 +1,40 @@
+{{/* Pasargad CDN alert messages (Persian). Telegram uses parse_mode HTML. */}}
+
+{{ define "pcdn.status.icon" }}{{ if eq .Status "firing" }}{{ if eq .CommonLabels.severity "critical" }}🔴{{ else if eq .CommonLabels.severity "info" }}🔵{{ else }}🟠{{ end }}{{ else }}✅{{ end }}{{ end }}
+
+{{ define "pcdn.status.text" }}{{ if eq .Status "firing" }}فعال{{ else }}برطرف شد{{ end }}{{ end }}
+
+{{ define "pcdn.telegram.message" -}}
+{{ template "pcdn.status.icon" . }} <b>[{{ template "pcdn.status.text" . }}] {{ .CommonLabels.alertname }}</b>{{ if .CommonLabels.severity }} — {{ .CommonLabels.severity }}{{ end }}
+{{ range .Alerts }}
+• {{ .Annotations.summary | html }}
+{{- if .Annotations.description }}
+  {{ .Annotations.description | html }}{{ end }}
+{{- if .Annotations.runbook }}
+  📘 {{ .Annotations.runbook | html }}{{ end }}
+  <i>{{ .StartsAt.Format "2006-01-02 15:04 UTC" }}{{ if eq .Status "resolved" }} → {{ .EndsAt.Format "15:04 UTC" }}{{ end }}</i>
+{{ end -}}
+{{- end }}
+
+{{ define "pcdn.email.subject" -}}
+[PCDN {{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}{{ if .CommonLabels.severity }} ({{ .CommonLabels.severity }}){{ end }}
+{{- end }}
+
+{{ define "pcdn.email.html" -}}
+<!doctype html>
+<html lang="fa" dir="rtl"><body style="font-family:Tahoma,Arial,sans-serif;direction:rtl;text-align:right">
+<h3>{{ template "pcdn.status.text" . }}: {{ .CommonLabels.alertname }}</h3>
+<ul>
+{{ range .Alerts }}
+<li style="margin-bottom:12px">
+<b>{{ .Annotations.summary }}</b><br>
+{{ if .Annotations.description }}{{ .Annotations.description }}<br>{{ end }}
+{{ if .Annotations.runbook }}راهنما: <code dir="ltr">{{ .Annotations.runbook }}</code><br>{{ end }}
+<small dir="ltr">{{ range .Labels.SortedPairs }}{{ .Name }}={{ .Value }} {{ end }}</small><br>
+<small dir="ltr">{{ .StartsAt.Format "2006-01-02 15:04 UTC" }}{{ if eq .Status "resolved" }} → {{ .EndsAt.Format "2006-01-02 15:04 UTC" }}{{ end }}</small>
+</li>
+{{ end }}
+</ul>
+<p><small><a href="{{ .ExternalURL }}">Alertmanager</a></small></p>
+</body></html>
+{{- end }}
