@@ -58,6 +58,14 @@ class ClientApi
      */
     const BUCKET = '[a-z0-9][a-z0-9-]{1,38}[a-z0-9]';
 
+    /**
+     * SPEC §17.2 learning-mode proposal id, as the controller makes it (waf_learning.proposal_id:
+     * "p_" + 16 hex of sha256(kind:target)); POST waf/learning/apply carries 1..MAX_APPLY_IDS of them
+     * and nothing else.
+     */
+    const PROPOSAL_ID = '/^p_[0-9a-f]{16}$/D';
+    const MAX_APPLY_IDS = 100;
+
     /** method => [sub-path regex relative to /api/v1/sites/{domain}, ...] */
     const ROUTES = [
         'GET' => [
@@ -72,13 +80,18 @@ class ClientApi
             'storage', 'storage/buckets',
             // SPEC §16.9 edge functions: invocations / CPU / errors of the last `hours` (read-only)
             'functions/stats',
+            // SPEC §17.3 WAF learning mode: state, progress and proposals (read-only; starting / stopping
+            // is a PUT config/waf with `learning`)
+            'waf/learning',
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
             // Wave 8 (SPEC §16.6): new image transform secret (returned once, never logged — ApiClient::redact)
             'image/transform-secret',
             // SPEC §16.8: new bucket / new access key — secret_key returned once, never logged (ApiClient::redact)
-            'storage/buckets', 'storage/buckets/' . self::BUCKET . '/rotate-key'],
+            'storage/buckets', 'storage/buckets/' . self::BUCKET . '/rotate-key',
+            // SPEC §17.3: apply the chosen learning-mode proposals — body re-checked by applyBody()
+            'waf/learning/apply'],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
         'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client',
             // Wave 8 (SPEC §16.6): forget the image transform secret (unsigned transforms allowed again)
@@ -232,6 +245,12 @@ class ClientApi
             $data = $raw === '' ? [] : json_decode($raw, true, 64);
             if (!is_array($data)) {
                 return self::fail(400, 'بدنه درخواست باید JSON معتبر باشد.');
+            }
+            if ($method === 'POST' && $path === 'waf/learning/apply') {
+                $data = self::applyBody($data);
+                if ($data === null) {
+                    return self::fail(400, 'پارامتر نامعتبر است.');
+                }
             }
             // Re-encoded, so only well-formed JSON ever reaches the controller.
             $body = json_encode($data === [] ? new \stdClass() : $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -493,6 +512,25 @@ class ClientApi
     public static function maxBody(string $method, string $path): int
     {
         return strtoupper($method) === 'PUT' && $path === 'config/functions' ? self::MAX_BODY_FUNCTIONS : self::MAX_BODY;
+    }
+
+    /**
+     * SPEC §17.3: the only body POST waf/learning/apply may carry — {ids: [1..100 distinct proposal ids]}.
+     * Returns the cleaned body (just `ids`, order kept) or null when anything else is in it.
+     */
+    public static function applyBody(array $data): ?array
+    {
+        $ids = $data['ids'] ?? null;
+        if (array_diff(array_keys($data), ['ids']) || !is_array($ids) || !$ids || count($ids) > self::MAX_APPLY_IDS
+            || array_keys($ids) !== range(0, count($ids) - 1)) {
+            return null;
+        }
+        foreach ($ids as $id) {
+            if (!is_string($id) || !preg_match(self::PROPOSAL_ID, $id)) {
+                return null;
+            }
+        }
+        return ['ids' => array_values(array_unique($ids))];
     }
 
     public static function allowed(string $method, string $path): bool

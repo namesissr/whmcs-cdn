@@ -130,6 +130,8 @@ class I18n
         'توابع لبه با تونلی که پاسخ پیش‌فرض آن decoy یا 404 است اجرا نمی‌شوند؛ fallback تونل را origin کنید یا توابع را خاموش کنید'
             => 'Edge functions do not run while the tunnel answers unknown paths with a decoy or 404; set the tunnel fallback to origin or turn functions off',
         'hours باید بین 1 و %s باشد' => 'hours must be between 1 and %s',
+        // SPEC §17.2 WAF learning mode — controller details (translated by controller(), see below)
+        'پیشنهاد نامعتبر یا منقضی است: %s' => 'Invalid or expired proposal: %s',
         // templates/clientarea.tpl
         'برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.' => 'Enable JavaScript in your browser to manage the CDN.',
         'در حال بارگذاری پنل CDN…' => 'Loading the CDN panel…',

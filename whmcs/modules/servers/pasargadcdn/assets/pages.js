@@ -750,7 +750,9 @@
           P.btn(t('افزودن استثنا'), { icon: 'plus', size: 'sm', write: true, onclick: function () { d.exclusions.push({ rule_id: 0, path: '' }); adv.setOpen(true); f2.redraw(); } }))]);
       // Managed rule packs (§14.2) — only when the controller's waf section carries `packs`.
       var packs = sec6b().wafPacks ? sec6b().wafPacks(d, f2, Aa) : null;
-      return [levels, mode, packs, adv];
+      // «حالت یادگیری» (§17.3, waflearn.js) — stays hidden unless the controller answers GET waf/learning.
+      var learn = P.wafLearn ? P.wafLearn.card(d, f2, Aa) : null;
+      return [levels, mode, learn, packs, adv];
     }, { validate: sec6b().validateWaf });
     return f.el;
   }
