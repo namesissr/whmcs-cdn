@@ -158,7 +158,7 @@ class Shares
     public static function invite(array $owner, string $email, string $role, string $createdBy): array
     {
         if (!self::ensure()) {
-            return [false, 'ذخیره در WHMCS ممکن نشد؛ دوباره تلاش کنید.'];
+            return [false, 'ذخیره ممکن نشد؛ دوباره تلاش کنید.'];
         }
         $email = strtolower(trim($email));
         if (!self::validEmail($email)) {
@@ -174,7 +174,7 @@ class Shares
                 return [false, 'نمی‌توانید خودتان را دعوت کنید.'];
             }
             if (self::ownTeam($ownerId, $email)) {
-                return [false, 'این ایمیل عضو تیم حساب خود شماست؛ برای دسترسی او از «مدیریت کاربران» حساب WHMCS استفاده کنید.'];
+                return [false, 'این ایمیل عضو تیم حساب خود شماست؛ برای دسترسی او از «مدیریت کاربران» حساب کاربری خود استفاده کنید.'];
             }
         }
         $live = self::scoped($owner)->whereIn('status', self::LIVE)->get(['id', 'email', 'status', 'member_client_id']);

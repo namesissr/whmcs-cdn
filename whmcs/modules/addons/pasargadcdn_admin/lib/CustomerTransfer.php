@@ -315,7 +315,7 @@ final class CustomerTransfer
             return $fail(403, 'دسترسی شما به این سرویس فقط‌خواندنی است.', 'Your access to this service is read-only.');
         }
         if (!self::ensure()) {
-            return $fail(503, 'ذخیره در WHMCS ممکن نشد؛ دوباره تلاش کنید.', 'Could not save in WHMCS; please try again.');
+            return $fail(503, 'ذخیره ممکن نشد؛ دوباره تلاش کنید.', 'Could not save; please try again.');
         }
         $svc = Capsule::table('tblhosting')->where('id', (int) $svc->id)->first();
         $sid = (int) $svc->id;

@@ -46,7 +46,7 @@
     if (d.request) body.appendChild(openCard(body, d.request));
     else body.appendChild(formCard(body, d));
     if (Array.isArray(d.recent) && d.recent.length) body.appendChild(recentCard(d.recent));
-    body.appendChild(P.alertBox('info', t('گیرنده باید با همان ایمیل اصلی حساب WHMCS داشته باشد. پس از پذیرش او، سرویس با همان دوره، سررسید و صورت‌حساب‌های پرداخت‌نشدهٔ همین سرویس به حساب او منتقل می‌شود؛ اعتبار حساب و صورت‌حساب‌های پرداخت‌شده نزد شما می‌ماند.')));
+    body.appendChild(P.alertBox('info', t('گیرنده باید با همین ایمیل در پاسارگاد میزبان حساب کاربری داشته باشد. پس از پذیرش او، سرویس با همان دوره، سررسید و صورت‌حساب‌های پرداخت‌نشدهٔ همین سرویس به حساب فرد موردنظر شما منتقل می‌شود؛ اعتبار حساب و صورت‌حساب‌های پرداخت‌شده نزد شما می‌ماند.')));
   }
 
   /** What moves — the same facts the recipient sees on the accept page and in the e-mail. */
@@ -102,7 +102,7 @@
         preview.appendChild(confirmBox(body, model, e, res.data || {}, d));
       });
     } });
-    append(c.body, [h('p', { className: 'pcdn-muted', text: t('مالکیت کامل این سرویس — با صورت‌حساب‌ها و تمدید بعدی — به حساب WHMCS دیگری منتقل می‌شود. گیرنده باید درخواست را بپذیرد؛ تا آن زمان می‌توانید آن را لغو کنید.') }),
+    append(c.body, [h('p', { className: 'pcdn-muted', text: t('مالکیت کامل این سرویس — با صورت‌حساب‌ها و تمدید بعدی — به حساب فرد موردنظر شما منتقل می‌شود. گیرنده باید درخواست را بپذیرد؛ تا آن زمان می‌توانید آن را لغو کنید.') }),
       email, msgField, h('div', { className: 'pcdn-row-actions' }, check), preview]);
     return c;
   }
@@ -170,7 +170,7 @@
 
   pages.xfer = {
     title: t('انتقال دامنه'), icon: 'send',
-    desc: t('انتقال مالکیت این سرویس و دامنه به حساب WHMCS دیگر، با پذیرش گیرنده.'),
+    desc: t('انتقال مالکیت این سرویس و دامنه به حساب فرد موردنظر شما، با پذیرش گیرنده.'),
     hidden: function () { var a = P.app; return !a || !a.xfer || (a.inSubSite && a.inSubSite()); },
     render: function () { return render(); }
   };

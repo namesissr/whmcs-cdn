@@ -568,7 +568,7 @@ class ClientApi
             return self::xferOp($method, $svc, $req);
         }
         if (!ServiceState::ensure()) {
-            return self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
+            return self::fail(503, 'ذخیره تنظیمات ممکن نشد؛ دوباره تلاش کنید.');
         }
         if ($op === 'state' && $method === 'GET') {
             $r = ServiceState::report($sid);
@@ -589,12 +589,12 @@ class ClientApi
                 }
             }
             $saved = ServiceState::saveOnboarding($sid, $patch);
-            return $saved === null ? self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.') : [200, ['onboarding' => $saved]];
+            return $saved === null ? self::fail(503, 'ذخیره تنظیمات ممکن نشد؛ دوباره تلاش کنید.') : [200, ['onboarding' => $saved]];
         }
         if ($op === 'transfer') {
             require_once __DIR__ . '/Transfers.php';
             return Transfers::dismiss($sid, (int) ($req['client_id'] ?? 0)) ? [200, ['ok' => true]]
-                : self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
+                : self::fail(503, 'ذخیره تنظیمات ممکن نشد؛ دوباره تلاش کنید.');
         }
         if ($op === 'report') {
             $freq = is_string($data['freq'] ?? null) ? $data['freq'] : '';
@@ -602,7 +602,7 @@ class ClientApi
                 return self::fail(400, 'پارامتر نامعتبر است.');
             }
             $saved = ServiceState::setReport($sid, $freq);
-            return $saved === null ? self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.')
+            return $saved === null ? self::fail(503, 'ذخیره تنظیمات ممکن نشد؛ دوباره تلاش کنید.')
                 : [200, ['report' => ['freq' => $saved['freq'], 'last' => ServiceState::lastReport($sid)]]];
         }
         return self::fail(405, 'متد مجاز نیست.');
@@ -654,7 +654,7 @@ class ClientApi
         $domain = \pasargadcdn_domain(['domain' => (string) ($svc->domain ?? '')]);
         $owner = ['service_id' => (int) $svc->id, 'owner_client_id' => (int) $svc->userid, 'domain' => $domain];
         if (!Shares::ensure()) {
-            return self::fail(503, 'ذخیره تنظیمات در WHMCS ممکن نشد؛ دوباره تلاش کنید.');
+            return self::fail(503, 'ذخیره تنظیمات ممکن نشد؛ دوباره تلاش کنید.');
         }
         $list = function () use ($owner) {
             $cfg = Shares::settings();

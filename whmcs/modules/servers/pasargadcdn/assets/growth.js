@@ -137,7 +137,7 @@
   function renderReports() {
     var a = A(), draft = { freq: G.report.freq };
     var c = P.card({ title: t('گزارش ایمیلی دوره‌ای'), icon: 'mail', id: 'email-report',
-      subtitle: t('خلاصه عملکرد سایت را به‌صورت خودکار به ایمیل حساب WHMCS خود دریافت کنید.') });
+      subtitle: t('خلاصه عملکرد سایت را به‌صورت خودکار به ایمیل حساب کاربری خود دریافت کنید.') });
     var choice = h('div', { className: 'pcdn-choice-row', role: 'radiogroup', 'aria-label': t('دفعات ارسال') });
     var save = P.btn(t('ذخیره'), { kind: 'primary', icon: 'check', write: true, cls: 'pcdn-report-save', onclick: function () {
       P.busy(save, api('POST', '', { freq: draft.freq }, { lop: 'report' })).then(function (res) {
@@ -165,7 +165,7 @@
         G.report.last ? h('span', { className: 'pcdn-muted pcdn-small', 'data-report-last': '1', text: t(' · آخرین گزارش: {0}', P.date(String(G.report.last.at).replace(' ', 'T') + 'Z', { dateStyle: 'medium' })) }) : null),
       choice,
       h('div', { className: 'pcdn-row-actions' }, save),
-      h('p', { className: 'pcdn-hint', text: t('گزارش هفتگی پس از پایان هر هفته (دوشنبه) و گزارش ماهانه در روز اول ماه بعد، به زبانی که در حساب WHMCS انتخاب کرده‌اید ارسال می‌شود.') })]);
+      h('p', { className: 'pcdn-hint', text: t('گزارش هفتگی پس از پایان هر هفته (دوشنبه) و گزارش ماهانه در روز اول ماه بعد، به زبانی که در حساب کاربری خود انتخاب کرده‌اید ارسال می‌شود.') })]);
     var inc = P.card({ title: t('محتوای گزارش'), icon: 'fileText', id: 'email-report-contents' });
     var items = [t('تعداد درخواست‌ها و ترافیک دوره'), t('نرخ کش (درصد پاسخ مستقیم از CDN)'), t('کشورها و مسیرهای پربازدید'),
       t('تهدیدهای متوقف‌شده به تفکیک WAF، فایروال، محدودیت نرخ و …'), t('دسترس‌پذیری ماه (SLA) در صورت پشتیبانی سرور CDN'), t('مصرف تونل، اگر حالت تونل در پلن شما فعال باشد')];

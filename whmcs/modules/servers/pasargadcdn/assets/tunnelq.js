@@ -428,7 +428,7 @@
     var C = P.tunnelCheck;
     var ctx = checkCtx();
     var out = [];
-    out.push(P.alertBox('info', [h('strong', { text: t('حریم خصوصی: ') }), t('کانفیگ فقط در همین مرورگر بررسی می‌شود؛ به WHMCS یا سرور CDN فرستاده نمی‌شود و جایی ذخیره نمی‌شود. با بستن یا ترک این صفحه پاک می‌شود. شناسه‌ها و کلیدهای خصوصی هیچ‌جا کامل نمایش داده نمی‌شوند.')], { icon: 'lock' }));
+    out.push(P.alertBox('info', [h('strong', { text: t('حریم خصوصی: ') }), t('کانفیگ فقط در همین مرورگر بررسی می‌شود؛ به هیچ سروری فرستاده نمی‌شود و جایی ذخیره نمی‌شود. با بستن یا ترک این صفحه پاک می‌شود. شناسه‌ها و کلیدهای خصوصی هیچ‌جا کامل نمایش داده نمی‌شوند.')], { icon: 'lock' }));
     var c = P.card({ title: t('کانفیگ سرور'), icon: 'fileText', id: 'tc-input', subtitle: t('محتوای config.json سرور Xray یا sing-box را بچسبانید (کامل یا فقط بخش inbounds).') });
     var ta = h('textarea', { className: 'pcdn-input pcdn-mono pcdn-tc-input', dir: 'ltr', rows: 12, spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off',
       'data-ro-ok': '1', 'aria-label': t('کانفیگ JSON سرور'), placeholder: '{\n  "inbounds": [ … ]\n}', maxlength: MAX_CFG, 'data-lpignore': 'true', 'data-1p-ignore': 'true' });

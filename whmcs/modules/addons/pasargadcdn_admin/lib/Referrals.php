@@ -542,8 +542,8 @@ final class Referrals
         'paid' => ['پاداش گرفته', 'Rewarded'],
         'earned' => ['اعتبار دریافتی', 'Credit earned'],
         'more' => ['جزئیات', 'Details'],
-        'rules' => ['قوانین: معرفی خود، حساب‌های هم‌دامنه یا هم‌آی‌پی پاداش ندارند؛ بازپرداخت فاکتور پیش از پرداخت پاداش آن را لغو می‌کند؛ پاداش به اعتبار حساب WHMCS اضافه می‌شود.',
-            'Rules: self-referrals and accounts sharing an e-mail domain or signup IP are not rewarded; a refund before the payout cancels it; rewards are added to your WHMCS credit balance.'],
+        'rules' => ['قوانین: معرفی خود، حساب‌های هم‌دامنه یا هم‌آی‌پی پاداش ندارند؛ بازپرداخت فاکتور پیش از پرداخت پاداش آن را لغو می‌کند؛ پاداش به اعتبار حساب شما اضافه می‌شود.',
+            'Rules: self-referrals and accounts sharing an e-mail domain or signup IP are not rewarded; a refund before the payout cancels it; rewards are added to your account credit balance.'],
         'off' => ['برنامهٔ معرفی در حال حاضر فعال نیست.', 'The referral programme is not active right now.'],
     ];
 

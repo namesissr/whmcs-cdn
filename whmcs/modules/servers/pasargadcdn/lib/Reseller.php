@@ -277,7 +277,7 @@ class Reseller
         }
         try {
             if (Capsule::table('tblhosting')->whereRaw('LOWER(domain) = ?', [$domain])->exists()) {
-                return [false, I18n::tr('این دامنه به یک سرویس WHMCS تعلق دارد و به‌عنوان زیرسایت نمایندگی قابل ثبت نیست.')];
+                return [false, I18n::tr('این دامنه به یک سرویس ثبت‌شده تعلق دارد و به‌عنوان زیرسایت نمایندگی قابل ثبت نیست.')];
             }
         } catch (\Throwable $e) {
             // best effort

@@ -86,7 +86,7 @@
   function inviteCard(reveal, onDone) {
     var c = P.card({ title: t('دعوت عضو جدید'), icon: 'mail', id: 'sharing-invite', tone: 'brand' });
     var model = { email: '', role: 'viewer' };
-    var email = P.input(model, 'email', t('ایمیل حساب WHMCS شخص'), { maxlength: 191, placeholder: 'name@example.com', type: 'email' });
+    var email = P.input(model, 'email', t('ایمیل حساب کاربری شخص'), { maxlength: 191, placeholder: 'name@example.com', type: 'email' });
     var roleSel = P.select(model, 'role', t('نقش'), ROLES.map(function (r) { return [r[0], r[1] + ' — ' + r[2]]; }));
     var send = P.btn(t('ارسال دعوت'), { kind: 'primary', icon: 'send', write: true, cls: 'pcdn-share-invite', onclick: function () {
       var e = String(model.email || '').trim();
@@ -108,7 +108,7 @@
         onDone(d);
       });
     } });
-    append(c.body, [h('p', { className: 'pcdn-muted', text: t('این دامنه را با حساب WHMCS شخص دیگری به اشتراک بگذارید تا آن را از ناحیهٔ کاربری خودش مدیریت کند. صورت‌حساب و مالکیت تغییر نمی‌کند.') }),
+    append(c.body, [h('p', { className: 'pcdn-muted', text: t('این دامنه را با حساب کاربری شخص دیگری به اشتراک بگذارید تا آن را از ناحیهٔ کاربری خودش مدیریت کند. صورت‌حساب و مالکیت تغییر نمی‌کند.') }),
       email, roleSel, h('div', { className: 'pcdn-row-actions' }, send)]);
     return c;
   }
