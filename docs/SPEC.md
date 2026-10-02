@@ -1389,3 +1389,17 @@ without the customer's action; every new section is plan-gated and validated on 
   WHMCS staging checklist (every item from docs/WHMCS.md "to verify"), rollback per component,
   go/no-go criteria, versioning and release process (tag vX.Y.Z on main, CHANGELOG.md).
 - `CHANGELOG.md` (Keep a Changelog), version 2.0.0 for this PR's contents (waves 1–10, summarised).
+
+### 18.7 As built
+- Secrets travel inside the blocks as `waiting_room.secret` / `access.secret` (64 hex; HMAC key = raw
+  bytes). Access enabled without a readable secret fails closed on the edge.
+- OTP code: RFC 4226 dynamic truncation over HMAC-SHA256 of
+  `"otp|"+app+"|"+lower(trim(email))+"|"+window` (window = unix/300, current and previous accepted);
+  reference `controller/app/access.py::otp_code` with test vectors shared by the edge tests. Codes are
+  single-use on the edge; 10 failures / 10 min lock the IP for 10 min.
+- `node_max = ceil(max_active / n)`, n = edges DNS currently answers with for the site (≥1). The edge also
+  caps new waiting-room sessions at 30 per IP per minute and skips abandoned tickets after 45 s.
+- Statements: WHMCS passes `plan` (product name) and `block_gb` (prepaid block size); the PDF is
+  deterministic (creation date = month start). Audit export masks actors for customers.
+- WHMCS products get options `Waiting room` / `Protected access` (auto|on|off; `auto` sends nothing).
+  Referral rewards over the monthly cap are deferred to the next month, not cancelled.
