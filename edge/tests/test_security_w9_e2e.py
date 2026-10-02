@@ -41,9 +41,9 @@ SECRET = "5e" * 32
 
 
 def free_port(host="127.0.0.1") -> int:
-    with socket.socket() as s:
-        s.bind((host, 0))
-        return s.getsockname()[1]
+    from conftest import pick_port
+
+    return pick_port(host)
 
 
 class Origin:

@@ -9,6 +9,7 @@ driven by `pcdn-agent` (stdlib-only Python). The controller contract is `docs/SP
 | Source (repo) | Installed to | Purpose |
 |---|---|---|
 | `edge/pcdn-agent.py` | `/usr/local/bin/pcdn-agent` | sync loop: config → nginx, purges, usage/events |
+| `edge/pcdn_agent/` | `/usr/local/lib/pcdn/pcdn_agent/` | the agent package (settings, validation, render/*, usage, logship, apply, cli); `pcdn-agent` is its launcher |
 | `edge/nginx/pcdn-base.conf` | `/usr/share/pcdn/nginx/` | **template** of the http-context config |
 | `edge/njs/pcdn.js` | `/usr/share/pcdn/njs/` | request logic (verdict, LB, challenge pages, health checks) |
 | `edge/pages/*.html` | `/usr/share/pcdn/pages/` | suspended / over-quota pages, `decoy.html` (tunnel fallback) |

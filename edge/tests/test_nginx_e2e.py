@@ -41,9 +41,9 @@ SQLI = "/?id=" + urllib.parse.quote("1' or '1'='1")
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    from conftest import pick_port
+
+    return pick_port()
 
 
 def make_png(w: int, h: int) -> bytes:

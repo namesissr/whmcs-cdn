@@ -14,7 +14,6 @@ import importlib.util
 import json
 import pathlib
 import shutil
-import socket
 import subprocess
 import threading
 import time
@@ -36,9 +35,9 @@ TOKEN = "edge_e2e_" + "x" * 20
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    from conftest import pick_port
+
+    return pick_port()
 
 
 def serve(handler) -> http.server.ThreadingHTTPServer:

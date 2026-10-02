@@ -273,7 +273,23 @@ install -d -m 755 /etc/pcdn /var/lib/pcdn /usr/share/pcdn/pages /usr/share/pcdn/
 install -d -m 755 -o "$NGINX_USER" /var/cache/pcdn
 # the nginx.org build runs its workers as "nginx", the distro one as "www-data": the cache follows
 chown -R "$NGINX_USER" /var/cache/pcdn 2>/dev/null || true
-install -m 755 "$HERE/pcdn-agent.py" /usr/local/bin/pcdn-agent
+# >>> pcdn agent files (edge/tests/test_install_agent.py runs this block into a temporary root)
+# the pcdn_agent package in /usr/local/lib/pcdn (replaced as a whole, so a module an upgrade drops never
+# lingers; pre-compiled, pcdn-imaged runs it from a read-only /usr) and the /usr/local/bin/pcdn-agent
+# launcher, which finds the package at ../lib/pcdn. --upgrade of an edge that still runs the former
+# single-file agent: that file is simply replaced by the launcher.
+AGENT_LIB=/usr/local/lib/pcdn
+install -d -m 755 "$AGENT_LIB"
+rm -rf "$AGENT_LIB/pcdn_agent.new" "$AGENT_LIB/pcdn_agent.old"
+(cd "$HERE" && find pcdn_agent -name '*.py' -not -path '*/__pycache__/*' -print0) |
+  while IFS= read -r -d '' f; do install -D -m 644 "$HERE/$f" "$AGENT_LIB/pcdn_agent.new/${f#pcdn_agent/}"; done
+[ -f "$AGENT_LIB/pcdn_agent.new/__init__.py" ] || { echo "the edge bundle has no pcdn_agent package"; exit 1; }
+python3 -m compileall -q "$AGENT_LIB/pcdn_agent.new" >/dev/null || true
+if [ -d "$AGENT_LIB/pcdn_agent" ]; then mv "$AGENT_LIB/pcdn_agent" "$AGENT_LIB/pcdn_agent.old"; fi
+mv "$AGENT_LIB/pcdn_agent.new" "$AGENT_LIB/pcdn_agent"
+rm -rf "$AGENT_LIB/pcdn_agent.old"
+install -D -m 755 "$HERE/pcdn-agent.py" /usr/local/bin/pcdn-agent
+# <<< pcdn agent files
 install -m 644 "$HERE"/pages/*.html /usr/share/pcdn/pages/
 install -m 644 "$HERE/njs/pcdn.js" /usr/share/pcdn/njs/pcdn.js
 install -m 644 "$HERE/nginx/pcdn-base.conf" /usr/share/pcdn/nginx/pcdn-base.conf

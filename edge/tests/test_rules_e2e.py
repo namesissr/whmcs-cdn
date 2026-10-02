@@ -21,7 +21,6 @@ import json
 import pathlib
 import re
 import shutil
-import socket
 import ssl
 import struct
 import subprocess
@@ -51,9 +50,9 @@ BOTS = {"verified": {"google": [GOOGLE_IP + "/32"], "bing": [BING_IP + "/32"]}, 
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    from conftest import pick_port
+
+    return pick_port()
 
 
 def make_png(w: int, h: int) -> bytes:

@@ -86,7 +86,7 @@ async function handleRequest(req) {
 }"""
 
 FNS = [
-    {"id": "echo", "route": "/fn/echo", "code": ECHO},
+    {"id": "echo", "route": "/fn/echo", "code": ECHO, "timeout_ms": 200},   # 1 MB body echo: CPU headroom on a busy runner
     {"id": "pass", "route": "/fn/pass", "code": "function handleRequest(){ return null }"},
     {"id": "throwo", "route": "/fn/throw-o", "on_error": "origin", "code": "function handleRequest(){throw 1}"},
     {"id": "throwc", "route": "/fn/throw-c", "code": "function handleRequest(){throw 1}"},

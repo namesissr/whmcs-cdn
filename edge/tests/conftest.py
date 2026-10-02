@@ -38,3 +38,29 @@ def nginx_conf(tmp_path, cfg, workers=2, modules=None) -> pathlib.Path:
     path = tmp / "nginx.conf"
     path.write_text(text)
     return path
+
+
+_PICKED_PORTS: set[int] = set()
+
+
+def pick_port(host: str = "127.0.0.1") -> int:
+    """A free TCP+UDP port for a test listener, chosen from 10000-19999: below the kernel's ephemeral
+    range (outgoing connections never take it between our check and nginx's bind) and below the
+    default L4 app range, and never handed out twice in one test run."""
+    import random
+    import socket
+
+    for _ in range(500):
+        port = random.randint(10000, 19999)
+        if port in _PICKED_PORTS:
+            continue
+        try:
+            for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                for addr in ("0.0.0.0", host):
+                    with socket.socket(socket.AF_INET, kind) as s:
+                        s.bind((addr, port))
+        except OSError:
+            continue
+        _PICKED_PORTS.add(port)
+        return port
+    raise RuntimeError("no free test port in 10000-19999")

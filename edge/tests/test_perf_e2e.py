@@ -45,9 +45,9 @@ WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"webp-bytes" * 10
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    from conftest import pick_port
+
+    return pick_port()
 
 
 class Origin:
