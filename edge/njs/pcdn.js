@@ -1290,19 +1290,117 @@ function videoNext(r) {
 }
 
 // ------------------------------------------------------------------ pages
+//
+// One design system for every visitor-facing page (the static edge/pages/suspended.html and
+// over_quota.html carry a copy of CSS, kept identical by tests/test_pages.py). Self-contained: no
+// external fonts, styles, images or scripts, so the pages stay tiny and work during an attack.
+// Accent per page type: body class red (block), amber (rate limit / quota / failed check),
+// blue (default: checks, queue), violet (protected access), slate (suspended).
 
-const CSS = 'body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Tahoma,Vazirmatn,sans-serif;background:#f5f7fb;color:#1f2937}'
-    + '.box{max-width:460px;padding:32px;background:#fff;border-radius:16px;box-shadow:0 10px 30px #0001;text-align:center}'
-    + 'h1{font-size:20px;margin:0 0 12px}p{line-height:1.9;color:#4b5563;margin:0}.en{margin-top:16px;font-size:13px}'
-    + '.meta{margin-top:18px;font-size:12px;color:#9ca3af;direction:ltr}input,button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid #d1d5db}'
-    + 'button{background:#2563eb;color:#fff;border:0;cursor:pointer}.err{color:#b91c1c}svg{background:#f3f4f6;border-radius:8px;margin:12px 0}';
+const CSS = ':root{color-scheme:light dark;--bg:#f3f5fa;--bg2:#e8ecf5;--dot:#d3d9e6;--card:#fff;--tx:#0f172a;--mu:#3f4b5e;'
+    + '--fa:#5b6779;--bd:#e2e7f0;--sf:#f7f9fc;--on:#fff;--a:#2563eb;--at:#1d4ed8;--as:#dbe7fe}'
+    + '.red{--a:#dc2626;--at:#b91c1c;--as:#fde2e2}.amber{--a:#c2610c;--at:#92400e;--as:#fdefc8}'
+    + '.violet{--a:#7c3aed;--at:#6d28d9;--as:#ece7fe}.slate{--a:#52627a;--at:#3f4b5e;--as:#e3e8f0}'
+    + '@media(prefers-color-scheme:dark){:root{--bg:#0a0f1c;--bg2:#0f1626;--dot:#1b2436;--card:#121a2b;--tx:#f1f5f9;--mu:#cdd5e1;'
+    + '--fa:#9aa6b8;--bd:#222d42;--sf:#0d1424;--on:#0a0f1c;--a:#6ea8fe;--at:#93c0ff;--as:#16264a}'
+    + '.red{--a:#f87171;--at:#fca5a5;--as:#3d1418}.amber{--a:#fbbf24;--at:#fcd34d;--as:#3a2508}'
+    + '.violet{--a:#a78bfa;--at:#c4b5fd;--as:#2a1a52}.slate{--a:#a9b6c9;--at:#cdd5e1;--as:#1d2638}}'
+    + '*{box-sizing:border-box}html{min-height:100%;background:radial-gradient(1000px 460px at 50% -160px,var(--as),transparent 70%),'
+    + 'radial-gradient(var(--dot) 1px,transparent 1.4px) 0 0/22px 22px,linear-gradient(var(--bg),var(--bg2)) var(--bg2)}'
+    + 'body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;'
+    + 'padding:32px 16px;font:15px/1.9 Vazirmatn,"Segoe UI",Tahoma,system-ui,-apple-system,Roboto,"Noto Sans Arabic",sans-serif;color:var(--tx)}'
+    + 'main{position:relative;overflow:hidden;width:100%;max-width:540px;padding:40px 36px 30px;text-align:center;background:var(--card);'
+    + 'border:1px solid var(--bd);border-radius:22px;box-shadow:0 1px 2px #0f172a0f,0 24px 48px -24px #0f172a3d}'
+    + 'main:before{content:"";position:absolute;inset:0 0 auto;height:4px;background:var(--a)}'
+    + '.ic{position:relative;width:76px;height:76px;margin:0 auto 18px;display:grid;place-items:center;border-radius:50%;'
+    + 'color:var(--a);background:var(--as);box-shadow:0 0 0 8px var(--card),0 0 0 9px var(--as)}'
+    + '.ic svg{width:40px;height:40px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}'
+    + '.sp:after{content:"";position:absolute;inset:-9px;border-radius:50%;border:2px solid transparent;border-top-color:var(--a);'
+    + 'animation:rt 1s linear infinite}@keyframes rt{to{transform:rotate(1turn)}}'
+    + '.pill{display:inline-block;margin:0 0 10px;padding:4px 12px;border-radius:99px;direction:ltr;color:var(--at);background:var(--as);'
+    + 'font:600 12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.03em}'
+    + 'h1{margin:0 0 10px;font-size:23px;line-height:1.55}h2{margin:0 0 4px;font-size:15px;line-height:1.6}'
+    + 'p{margin:0 0 10px;color:var(--mu)}.hint{font-size:13.5px;color:var(--fa)}a{color:var(--at)}'
+    + '.hl{margin:14px 0;padding:10px 14px;border-radius:12px;color:var(--tx);background:var(--as);font-weight:600}'
+    + '.en,.alt{margin-top:16px;padding-top:14px;border-top:1px dashed var(--bd);font-size:13.5px}.en,.alt p{color:var(--fa)}'
+    + '.tech{margin-top:20px;padding:12px 16px;border:1px solid var(--bd);border-radius:14px;background:var(--sf);text-align:start}'
+    + '.tech h2{font-size:12.5px;color:var(--fa);margin-bottom:6px}.tech h2 span{margin:0 8px;font-weight:400}'
+    + '.tech dl{display:grid;grid-template-columns:auto 1fr;align-items:baseline;gap:2px 16px;margin:0;direction:ltr;text-align:left;font-size:12.5px}'
+    + '.tech dt{color:var(--fa)}.tech dd{margin:0;color:var(--tx);overflow-wrap:anywhere;'
+    + 'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}'
+    + 'form{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin:18px 0 6px}'
+    + 'input{flex:1 1 200px;min-width:0;padding:10px 14px;font:inherit;color:var(--tx);background:var(--sf);border:1px solid var(--bd);border-radius:12px}'
+    + 'input:focus{outline:2px solid var(--a);outline-offset:1px}'
+    + 'button,.btn{display:inline-block;padding:10px 22px;font:inherit;font-weight:600;color:var(--on);background:var(--a);'
+    + 'border:0;border-radius:12px;cursor:pointer;text-decoration:none}button:hover,.btn:hover{filter:brightness(1.08)}'
+    + '.err{padding:8px 12px;border-radius:12px;color:#991b1b;background:#fde2e2}'
+    + '.cap{display:inline-block;max-width:100%;margin:6px 0;padding:4px;background:#fff;border:1px solid var(--bd);border-radius:14px}'
+    + '.cap svg{display:block;max-width:100%;height:auto}'
+    + '.bar{height:6px;margin:18px 0 8px;overflow:hidden;direction:ltr;border-radius:99px;background:var(--as)}'
+    + '.bar i{display:block;width:35%;height:100%;border-radius:99px;background:var(--a);animation:ld 1.5s ease-in-out infinite}'
+    + '@keyframes ld{from{transform:translateX(-100%)}to{transform:translateX(290%)}}'
+    + 'footer{text-align:center;font-size:12.5px;line-height:1.9;color:var(--fa)}footer a{color:var(--mu);font-weight:600;text-decoration:none}'
+    + 'footer a:hover{color:var(--at);text-decoration:underline}'
+    + '@media(prefers-color-scheme:dark){.err{color:#fecaca;background:#3d1418}}'
+    + '@media(max-width:480px){main{padding:32px 20px 24px;border-radius:18px}h1{font-size:20px}}'
+    + '@media(prefers-reduced-motion:reduce){*{animation:none!important}}';
 
-function page(title, bodyFa, en, extra, meta) {
-    return '<!doctype html>\n<html lang="fa" dir="rtl">\n<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        + '<meta name="robots" content="noindex"><title>' + esc(title) + '</title><style>' + CSS + '</style></head>\n'
-        + '<body><div class="box"><h1>' + esc(title) + '</h1><p>' + bodyFa + '</p>' + (extra || '')
-        + '<p dir="ltr" class="en">' + esc(en) + '</p>'
-        + (meta ? '<div class="meta">' + esc(meta) + '</div>' : '') + '</div></body></html>\n';
+// inline icons (24x24, stroked with the accent colour)
+const ICONS = {
+    block: '<path d="M12 2.8l7.6 3v5.6c0 4.7-3.2 8.5-7.6 9.8-4.4-1.3-7.6-5.1-7.6-9.8V5.8z"/><path d="M9.6 9.6l4.8 4.8m0-4.8l-4.8 4.8"/>',
+    speed: '<path d="M4.2 17.5a9 9 0 1 1 15.6 0"/><path d="M12 13l4.2-4.4"/><circle cx="12" cy="13" r="1.4"/>'
+        + '<path d="M12 4v1.6M5.6 6.6l1.1 1.1M18.4 6.6l-1.1 1.1M3 13h1.6M21 13h-1.6"/>',
+    check: '<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9h18M6 6.8h.01M8.5 6.8h.01"/><path d="M8.7 14.3l2.3 2.3 4.6-4.6"/>',
+    fail: '<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9h18M6 6.8h.01M8.5 6.8h.01"/><path d="M10 12l4 4m0-4l-4 4"/>',
+    captcha: '<path d="M12 2.8l7.6 3v5.6c0 4.7-3.2 8.5-7.6 9.8-4.4-1.3-7.6-5.1-7.6-9.8V5.8z"/><path d="M8.9 12.1l2.2 2.2 4.2-4.3"/>',
+    queue: '<path d="M6.5 3h11M6.5 21h11"/><path d="M8 3v3a4 4 0 0 0 1.6 3.2L12 12l2.4-2.8A4 4 0 0 0 16 6V3M8 21v-3a4 4 0 0 1 1.6-3.2L12 12'
+        + 'l2.4 2.8A4 4 0 0 1 16 18v3"/><path d="M10.2 18.6h3.6"/>',
+    lock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3M12 14.6v2.4"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.6 6.6l8.4 6.4 8.4-6.4"/>',
+    pause: '<circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/>',
+    gauge: '<path d="M5.6 18.4a9 9 0 1 1 12.8 0"/><path d="M12 12l4.6 3.2"/><circle cx="12" cy="12" r="1.4"/><path d="M9 20.5h6"/>',
+};
+
+const FOOTER = '<footer><a href="https://pasargadmizban.com" rel="noopener" target="_blank">پاسارگاد میزبان'
+    + ' · <span dir="ltr">pasargadmizban.com</span></a><br>قدرت گرفته از پاسارگاد سی‌دی‌ان'
+    + ' · <span lang="en" dir="ltr">Powered by Pasargad CDN</span></footer>';
+
+const SUPPORT_FA = 'اگر فکر می‌کنید اشتباهی رخ داده، کد پیگیری زیر را برای مدیر وب‌سایت بفرستید.';
+const SUPPORT_EN = 'If you believe this is a mistake, send the reference below to the website owner.';
+
+// the whole document: kind = accent class, body = the card's inner HTML (already escaped),
+// head = extra <head> markup, nonce = style nonce under a strict CSP
+function shell(lang, title, kind, body, head, nonce) {
+    return '<!doctype html>\n<html lang="' + lang + '" dir="' + (lang === 'fa' ? 'rtl' : 'ltr') + '">\n<head><meta charset="utf-8">'
+        + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+        + '<meta name="color-scheme" content="light dark">' + (head || '') + '<title>' + esc(title) + '</title>'
+        + '<style' + (nonce ? ' nonce="' + nonce + '"' : '') + '>' + CSS + '</style></head>\n'
+        + '<body class="' + kind + '"><main>' + body + '</main>' + FOOTER + '</body></html>\n';
+}
+
+function cardHead(icon, pill, title, spin) {
+    return '<div class="ic' + (spin ? ' sp' : '') + '"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' + ICONS[icon]
+        + '</svg></div>' + (pill ? '<p class="pill">' + esc(pill) + '</p>' : '') + '<h1>' + esc(title) + '</h1>';
+}
+
+function utcNow() { return new Date().toISOString().substring(0, 19).replace('T', ' ') + ' UTC'; }
+
+// «جزئیات فنی»: [label, value] rows (values escaped, empty ones left out), LTR monospace
+function techBox(rows) {
+    return '<section class="tech"><h2>جزئیات فنی<span lang="en" dir="ltr">Technical details</span></h2><dl>'
+        + rows.filter(function (x) { return x[1]; }).map(function (x) { return '<dt>' + x[0] + '</dt><dd>' + esc(x[1]) + '</dd>'; }).join('')
+        + '</dl></section>';
+}
+
+function techRows(r, v, more) {
+    return [['Reference', v || ''], ['Your IP', String(r.variables.remote_addr || '')], ['Time', utcNow()]].concat(more || []);
+}
+
+// a Persian page with an English line: o = { kind, icon, spin, pill, title, fa (HTML), hint, en, extra (HTML), rows }
+function page(o) {
+    return shell('fa', o.title, o.kind || 'blue', cardHead(o.icon, o.pill, o.title, o.spin) + '<p>' + o.fa + '</p>'
+        + (o.hint ? '<p class="hint">' + esc(o.hint) + '</p>' : '') + (o.extra || '')
+        + '<p class="en" lang="en" dir="ltr">' + esc(o.en) + '</p>' + (o.rows ? techBox(o.rows) : ''));
 }
 
 function send(r, code, html, headers) {
@@ -1316,10 +1414,6 @@ function safeReturn(u) {
     u = String(u || '/');
     if (u.charAt(0) !== '/' || u.charAt(1) === '/' || u.charAt(1) === '\\' || /[\r\n]/.test(u) || u.length > 4096) return '/';
     return u;
-}
-
-function metaLine(r, v) {
-    return 'ref ' + v + ' · ip ' + r.variables.remote_addr + ' · ' + new Date().toISOString().substring(0, 19) + 'Z';
 }
 
 function deny(r) {
@@ -1336,15 +1430,18 @@ function deny(r) {
             const until = ngx.shared.pcdn_blk.get('b:' + site.id + ':' + rule + ':' + r.variables.remote_addr) || 0;
             retry = Math.max(1, until - now());
         }
-        return send(r, 429, page('درخواست‌های بیش از حد', 'تعداد درخواست‌های شما از حد مجاز بیشتر شده است. لطفاً کمی بعد دوباره تلاش کنید.',
-            'Too many requests. Please try again later.', '', metaLine(r, v)), { 'Retry-After': String(retry) });
+        return send(r, 429, page({ kind: 'amber', icon: 'speed', pill: '429 Too Many Requests', title: 'درخواست‌های بیش از حد',
+            fa: 'تعداد درخواست‌های شما از حد مجاز بیشتر شده است. لطفاً کمی بعد دوباره تلاش کنید.', hint: SUPPORT_FA,
+            en: 'Too many requests. Please try again later. ' + SUPPORT_EN, rows: techRows(r, v, [['Retry after', retry + ' s']]) }),
+            { 'Retry-After': String(retry) });
     }
     return blockPage(r, v);
 }
 
 function blockPage(r, v) {
-    return send(r, 403, page('دسترسی مسدود شد', 'درخواست شما توسط سامانه امنیتی CDN مسدود شد. اگر فکر می‌کنید اشتباهی رخ داده، با مدیر وب‌سایت تماس بگیرید.',
-        'Access denied by the website\'s security settings.', '', metaLine(r, v)));
+    return send(r, 403, page({ kind: 'red', icon: 'block', pill: '403 Forbidden', title: 'دسترسی مسدود شد',
+        fa: 'درخواست شما توسط سامانه امنیتی این وب‌سایت مسدود شد.', hint: SUPPORT_FA,
+        en: 'Access denied by the website\'s security settings. ' + SUPPORT_EN, rows: techRows(r, v) }));
 }
 
 // ---- JS proof-of-work challenge
@@ -1369,8 +1466,11 @@ function challengePage(r, site, v) {
         + ';(function(){var c=JSON.parse(document.getElementById("pcdn-challenge").textContent),z=new Array(c.d+1).join("0"),n=0;'
         + 'function step(){for(var k=0;k<5000;k++,n++){if(S(c.n+":"+n).slice(0,c.d)===z){location.replace("/__pcdn/verify?t="+encodeURIComponent(c.t)+"&n="+n+"&r="+encodeURIComponent(c.r));return}}setTimeout(step,0)}step()})()</script>'
         + '<noscript><p class="err">برای ادامه باید جاوااسکریپت مرورگر فعال باشد.</p></noscript>';
-    send(r, 403, page('در حال بررسی مرورگر شما…', 'این بررسی خودکار چند ثانیه طول می‌کشد و از وب‌سایت در برابر حملات محافظت می‌کند.',
-        'Checking your browser before accessing the website…', script, metaLine(r, v)));
+    send(r, 403, page({ icon: 'check', spin: true, pill: 'Security check', title: 'در حال بررسی مرورگر شما…',
+        fa: 'این بررسی خودکار چند ثانیه طول می‌کشد و از وب‌سایت در برابر حملات محافظت می‌کند.',
+        hint: 'لطفاً صبر کنید؛ پس از پایان بررسی به‌طور خودکار به وب‌سایت منتقل می‌شوید.',
+        extra: '<div class="bar" role="progressbar" aria-label="Checking"><i></i></div>' + script,
+        en: 'Checking your browser before accessing the website…', rows: techRows(r, v) }));
 }
 
 function verify(r) {
@@ -1385,8 +1485,10 @@ function verify(r) {
         && sha256(p[1] + ':' + n).substring(0, +p[2]) === new Array(+p[2] + 1).join('0');
     ok = ok && useOnce('pv:' + p[1], +p[0]);
     if (!ok) {
-        return send(r, 403, page('بررسی ناموفق بود', 'تأیید مرورگر انجام نشد. <a href="' + esc(back) + '">دوباره تلاش کنید</a>.',
-            'Browser verification failed. Please try again.', '', ''));
+        return send(r, 403, page({ kind: 'amber', icon: 'fail', pill: 'Verification failed', title: 'بررسی ناموفق بود',
+            fa: 'تأیید مرورگر انجام نشد. ممکن است زمان بررسی تمام شده باشد یا مرورگر شما تغییر کرده باشد.',
+            extra: '<p><a class="btn" href="' + esc(back) + '">دوباره تلاش کنید</a></p>',
+            en: 'Browser verification failed. Please try again.', rows: techRows(r, '') }));
     }
     grant(r, site, 'js', back);
 }
@@ -1459,14 +1561,15 @@ function captchaSvg(text) {
 function captchaPage(r, site, back, err, v) {
     const exp = now() + TOKEN_TTL, nonce = randHex(16), ip = r.variables.remote_addr, ua = String(r.headersIn['User-Agent'] || '');
     const token = exp + '.' + nonce + '.' + capSig(site, ip, ua, exp, nonce);
-    const form = '<div>' + captchaSvg(captchaAnswer(site, nonce)) + '</div>'
-        + (err ? '<p class="err">' + err + '</p>' : '')
+    const form = '<div class="cap">' + captchaSvg(captchaAnswer(site, nonce)) + '</div>'
+        + (err ? '<p class="err" role="alert">' + err + '</p>' : '')
         + '<form method="post" action="/__pcdn/captcha"><input type="hidden" name="t" value="' + esc(token) + '">'
         + '<input type="hidden" name="r" value="' + esc(back) + '">'
         + '<input name="a" autocomplete="off" autofocus required maxlength="12" dir="ltr" placeholder="کد تصویر"> '
         + '<button type="submit">تأیید</button></form>';
-    send(r, 403, page('لطفاً کد امنیتی را وارد کنید', 'برای ادامه، حروف و اعداد تصویر زیر را وارد کنید.',
-        'Please type the characters shown in the image to continue.', form, v ? metaLine(r, v) : ''));
+    send(r, 403, page({ icon: 'captcha', pill: 'Security check', title: 'لطفاً کد امنیتی را وارد کنید',
+        fa: 'برای ادامه، حروف و اعداد تصویر زیر را وارد کنید.', extra: form,
+        en: 'Please type the characters shown in the image to continue.', rows: techRows(r, v || '') }));
 }
 
 function parseForm(body) {
@@ -1604,21 +1707,22 @@ function pickLang(r) {
 }
 
 // a gate page: the visitor's language first, the other one below; no script; inline style with a
-// per-response nonce under a strict CSP
+// per-response nonce under a strict CSP. T = { fa: {title, lines}, en: {...}, kind, icon, pill,
+// refresh (meta refresh s), hl (index of the line to highlight), wait (progress bar caption per lang), rows }
 function gatePage(r, code, lang, T, form, headers) {
     const nonce = randHex(16);
-    const one = function (l, cls) {
-        const t = T[l];
-        return '<div class="' + cls + '" dir="' + (l === 'fa' ? 'rtl' : 'ltr') + '" lang="' + l + '"><h1>' + esc(t.title) + '</h1>'
-            + t.lines.map(function (x) { return '<p>' + esc(x) + '</p>'; }).join('') + '</div>';
-    };
     const other = lang === 'fa' ? 'en' : 'fa';
-    const html = '<!doctype html>\n<html lang="' + lang + '" dir="' + (lang === 'fa' ? 'rtl' : 'ltr') + '">\n<head><meta charset="utf-8">'
-        + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
-        + (T.refresh ? '<meta http-equiv="refresh" content="' + T.refresh + '">' : '')
-        + '<title>' + esc(T[lang].title) + '</title><style nonce="' + nonce + '">' + CSS
-        + '.alt{margin-top:18px;font-size:13px;opacity:.85}form{margin-top:16px}input{margin:4px}</style></head>\n'
-        + '<body><div class="box">' + one(lang, 'main') + (form || '') + one(other, 'alt') + '</div></body></html>\n';
+    const lines = function (l, main) {
+        return T[l].lines.map(function (x, i) { return '<p' + (main && i === T.hl ? ' class="hl"' : '') + '>' + esc(x) + '</p>'; }).join('');
+    };
+    const body = cardHead(T.icon || 'lock', T.pill || '', T[lang].title, false) + lines(lang, true)
+        + (T.wait ? '<div class="bar" role="progressbar" aria-label="' + esc(T.wait.en) + '"><i></i></div><p class="hint">'
+            + esc(T.wait[lang]) + '</p>' : '')
+        + (form || '')
+        + '<div class="alt" dir="' + (other === 'fa' ? 'rtl' : 'ltr') + '" lang="' + other + '"><h2>' + esc(T[other].title) + '</h2>'
+        + lines(other, false) + '</div>' + techBox(techRows(r, '', T.rows));
+    const html = shell(lang, T[lang].title, T.kind || 'violet', body,
+        T.refresh ? '<meta http-equiv="refresh" content="' + T.refresh + '">' : '', nonce);
     const h = { 'Content-Security-Policy': "default-src 'none'; style-src 'nonce-" + nonce + "'; form-action 'self'; "
         + "frame-ancestors 'none'; base-uri 'none'", 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
         'X-Content-Type-Options': 'nosniff' };
@@ -1765,7 +1869,8 @@ function wrPage(r, site, pos) {
     if (ck) h['Set-Cookie'] = String(ck);
     if (!wantsHtml(r)) return sendJson(r, 503, { error: 'waiting_room', position: pos, retry_after: retry }, h);
     const p = (site && site.wr && site.wr.page) || {};
-    const T = { refresh: retry };
+    const T = { refresh: retry, kind: 'blue', icon: 'queue', pill: 'Waiting room', hl: 1,
+        wait: { fa: 'به‌روزرسانی خودکار تا ' + retry + ' ثانیه دیگر', en: 'Refreshing automatically in ' + retry + ' seconds' } };
     ['fa', 'en'].forEach(function (l) {
         T[l] = { title: p['title_' + l] || WR_TEXT[l].title,
             lines: [p['message_' + l] || WR_TEXT[l].message, WR_TEXT[l].pos + pos] };
@@ -1896,9 +2001,15 @@ const ACC_TEXT = {
         code: '6-digit code' },
 };
 
-function accT(key, name) {
-    return { fa: { title: ACC_TEXT.fa.title, lines: [ACC_TEXT.fa[key].replace('%s', name || '')] },
-        en: { title: ACC_TEXT.en.title, lines: [ACC_TEXT.en[key].replace('%s', name || '')] } };
+// gate page text for an access page; extra = { icon, pill, rows, title (ACC_TEXT key) }
+function accT(key, name, extra) {
+    const tk = (extra && extra.title) || 'title';
+    const nm = name ? '\u2068' + name + '\u2069' : '';   // bidi-isolated app name
+    const T = { fa: { title: ACC_TEXT.fa[tk], lines: [ACC_TEXT.fa[key].replace('%s', nm)] },
+        en: { title: ACC_TEXT.en[tk], lines: [ACC_TEXT.en[key].replace('%s', nm)] }, kind: 'violet', icon: 'lock',
+        pill: 'Protected area' };
+    Object.keys(extra || {}).forEach(function (k) { if (k !== 'title') T[k] = extra[k]; });
+    return T;
 }
 
 function hidden(n, v) { return '<input type="hidden" name="' + n + '" value="' + esc(v) + '">'; }
@@ -1929,8 +2040,7 @@ function accessDenied(r, site, kind, appId) {
         return sendJson(r, 401, { error: 'access_required', app: app.id, login: url });
     }
     if (!wantsHtml(r)) return sendJson(r, 403, { error: 'access_denied' });
-    const T = { fa: { title: ACC_TEXT.fa.denyTitle, lines: [ACC_TEXT.fa.deny] }, en: { title: ACC_TEXT.en.denyTitle, lines: [ACC_TEXT.en.deny] } };
-    gatePage(r, 403, pickLang(r), T, '', {});
+    gatePage(r, 403, pickLang(r), accT('deny', '', { title: 'denyTitle', pill: '403 Forbidden' }), '', {});
 }
 
 function accessLogin(r) {
@@ -1957,7 +2067,7 @@ function accessSend(r) {
     if (n > ACC_SEND_PER_MIN) {
         noteVerdict(r, 'acc:limited:' + (app ? app.id : '-'));
         if (json) return sendJson(r, 429, { error: 'rate_limited' }, { 'Retry-After': '60' });
-        const T = { fa: { title: ACC_TEXT.fa.title, lines: [ACC_TEXT.fa.many] }, en: { title: ACC_TEXT.en.title, lines: [ACC_TEXT.en.many] } };
+        const T = accT('many', '', { pill: '429 Too Many Requests', rows: [['Retry after', '60 s']] });
         return gatePage(r, 429, lang, T, '', { 'Retry-After': '60' });
     }
     if (app && app.otp && ACC_EMAIL_RE.test(email) && emailAllowed(app, email)) {
@@ -1970,7 +2080,7 @@ function accessSend(r) {
     }
     // the same answer whether or not the address is allowed (no enumeration)
     if (json || !app || !app.otp) return sendJson(r, 200, { ok: true, message: ACC_TEXT.en.sent });
-    gatePage(r, 200, lang, accT('sent'), codeForm(lang, app, email, next), {});
+    gatePage(r, 200, lang, accT('sent', '', { icon: 'mail' }), codeForm(lang, app, email, next), {});
 }
 
 function accessVerify(r) {
@@ -1990,7 +2100,7 @@ function accessVerify(r) {
         noteVerdict(r, 'acc:locked:' + tag);
         const wait = String(lockedUntil - t);
         if (json) return sendJson(r, 429, { error: 'locked', retry_after: +wait }, { 'Retry-After': wait });
-        const T = { fa: { title: ACC_TEXT.fa.title, lines: [ACC_TEXT.fa.locked] }, en: { title: ACC_TEXT.en.title, lines: [ACC_TEXT.en.locked] } };
+        const T = accT('locked', '', { pill: '429 Too Many Requests', rows: [['Retry after', wait + ' s']] });
         return gatePage(r, 429, lang, T, '', { 'Retry-After': wait });
     }
     let ok = false;
@@ -2006,7 +2116,7 @@ function accessVerify(r) {
         if (n >= ACC_FAIL_MAX) blk.set(lockKey, t + ACC_LOCK_S);
         noteVerdict(r, 'acc:fail:' + tag);
         if (json || !app) return sendJson(r, 401, { ok: false, error: 'invalid_code' });
-        const T = accT('bad');
+        const T = accT('bad', '', { pill: '401 Unauthorized' });
         return gatePage(r, 401, lang, T, app.otp ? codeForm(lang, app, email, next) : '', {});
     }
     const exp = t + app.sessionS;
