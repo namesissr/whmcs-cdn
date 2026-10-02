@@ -224,6 +224,14 @@ def test_static_pages_share_the_njs_css(pages):
         assert m and m.group(1) == pages["CSS"], f"pages/{name}.html: copy CSS from njs/pcdn.js"
 
 
+
+def test_integration_markers_stay_on_the_pages():
+    # tests/integration/test_e2e.py tells the suspended page apart by this sentence
+    src = (EDGE.parent / "tests" / "integration" / "test_e2e.py").read_text()
+    mark = re.search(r'^SUSPENDED_MARK = "([^"]+)"', src, re.M).group(1)
+    assert mark in (EDGE / "pages" / "suspended.html").read_text()
+    assert mark not in (EDGE / "pages" / "over_quota.html").read_text()
+
 def test_decoy_stays_neutral():
     h = (EDGE / "pages" / "decoy.html").read_text()
     for word in ("cdn", "pasargad", "proxy", "nginx", "tunnel", "vpn"):

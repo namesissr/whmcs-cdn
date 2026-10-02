@@ -16,7 +16,7 @@ from conftest import (ApiError, ORIGIN_IP, KEEP, dig, edge_request, new_domain, 
 DOMAIN = new_domain("shop")
 ASSET = f"/assets/app-{uuid.uuid4().hex[:8]}.js"
 TUNNEL_PATH = "/tun-ws-" + uuid.uuid4().hex[:6]
-SUSPENDED_MARK = "سرویس معلق است"  # <title> of edge/pages/suspended.html
+SUSPENDED_MARK = "سرویس CDN این دامنه معلق شده است"  # body of edge/pages/suspended.html (pinned in edge/tests/test_pages.py)
 
 
 @pytest.fixture(scope="module")
