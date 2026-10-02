@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import warnings
 
 from .common import SAFE_FSPATH
 
@@ -146,7 +147,9 @@ def image_capabilities(cfg: dict) -> dict:
             out["transform"] = True
             out["webp"] = bool(features.check("webp"))
             try:
-                out["pillow_avif"] = bool(features.check("avif"))
+                with warnings.catch_warnings():   # Pillow < 11.2 warns "Unknown feature 'avif'"
+                    warnings.simplefilter("ignore")
+                    out["pillow_avif"] = bool(features.check("avif"))
             except (ValueError, KeyError):   # Pillow < 11.2 has no "avif" feature name
                 out["pillow_avif"] = False
         except Exception:  # noqa: BLE001 - ImportError or a broken install: no transformer
