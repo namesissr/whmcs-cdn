@@ -1531,3 +1531,16 @@ read-only for collaborators exactly as for the owner.
 ### 20.4 Admin
 - Addon page «اشتراک‌ها»: all shares with filters, revoke, and the audit trail; service tab shows the
   service's members.
+
+### 20.5 As built
+- Roles are enforced by a deny-by-default allow-list in WHMCS (`ClientApi::shareAllows`); billing,
+  upgrade, cancel, transfer, sharing, team access, customer API keys, site delete and bucket key
+  rotation are never proxied for members. Editors may create/delete storage buckets (storage is billed
+  to the owner's service).
+- WHMCS SendEmail reaches existing clients only: for an e-mail without an account the owner is shown
+  the register-then-accept link once to forward it.
+- Controller: admin DNS record writes are audited (they were not before) and the validated
+  `X-PCDN-Actor` header is stored as `on_behalf_of` in the audit detail.
+- §19 as built: controller head `0021`; transfers with `revoke_credentials` also rotate the image
+  signing key, the secondary-DNS TSIG secret and storage bucket keys (after commit, retried by a
+  scheduler job, deep-health warning while pending).
