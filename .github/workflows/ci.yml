@@ -130,3 +130,35 @@ jobs:
           version: "~> v2"
           workdir: terraform-provider-pcdn
           args: check
+
+  # end-to-end: the full staging stack (deploy/staging, docs/STAGING.md) — controller + PostgreSQL +
+  # PowerDNS + two edges installed through the controller's one-command installer + a sample origin —
+  # and tests/integration run inside the stack's runner container
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      STAGING_WAIT_TIMEOUT: "600"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the staging compose file
+        run: deploy/staging/staging.sh config
+      - name: Start the staging stack (build + wait until healthy)
+        run: deploy/staging/staging.sh up
+      - name: Integration tests
+        run: deploy/staging/staging.sh test
+      - name: Dump logs
+        if: failure()
+        run: |
+          deploy/staging/staging.sh logs
+          deploy/staging/staging.sh logs staging-logs
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-logs
+          path: staging-logs/
+          if-no-files-found: ignore
+      - name: Tear down
+        if: always()
+        run: deploy/staging/staging.sh down
