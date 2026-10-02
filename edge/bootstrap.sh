@@ -74,8 +74,13 @@ if [ -z "$TOKEN" ] && [ "$UPGRADE" != yes ] && (: </dev/tty) 2>/dev/null; then
   read -r -s -p "Edge token: " TOKEN </dev/tty || true
   echo >&2
 fi
+# an --upgrade of an installed edge reuses its controller URL (as install.sh --upgrade does)
+if [ -z "$CONTROLLER" ] && [ "$UPGRADE" = yes ] && [ -r /etc/pcdn/agent.conf ]; then
+  CONTROLLER="$(sed -n 's/^CONTROLLER_URL=//p' /etc/pcdn/agent.conf | tail -1 | tr -d "\"' \r")"
+fi
 [ -n "$CONTROLLER" ] && { [ -n "$TOKEN" ] || [ "$UPGRADE" = yes ]; } || {
   echo "usage: bootstrap.sh --controller <url> [--token <edge_token> | --token-file <path>] [flags]" >&2
+  echo "       bootstrap.sh --upgrade   (an installed edge: controller URL from /etc/pcdn/agent.conf)" >&2
   echo "       (or the token in PCDN_EDGE_TOKEN; not needed with --upgrade)" >&2; exit 1; }
 
 CONTROLLER="${CONTROLLER%/}"
