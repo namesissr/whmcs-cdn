@@ -43,6 +43,9 @@ def _times(ts: str) -> tuple:
 
 CACHE_SERVED = ("HIT", "STALE", "UPDATING", "REVALIDATED")
 SECURITY_ACTIONS = ("block", "challenge", "captcha")
+# SPEC §18: waiting-room queue answers (503 for a queued API call) and access-app answers are the
+# customer's settings, never platform errors
+GATE_ACTIONS = ("wr", "acc")
 # 5xx answers nginx gives to a malformed / unsupported CLIENT request (unknown transfer coding or
 # method, bad HTTP version): client-triggerable, so they never count against the platform
 CLIENT_5XX = (501, 505)
@@ -77,7 +80,7 @@ def platform_error(e: dict) -> bool:
         return False
     if e.get("c") in CACHE_SERVED:
         return False
-    if str(e.get("v") or "ok").split(":", 1)[0] in SECURITY_ACTIONS:
+    if str(e.get("v") or "ok").split(":", 1)[0] in SECURITY_ACTIONS + GATE_ACTIONS:
         return False
     return not e.get("pg")
 
@@ -705,6 +708,8 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
                        "country": cc, "method": str(e.get("m") or ""), "path": uri[:2048], "action": action,
                        "source": source, "rule": rule, "user_agent": str(e.get("ua") or "")[:512]})
     # best-effort extras last, so nothing in them can cut the hourly / security accounting short
+    if parts[0] == "wr" or (parts[0] == "ok" and len(parts) == 3 and parts[1] in ("wr", "acc")):
+        _account_gate(a, parts, dt)
     if learn and not tn and not path.startswith("/__pcdn/"):
         # SPEC §17.1: learning hosts only, until their learning ends (learn = _learn_ctx(state))
         lu = learn_until(learn["hosts"], host)
@@ -718,6 +723,86 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
             ship.offer(e, host, dt, raw)
         except Exception as exc:  # noqa: BLE001 - log export must never break usage accounting
             log.debug("logship: record skipped: %s", exc)
+
+
+# ---- SPEC §18.1 / §18.2 visitor gates: per host-hour `waiting_room` and `access` counters and the
+# bounded `access_events` list, from the verdict ("v") pcdn.js logs:
+#   ok:wr:a:<active>:<waited_s>  admitted (new visitor or from the queue)
+#   ok:wr:t:<active>             an active session's first request of a minute
+#   wr:qn:<position>:<active>    queued with a new ticket (counted), wr:q:... a queued visitor's poll
+#   ok:acc:ok|fail|otp:<app>:<email hash>  sign-in / failed code / code requested (also
+#                                ok:acc:locked / ok:acc:limited, and the gate's acc:login / acc:deny:
+#                                not counted). email hash = pcdn.js emailHash (access_email_hash).
+# admitted / queued / ok / fail / otp are deltas per push; max_wait_s / peak_active are hour-to-date
+# maxima (state["wr_hour"], merged in by gate_hour_merge before the items are built).
+WR_USAGE_KEYS = ("admitted", "queued", "max_wait_s", "peak_active")
+WR_MAX_KEYS = ("max_wait_s", "peak_active")
+ACCESS_USAGE_KEYS = ("ok", "fail", "otp")
+ACCESS_EVENTS_MAX = 50         # per host-hour item (SPEC §18.2)
+WR_MAX_INT = 10 ** 9
+WR_MAX_WAIT = 7 * 86400        # controller limit of max_wait_s
+WR_HOURS = 2000                # host-hours of hour-to-date maxima kept ...
+WR_HOUR_TTL = 3 * 3600         # ... and at most this much older than the newest one (s)
+_EMAIL_HASH = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _gate_int(v) -> int:
+    try:
+        return max(0, min(WR_MAX_INT, int(v)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _account_gate(a: dict, parts: list, dt: datetime):
+    if parts[0] == "wr" or parts[1] == "wr":
+        w = a.setdefault("waiting_room", {k: 0 for k in WR_USAGE_KEYS})
+        f = parts[2].split(":") if len(parts) == 3 else []
+        if parts[0] == "ok" and f and f[0] == "a":
+            w["admitted"] += 1
+            w["peak_active"] = max(w["peak_active"], _gate_int(f[1] if len(f) > 1 else 0))
+            w["max_wait_s"] = max(w["max_wait_s"], min(WR_MAX_WAIT, _gate_int(f[2] if len(f) > 2 else 0)))
+        elif parts[0] == "ok" and f and f[0] == "t":
+            w["peak_active"] = max(w["peak_active"], _gate_int(f[1] if len(f) > 1 else 0))
+        elif parts[0] == "wr" and len(parts) == 3 and parts[1] in ("q", "qn"):
+            if parts[1] == "qn":
+                w["queued"] += 1
+            w["peak_active"] = max(w["peak_active"], _gate_int(f[1] if len(f) > 1 else 0))
+        return
+    kind, _, rest = parts[2].partition(":")
+    if kind not in ACCESS_USAGE_KEYS:
+        return
+    c = a.setdefault("access", {k: 0 for k in ACCESS_USAGE_KEYS})
+    c[kind] += 1
+    app, _, eh = rest.partition(":")
+    if kind == "otp" or not SAFE_ID.match(app) or not _EMAIL_HASH.match(eh):
+        return
+    ev = a.setdefault("access_events", [])
+    if len(ev) < ACCESS_EVENTS_MAX:
+        ev.append({"t": dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "app": app, "email_hash": eh, "ok": kind == "ok"})
+
+
+def gate_hour_merge(state: dict, pending: dict):
+    """Turn the per-push waiting-room maxima of `pending` into hour-to-date maxima (state["wr_hour"],
+    bounded: WR_HOURS host-hours, none older than WR_HOUR_TTL before the newest)."""
+    hours = state.get("wr_hour")
+    if not isinstance(hours, dict):
+        hours = {}
+    for key, a in pending.items():
+        w = a.get("waiting_room") if isinstance(a, dict) else None
+        if not w:
+            continue
+        h = hours.setdefault(key, {k: 0 for k in WR_MAX_KEYS})
+        for k in WR_MAX_KEYS:
+            h[k] = w[k] = max(_gate_int(h.get(k)), _gate_int(w.get(k)))
+    if hours:
+        newest = max(k.split("|", 1)[1] for k in hours)
+        cut = (_utc(newest).timestamp() - WR_HOUR_TTL) if newest else 0
+        keep = sorted((k for k in hours if _utc(k.split("|", 1)[1]).timestamp() >= cut),
+                      key=lambda k: k.split("|", 1)[1])[-WR_HOURS:]
+        hours = {k: hours[k] for k in keep}
+        state["wr_hour"] = hours
+    else:
+        state.pop("wr_hour", None)
 
 
 def _nsum(v) -> int:
@@ -950,6 +1035,12 @@ def usage_item(key: str, a, learn_hours: dict | None = None) -> dict:
     lhour = (learn_hours or {}).get(key)
     if a.get("waf_learn") or lhour:   # SPEC §17.1 (optional): learning sites only
         item["waf_learn"] = waf_learn_item(a.get("waf_learn"), lhour)
+    if a.get("waiting_room"):   # SPEC §18.1 (optional): counters are deltas, max_wait_s / peak_active maxima
+        item["waiting_room"] = {k: _gate_int(a["waiting_room"].get(k)) for k in WR_USAGE_KEYS}
+    if a.get("access"):         # SPEC §18.2 (optional)
+        item["access"] = {k: _gate_int(a["access"].get(k)) for k in ACCESS_USAGE_KEYS}
+    if a.get("access_events"):
+        item["access_events"] = list(a["access_events"][:ACCESS_EVENTS_MAX])
     if a.get("functions"):   # SPEC §16.9 (optional): edge function invocations of this host-hour
         item["functions"] = {k: int(a["functions"].get(k) or 0)
                              for k in ("invocations", "cpu_ms", "errors", "timeouts")}

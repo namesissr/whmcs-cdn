@@ -8,13 +8,15 @@ from ..common import (
     _int, _sec, wildcard_re,
 )
 from ..settings import log
+from ..validation.gates import norm_access, norm_waiting_room
 from ..validation.regex import regex_unsafe
 from ..validation.rules import WAF_PACKS, norm_bots, norm_image_v2, norm_waf_learning, page_rules
 
 
 def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | None = None,
-            tf_resp: list | None = None, video: dict | None = None) -> dict:
-    """Per-site data for njs (sites.js). Only validated / typed values end up here."""
+            tf_resp: list | None = None, video: dict | None = None, gates: tuple | None = None) -> dict:
+    """Per-site data for njs (sites.js). Only validated / typed values end up here.
+    gates: (norm_waiting_room, norm_access) results already computed by the caller (None: computed here)."""
     fw = _sec(site, "firewall")
     rules = []
     for r in fw.get("rules") or []:
@@ -79,6 +81,11 @@ def site_js(site: dict, hosts: list, pools: dict, sslo: dict, tunnel: dict | Non
         extra["tunnel_fair"] = bool(tunnel["fair_share"])
     if video and video["prefetch"]:   # SPEC §16.5 (video sites only)
         extra["video"] = {"prefetch": True}
+    wr, acc = gates if gates is not None else (norm_waiting_room(site), norm_access(site))
+    if wr:                            # SPEC §18.1 (waiting-room sites only)
+        extra["waiting_room"] = wr
+    if acc:                           # SPEC §18.2 (access sites only)
+        extra["access"] = acc
     return dict({
         "domain": site["domain"],
         "secret": str(site.get("secret") or ""),

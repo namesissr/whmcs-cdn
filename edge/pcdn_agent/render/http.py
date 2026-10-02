@@ -120,6 +120,25 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
     return text
 
 
+WR_DICT_TIMEOUT = 10800   # s; > the longest session (120 min): idle sessions and old counters expire
+
+
+def render_gates(cfg: dict, wr: bool, access: bool) -> str:
+    """http-level part of the visitor gates (SPEC §18.1 / §18.2), appended to http.conf only while
+    some site uses them (nodes without them keep a byte-identical http.conf): the waiting-room dict
+    (sessions, per-minute activity buckets, ticket counters; bounded by size + timeout + evict), the
+    $pcdn_wrc cookie handed from the verdict to the response, and the signed-in access email."""
+    out = ["", "# visitor gates (SPEC §18.1 waiting room, §18.2 access) - pcdn.js wr* / access*"]
+    if wr:
+        size = cfg.get("WR_DICT_SIZE") or "48m"
+        size = size if SAFE_SIZE.match(size) else "48m"
+        out += [f"js_shared_dict_zone zone=pcdn_wr:{size} type=number timeout={WR_DICT_TIMEOUT}s evict;",
+                "js_var $pcdn_wrc;"]
+    if access:
+        out.append("js_set $pcdn_acc_email pcdn.accessEmail;")
+    return "\n".join(out) + "\n"
+
+
 def render_resizer(cfg: dict) -> str:
     """The loopback image server block of http.conf (SPEC §2 resize, §16.6 images v2).
 

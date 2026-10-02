@@ -35,8 +35,9 @@ def write_tree(root: str, files: dict):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # keys and the HMAC / shield secrets are only read by the nginx master (root) at load time;
         # so are the origin-pull client certificates (mtls/, mtls.conf; SPEC §14.2) and the object-
-        # storage read tokens (storage/; SPEC §16.8)
-        mode = 0o600 if (rel.endswith(".key") or rel in ("js/sites.js", "shield.conf", "mtls.conf")
+        # storage read tokens (storage/; SPEC §16.8) and the controller token of the access OTP hop
+        # (edge-auth.conf; SPEC §18.2)
+        mode = 0o600 if (rel.endswith(".key") or rel in ("js/sites.js", "shield.conf", "mtls.conf", "edge-auth.conf")
                          or rel.startswith(("mtls/", "storage/"))) else 0o644
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as f:

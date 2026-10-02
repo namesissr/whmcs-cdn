@@ -24,11 +24,17 @@ from .reload import cert_digests, global_digest, site_digests
 from .render.http import fair_hot, norm_node
 from .render.shield import norm_shield
 from .render.tree import render_tree
-from .settings import agent_source_files, log
+from .settings import AGENT_ERRORS, agent_source_files, log
 from .usage import (
-    learn_hosts, live_cutoff, live_items, read_l4_usage, read_usage, trim_live_backlog, usage_item, video_hosts,
+    gate_hour_merge, learn_hosts, live_cutoff, live_items, read_l4_usage, read_usage, trim_live_backlog, usage_item,
+    video_hosts,
 )
+from .validation.gates import gate_sites
 from .validation.rules import key_infos, with_cached_bot_ranges
+
+HB_WAITING_ROOM = "waiting_room"        # heartbeat: {site_id: {active, queued}} (SPEC §18.1)
+HB_ERRORS = "errors_last_hour"          # heartbeat: agent ERROR records of the last hour (SPEC §18.4)
+HB_WR_SITES_MAX = 1000
 
 
 # ----------------------------------------------------------------- main loop
@@ -81,6 +87,24 @@ def bundle_version(cfg: dict) -> str | None:
         return None
 
 
+def wr_heartbeat(raw: bytes, sites: list) -> dict:
+    """The heartbeat `waiting_room` object from pcdn.js wrStats ({site domain: {active, queued}}): only
+    the configured waiting-room sites, non-negative integers, at most HB_WR_SITES_MAX sites."""
+    try:
+        data = json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for sid in sites:
+        v = data.get(str(sid))
+        if not isinstance(v, dict) or len(out) >= HB_WR_SITES_MAX:
+            continue
+        out[str(sid)] = {k: _int(v.get(k), 0, 0, 10 ** 9) for k in ("active", "queued")}
+    return out
+
+
 class Agent:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -90,6 +114,7 @@ class Agent:
         self.last_usage = 0.0
         self.last_heartbeat = 0.0
         self.net_prev = None
+        self.wr_stats = None
 
     @property
     def logship(self) -> LogShip:
@@ -179,6 +204,11 @@ class Agent:
                 st["learn_hosts"] = lh
             else:
                 st.pop("learn_hosts", None)
+            wr = gate_sites(body)["wr"]   # SPEC §18.1 heartbeat waiting-room state (domains; agent-side only)
+            if wr:
+                st["wr_sites"] = wr
+            else:
+                st.pop("wr_sites", None)
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
         try:   # origin guard: private shield peers stay reachable (agent-side only, never rendered)
@@ -270,6 +300,10 @@ class Agent:
         outbox = self.state.setdefault("outbox", [])
         keys, evs = list(pending), list(events)
         lh = self.state.get("waf_learn_hour")   # SPEC §17.1 hour-to-date statistics (read only here)
+        try:   # SPEC §18.1: waiting-room maxima are hour-to-date values
+            gate_hour_merge(self.state, pending)
+        except Exception as e:  # noqa: BLE001 - never let it block the usage push
+            log.error("waiting-room usage merge failed: %s", e)
         now = time.time()
         cutoff = live_cutoff(now)
         entries = []
@@ -371,6 +405,7 @@ class Agent:
             body["region"] = self.cfg["REGION"]
         if self.cfg.get("GROUP"):
             body["group"] = self.cfg["GROUP"]
+        body[HB_ERRORS] = AGENT_ERRORS.last_hour()   # SPEC §18.4
         body.update(over)
         return body
 
@@ -383,10 +418,13 @@ class Agent:
         except Exception:  # noqa: BLE001 - informational only
             pass
         m = self.metrics()
+        self.wr_stats = None
         try:
             self.fair_signal(m)
         except Exception as e:  # noqa: BLE001 - fair share is best-effort and fails open
             log.debug("fair share signal: %s", e)
+        if self.wr_stats:   # SPEC §18.1: per-site waiting-room state of this node
+            extra[HB_WAITING_ROOM] = self.wr_stats
         self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
                                                              error=self.state.get("last_error"),
                                                              metrics=m, **extra))
@@ -405,9 +443,13 @@ class Agent:
                      m.get("tx_mbps") or 0, node["capacity_mbps"],
                      f"active at {node['fair_share_pct']} %" if hot else "idle")
         port = _int(self.cfg.get("HTTP_PORT"), 80, 1, 65535)
-        url = f"http://127.0.0.1:{port}/__pcdn/fair?hot={node['fair_share_pct'] if hot else 0}"
+        wr_sites = self.state.get("wr_sites") or []
+        url = (f"http://127.0.0.1:{port}/__pcdn/fair?hot={node['fair_share_pct'] if hot else 0}"
+               + ("&wr=1" if wr_sites else ""))
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=2) as r:
-            r.read()
+            raw = r.read(1 << 20)
+        if wr_sites:   # SPEC §18.1: the same localhost call returns the waiting-room state (pcdn.js wrStats)
+            self.wr_stats = wr_heartbeat(raw, wr_sites)
 
     def ship_logs(self):
         """Ship new WARN/ERROR/crit lines to the controller (SPEC §11.2). Fail-soft: never raises."""

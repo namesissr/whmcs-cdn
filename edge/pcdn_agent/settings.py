@@ -4,6 +4,7 @@ agent logger and the buffer of its own WARN/ERROR lines shipped with the node lo
 import collections
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 
@@ -51,6 +52,33 @@ class LogBuffer(logging.Handler):
 
 AGENT_LOGS = LogBuffer()
 
+
+class ErrorCounter(logging.Handler):
+    """SPEC §18.4: the agent's ERROR / CRITICAL records (logged exceptions included) of the last hour,
+    for the heartbeat's `errors_last_hour`. Keeps at most `cap` timestamps, so the count saturates
+    at `cap` instead of growing without bound; never raises into the caller."""
+
+    WINDOW = 3600
+
+    def __init__(self, cap: int = 10000):
+        super().__init__(level=logging.ERROR)
+        self.times: collections.deque = collections.deque(maxlen=cap)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.times.append(float(record.created))
+        except Exception:  # noqa: BLE001 - logging must never crash the agent
+            pass
+
+    def last_hour(self, now: float | None = None) -> int:
+        cut = (time.time() if now is None else now) - self.WINDOW
+        while self.times and self.times[0] < cut:
+            self.times.popleft()
+        return len(self.times)
+
+
+AGENT_ERRORS = ErrorCounter()
+
 DEFAULTS = {
     "CONTROLLER_URL": "",
     "EDGE_TOKEN": "",
@@ -78,6 +106,9 @@ DEFAULTS = {
     # whose origin is an object-storage bucket (rendered only while such a host has images on)
     "STORAGE_FETCH_PORT": "8091",
     "DICT_SIZE": "32m",
+    # SPEC §18.1 waiting-room sessions / queue counters (js_shared_dict pcdn_wr, only on nodes serving a
+    # waiting room): 48m holds well over the 200k entries the SPEC asks for
+    "WR_DICT_SIZE": "48m",
     "CACHE_MAX_SIZE": "10g",
     "CACHE_KEYS_ZONE": "5m",
     "CACHE_INACTIVE": "7d",

@@ -24,7 +24,8 @@ TUNNEL_PROTOCOLS = ("ws", "httpupgrade", "grpc", "xhttp", "h2")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
                "transfer-encoding", "upgrade", "host", "content-length",
                "x-pcdn-shield",  # SPEC §14.1: the shield hop header is reserved for the edge itself
-               "x-pcdn-origin", "x-pcdn-mtls"}   # the resizer's internal fetch URL / client-cert token
+               "x-pcdn-origin", "x-pcdn-mtls",   # the resizer's internal fetch URL / client-cert token
+               "x-pcdn-access-email"}            # SPEC §18.2: set by the edge only
 FW_ACTIONS = {"allow", "block", "challenge", "captcha", "log"}
 FW_FIELDS = {"ip", "country", "path", "host", "query", "user_agent", "referer", "method", "header"}
 FW_OPS = {"eq", "ne", "contains", "not_contains", "starts_with", "ends_with", "regex", "in", "not_in"}

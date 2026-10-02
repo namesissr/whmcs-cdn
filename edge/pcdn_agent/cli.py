@@ -24,13 +24,14 @@ from .agent import Agent
 from .apply import bootstrap
 from .imaged import run_imaged
 from .render.guards import render_guard, render_origin_guard
-from .settings import AGENT_LOGS, load_config, log
+from .settings import AGENT_ERRORS, AGENT_LOGS, load_config, log
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # capture the agent's own WARN/ERROR lines so they ship with the nginx error log (SPEC §11.2)
     logging.getLogger("pcdn-agent").addHandler(AGENT_LOGS)
+    logging.getLogger("pcdn-agent").addHandler(AGENT_ERRORS)   # heartbeat errors_last_hour (SPEC §18.4)
     try:
         cfg = load_config(os.getenv("PCDN_CONFIG", "/etc/pcdn/agent.conf"))
     except PermissionError:   # the sandboxed imaged cannot read a root-only file: defaults + env

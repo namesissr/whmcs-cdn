@@ -17,6 +17,8 @@
 //   bodyInspect                    — js_content for /__pcdn/body/*: inspects the body, then proxies
 //   tfHeaders js_header_filter     — conditional transform-rule response headers (SPEC §14.2)
 //   deny / verify / captcha        — js_content handlers for /__pcdn/*
+//   accessEmail js_set $pcdn_acc_email — signed-in email of an access app (SPEC §18.2)
+//   accessLogin/Send/Verify/Logout — js_content of /__pcdn/access/* (SPEC §18.2)
 //   health                         — js_periodic origin health checker
 //
 // njs 0.8.2 notes: no destructuring/spread/classes/optional chaining/BigInt,
@@ -505,6 +507,8 @@ function prepSite(id, s) {
         secret: typeof im.secret === 'string' && im.secret.length >= 16 ? im.secret : '' } : null;
     // video delivery (SPEC §16.5): next-segment prefetch flag
     P.video = s.video && s.video.prefetch === true ? { prefetch: true } : null;
+    P.wr = prepWaitingRoom(s.waiting_room);    // SPEC §18.1
+    P.access = prepAccess(s.access);            // SPEC §18.2
     return P;
 }
 
@@ -575,11 +579,28 @@ function verdict(r) {
     return v;
 }
 
+// The verdict: the security checks, then (when they pass) the visitor gates of SPEC §18 - access apps
+// and the waiting room (gates). A gate that lets the request through may add "ok:wr:..." (read by
+// the usage pass); a "log:..." security verdict is kept as it is.
 function evaluate(r) {
+    const v = security(r);
+    if (v !== 'ok' && v.indexOf('log:') !== 0) return v;
+    const site = siteOf(r);
+    if (!site || (!site.access && !site.wr)) return v;
+    const uri = String(r.uri);
+    if (uri.indexOf('/__pcdn/') === 0 || (site.tunnel.length && inTunnel(site, uri))) return v;
+    const g = gates(mkctx(r, site), site);
+    if (!g) return v;
+    if (g.indexOf('ok:') === 0) return v === 'ok' ? g : v;
+    return g;
+}
+
+function security(r) {
     const uri = String(r.uri);
     // speed test (SPEC §15.6): like a tunnel path - firewall block rules, blocked_ips and min_tls apply,
-    // challenges / WAF / rate-limit rules / DDoS do not (the measurement must not hit an HTML challenge)
-    const speed = uri.indexOf('/__pcdn/speed/') === 0;
+    // challenges / WAF / rate-limit rules / DDoS do not (the measurement must not hit an HTML challenge).
+    // The access sign-in endpoints (SPEC §18.2) are treated the same way.
+    const speed = uri.indexOf('/__pcdn/speed/') === 0 || uri.indexOf('/__pcdn/access/') === 0;
     if (!speed && uri.indexOf('/__pcdn/') === 0) return 'ok';
     const site = siteOf(r);
     if (!site) return 'ok';
@@ -693,6 +714,12 @@ function tunnelFair(r) {
 function fairSet(r) {
     const d = ngx.shared.pcdn_fair, pct = Math.floor(+r.args.hot || 0);
     if (pct >= 1 && pct <= 100) d.set('hot', pct); else d.delete('hot');
+    if (r.args.wr === '1') {   // the agent's heartbeat: per-site waiting-room state (SPEC §18.1)
+        let out = {};
+        try { out = wrStats(); } catch (e) { r.error('pcdn wr stats: ' + e); }
+        r.headersOut['Content-Type'] = 'application/json';
+        return r.return(200, JSON.stringify(out));
+    }
     r.return(204);
 }
 
@@ -987,7 +1014,8 @@ function bodyInspect(r) {
     if (hit) {
         let v = (wafMode(site.waf) === 'block' ? 'block' : 'log') + ':waf:' + hit;
         const cur = String(r.variables.pcdn_vmemo || 'ok');
-        let set = v.indexOf('block:') === 0 || cur === 'ok';
+        // "ok:wr:..." (a waiting-room note, SPEC §18.1) counts as "ok"
+        let set = v.indexOf('block:') === 0 || cur === 'ok' || cur.indexOf('ok:') === 0;
         if (!set && wafLearning(site.waf) && cur.indexOf('log:') === 0) {
             // learning (SPEC §17.1): the request already carried a signal - keep a WAF id, mark ":a"
             const same = cur === v || cur === v + ':a';   // the same rule matched the URI already
@@ -1298,6 +1326,8 @@ function deny(r) {
     const v = String(r.variables.pcdn_verdict || 'block:firewall:x');
     const p = v.split(':'), action = p[0], source = p[1] || '', rule = p[2] || '';
     const site = siteOf(r);
+    if (action === 'wr') return wrPage(r, site, Math.max(1, +p[2] || 1));        // SPEC §18.1
+    if (action === 'acc') return accessDenied(r, site, source, rule);              // SPEC §18.2
     if (site && action === 'challenge') return challengePage(r, site, v);
     if (site && action === 'captcha') return captchaPage(r, site, safeReturn(r.variables.request_uri), '', v);
     if (source === 'ratelimit') {
@@ -1462,5 +1492,542 @@ function captcha(r) {
     grant(r, site, 'cap', back);
 }
 
+// ------------------------------------------------------------------ visitor gates (SPEC §18.1 / §18.2)
+//
+// Both run after the security checks, never on /__pcdn/ paths or tunnel paths, and fail open when
+// their shared dictionary is missing (an older http.conf).
+
+const WR_COOKIE = '__pcdn_wr';
+const WR_TICKET_TTL = 3600;        // s: a queue ticket older than this is void (the visitor starts again)
+const WR_SKIP_AFTER = 45;          // s that slots stay free while tickets wait without anyone claiming
+                                   // them: the tickets ahead of the free slots are taken as abandoned
+const WR_IP_NEW = 30;              // sessions admitted per client IP per minute (more wait in the queue)
+const WR_REFRESH_MIN = 15;         // queue page refresh / Retry-After: 15..30 s with jitter
+const WR_REFRESH_SPAN = 16;
+const WR_STATS_MAX = 1000;         // sites reported to the agent (heartbeat, keyed by site domain)
+const WR_COOKIE_RE = /^([0-9a-f]{16})\.(\d{1,15})\.(\d{1,12})\.(\d{1,12})\.([aq])\.([0-9a-f]{64})$/;
+
+const ACC_COOKIE = '__pcdn_access_';
+// one-time codes (pcdn-agent validation/gates.py OTP_*, the controller computes the same):
+// d = HMAC-SHA256(bytes(access secret), "otp|<app>|<email>|<window>"), RFC 4226 dynamic truncation
+// (offset = d[31] & 15, 31 bits from there) mod 10^6, window = floor(unix / 300)
+const OTP_PREFIX = 'otp';
+const OTP_WINDOW = 300;
+const OTP_DIGITS = 6;
+const OTP_WINDOWS = 2;             // the current and the previous window
+const ACC_SEND_PER_MIN = 5;        // code requests per client IP per site and minute
+const ACC_FAIL_MAX = 10;           // failed codes per client IP per site ...
+const ACC_FAIL_WINDOW = 600;       // ... in this window lock the IP out ...
+const ACC_LOCK_S = 600;            // ... for this long
+const ACC_EMAIL_RE = /^[a-z0-9._%+'-]{1,64}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+function lowerList(v) {
+    return (Array.isArray(v) ? v : []).map(function (x) { return String(x).toLowerCase(); }).filter(function (x) { return x.charAt(0) === '/'; });
+}
+
+function underAny(list, pathL) {
+    for (let i = 0; i < list.length; i++) if (pathL.indexOf(list[i]) === 0) return true;
+    return false;
+}
+
+function prepWaitingRoom(w) {
+    if (!w || typeof w !== 'object' || !(+w.max >= 1) || typeof w.secret !== 'string'
+        || !/^(?:[0-9a-f]{2}){16,64}$/.test(w.secret)) return null;
+    const b = w.bypass || {};
+    return { paths: lowerList(w.paths), max: Math.floor(+w.max), secret: Buffer.from(w.secret, 'hex'),
+        sessMin: Math.min(120, Math.max(1, Math.ceil((+w.session_s || 600) / 60))),
+        page: w.page || {}, bots: b.bots !== false, bpaths: lowerList(b.paths),
+        bips: (Array.isArray(b.ips) ? b.ips : []).map(cidr).filter(Boolean) };
+}
+
+function prepAccess(a) {
+    if (!a || typeof a !== 'object' || !Array.isArray(a.apps) || !a.apps.length) return null;
+    const key = typeof a.secret === 'string' && /^(?:[0-9a-f]{2}){16,64}$/.test(a.secret) ? Buffer.from(a.secret, 'hex') : null;
+    const A = { key: key, apps: [], byId: {} };
+    a.apps.forEach(function (x) {
+        if (!x || typeof x.id !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(x.id) || A.byId[x.id]) return;
+        const app = { id: x.id, name: String(x.name || x.id), paths: lowerList(x.paths),
+            methods: ['otp', 'ip', 'otp_or_ip'].indexOf(x.methods) >= 0 ? x.methods : 'none',
+            emails: (Array.isArray(x.emails) ? x.emails : []).map(function (e) { return String(e).toLowerCase(); }),
+            ips: (Array.isArray(x.ips) ? x.ips : []).map(cidr).filter(Boolean),
+            sessionS: Math.min(720 * 3600, Math.max(3600, Math.floor(+x.session_s || 86400))) };
+        if (!app.paths.length) return;
+        if (!key) { app.methods = 'none'; app.ips = []; }   // enabled without a secret: fail closed
+        app.otp = !!key && (app.methods === 'otp' || app.methods === 'otp_or_ip');
+        A.apps.push(app);
+        A.byId[app.id] = app;
+    });
+    return A.apps.length ? A : null;
+}
+
+function gates(ctx, site) {
+    if (site.access) {
+        const v = accessGate(ctx, site);
+        if (v) return v;
+    }
+    return site.wr ? wrGate(ctx, site) : null;
+}
+
+function cookieGet(r, name) {
+    const h = r.headersIn.Cookie;
+    if (!h) return '';
+    const parts = String(h).split(';');
+    for (let i = 0; i < parts.length; i++) {
+        const kv = parts[i], j = kv.indexOf('=');
+        if (j > 0 && kv.substring(0, j).trim() === name) return kv.substring(j + 1).trim();
+    }
+    return '';
+}
+
+function cookieAttrs(r, maxAge) {
+    return '; Path=/' + (maxAge === null ? '' : '; Max-Age=' + maxAge) + '; HttpOnly; SameSite=Lax'
+        + (r.variables.scheme === 'https' ? '; Secure' : '');
+}
+
+// the verdict reported in the access log for a /__pcdn/access/ request (usage `access`):
+// "ok:acc:<kind>:..." - it starts with "ok", so the OTP subrequest (which shares the variables of
+// this request) still passes the server-level verdict check
+function noteVerdict(r, v) {
+    try { r.variables.pcdn_verdict = 'ok:' + v; } catch (e) { r.error('pcdn note verdict: ' + e); }
+}
+
+function wantsHtml(r) {
+    return (r.method === 'GET' || r.method === 'HEAD') && /text\/html/i.test(String(r.headersIn.Accept || ''))
+        && !/xmlhttprequest/i.test(String(r.headersIn['X-Requested-With'] || ''));
+}
+
+// primary language of the visitor: "fa" unless English comes first in Accept-Language
+function pickLang(r) {
+    const h = String(r.headersIn['Accept-Language'] || '').toLowerCase();
+    const fa = h.search(/(?:^|[\s,])fa\b/), en = h.search(/(?:^|[\s,])en\b/);
+    return en >= 0 && (fa < 0 || en < fa) ? 'en' : 'fa';
+}
+
+// a gate page: the visitor's language first, the other one below; no script; inline style with a
+// per-response nonce under a strict CSP
+function gatePage(r, code, lang, T, form, headers) {
+    const nonce = randHex(16);
+    const one = function (l, cls) {
+        const t = T[l];
+        return '<div class="' + cls + '" dir="' + (l === 'fa' ? 'rtl' : 'ltr') + '" lang="' + l + '"><h1>' + esc(t.title) + '</h1>'
+            + t.lines.map(function (x) { return '<p>' + esc(x) + '</p>'; }).join('') + '</div>';
+    };
+    const other = lang === 'fa' ? 'en' : 'fa';
+    const html = '<!doctype html>\n<html lang="' + lang + '" dir="' + (lang === 'fa' ? 'rtl' : 'ltr') + '">\n<head><meta charset="utf-8">'
+        + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+        + (T.refresh ? '<meta http-equiv="refresh" content="' + T.refresh + '">' : '')
+        + '<title>' + esc(T[lang].title) + '</title><style nonce="' + nonce + '">' + CSS
+        + '.alt{margin-top:18px;font-size:13px;opacity:.85}form{margin-top:16px}input{margin:4px}</style></head>\n'
+        + '<body><div class="box">' + one(lang, 'main') + (form || '') + one(other, 'alt') + '</div></body></html>\n';
+    const h = { 'Content-Security-Policy': "default-src 'none'; style-src 'nonce-" + nonce + "'; form-action 'self'; "
+        + "frame-ancestors 'none'; base-uri 'none'", 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff' };
+    Object.keys(headers || {}).forEach(function (k) { h[k] = headers[k]; });
+    send(r, code, html, h);
+}
+
+function sendJson(r, code, obj, headers) {
+    r.headersOut['Content-Type'] = 'application/json';
+    r.headersOut['Cache-Control'] = 'no-store';
+    Object.keys(headers || {}).forEach(function (k) { r.headersOut[k] = headers[k]; });
+    r.return(code, JSON.stringify(obj));
+}
+
+// ---- waiting room (SPEC §18.1)
+//
+// Per site in js_shared_dict pcdn_wr (number values, zone timeout + evict bound the memory):
+//   s:<site>:<rid>   minute of the session's last request (a session = an admitted visitor)
+//   m:<site>:<min>   sessions whose last request fell in that minute; active = the sum over the last
+//                    session_minutes minutes, so idle sessions drop out without any sweep
+//   c:<site> / cs:<site>  that sum, cached for the current second (cs) and bumped by admissions
+//   t:<site>         last queue ticket issued (monotonic per node), l:<site> last admitted ticket,
+//   lf:<site>        since when slots are free while tickets wait (abandoned tickets: WR_SKIP_AFTER)
+// The cookie __pcdn_wr = rid.ticket.issued.last.state(a|q).hmac (key: the raw bytes of
+// waiting_room.secret); a session is valid
+// while its s: entry exists and is younger than session_minutes.
+
+function wrSig(site, rid, ticket, issued, last, state) {
+    return hmac(site.wr.secret, 'wr|' + site.domain + '|' + rid + '|' + ticket + '|' + issued + '|' + last + '|' + state);
+}
+
+function wrCookie(ctx, site) {
+    const m = WR_COOKIE_RE.exec(cookieGet(ctx.r, WR_COOKIE));
+    if (!m || !safeEq(m[6], wrSig(site, m[1], m[2], m[3], m[4], m[5]))) return null;
+    return { rid: m[1], ticket: +m[2], issued: +m[3], last: +m[4], state: m[5] };
+}
+
+function wrSetCookie(ctx, site, rid, ticket, issued, state) {
+    const t = now();
+    const val = rid + '.' + ticket + '.' + issued + '.' + t + '.' + state + '.' + wrSig(site, rid, ticket, issued, t, state);
+    try { ctx.r.variables.pcdn_wrc = WR_COOKIE + '=' + val + cookieAttrs(ctx.r, 86400); } catch (e) { ctx.r.error('pcdn wr cookie: ' + e); }
+}
+
+function wrBypass(ctx, w) {
+    if (underAny(w.bpaths, ctx.pathL)) return true;
+    for (let i = 0; i < w.bips.length; i++) if (inCidr(ctx.ip, w.bips[i])) return true;
+    return w.bots && botClass(ctx.ua, ctx.r.variables.pcdn_vbot, false).verified;
+}
+
+function wrActive(d, site, t) {
+    const id = site.id;
+    if (d.get('cs:' + id) === t) return Math.max(0, d.get('c:' + id) || 0);
+    const min = Math.floor(t / 60);
+    let n = 0;
+    for (let k = 0; k < site.wr.sessMin; k++) n += d.get('m:' + id + ':' + (min - k)) || 0;
+    n = Math.max(0, n);
+    d.set('c:' + id, n);
+    d.set('cs:' + id, t);
+    return n;
+}
+
+function wrAdmit(ctx, d, site, t, active, ticket, waited) {
+    const id = site.id, min = Math.floor(t / 60), rid = randHex(8);
+    d.set('s:' + id + ':' + rid, min);
+    d.incr('m:' + id + ':' + min, 1, 0);
+    d.incr('c:' + id, 1, 0);
+    try { ngx.shared.pcdn_cnt.incr('wi:' + id + ':' + ctx.ipStr + ':' + min, 1, 0); } catch (e) { /* best effort */ }
+    wrSetCookie(ctx, site, rid, ticket, t, 'a');
+    return 'ok:wr:a:' + (active + 1) + ':' + Math.max(0, waited);
+}
+
+// -> null (not covered / bypassed / an active session in the same minute), "ok:wr:..." (admitted or
+// an active session's first request of a minute) or "wr:q:<position>:<active>" / "wr:qn:..." (queued;
+// qn = a new ticket)
+function wrGate(ctx, site) {
+    const w = site.wr, d = ngx.shared.pcdn_wr;
+    if (!d || !underAny(w.paths, ctx.pathL) || wrBypass(ctx, w)) return null;
+    const id = site.id, t = now(), min = Math.floor(t / 60);
+    const c = wrCookie(ctx, site);
+    if (c && c.state === 'a') {
+        const sk = 's:' + id + ':' + c.rid, last = d.get(sk);
+        if (last !== undefined && min - last < w.sessMin && min >= last) {
+            if (last === min) return null;
+            d.set(sk, min);
+            d.incr('m:' + id + ':' + min, 1, 0);
+            d.incr('m:' + id + ':' + last, -1, 0);
+            return 'ok:wr:t:' + wrActive(d, site, t);
+        }
+        // expired / unknown here (another node, restart): a new visitor
+    }
+    const active = wrActive(d, site, t), free = w.max - active;
+    const tq = d.get('t:' + id) || 0;
+    let la = d.get('l:' + id) || 0;
+    if (free > 0 && la < tq) {
+        // free slots nobody in the queue claimed for WR_SKIP_AFTER: the tickets ahead were abandoned
+        const lf = d.get('lf:' + id);
+        if (!lf) d.set('lf:' + id, t);
+        else if (t - lf > WR_SKIP_AFTER) {
+            la = Math.min(tq, la + free);
+            d.set('l:' + id, la);
+            d.delete('lf:' + id);
+        }
+    }
+    if (c && c.state === 'q' && c.ticket >= 1 && c.ticket <= tq && t - c.issued < WR_TICKET_TTL) {
+        if (free > 0 && c.ticket - la <= free) {   // FIFO: the first `free` tickets after the last admitted one
+            if (c.ticket > la) d.set('l:' + id, c.ticket);
+            d.delete('lf:' + id);
+            return wrAdmit(ctx, d, site, t, active, c.ticket, t - c.issued);
+        }
+        return 'wr:q:' + Math.max(1, c.ticket - la) + ':' + active;
+    }
+    let ipOk = true;
+    try { ipOk = (ngx.shared.pcdn_cnt.get('wi:' + id + ':' + ctx.ipStr + ':' + min) || 0) < WR_IP_NEW; } catch (e) { /* open */ }
+    if (free > 0 && la >= tq && ipOk) return wrAdmit(ctx, d, site, t, active, 0, 0);
+    const ticket = d.incr('t:' + id, 1, 0);
+    wrSetCookie(ctx, site, randHex(8), ticket, t, 'q');
+    return 'wr:qn:' + Math.max(1, ticket - la) + ':' + active;
+}
+
+function wrStats() {
+    const d = ngx.shared.pcdn_wr, out = {}, t = now();
+    if (!d) return out;
+    let n = 0;
+    Object.keys(S).forEach(function (id) {
+        const site = S[id];
+        if (!site || !site.wr || n >= WR_STATS_MAX) return;
+        n++;
+        out[site.domain] = { active: wrActive(d, site, t), queued: Math.max(0, (d.get('t:' + id) || 0) - (d.get('l:' + id) || 0)) };
+    });
+    return out;
+}
+
+const WR_TEXT = {
+    fa: { title: 'در صف ورود به وب‌سایت هستید', message: 'به دلیل ترافیک زیاد، ورود به وب‌سایت به ترتیب انجام می‌شود. این صفحه خودکار به‌روز می‌شود؛ لطفاً آن را نبندید.',
+        pos: 'جایگاه تقریبی شما در صف: ' },
+    en: { title: 'You are in the queue', message: 'Due to high traffic, visitors enter the website in order. This page refreshes automatically; please keep it open.',
+        pos: 'Your estimated position in the queue: ' },
+};
+
+function wrPage(r, site, pos) {
+    const retry = WR_REFRESH_MIN + Math.floor(Math.random() * WR_REFRESH_SPAN);
+    const h = { 'Retry-After': String(retry) };
+    const ck = r.variables.pcdn_wrc;
+    if (ck) h['Set-Cookie'] = String(ck);
+    if (!wantsHtml(r)) return sendJson(r, 503, { error: 'waiting_room', position: pos, retry_after: retry }, h);
+    const p = (site && site.wr && site.wr.page) || {};
+    const T = { refresh: retry };
+    ['fa', 'en'].forEach(function (l) {
+        T[l] = { title: p['title_' + l] || WR_TEXT[l].title,
+            lines: [p['message_' + l] || WR_TEXT[l].message, WR_TEXT[l].pos + pos] };
+    });
+    gatePage(r, 200, pickLang(r), T, '', h);
+}
+
+// ---- access apps (SPEC §18.2)
+
+function accessApp(A, pathL) {
+    for (let i = 0; i < A.apps.length; i++) if (underAny(A.apps[i].paths, pathL)) return A.apps[i];
+    return null;
+}
+
+function emailAllowed(app, email) {
+    const dom = email.substring(email.lastIndexOf('@'));
+    for (let i = 0; i < app.emails.length; i++) {
+        const e = app.emails[i];
+        if (e.charAt(0) === '@' ? dom === e : email === e) return true;
+    }
+    return false;
+}
+
+// access_events email_hash: HMAC-SHA256(access secret, "email|" + email), first 16 hex
+function emailHash(A, email) { return A.key ? hmac(A.key, 'email|' + email).substring(0, 16) : '-'; }
+
+function otpCode(key, app, email, win) {
+    const h = hmac(key, OTP_PREFIX + '|' + app + '|' + email + '|' + win);
+    const b = function (i) { return parseInt(h.substring(i * 2, i * 2 + 2), 16); };
+    const off = b(31) & 15;
+    const bin = (b(off) & 0x7f) * 16777216 + b(off + 1) * 65536 + b(off + 2) * 256 + b(off + 3);
+    let c = String(bin % Math.pow(10, OTP_DIGITS));
+    while (c.length < OTP_DIGITS) c = '0' + c;
+    return c;
+}
+
+// session cookie __pcdn_access_<app> = base64url(app|email|exp) "." hex HMAC(access_secret, "sess|" + b64)
+function accSig(A, b64) { return hmac(A.key, 'sess|' + b64); }
+
+function accessSession(r, site, app) {
+    const A = site.access;
+    if (!A.key) return '';
+    const v = cookieGet(r, ACC_COOKIE + app.id), i = v.lastIndexOf('.');
+    if (i < 1 || !/^[A-Za-z0-9_-]{1,1024}$/.test(v.substring(0, i)) || !safeEq(v.substring(i + 1), accSig(A, v.substring(0, i)))) return '';
+    let p;
+    try { p = Buffer.from(v.substring(0, i), 'base64url').toString().split('|'); } catch (e) { return ''; }
+    if (p.length !== 3 || p[0] !== app.id || !(+p[2] > now()) || !ACC_EMAIL_RE.test(p[1]) || !emailAllowed(app, p[1])) return '';
+    return p[1];
+}
+
+function accessGate(ctx, site) {
+    const app = accessApp(site.access, ctx.pathL);
+    if (!app) return null;
+    if (app.methods !== 'otp') {
+        for (let i = 0; i < app.ips.length; i++) if (inCidr(ctx.ip, app.ips[i])) return null;
+    }
+    if (app.otp) return accessSession(ctx.r, site, app) ? null : 'acc:login:' + app.id;
+    return 'acc:deny:' + app.id;
+}
+
+// js_set $pcdn_acc_email -> X-PCDN-Access-Email: the signed-in email on a path of an access app
+// ("" = the header is not sent; a visitor's own copy never reaches the origin)
+function accessEmail(r) {
+    try {
+        const site = siteOf(r);
+        if (!site || !site.access) return '';
+        const path = String(r.uri).replace(/^\/__pcdn\/(?:img|body)(?=\/)/, '').toLowerCase();
+        if (path.indexOf('/__pcdn/') === 0) return '';
+        const app = accessApp(site.access, path);
+        return app && app.otp ? accessSession(r, site, app) : '';
+    } catch (e) { r.error('pcdn accessEmail: ' + e); }
+    return '';
+}
+
+// a same-site relative path only: no scheme, no "//" or "/\" (protocol-relative), no backslash,
+// no control / space / non-ASCII characters, never the sign-in endpoints themselves
+function safeNext(u) {
+    u = String(u === undefined || u === null ? '' : u);
+    if (u.length > 2048 || !/^\/(?![\/\\])[\x21-\x7e]*$/.test(u) || u.indexOf('\\') >= 0 || /^\/__pcdn\/access\//i.test(u)) return '/';
+    return u;
+}
+
+function queryArgs(r) {
+    const o = {};
+    String(r.variables.args || '').split('&').forEach(function (kv) {
+        const i = kv.indexOf('=');
+        if (i > 0) {
+            const k = pctDecode(kv.substring(0, i).replace(/\+/g, ' '));
+            if (!own(o, k)) o[k] = pctDecode(kv.substring(i + 1).replace(/\+/g, ' '));
+        }
+    });
+    return o;
+}
+
+function jsonReq(r) { return /^application\/json\b/i.test(String(r.headersIn['Content-Type'] || '')); }
+
+function gateBody(r) {
+    const text = String(r.requestText || '');
+    if (jsonReq(r)) {
+        try {
+            const o = JSON.parse(text);
+            return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+        } catch (e) { return {}; }
+    }
+    return parseForm(text);
+}
+
+function str(v, max) { return typeof v === 'string' || typeof v === 'number' ? String(v).substring(0, max) : ''; }
+
+// cross-site form posts are refused (an Origin header naming another host)
+function sameOrigin(r) {
+    const o = r.headersIn.Origin;
+    if (o === undefined) return true;
+    const m = /^https?:\/\/([^\/:]+)(?::\d+)?\/?$/i.exec(String(o));
+    return !!m && m[1].toLowerCase() === String(r.variables.host || '').toLowerCase();
+}
+
+const ACC_TEXT = {
+    fa: { title: 'ورود به بخش محافظت‌شده', email: 'برای دسترسی به «%s» نشانی ایمیل خود را وارد کنید تا کد ورود برایتان ارسال شود.',
+        sent: 'اگر این نشانی مجاز باشد، یک کد ۶ رقمی به آن ارسال شد. کد را وارد کنید.', bad: 'کد وارد شده درست نیست یا منقضی شده است.',
+        locked: 'تلاش‌های ناموفق زیاد بود. لطفاً چند دقیقه دیگر دوباره تلاش کنید.', many: 'درخواست‌های زیاد. لطفاً یک دقیقه دیگر تلاش کنید.',
+        deny: 'دسترسی به این بخش از وب‌سایت محدود است.', denyTitle: 'دسترسی محدود', send: 'ارسال کد', verify: 'ورود', ph: 'ایمیل',
+        code: 'کد ۶ رقمی' },
+    en: { title: 'Sign in to a protected area', email: 'To access "%s", enter your email address and we will send you a sign-in code.',
+        sent: 'If this address is allowed, a 6-digit code has been sent to it. Enter the code.', bad: 'The code is wrong or has expired.',
+        locked: 'Too many failed attempts. Please try again in a few minutes.', many: 'Too many requests. Please try again in a minute.',
+        deny: 'Access to this part of the website is restricted.', denyTitle: 'Restricted', send: 'Send code', verify: 'Sign in', ph: 'Email',
+        code: '6-digit code' },
+};
+
+function accT(key, name) {
+    return { fa: { title: ACC_TEXT.fa.title, lines: [ACC_TEXT.fa[key].replace('%s', name || '')] },
+        en: { title: ACC_TEXT.en.title, lines: [ACC_TEXT.en[key].replace('%s', name || '')] } };
+}
+
+function hidden(n, v) { return '<input type="hidden" name="' + n + '" value="' + esc(v) + '">'; }
+
+function emailForm(lang, app, next) {
+    const L = ACC_TEXT[lang];
+    return '<form method="post" action="/__pcdn/access/send">' + hidden('app', app.id) + hidden('next', next)
+        + '<input type="email" name="email" required maxlength="254" autocomplete="email" dir="ltr" placeholder="' + esc(L.ph) + '"> '
+        + '<button type="submit">' + esc(L.send) + '</button></form>';
+}
+
+function codeForm(lang, app, email, next) {
+    const L = ACC_TEXT[lang];
+    return '<form method="post" action="/__pcdn/access/verify">' + hidden('app', app.id) + hidden('email', email) + hidden('next', next)
+        + '<input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" dir="ltr" placeholder="'
+        + esc(L.code) + '"> <button type="submit">' + esc(L.verify) + '</button></form>';
+}
+
+// deny() for "acc:login:<app>" / "acc:deny:<app>"
+function accessDenied(r, site, kind, appId) {
+    const app = site && site.access ? site.access.byId[appId] : null;
+    if (kind === 'login' && app) {
+        const url = '/__pcdn/access/login?app=' + encodeURIComponent(app.id) + '&next=' + encodeURIComponent(safeNext(r.variables.request_uri));
+        if (wantsHtml(r)) {
+            r.headersOut['Cache-Control'] = 'no-store';
+            return r.return(302, url);
+        }
+        return sendJson(r, 401, { error: 'access_required', app: app.id, login: url });
+    }
+    if (!wantsHtml(r)) return sendJson(r, 403, { error: 'access_denied' });
+    const T = { fa: { title: ACC_TEXT.fa.denyTitle, lines: [ACC_TEXT.fa.deny] }, en: { title: ACC_TEXT.en.denyTitle, lines: [ACC_TEXT.en.deny] } };
+    gatePage(r, 403, pickLang(r), T, '', {});
+}
+
+function accessLogin(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    const q = queryArgs(r), app = A.byId[str(q.app, 64)] || null, next = safeNext(q.next), lang = pickLang(r);
+    if (!app || !app.otp) return r.return(404);
+    if (accessSession(r, site, app)) {
+        r.headersOut['Cache-Control'] = 'no-store';
+        return r.return(302, next);
+    }
+    gatePage(r, 200, lang, accT('email', app.name), emailForm(lang, app, next), {});
+}
+
+function accessSend(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    if (r.method !== 'POST') return r.return(405);
+    if (!sameOrigin(r)) return r.return(403);
+    const f = gateBody(r), ip = r.variables.remote_addr, lang = pickLang(r), json = jsonReq(r);
+    const app = A.byId[str(f.app, 64)] || null;
+    const email = str(f.email, 254).trim().toLowerCase(), next = safeNext(str(f.next, 2048));
+    const n = ngx.shared.pcdn_cnt.incr('as:' + site.id + ':' + ip + ':' + Math.floor(now() / 60), 1, 0);
+    if (n > ACC_SEND_PER_MIN) {
+        noteVerdict(r, 'acc:limited:' + (app ? app.id : '-'));
+        if (json) return sendJson(r, 429, { error: 'rate_limited' }, { 'Retry-After': '60' });
+        const T = { fa: { title: ACC_TEXT.fa.title, lines: [ACC_TEXT.fa.many] }, en: { title: ACC_TEXT.en.title, lines: [ACC_TEXT.en.many] } };
+        return gatePage(r, 429, lang, T, '', { 'Retry-After': '60' });
+    }
+    if (app && app.otp && ACC_EMAIL_RE.test(email) && emailAllowed(app, email)) {
+        try {
+            // detached: the visitor's answer never waits for the controller (no timing difference)
+            r.subrequest('/__pcdn/access/otp', { method: 'POST', detached: true,
+                body: JSON.stringify({ domain: site.domain, app: app.id, email: email }) });
+            noteVerdict(r, 'acc:otp:' + app.id + ':' + emailHash(A, email));
+        } catch (e) { r.error('pcdn access send: ' + e); }
+    }
+    // the same answer whether or not the address is allowed (no enumeration)
+    if (json || !app || !app.otp) return sendJson(r, 200, { ok: true, message: ACC_TEXT.en.sent });
+    gatePage(r, 200, lang, accT('sent'), codeForm(lang, app, email, next), {});
+}
+
+function accessVerify(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    if (r.method !== 'POST') return r.return(405);
+    if (!sameOrigin(r)) return r.return(403);
+    const f = gateBody(r), ip = r.variables.remote_addr, lang = pickLang(r), json = jsonReq(r), t = now();
+    const app = A.byId[str(f.app, 64)] || null;
+    const email = str(f.email, 254).trim().toLowerCase(), next = safeNext(str(f.next, 2048));
+    const code = str(f.code, 32).replace(/\s/g, '');
+    const okEmail = ACC_EMAIL_RE.test(email);
+    const tag = (app ? app.id : '-') + ':' + (okEmail ? emailHash(A, email) : '-');
+    const blk = ngx.shared.pcdn_blk, lockKey = 'al:' + site.id + ':' + ip;
+    const lockedUntil = blk.get(lockKey) || 0;
+    if (lockedUntil > t) {
+        noteVerdict(r, 'acc:locked:' + tag);
+        const wait = String(lockedUntil - t);
+        if (json) return sendJson(r, 429, { error: 'locked', retry_after: +wait }, { 'Retry-After': wait });
+        const T = { fa: { title: ACC_TEXT.fa.title, lines: [ACC_TEXT.fa.locked] }, en: { title: ACC_TEXT.en.title, lines: [ACC_TEXT.en.locked] } };
+        return gatePage(r, 429, lang, T, '', { 'Retry-After': wait });
+    }
+    let ok = false;
+    if (app && app.otp && okEmail && emailAllowed(app, email) && new RegExp('^\\d{' + OTP_DIGITS + '}$').test(code)) {
+        const w = Math.floor(t / OTP_WINDOW);
+        let hit = false;
+        for (let i = 0; i < OTP_WINDOWS; i++) hit = safeEq(code, otpCode(A.key, app.id, email, w - i)) || hit;
+        // a code signs in once
+        ok = hit && useOnce('ao:' + site.id + ':' + sha256(app.id + '|' + email + '|' + code).substring(0, 32), t + OTP_WINDOW * (OTP_WINDOWS + 1));
+    }
+    if (!ok) {
+        const n = ngx.shared.pcdn_cnt.incr('af:' + site.id + ':' + ip + ':' + Math.floor(t / ACC_FAIL_WINDOW), 1, 0);
+        if (n >= ACC_FAIL_MAX) blk.set(lockKey, t + ACC_LOCK_S);
+        noteVerdict(r, 'acc:fail:' + tag);
+        if (json || !app) return sendJson(r, 401, { ok: false, error: 'invalid_code' });
+        const T = accT('bad');
+        return gatePage(r, 401, lang, T, app.otp ? codeForm(lang, app, email, next) : '', {});
+    }
+    const exp = t + app.sessionS;
+    const b64 = Buffer.from(app.id + '|' + email + '|' + exp).toString('base64url');
+    r.headersOut['Set-Cookie'] = ACC_COOKIE + app.id + '=' + b64 + '.' + accSig(A, b64) + cookieAttrs(r, app.sessionS);
+    noteVerdict(r, 'acc:ok:' + tag);
+    if (json) return sendJson(r, 200, { ok: true, next: next });
+    r.headersOut['Cache-Control'] = 'no-store';
+    r.return(302, next);
+}
+
+function accessLogout(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    const q = queryArgs(r), one = A.byId[str(q.app, 64)];
+    const apps = one ? [one] : A.apps;
+    r.headersOut['Set-Cookie'] = apps.map(function (a) { return ACC_COOKIE + a.id + '=' + cookieAttrs(r, 0); });
+    r.headersOut['Cache-Control'] = 'no-store';
+    r.return(302, safeNext(q.next));
+}
+
 export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
-    bodyNeed, bodyInspect, tfHeaders, tunnelFair, fairSet, speedDown, speedUp, videoNext };
+    bodyNeed, bodyInspect, tfHeaders, tunnelFair, fairSet, speedDown, speedUp, videoNext,
+    accessEmail, accessLogin, accessSend, accessVerify, accessLogout };

@@ -10,6 +10,7 @@ Modules, lowest layer first (a module imports only from modules listed before it
     validation.storage  object-storage origins
     validation.regex    customer regex safety (parity with the controller)
     validation.rules    page rules, cache keys, redirects, transforms, bots, mTLS pulls, images, video
+    validation.gates    visitor gates: waiting room and access apps (SPEC §18.1, §18.2)
     usage               access-log usage, tunnel quality, live aggregates, L4 usage
     functions           edge functions glue (pcdn-fn): routes, code bundle, status, usage
     render.stream       L4 apps and the stream {} config
@@ -41,9 +42,9 @@ import types
 
 # every module, lowest layer first (as in the table above)
 _MODULE_NAMES = ("settings", "common", "capabilities", "reload", "validation.origin", "validation.storage",
-                 "validation.regex", "validation.rules", "usage", "functions", "render.stream", "render.guards",
-                 "render.shield", "render.http", "render.njs", "render.site", "render.tree", "logship", "nodelogs",
-                 "heartbeat", "purge", "apply", "controller", "imaged", "agent", "cli")
+                 "validation.regex", "validation.rules", "validation.gates", "usage", "functions", "render.stream",
+                 "render.guards", "render.shield", "render.http", "render.njs", "render.site", "render.tree", "logship",
+                 "nodelogs", "heartbeat", "purge", "apply", "controller", "imaged", "agent", "cli")
 _MODULES = tuple(importlib.import_module(f"{__name__}.{m}") for m in _MODULE_NAMES)
 _MISSING = object()
 
