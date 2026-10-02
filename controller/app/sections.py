@@ -207,6 +207,30 @@ WAF_GROUPS = ["sqli", "xss", "lfi", "rce", "php", "scanner", "protocol"]
 WAF_PACKS = ["generic", "wordpress", "joomla", "drupal", "laravel", "api"]
 
 
+def _iso_or_none(v):
+    """A controller-managed ISO 8601 UTC timestamp ("2026-10-09T12:00:00Z") or None; anything that
+    does not parse is dropped (these fields are ignored on input, see waf_learning.manage)."""
+    from .waf_learning import fmt_iso, parse_iso
+
+    dt = parse_iso(v)
+    return None if dt is None else fmt_iso(dt)
+
+
+class WafLearning(Strict):
+    """SPEC §17: WAF learning mode. `enabled` and `days` (1..30) are the customer's input; `until`
+    and `started_at` are managed by the controller (waf_learning.manage): whatever a client sends
+    for them is replaced by the stored values."""
+    enabled: bool = False
+    days: int = Field(7, ge=1, le=30)
+    until: str | None = Field(None, max_length=40)
+    started_at: str | None = Field(None, max_length=40)
+
+    @field_validator("until", "started_at", mode="before")
+    @classmethod
+    def _ts(cls, v):
+        return _iso_or_none(v) if isinstance(v, str) else None
+
+
 class Waf(Strict):
     mode: Literal["off", "detect", "block"] = "off"
     paranoia: int = Field(1, ge=1, le=3)
@@ -216,6 +240,8 @@ class Waf(Strict):
     # empty = no managed pack (today's behaviour); packs honour `mode` and `exclusions`
     packs: list[Literal["generic", "wordpress", "joomla", "drupal", "laravel", "api"]] = Field(
         default_factory=list, max_length=20)
+    # SPEC §17: learning mode (observe in log mode, propose exclusions / rate limits / pack changes)
+    learning: WafLearning = Field(default_factory=WafLearning)
 
     @field_validator("packs")
     @classmethod
@@ -1865,6 +1891,10 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
         data = _strip_function_outputs(data)
     parsed = model.model_validate(data)
     value = dump(parsed)
+    if name == "waf":  # SPEC §17: started_at / until are controller-managed
+        from . import waf_learning
+
+        value = waf_learning.manage(site, value)
     if gate and not feats[gate]:
         # allow writing the "disabled" shape so clients can always turn things off
         if value != dump(model()) and _is_enabled(name, value):
@@ -2154,7 +2184,7 @@ def _tsig_name_ok(site, name: str) -> bool:
 
 def _is_enabled(name: str, value: dict) -> bool:
     if name == "waf":
-        return value["mode"] != "off"
+        return value["mode"] != "off" or bool((value.get("learning") or {}).get("enabled"))
     if name == "ddos":
         return value["mode"] != "off"
     if name == "image":

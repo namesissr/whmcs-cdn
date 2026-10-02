@@ -15,7 +15,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import dns_secondary, edge_functions, images, l4, logexport, origin_pull, pdns, sections, ssl, tunnel, webhooks
+from . import (dns_secondary, edge_functions, images, l4, logexport, origin_pull, pdns, sections, ssl, tunnel,
+               waf_learning, webhooks)
 from .audit import record_audit
 from .auth import require_admin
 from .config import settings
@@ -178,6 +179,55 @@ def config_audit(section: str, value: dict) -> dict:
     if section == "functions":
         return sections.functions_audit(value)
     return {"section": section}
+
+
+# ------------------------------------------------------------------ WAF learning mode (SPEC §17.2)
+
+class LearningApplyIn(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=200)
+
+
+def waf_learning_of(db: Session, site: Site) -> dict:
+    return waf_learning.report(db, site)
+
+
+def waf_learning_apply_of(db: Session, site: Site, ids: list[str]) -> dict:
+    """Apply the chosen proposals (normal section validation, one commit); already applied ones
+    are `unchanged` (idempotent). Unknown ids -> 422 and nothing is applied."""
+    try:
+        return waf_learning.apply(db, site, ids)
+    except waf_learning.UnknownProposals as e:
+        db.rollback()
+        raise HTTPException(422, "پیشنهاد نامعتبر یا منقضی است: " + ", ".join(e.ids[:20]))
+    except pydantic.ValidationError as e:
+        db.rollback()
+        _pydantic_422(e)
+    except PermissionError as e:
+        db.rollback()
+        raise HTTPException(403, str(e))
+    except ValidationError as e:
+        db.rollback()
+        bad(e)
+
+
+def waf_learning_audit(result: dict) -> dict:
+    return {"section": ",".join(result["changed"]), "items": result["applied"],
+            "count": len(result["applied"])}
+
+
+@router.get("/sites/{domain}/waf/learning")
+def waf_learning_report(domain: str, db: Session = Depends(get_db)):
+    """Learning state and proposals (SPEC §17.2). Nothing is ever applied automatically."""
+    return waf_learning_of(db, get_site(db, domain))
+
+
+@router.post("/sites/{domain}/waf/learning/apply")
+def waf_learning_apply(domain: str, body: LearningApplyIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = waf_learning_apply_of(db, site, body.ids)
+    if result["applied"]:
+        _audit(db, request, "waf.learning.apply", site.domain, waf_learning_audit(result))
+    return result
 
 
 # ------------------------------------------------------------------ images v2 (SPEC §16.6)

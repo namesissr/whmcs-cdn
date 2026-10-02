@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import (botranges, crypto, dnsbuild, images, l4, logexport, origin_guard, origin_pull, pdns, sections, storage,
-               webhooks)
+               waf_learning, webhooks)
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -546,7 +546,8 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "blocked_ips": site.blocked_ip_list,
             "cache": cache,
             "ssl_options": ssl_opts,
-            "waf": cfg["waf"],
+            # SPEC §17.1: learning reduced to {enabled, until}; off without the plan's WAF
+            "waf": waf_learning.edge_waf(cfg["waf"], feats),
             "ddos": cfg["ddos"],
             "firewall": cfg["firewall"],
             "ratelimit": cfg["ratelimit"],

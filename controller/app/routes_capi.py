@@ -48,6 +48,7 @@ from .routes_admin import (
 from .routes_platform import live_of
 from .routes_tunnel import quality_of, usage_of
 from .routes_v2 import (
+    LearningApplyIn,
     config_audit,
     csv_body,
     functions_stats_of,
@@ -57,6 +58,9 @@ from .routes_v2 import (
     read_section_of,
     site_analytics,
     site_events,
+    waf_learning_apply_of,
+    waf_learning_audit,
+    waf_learning_of,
     write_section_of,
 )
 from .validation import fqdn
@@ -247,6 +251,24 @@ def tunnel_health(key: ApiKey = Depends(require_scope("stats")), db: Session = D
 def functions_stats(hours: int = 24, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
     """Invocations, CPU ms, errors and timeouts of the site's edge functions, last `hours` (1..744)."""
     return functions_stats_of(db, _site(key), hours)
+
+
+# ------------------------------------------------------------------ WAF learning (SPEC §17.2)
+
+@router.get("/waf/learning")
+def waf_learning_report(key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Learning state and proposals (scope stats)."""
+    return waf_learning_of(db, _site(key))
+
+
+@router.post("/waf/learning/apply")
+def waf_learning_apply(body: LearningApplyIn, request: Request,
+                       key: ApiKey = Depends(require_scope("config", write=True)), db: Session = Depends(get_db)):
+    """Apply chosen proposals (scope config; refused while suspended); idempotent."""
+    result = waf_learning_apply_of(db, _site(_rate_limit_config(key)), body.ids)
+    if result["applied"]:
+        _audit(db, request, key, "waf.learning.apply", waf_learning_audit(result))
+    return result
 
 
 # ------------------------------------------------------------------ records (scope: dns), config (config / functions)

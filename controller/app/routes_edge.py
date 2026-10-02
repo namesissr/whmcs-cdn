@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import alerts, dnsbuild, live, logexport, webhooks
+from . import alerts, dnsbuild, live, logexport, sections, waf_learning, webhooks
 from .auth import require_edge
 from .config import settings
 from .db import get_db
@@ -380,6 +380,10 @@ class UsageItem(BaseModel):
     video: VideoUsage | None = None
     # SPEC §16.9 (optional): edge function invocations of this host-hour (not billed as bytes)
     functions: FunctionsUsage | None = None
+    # SPEC §17.1 (optional): WAF learning observations of this host-hour, only from sites in learning
+    # mode (waf_learning.WafLearn: junk keys dropped and bounded, bad counters 422). Reports for a site
+    # that is not learning (or for an hour outside its window) are dropped by the controller.
+    waf_learn: waf_learning.WafLearn | None = None
 
     @field_validator("l4", mode="before")
     @classmethod
@@ -487,6 +491,9 @@ def _merge_details(current: dict, add: dict) -> dict:
                 a = apps[app_id] = {}
             for k in L4_COUNTERS:
                 a[k] = num(a.get(k)) + num(c.get(k))
+    wl = _obj(add.get("waf_learn"))
+    if wl:
+        current["waf_learn"] = waf_learning.merge(current.get("waf_learn"), wl)
     tn = _obj(add.get("tunnel"))
     if tn:
         dst = current.get("tunnel")
@@ -561,6 +568,7 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
     agg: dict[tuple[int, datetime], dict] = {}
     # security events per site in this batch (attack.detected webhook, SPEC §14.3.3)
     security: dict[int, dict[str, int]] = {}
+    learning: dict[int, dict] = {}  # site id -> waf.learning (only looked up for items with waf_learn)
     for it in body.items:
         sid = _site_for_host(it.host, domains)
         if sid is None:
@@ -579,7 +587,14 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         a["b"] += sum(u.bytes_in + u.bytes_out for u in it.l4.values())
         a["r"] += it.requests
         a["h"] += it.cache_hits
-        _merge_details(a["d"], it.model_dump())
+        item = it.model_dump()
+        if item.get("waf_learn") is not None:
+            if sid not in learning:
+                site = db.get(Site, sid)
+                learning[sid] = sections.get_section(site, "waf")["learning"] if site is not None else {}
+            if not waf_learning.accepts(learning[sid], hour):
+                item["waf_learn"] = None  # SPEC §17.1: only sites in learning, inside the window
+        _merge_details(a["d"], item)
         for k, v in it.security.items():
             if v > 0:
                 src = security.setdefault(sid, {})
