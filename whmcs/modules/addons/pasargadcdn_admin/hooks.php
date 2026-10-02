@@ -194,6 +194,23 @@ add_hook('ClientAreaHomepagePanels', 1, function ($panels) {
         if ($uid <= 0) {
             return;
         }
+        // SPEC §20.3: «دامنه‌های اشتراکی» — the domains other accounts shared with this client, with «مدیریت»
+        try {
+            require_once __DIR__ . '/lib/Data.php';
+            require_once __DIR__ . '/lib/Sharing.php';
+            if (\PasargadCdn\Admin\Env::loadServerModule() && ($card = \PasargadCdn\Admin\Sharing::homeSharedCard($uid)) !== '') {
+                $en = function_exists('pasargadcdn_lang') && \pasargadcdn_lang([]) === 'en';
+                $panels->addChild('pasargadcdn_shared_domains', [
+                    'label' => $en ? 'Domains shared with you' : 'دامنه‌های اشتراکی',
+                    'icon' => 'fa-users',
+                    'order' => 235,
+                    'extras' => ['color' => 'green', 'btn-link' => \PasargadCdn\Admin\Sharing::ROUTE, 'btn-text' => $en ? 'All shared domains' : 'همهٔ دامنه‌های اشتراکی'],
+                    'bodyHtml' => $card,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            // the home page never breaks because of this card
+        }
         // SPEC §20.2: «دعوت به مدیریت دامنه» — pending invitations to this client's primary e-mail (one query when none)
         try {
             require_once __DIR__ . '/lib/Data.php';
@@ -330,5 +347,102 @@ add_hook('AfterCronJob', 1, function ($vars) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: storage billing cron hook error: ' . $e->getMessage());
         }
+    }
+});
+
+/**
+ * SPEC §20.3: the logged-in client's id for the client-area menu hooks below (0 when nobody is logged in).
+ */
+if (!function_exists('pasargadcdn_admin_client_id')) {
+    function pasargadcdn_admin_client_id(): int
+    {
+        try {
+            if (class_exists('\\WHMCS\\Authentication\\CurrentUser')) {
+                $c = (new \WHMCS\Authentication\CurrentUser())->client();
+                return $c ? (int) $c->id : 0;
+            }
+        } catch (\Throwable $e) {
+            // fall through
+        }
+        return (int) ($_SESSION['uid'] ?? 0);
+    }
+}
+
+/** The client's shared domains / pending invitations, or null when there are none (or on any error). */
+if (!function_exists('pasargadcdn_admin_shared_links')) {
+    function pasargadcdn_admin_shared_links(int $uid): ?array
+    {
+        if ($uid <= 0) {
+            return null;
+        }
+        try {
+            require_once __DIR__ . '/lib/Env.php';
+            require_once __DIR__ . '/lib/View.php';
+            require_once __DIR__ . '/lib/Data.php';
+            require_once __DIR__ . '/lib/Sharing.php';
+            if (!\PasargadCdn\Admin\Env::loadServerModule()) {
+                return null;
+            }
+            $mine = \PasargadCdn\Admin\Sharing::mine($uid);
+            if (!$mine['active'] && !$mine['pending']) {
+                return null;
+            }
+            return ['label' => \PasargadCdn\Admin\Sharing::menuLabel($uid), 'links' => \PasargadCdn\Admin\Sharing::links($uid)];
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+}
+
+// SPEC §20.3: «دامنه‌های اشتراکی» under the client-area «Services» menu (only for clients with a share or an invite)
+add_hook('ClientAreaPrimaryNavbar', 1, function ($navbar) {
+    try {
+        if (!is_object($navbar) || !method_exists($navbar, 'getChild')) {
+            return;
+        }
+        $info = pasargadcdn_admin_shared_links(pasargadcdn_admin_client_id());
+        if ($info === null) {
+            return;
+        }
+        $services = $navbar->getChild('Services');
+        $item = ['label' => $info['label'], 'uri' => \PasargadCdn\Admin\Sharing::ROUTE, 'order' => 15];
+        if (is_object($services) && method_exists($services, 'addChild')) {
+            $services->addChild('pasargadcdn-shared-domains', $item);
+        } else {
+            $navbar->addChild('pasargadcdn-shared-domains', $item + ['order' => 25]);
+        }
+    } catch (\Throwable $e) {
+        // the menu never breaks because of this item
+    }
+});
+
+// SPEC §20.3: on «My Services» (and the service pages) a sidebar box lists the shared domains with direct
+// «مدیریت» links — a shared domain is not a WHMCS service of the member, so it is not in that list itself
+add_hook('ClientAreaSecondarySidebar', 1, function ($sidebar) {
+    try {
+        if (!is_object($sidebar) || !method_exists($sidebar, 'addChild')) {
+            return;
+        }
+        $script = basename((string) ($_SERVER['SCRIPT_NAME'] ?? ''));
+        $action = (string) ($_GET['action'] ?? '');
+        if ($script !== 'clientarea.php' || !in_array($action, ['products', 'services', 'productdetails'], true)) {
+            return;
+        }
+        $info = pasargadcdn_admin_shared_links(pasargadcdn_admin_client_id());
+        if ($info === null) {
+            return;
+        }
+        $box = $sidebar->addChild('pasargadcdn-shared-domains', ['label' => $info['label'], 'icon' => 'fa-users', 'order' => 5]);
+        if (!is_object($box) || !method_exists($box, 'addChild')) {
+            return;
+        }
+        $i = 0;
+        foreach ($info['links'] as [$domain, $uri, $id]) {
+            $box->addChild('pcdn-share-' . $id, ['label' => $domain, 'uri' => $uri, 'order' => ++$i]);
+        }
+        $box->addChild('pcdn-share-all', ['label' => function_exists('pasargadcdn_lang') && \pasargadcdn_lang([]) === 'en'
+            ? 'All shared domains / invitations' : 'همهٔ دامنه‌های اشتراکی و دعوت‌ها', 'uri' => \PasargadCdn\Admin\Sharing::ROUTE, 'order' => 999]);
+    } catch (\Throwable $e) {
+        // the sidebar never breaks because of this box
     }
 });

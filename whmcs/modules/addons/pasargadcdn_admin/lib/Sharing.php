@@ -213,7 +213,9 @@ final class Sharing
                 (int) $res->owner_client_id);
             if ($a === 'accept') {
                 Shares::mailAccepted($res);
-                return ['success', self::tx('دعوت پذیرفته شد؛ اکنون می‌توانید ' . $res->domain . ' را مدیریت کنید.', 'Invitation accepted; you can now manage ' . $res->domain . '.')];
+                self::$memo = [];
+                return ['success', self::tx('دعوت پذیرفته شد؛ اکنون می‌توانید ' . $res->domain . ' را مدیریت کنید.', 'Invitation accepted; you can now manage ' . $res->domain . '.'),
+                    self::ROUTE . '&share=' . (int) $res->id];
             }
             return ['info', self::tx('دعوت رد شد.', 'Invitation declined.')];
         }
@@ -222,6 +224,7 @@ final class Sharing
             if (!$r) {
                 return ['danger', self::tx('اشتراک پیدا نشد.', 'Share not found.')];
             }
+            self::$memo = [];
             Shares::log('#' . (int) $r->id . ' left by client #' . $clientId . ' (' . $r->domain . ')', (int) $r->owner_client_id);
             return ['info', self::tx('از مدیریت ' . $r->domain . ' خارج شدید.', 'You left ' . $r->domain . '.')];
         }
@@ -239,8 +242,10 @@ final class Sharing
         $dir = $en ? 'ltr' : 'rtl';
         $flash = '';
         if ($method === 'POST') {
-            [$tone, $msg] = self::act($post, $clientId);
-            $flash = '<div class="alert alert-' . $tone . '" role="status" data-share-flash="' . self::e($tone) . '">' . self::e($msg) . '</div>';
+            $res = self::act($post, $clientId);
+            [$tone, $msg] = $res;
+            $go = isset($res[2]) ? ' <a class="btn btn-primary btn-sm" data-manage-now="1" href="' . self::e($res[2]) . '">' . self::e(self::tx('مدیریت دامنه', 'Manage the domain')) . '</a>' : '';
+            $flash = '<div class="alert alert-' . $tone . '" role="status" data-share-flash="' . self::e($tone) . '">' . self::e($msg) . $go . '</div>';
         }
         $sid = ctype_digit((string) ($get['share'] ?? '')) ? (int) $get['share'] : 0;
         if ($sid > 0 && $method !== 'POST') {
@@ -340,10 +345,65 @@ final class Sharing
 
     // ------------------------------------------------------------------ home card / cron
 
+    /** @var array<int, array> per-request memo of activeFor/pendingFor (the hooks run on every client page) */
+    private static $memo = [];
+
+    /** Drop the per-request memo (after an accept/leave, and in tests). */
+    public static function forget(): void
+    {
+        self::$memo = [];
+    }
+
+    /** ['active' => rows, 'pending' => rows] of $clientId, memoised for this request. */
+    public static function mine(int $clientId): array
+    {
+        if ($clientId <= 0) {
+            return ['active' => [], 'pending' => []];
+        }
+        if (!isset(self::$memo[$clientId])) {
+            self::$memo[$clientId] = ['active' => Shares::activeFor($clientId), 'pending' => Shares::pendingFor($clientId)];
+        }
+        return self::$memo[$clientId];
+    }
+
+    /** Menu label «دامنه‌های اشتراکی» (+ the count of pending invitations). */
+    public static function menuLabel(int $clientId): string
+    {
+        $m = self::mine($clientId);
+        $n = count($m['pending']);
+        return self::tx('دامنه‌های اشتراکی', 'Shared domains') . ($n > 0 ? ' (' . $n . ')' : '');
+    }
+
+    /** [label, uri] links: one «مدیریت» link per active shared domain, then the list page. */
+    public static function links(int $clientId): array
+    {
+        $out = [];
+        foreach (self::mine($clientId)['active'] as $r) {
+            $out[] = [(string) $r->domain, self::ROUTE . '&share=' . (int) $r->id, (int) $r->id];
+        }
+        return $out;
+    }
+
+    /** Home panel body listing the active shared domains with «مدیریت» buttons ('' when none). */
+    public static function homeSharedCard(int $clientId): string
+    {
+        $rows = self::mine($clientId)['active'];
+        if (!$rows) {
+            return '';
+        }
+        $h = '<div class="pcdn-share-card" data-shared-card="1"><ul class="list-unstyled">';
+        foreach ($rows as $r) {
+            $h .= '<li style="margin:4px 0"><strong dir="ltr">' . self::e($r->domain) . '</strong> ' . self::roleBadge((string) $r->role)
+                . ' <a class="btn btn-primary btn-xs" data-manage="1" href="' . self::e(self::ROUTE . '&share=' . (int) $r->id) . '">'
+                . self::e(self::tx('مدیریت', 'Manage')) . '</a></li>';
+        }
+        return $h . '</ul></div>';
+    }
+
     /** «دعوت به مدیریت دامنه» card body for the client-area home ('' when nothing is pending). */
     public static function homeCard(int $clientId): string
     {
-        $rows = Shares::pendingFor($clientId);
+        $rows = self::mine($clientId)['pending'];
         if (!$rows) {
             return '';
         }
