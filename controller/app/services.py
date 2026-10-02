@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import botranges, crypto, dnsbuild, images, l4, logexport, origin_pull, pdns, sections, storage, webhooks
+from . import (botranges, crypto, dnsbuild, images, l4, logexport, origin_guard, origin_pull, pdns, sections, storage,
+               webhooks)
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -268,6 +269,7 @@ def site_to_dict(db: Session, site: Site) -> dict:
         "id": site.id,
         "domain": site.domain,
         "external_id": site.external_id,
+        "client_id": site.client_id,
         "reseller_client_id": site.reseller_client_id,
         "reseller_label": site.reseller_label,
         "status": site.effective_status,
@@ -433,6 +435,8 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
     shield_used = False
     platform_pull = False  # some site presents the platform origin-pull client certificate
     buckets = storage.edge_buckets(db)  # SPEC §16.8 storage origins: (site id, name) -> bucket
+    # origin host names that resolve to non-public addresses (origin_guard.py): never handed out
+    blocked_hosts = origin_guard.blocked(db)
     for site in db.scalars(select(Site).order_by(Site.id)):
         hosts, seen = [], set()
         storage_on = bool(buckets) and sections.features_of(site)["storage_gb"] > 0
@@ -457,7 +461,7 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
                 origin = {"pool": r.pool}
             else:
                 address = resolve_origin(site, r)
-                if not address:
+                if not address or origin_guard.is_blocked(blocked_hosts, address):
                     continue
                 origin = {"address": address, "port": r.origin_port}
             seen.add(name)
@@ -501,6 +505,18 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
         if not feats["load_balancer"]:
             cfg["pools"] = {"pools": []}
             hosts = [h for h in hosts if "pool" not in h["origin"]]
+        if blocked_hosts:
+            # members on the origin guard's block list leave their pool; an emptied pool goes
+            pools = []
+            for p in cfg["pools"]["pools"]:
+                members = [o for o in p["origins"] if not origin_guard.is_blocked(blocked_hosts, o["address"])]
+                if members:
+                    pools.append(dict(p, origins=members))
+            cfg["pools"] = dict(cfg["pools"], pools=pools)
+        # H2: a firewall rule stored before the regex safety check existed is not sent while one of
+        # its regex conditions fails that check (dropping only the condition would widen the rule)
+        cfg["firewall"] = dict(cfg["firewall"], rules=[r for r in cfg["firewall"]["rules"]
+                                                       if sections.firewall_rule_safe(r)])
         for key, feat in (("firewall", "max_firewall_rules"), ("ratelimit", "max_ratelimit_rules"),
                           ("pagerules", "max_page_rules"), ("transform", "max_transform_rules"),
                           ("redirects", "max_redirects")):
@@ -544,9 +560,9 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             # SPEC §16.5: HLS/DASH delivery settings, passed through
             "video": cfg["video"],
             # SPEC §16.4: this site's TCP/UDP apps for this node (same apps as the node-wide `l4`)
-            "l4": l4.site_block(site, edge),
+            "l4": l4.site_block(site, edge, blocked_hosts),
             "errorpages": cfg["errorpages"],
-            "tunnel": tunnel_for_edge(site, cfg["tunnel"], feats, pool_names),
+            "tunnel": tunnel_for_edge(site, cfg["tunnel"], feats, pool_names, blocked_hosts),
             # rules & security (SPEC §14.2); waf.packs travels inside "waf"
             "transform": cfg["transform"],
             "redirects": cfg["redirects"],
@@ -582,7 +598,7 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
         },
         # SPEC §16.4: the TCP/UDP proxy apps this node listens for — apps of the node's own edge
         # group, of active sites whose plan has l4_proxy, enabled apps only (l4.edge_block)
-        "l4": l4.edge_block(db, edge),
+        "l4": l4.edge_block(db, edge, blocked_hosts),
     }
     # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
@@ -604,11 +620,15 @@ def functions_for_edge(site: Site, fn: dict, feats: dict) -> dict:
     return {"enabled": bool(items), "on_error": fn["on_error"], "items": items}
 
 
-def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str]) -> dict:
+def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str],
+                    blocked_hosts: dict | None = None) -> dict:
     """Tunnel section as the edges get it (SPEC §7.3): plan limits folded in."""
     t = dict(tunnel)
-    # a path whose pool is gone (or load balancing is off) is dropped, like hosts above
-    t["paths"] = [p for p in t["paths"] if not p["pool"] or p["pool"] in pool_names][: feats["max_tunnel_paths"]]
+    # a path whose pool is gone (or load balancing is off) is dropped, like hosts above; so is a
+    # path whose own origin host is on the origin guard's block list
+    t["paths"] = [p for p in t["paths"] if (not p["pool"] or p["pool"] in pool_names) and not (
+        blocked_hosts and p.get("origin") and origin_guard.is_blocked(blocked_hosts, p["origin"]["address"]))
+    ][: feats["max_tunnel_paths"]]
     cap = feats["tunnel_max_mbps"]
     if cap > 0 and (t["per_connection_mbps"] == 0 or t["per_connection_mbps"] > cap):
         t["per_connection_mbps"] = cap

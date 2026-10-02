@@ -26,6 +26,8 @@ def utcnow() -> datetime:
 
 class Site(Base):
     __tablename__ = "sites"
+    # never reuse a deleted site's id on SQLite either: the edges key cache directories / state by it
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     domain: Mapped[str] = mapped_column(String(253), unique=True, index=True)
@@ -49,6 +51,9 @@ class Site(Base):
     # reseller tag: a sub-site owned by a reseller's WHMCS client (set by WHMCS), see SPEC §10.5
     reseller_client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True, default=None)
     reseller_label: Mapped[str | None] = mapped_column(String(120), nullable=True, default=None)
+    # owning WHMCS client (tblclients.id, set by WHMCS); with reseller_client_id it decides who
+    # "owns" a domain for the parent/child zone rule (tenancy.py, security review C1)
+    client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True, default=None)
 
     # customer settings: JSON document of sections (see sections.SECTIONS / SPEC §2)
     config: Mapped[str] = mapped_column(Text, default="{}")
@@ -293,6 +298,9 @@ class EdgeUptime(Base):
 
 class Purge(Base):
     __tablename__ = "purges"
+    # edges fetch purges with ?after=<last id seen>: ids must never be reused, also on SQLite (which
+    # otherwise hands out max(id)+1 again once the newest rows are deleted) — migration 0019
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
@@ -378,7 +386,7 @@ class ApiKey(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
     key_hash: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(64), default="")
-    scopes: Mapped[str] = mapped_column(Text, default="[]")  # JSON list, subset of {purge, stats, dns}
+    scopes: Mapped[str] = mapped_column(Text, default="[]")  # JSON list, subset of routes_admin.CAPI_SCOPES
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)

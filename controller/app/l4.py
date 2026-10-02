@@ -30,7 +30,7 @@ def _apps(site: Site) -> list[dict]:
     """The stored l4 apps of a site (validated; [] when absent or corrupt)."""
     try:
         stored = json.loads(site.config or "{}").get("l4") or {}
-        return sections.dump(sections.L4.model_validate(stored))["apps"]
+        return sections.dump(sections.L4.model_validate(stored, context=sections.STORED))["apps"]
     except Exception:  # noqa: BLE001 - corrupt/legacy data: no apps
         return []
 
@@ -104,7 +104,14 @@ def _serves(site: Site, edge, feats: dict) -> bool:
             and dnsbuild.site_edge_group(site) == dnsbuild.edge_group(edge))
 
 
-def site_block(site: Site, edge) -> dict:
+def _origin_ok(a: dict, blocked_hosts) -> bool:
+    """False while the app's origin host name is on the origin guard's block list."""
+    from . import origin_guard
+
+    return not (blocked_hosts and origin_guard.is_blocked(blocked_hosts, a["origin"]["address"]))
+
+
+def site_block(site: Site, edge, blocked_hosts=None) -> dict:
     """The per-site `l4` block of the edge config: the section shape ({"apps": [...]}, each app with
     its allocated edge_port and hostname) holding exactly the apps the node-wide `l4` list carries
     for this site — empty unless the requesting node is of the site's group, the site is active and
@@ -113,13 +120,19 @@ def site_block(site: Site, edge) -> dict:
     if not _serves(site, edge, feats):
         return {"apps": []}
     return {"apps": [dict(a, hostname=sections.l4_hostname(a["id"], site.domain))
-                     for a in _apps(site)[: feats["max_l4_apps"]] if a["enabled"] and a["edge_port"] is not None]}
+                     for a in _apps(site)[: feats["max_l4_apps"]]
+                     if a["enabled"] and a["edge_port"] is not None and _origin_ok(a, blocked_hosts)]}
 
 
-def edge_block(db: Session, edge) -> list[dict]:
-    """Node-wide `l4` list of the edge config for `edge` (see the module docstring)."""
+def edge_block(db: Session, edge, blocked_hosts=None) -> list[dict]:
+    """Node-wide `l4` list of the edge config for `edge` (see the module docstring). Apps whose
+    origin host is blocked by the origin guard are left out (origin_guard.py)."""
     if edge is None:
         return []
+    if blocked_hosts is None:
+        from . import origin_guard
+
+        blocked_hosts = origin_guard.blocked(db)
     group = dnsbuild.edge_group(edge)
     out = []
     for site in db.scalars(select(Site).order_by(Site.id)):
@@ -129,7 +142,7 @@ def edge_block(db: Session, edge) -> list[dict]:
         if not _serves(site, edge, feats):
             continue
         for a in _apps(site)[: feats["max_l4_apps"]]:
-            if not a["enabled"] or a["edge_port"] is None:
+            if not a["enabled"] or a["edge_port"] is None or not _origin_ok(a, blocked_hosts):
                 continue
             out.append({
                 "site": site.domain,

@@ -57,6 +57,9 @@ def secrets_at_rest():
 async def lifespan(app: FastAPI):
     init_db()
     secrets_at_rest()
+    from . import pdns
+
+    pdns.check_transport()  # M5: plain-HTTP PowerDNS API over a public network
     sched = None
     if settings.scheduler_enabled:
         from . import scheduler

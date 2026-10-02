@@ -310,7 +310,7 @@ def test_audit_has_ids_and_sizes_but_no_code(client):
 
 def test_capi_functions_write_and_audit(client):
     make_site(client, edge_functions=True, max_functions=5)
-    key = client.post(f"{S}/apikeys", json={"name": "ci", "scopes": ["dns"]}).json()["key"]
+    key = client.post(f"{S}/apikeys", json={"name": "ci", "scopes": ["functions"]}).json()["key"]
     h = {"Authorization": f"Bearer {key}"}
     r = client.put("/capi/v1/config/functions", json={"enabled": True, "items": [fn()]}, headers=h)
     assert r.status_code == 200 and r.json()["items"][0]["code"] == CODE

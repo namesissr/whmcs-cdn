@@ -438,6 +438,7 @@ class Server:
 
 def test_tunnel_check(client, monkeypatch, tmp_path):
     monkeypatch.setattr(tunnel, "_public", lambda ip: True)  # the test servers live on 127.0.0.1
+    _allow_local_origins(monkeypatch)
     cert, key = _cert(tmp_path, "localhost")
     (tmp_path / "c.pem").write_text(cert)
     (tmp_path / "k.pem").write_text(key)
@@ -482,9 +483,20 @@ def test_tunnel_check(client, monkeypatch, tmp_path):
         tls.close()
 
 
+def _allow_local_origins(monkeypatch):
+    """The origin guard (origin_guard.py) refuses localhost origins on save; these tests probe local
+    test servers (or a legacy origin stored before the guard), so it is switched off here."""
+    from app import origin_guard
+
+    monkeypatch.setattr(origin_guard, "name_problem", lambda host: None)
+    monkeypatch.setattr(origin_guard, "host_problem", lambda host: None)
+
+
 def test_tunnel_check_refuses_private_addresses(client, monkeypatch):
     site(client, origin=None)
-    client.post(f"{S}/records", json={"name": "@", "type": "CNAME", "content": "localhost", "proxied": True})
+    with monkeypatch.context() as m:  # a legacy origin saved before the origin guard existed
+        _allow_local_origins(m)
+        client.post(f"{S}/records", json={"name": "@", "type": "CNAME", "content": "localhost", "proxied": True})
     client.put(f"{S}/config/tunnel", json={"paths": [{"id": "own", "path": "/own", "protocol": "ws"}]})
     (res,) = client.post(f"{S}/tunnel/check").json()["results"]
     assert res["ok"] is False and "عمومی" in res["error"]

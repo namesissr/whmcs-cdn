@@ -289,7 +289,7 @@ def test_image_secret_via_capi(client):
     make_site(client)
     routes_capi._hits.clear()
     routes_capi._config_hits.clear()
-    key = client.post(f"{S}/apikeys", json={"name": "k", "scopes": ["dns"]}).json()["key"]
+    key = client.post(f"{S}/apikeys", json={"name": "k", "scopes": ["config"]}).json()["key"]
     h = {"Authorization": f"Bearer {key}"}
     r = client.post("/capi/v1/image/transform-secret", headers=h)
     assert r.status_code == 200 and r.json()["transform_secret"].startswith("imgsec_")
@@ -482,19 +482,20 @@ def test_record_probe_check_tcp_http_and_ssrf(monkeypatch):
 # ------------------------------------------------------------------ §16.7 secondary DNS
 
 def test_dns_secondary_slave_zone(client, fake_pdns):
-    make_site(client)
+    make_site(client, dns_secondary=True)
     z = "example.com."
     assert fake_pdns.zones[z]["kind"] == "Native"
     body = {"mode": "primary_elsewhere", "primaries": ["93.184.216.53"],
-            "tsig": {"name": "Transfer-Key.", "algorithm": "hmac-sha256", "secret": TSIG}}
+            "tsig": {"name": "Transfer-Key.Example.com.", "algorithm": "hmac-sha256", "secret": TSIG}}
     r = client.put(f"{S}/config/dns_secondary", json=body)
     assert r.status_code == 200, r.text
-    assert r.json()["tsig"] == {"name": "transfer-key", "algorithm": "hmac-sha256", "secret": "",
+    assert r.json()["tsig"] == {"name": "transfer-key.example.com", "algorithm": "hmac-sha256", "secret": "",
                                 "secret_set": True}
     zone = fake_pdns.zones[z]
     assert zone["kind"] == "Slave" and zone["masters"] == ["93.184.216.53"]
-    assert fake_pdns.tsigkeys["transfer-key."]["key"] == TSIG
-    assert zone["metadata"] == {"AXFR-MASTER-TSIG": ["transfer-key"]}
+    assert fake_pdns.tsigkeys["transfer-key.example.com."]["key"] == TSIG
+    # H1: LUA records are off for the transferred (customer-written) zone
+    assert zone["metadata"] == {"AXFR-MASTER-TSIG": ["transfer-key.example.com"], "ENABLE-LUA-RECORDS": ["0"]}
     assert fake_pdns.axfr_retrieved == [z]
     assert TSIG not in client.get(S).text and TSIG not in client.get("/api/v1/audit").text
     # a slave zone's rrsets are never written (the fake refuses PATCH on slaves like PowerDNS)
@@ -502,11 +503,11 @@ def test_dns_secondary_slave_zone(client, fake_pdns):
         "dns_error"] is None
     assert fake_pdns.rrset(z, "x.example.com.", "A") is None
     # the same key without a new secret keeps it; a renamed key needs one
-    body2 = {**body, "tsig": {"name": "transfer-key", "algorithm": "hmac-sha512"}}
+    body2 = {**body, "tsig": {"name": "transfer-key.example.com", "algorithm": "hmac-sha512"}}
     assert client.put(f"{S}/config/dns_secondary", json=body2).status_code == 200
-    assert fake_pdns.tsigkeys["transfer-key."]["algorithm"] == "hmac-sha512"
+    assert fake_pdns.tsigkeys["transfer-key.example.com."]["algorithm"] == "hmac-sha512"
     assert client.put(f"{S}/config/dns_secondary",
-                      json={**body, "tsig": {"name": "other-key"}}).status_code == 422
+                      json={**body, "tsig": {"name": "other-key.example.com"}}).status_code == 422
 
     # back to off: Native again, records published, metadata and the key gone
     r = client.put(f"{S}/config/dns_secondary", json={"mode": "off"})
@@ -517,29 +518,31 @@ def test_dns_secondary_slave_zone(client, fake_pdns):
 
 
 def test_dns_secondary_allow_axfr_and_validation(client, fake_pdns):
-    make_site(client)
-    make_site(client, "other.com")
+    make_site(client, dns_secondary=True)
+    make_site(client, "other.com", dns_secondary=True)
     z = "example.com."
     assert client.put(f"{S}/config/dns_secondary", json={"allow_axfr": ["93.184.216.0/28"]}).status_code == 422
     bad = [{"mode": "primary_elsewhere"}, {"mode": "primary_elsewhere", "primaries": ["10.0.0.1"]},
-           {"allow_axfr": ["192.168.0.0/16"], "tsig": {"name": "k", "secret": TSIG}},
-           {"tsig": {"name": "k", "secret": "not base64!"}},
-           {"tsig": {"name": "k", "secret": base64.b64encode(b"short").decode()}},
+           {"allow_axfr": ["192.168.0.0/16"], "tsig": {"name": "k.example.com", "secret": TSIG}},
+           {"tsig": {"name": "k.example.com", "secret": "not base64!"}},
+           {"tsig": {"name": "k.example.com", "secret": base64.b64encode(b"short").decode()}},
            {"tsig": {"name": "bad name", "secret": TSIG}},
-           {"tsig": {"name": "k"}}]  # no secret stored yet
+           {"tsig": {"name": "k.example.com"}},  # no secret stored yet
+           {"tsig": {"name": "k", "secret": TSIG}}]  # L2: not under the site's own domain
     for b in bad:
         assert client.put(f"{S}/config/dns_secondary", json=b).status_code == 422, b
-    body = {"allow_axfr": ["93.184.216.7", "2606:2800:220:1::/64"], "tsig": {"name": "xfr", "secret": TSIG}}
+    body = {"allow_axfr": ["93.184.216.7", "2606:2800:220:1::/64"], "tsig": {"name": "xfr.example.com", "secret": TSIG}}
     r = client.put(f"{S}/config/dns_secondary", json=body)
     assert r.status_code == 200, r.text
     zone = fake_pdns.zones[z]
     assert zone["kind"] == "Native"
     assert zone["metadata"] == {"ALLOW-AXFR-FROM": ["93.184.216.7/32", "2606:2800:220:1::/64"],
-                                "TSIG-ALLOW-AXFR": ["xfr"]}
+                                "TSIG-ALLOW-AXFR": ["xfr.example.com"]}
     assert fake_pdns.rrset(z, "example.com.", "NS") is not None  # records still published
-    # the key name belongs to this site only
-    r = client.put("/api/v1/sites/other.com/config/dns_secondary", json={"tsig": {"name": "xfr", "secret": TSIG}})
-    assert r.status_code == 409
+    # the key name belongs to this site only (L2: names live under the site's own domain)
+    r = client.put("/api/v1/sites/other.com/config/dns_secondary",
+                   json={"tsig": {"name": "xfr.example.com", "secret": TSIG}})
+    assert r.status_code == 422
     # a later full re-sync (scheduler) keeps the metadata
     add_edge(client)
     with SessionLocal() as db:
@@ -547,11 +550,11 @@ def test_dns_secondary_allow_axfr_and_validation(client, fake_pdns):
         from app.services import sync_site_dns
 
         assert sync_site_dns(db, site) is None
-    assert fake_pdns.zones[z]["metadata"]["TSIG-ALLOW-AXFR"] == ["xfr"]
+    assert fake_pdns.zones[z]["metadata"]["TSIG-ALLOW-AXFR"] == ["xfr.example.com"]
 
 
 def test_dns_secondary_new_zone_created_as_slave(client, fake_pdns):
-    make_site(client)
+    make_site(client, dns_secondary=True)
     client.put(f"{S}/config/dns_secondary", json={"mode": "primary_elsewhere", "primaries": ["93.184.216.53"]})
     fake_pdns.zones.clear()  # e.g. a fresh second nameserver
     with SessionLocal() as db:
@@ -561,6 +564,7 @@ def test_dns_secondary_new_zone_created_as_slave(client, fake_pdns):
         assert sync_site_dns(db, site) is None
     zone = fake_pdns.zones["example.com."]
     assert zone["kind"] == "Slave" and zone["masters"] == ["93.184.216.53"] and zone["rrsets"] == []
+    assert zone["metadata"]["ENABLE-LUA-RECORDS"] == ["0"]  # H1, also on a freshly created slave zone
 
 
 def test_record_columns_roundtrip_db(client):

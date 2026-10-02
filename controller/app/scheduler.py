@@ -467,6 +467,33 @@ def job_storage(db, now: datetime | None = None, force: bool = False):
     return storage.run_hourly(db, now=now, force=force)
 
 
+def job_security_audit(db, now: datetime | None = None, force: bool = False):
+    """Every ORIGIN_RECHECK_MINUTES (leader only, security review wave 9): re-resolve every customer
+    origin host name (origin_guard.recheck: a name now pointing at a non-public address leaves the
+    edge config + alert) and alert on parent/child sites of different owners (legacy data the
+    creation rule refuses today, tenancy.py)."""
+    if settings.origin_recheck_minutes <= 0:
+        return None
+    from . import origin_guard, tenancy
+
+    now = now or utcnow()
+    last = _state(db, "security_audit:last_run")
+    if not force and last and now - datetime.fromisoformat(last) < timedelta(minutes=settings.origin_recheck_minutes):
+        return None
+    blocked = origin_guard.recheck(db)
+    pairs = tenancy.nested_conflicts(db)
+    if pairs:
+        alerts.raise_alert("nested_sites", "سایت‌های تودرتو با مالک متفاوت",
+                           "این سایت‌ها زیردامنهٔ سایت مشتری دیگری‌اند (پیش از قانون C1 ساخته شده‌اند)؛ "
+                           "یکی را حذف یا مالک (client_id) آن‌ها را یکی کنید:\n"
+                           + "\n".join(f"• {p} ⊃ {c}" for p, c in pairs[:20]), "warning")
+    else:
+        alerts.resolve_alert("nested_sites", "دیگر سایت تودرتو با مالک متفاوتی وجود ندارد.")
+    _set_state(db, "security_audit:last_run", now.isoformat())
+    db.commit()
+    return {"blocked": blocked, "nested": pairs}
+
+
 def job_capacity(db, now: datetime | None = None, force: bool = False):
     """Daily: edge-group capacity alert from the 3-day p95 of the hourly tx (SPEC §15.5, leader
     only)."""
@@ -480,7 +507,7 @@ JOBRUN_PREFIX = "jobrun:"
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
 JOBS = [job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
         job_capacity, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
-        job_log_export, job_storage, job_bot_ranges]
+        job_log_export, job_storage, job_security_audit, job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
 FAST_JOBS = [job_webhooks]
 FAST_INTERVAL = 30.0

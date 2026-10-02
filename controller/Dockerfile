@@ -27,7 +27,11 @@ COPY app ./app
 COPY acme/dns_pcdn.sh /root/.acme.sh/dnsapi/dns_pcdn.sh
 
 ENV DATABASE_URL=sqlite:////data/cdn.db ACME_HOME=/data/acme BACKUP_DIR=/data/backups
+# L3 (security review): proxy headers (client IP, scheme) are trusted only from these addresses —
+# the reverse proxy (Caddy) on a private Docker network / private link. Override with
+# FORWARDED_ALLOW_IPS (comma separated IPs / networks, read by uvicorn); never "*".
+ENV FORWARDED_ALLOW_IPS=127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 VOLUME ["/data"]
 EXPOSE 8000
 # the schema is created / upgraded at startup (Alembic); see docs/OPERATIONS.md
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

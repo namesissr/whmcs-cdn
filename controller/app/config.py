@@ -286,5 +286,30 @@ class Settings:
     functions_max_site_kb: int = field(
         default_factory=lambda: min(8192, max(256, int(os.getenv("FUNCTIONS_MAX_SITE_KB") or 8192))))
 
+    # ---- security review wave 9 (docs/SECURITY.md) ----
+    # C1: before a pending site goes active, also ask the servers of its registered parent zone
+    # (iteratively from the public suffix down) whether THEY delegate exactly this name to our
+    # nameservers. When the parent servers cannot be reached (e.g. outbound DNS restricted to
+    # NS_RESOLVERS) the check is skipped with a warning; the database rule (no foreign parent site)
+    # always applies.
+    ns_check_parent: bool = field(default_factory=lambda: _bool("NS_CHECK_PARENT", True))
+    # M1: plausibility ceiling of what ONE edge may report in ONE hour (sum over every site). With a
+    # known capacity_mbps: capacity x 3600 s / 8 x USAGE_SAFETY_FACTOR bytes; without one this many
+    # Gbit/s. Requests: USAGE_MAX_RPS per second on average. Hours more than USAGE_MAX_AGE_DAYS old
+    # or in the future are dropped too. Dropped items are counted and alerted, never applied.
+    usage_safety_factor: float = field(default_factory=lambda: max(1.0, float(os.getenv("USAGE_SAFETY_FACTOR") or 1.5)))
+    usage_max_gbps: float = field(default_factory=lambda: max(0.001, float(os.getenv("USAGE_MAX_GBPS") or 40)))
+    usage_max_rps: int = field(default_factory=lambda: max(1, int(os.getenv("USAGE_MAX_RPS") or 500000)))
+    usage_max_age_days: int = field(default_factory=lambda: max(1, int(os.getenv("USAGE_MAX_AGE_DAYS") or 35)))
+    # customer origin host names (pools, tunnel, l4, proxied CNAME targets): resolved on save and
+    # re-checked by the leader every ORIGIN_RECHECK_MINUTES (0 = never); a name resolving to a
+    # non-public address is refused on save / left out of the edge config + alerted on re-check
+    origin_recheck_minutes: int = field(default_factory=lambda: max(0, int(os.getenv("ORIGIN_RECHECK_MINUTES") or 15)))
+    origin_resolve_timeout: float = field(
+        default_factory=lambda: max(0.5, float(os.getenv("ORIGIN_RESOLVE_TIMEOUT") or 3)))
+    # M5: refuse to start when a PDNS_API_URL entry is plain http:// to a non-private address (the
+    # API key would cross the internet in clear). Default: warn + alert only.
+    pdns_api_require_private: bool = field(default_factory=lambda: _bool("PDNS_API_REQUIRE_PRIVATE", False))
+
 
 settings = Settings()

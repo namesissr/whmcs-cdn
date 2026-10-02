@@ -1,6 +1,8 @@
 import ipaddress
 import re
 
+from .netguard import is_public_ip
+
 LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
 DOMAIN_RE = re.compile(rf"^(?:{LABEL}\.)+[a-z][a-z0-9-]{{1,62}}$")
 HOST_RE = re.compile(rf"^(?:{LABEL}\.)*{LABEL}\.?$")
@@ -42,15 +44,21 @@ def fqdn(name: str, domain: str) -> str:
     return domain if name == "@" else f"{name}.{domain}"
 
 
-def validate_ip(ip: str, version: int) -> str:
+def validate_ip(ip: str, version: int, strict: bool = True) -> str:
+    """A public IP address of `version`. strict (customer input: records, origins): the netguard rule
+    (globally routable unicast only — also refuses CGNAT 100.64/10, NAT64 / 6to4 / Teredo forms
+    embedding a non-public IPv4, reserved and documentation ranges). strict=False (operator input:
+    edge addresses) keeps the older check (private, loopback, unspecified, multicast, link-local)."""
     try:
-        addr = ipaddress.ip_address(ip.strip())
+        addr = ipaddress.ip_address((ip or "").strip())
     except ValueError as e:
         raise ValidationError("آدرس IP نامعتبر است") from e
     if addr.version != version:
         raise ValidationError(f"برای این نوع رکورد آدرس IPv{version} لازم است")
     if addr.is_private or addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local:
         raise ValidationError("آدرس IP باید عمومی باشد")
+    if strict and not is_public_ip(str(addr)):
+        raise ValidationError("آدرس IP باید عمومی باشد (CGNAT، NAT64، رزروشده و آدرس‌های مستندسازی مجاز نیستند)")
     return str(addr)
 
 
@@ -100,3 +108,25 @@ def validate_record(rtype: str, content: str, priority: int | None, proxied: boo
     if rtype not in ("MX", "SRV"):
         priority = None
     return rtype, content, priority, proxied
+
+
+def num(v) -> int:
+    """A stored / reported counter as a non-negative int; anything malformed (a string, a dict,
+    NaN …) counts as 0 instead of failing the request (security review L5)."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return max(v, 0)
+    if isinstance(v, float):
+        return max(int(round(v)), 0) if v == v and v not in (float("inf"), float("-inf")) else 0
+    if isinstance(v, str):
+        try:
+            return max(int(v.strip()), 0)
+        except ValueError:
+            return 0
+    return 0
+
+
+def obj(v) -> dict:
+    """v when it is a dict, else {} (malformed stored / reported details)."""
+    return v if isinstance(v, dict) else {}

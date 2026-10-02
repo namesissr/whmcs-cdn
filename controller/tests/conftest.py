@@ -144,6 +144,24 @@ class FakePdns:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _no_outbound_dns(monkeypatch):
+    """No real DNS from the controller code under test: the origin guard / SSRF guard resolver
+    (netguard.resolver) knows only localhost (tests that need names use `fake_dns`), and the NS
+    check's parent-delegation walk (nscheck.parent_delegation) reports "could not be checked"."""
+    import socket
+
+    from app import netguard, nscheck
+
+    def resolve(host, port):
+        if host == "localhost" or host.endswith(".localhost"):
+            return ["127.0.0.1"]
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(netguard, "resolver", resolve)
+    monkeypatch.setattr(nscheck, "parent_delegation", lambda domain: None)
+
+
 @pytest.fixture()
 def fake_pdns():
     fake = FakePdns()

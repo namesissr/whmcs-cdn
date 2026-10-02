@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from . import sections
 from .models import Site, UsageHourly, utcnow
 from .services import resolve_origin
-from .validation import fqdn
+from .validation import fqdn, num
 
 COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down")
 CONNECT_TIMEOUT = 5.0  # TCP connect, and again for the TLS handshake
@@ -41,7 +41,7 @@ def stats(db: Session, site: Site, hours: int) -> dict:
         for k in COUNTERS:
             b[k] += int(tn.get(k) or 0)
         for proto, v in (tn.get("by_protocol") or {}).items():
-            by_protocol[proto] = by_protocol.get(proto, 0) + int(v)
+            by_protocol[proto] = by_protocol.get(proto, 0) + num(v)
     series, t = [], since
     while t <= now:  # zero-filled: one point per hour
         key = t.strftime("%Y-%m-%dT%H:00:00Z")

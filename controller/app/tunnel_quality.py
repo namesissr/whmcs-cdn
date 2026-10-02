@@ -28,6 +28,7 @@ from .config import settings
 from .models import AnalyticsMinute, Edge, Site, SiteEvent, State, UsageHourly, utcnow
 from .routes_edge import TUNNEL_ERROR_KEYS, TUNNEL_PROTOCOLS
 from .services import month_start, usage_totals
+from .validation import num
 
 log = logging.getLogger("pcdn.tunnel")
 
@@ -135,8 +136,8 @@ def quality(db: Session, site: Site, hours: int, now: datetime | None = None) ->
                 continue
             _add(per_path.setdefault(str(pid), _empty()), c)
             _add(e, c)
-            h["sessions"] += max(int(c.get("sessions") or 0), 0)
-            h["abnormal"] += max(int(c.get("abnormal") or 0), 0)
+            h["sessions"] += num(c.get("sessions"))
+            h["abnormal"] += num(c.get("abnormal"))
             h["errors"] += sum(max(int((c.get("errors") or {}).get(k) or 0), 0) for k in TUNNEL_ERROR_KEYS)
 
     configured = sections.get_section(site, "tunnel")["paths"]
@@ -219,10 +220,10 @@ def usage(db: Session, site: Site, days: int, now: datetime | None = None) -> di
         b["sessions"] += max(int(tn.get("sessions") or 0), 0)
         for proto, v in (tn.get("by_protocol") or {}).items():
             if proto in TUNNEL_PROTOCOLS:
-                b["by_protocol"][proto] = b["by_protocol"].get(proto, 0) + max(int(v), 0)
+                b["by_protocol"][proto] = b["by_protocol"].get(proto, 0) + num(v)
         for pid, c in _tunnel_paths({"tunnel": tn}).items():
             if isinstance(c, dict):
-                n = max(int(c.get("bytes_up") or 0), 0) + max(int(c.get("bytes_down") or 0), 0)
+                n = num(c.get("bytes_up")) + num(c.get("bytes_down"))
                 b["by_path"][str(pid)] = b["by_path"].get(str(pid), 0) + n
     out, d = [], first
     while d <= today:
@@ -288,8 +289,8 @@ def _window(db: Session, now: datetime) -> dict[int, tuple[int, int]]:
     for sid, details in db.execute(select(AnalyticsMinute.site_id, AnalyticsMinute.details).where(
             AnalyticsMinute.minute >= since, AnalyticsMinute.minute <= now)):
         d = _loads(details)
-        a = max(int(d.get("tunnel_attempts") or 0), 0)
-        e = max(int(d.get("tunnel_errors") or 0), 0)
+        a = num(d.get("tunnel_attempts"))
+        e = num(d.get("tunnel_errors"))
         if a or e:
             acc = out.setdefault(sid, [0, 0])
             acc[0] += a

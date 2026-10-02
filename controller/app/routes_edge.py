@@ -5,21 +5,25 @@ import ipaddress
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import live, logexport, webhooks
+from . import alerts, dnsbuild, live, logexport, webhooks
 from .auth import require_edge
+from .config import settings
 from .db import get_db
 from .models import Edge, Purge, SecurityEvent, Site, State, UsageBatch, UsageHourly, utcnow
 from .services import EDGE_IP_PLACEHOLDER, build_edge_config, record_metrics
+from .validation import num
+from .validation import obj as _obj
 
 log = logging.getLogger("pcdn")
 
@@ -354,11 +358,11 @@ class FunctionsUsage(BaseModel):
 
 
 class UsageItem(BaseModel):
-    host: str
+    host: str = Field(max_length=253)
     hour: datetime
-    bytes: int = Field(ge=0)
-    requests: int = Field(ge=0)
-    cache_hits: int = Field(default=0, ge=0)
+    bytes: int = Field(ge=0, le=BIG)
+    requests: int = Field(ge=0, le=BIG)
+    cache_hits: int = Field(default=0, ge=0, le=BIG)
     status: Counts = {}
     codes: Counts = {}
     countries: Counts = {}
@@ -443,47 +447,64 @@ MAX_KEYS = {"codes": 60, "countries": 250, "paths": 200}
 def _merge_details(current: dict, add: dict) -> dict:
     pe = add.get("platform_errors")
     if pe:
-        current["platform_errors"] = int(current.get("platform_errors") or 0) + max(int(pe), 0)
+        current["platform_errors"] = num(current.get("platform_errors")) + num(pe)
     for key in DETAIL_KEYS:
-        src = add.get(key) or {}
+        src = _obj(add.get(key))
         if not src:
             continue
-        dst = current.setdefault(key, {})
+        dst = current.get(key)
+        if not isinstance(dst, dict):
+            dst = current[key] = {}
         for k, v in src.items():
             k = str(k)[:512]
             if k in dst or len(dst) < MAX_KEYS.get(key, 50):
-                dst[k] = dst.get(k, 0) + max(int(v), 0)
-    vd = add.get("video")
+                dst[k] = num(dst.get(k)) + num(v)
+    vd = _obj(add.get("video"))
     if vd:
-        dst = current.setdefault("video", {})
+        dst = current.get("video")
+        if not isinstance(dst, dict):
+            dst = current["video"] = {}
         for k in ("bytes", "requests", "cache_hits"):
-            dst[k] = int(dst.get(k) or 0) + max(int(vd.get(k) or 0), 0)
-    fn = add.get("functions")
+            dst[k] = num(dst.get(k)) + num(vd.get(k))
+    fn = _obj(add.get("functions"))
     if fn:
-        dst = current.setdefault("functions", {})
+        dst = current.get("functions")
+        if not isinstance(dst, dict):
+            dst = current["functions"] = {}
         for k in FUNCTION_COUNTERS:
-            dst[k] = int(dst.get(k) or 0) + max(int(fn.get(k) or 0), 0)
-    if add.get("l4"):
-        apps = current.setdefault("l4", {})
+            dst[k] = num(dst.get(k)) + num(fn.get(k))
+    if _obj(add.get("l4")):
+        apps = current.get("l4")
+        if not isinstance(apps, dict):
+            apps = current["l4"] = {}
         for app_id, c in add["l4"].items():
             if not L4_APP_ID_RE.match(str(app_id)) or not isinstance(c, dict):
                 continue
             if app_id not in apps and len(apps) >= L4_MAX_APPS:
                 continue
-            a = apps.setdefault(app_id, {})
+            a = apps.get(app_id)
+            if not isinstance(a, dict):
+                a = apps[app_id] = {}
             for k in L4_COUNTERS:
-                a[k] = int(a.get(k) or 0) + max(int(c.get(k) or 0), 0)
-    tn = add.get("tunnel")
+                a[k] = num(a.get(k)) + num(c.get(k))
+    tn = _obj(add.get("tunnel"))
     if tn:
-        dst = current.setdefault("tunnel", {})
+        dst = current.get("tunnel")
+        if not isinstance(dst, dict):
+            dst = current["tunnel"] = {}
         for k in TUNNEL_COUNTERS:
-            dst[k] = int(dst.get(k, 0)) + max(int(round(tn.get(k) or 0)), 0)
-        protos = dst.setdefault("by_protocol", {})
-        for k, v in (tn.get("by_protocol") or {}).items():
+            dst[k] = num(dst.get(k)) + num(tn.get(k))
+        protos = dst.get("by_protocol")
+        if not isinstance(protos, dict):
+            protos = dst["by_protocol"] = {}
+        for k, v in _obj(tn.get("by_protocol")).items():
             if k in TUNNEL_PROTOCOLS:
-                protos[k] = protos.get(k, 0) + max(int(v), 0)
-        if tn.get("paths"):
-            merge_tunnel_paths(dst.setdefault("paths", {}), tn["paths"])
+                protos[k] = num(protos.get(k)) + num(v)
+        if _obj(tn.get("paths")):
+            paths = dst.get("paths")
+            if not isinstance(paths, dict):
+                paths = dst["paths"] = {}
+            merge_tunnel_paths(paths, tn["paths"])
     return current
 
 
@@ -496,12 +517,16 @@ def merge_tunnel_paths(dst: dict, add: dict) -> dict:
             continue
         if pid not in dst and len(dst) >= TUNNEL_MAX_PATHS:
             continue
-        p = dst.setdefault(pid, {})
+        p = dst.get(pid)
+        if not isinstance(p, dict):
+            p = dst[pid] = {}
         for k in TUNNEL_PATH_COUNTERS:
-            p[k] = int(p.get(k) or 0) + max(int(round(src.get(k) or 0)), 0)
-        errs = p.setdefault("errors", {})
+            p[k] = num(p.get(k)) + num(src.get(k))
+        errs = p.get("errors")
+        if not isinstance(errs, dict):
+            errs = p["errors"] = {}
         for k in TUNNEL_ERROR_KEYS:
-            errs[k] = int(errs.get(k) or 0) + max(int((src.get("errors") or {}).get(k) or 0), 0)
+            errs[k] = num(errs.get(k)) + num(_obj(src.get("errors")).get(k))
     return dst
 
 
@@ -528,7 +553,11 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         except IntegrityError:
             db.rollback()
             return {"ok": True, "duplicate": True, "accepted": 0, "events": 0}
-    domains = {d: i for i, d in db.execute(select(Site.id, Site.domain)).all()}
+    domains, foreign = _own_group_sites(db, edge)
+    now = utcnow()
+    newest = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    oldest = now - timedelta(days=settings.usage_max_age_days)
+    dropped = {"foreign_group": 0, "out_of_window": 0, "implausible": 0}
     agg: dict[tuple[int, datetime], dict] = {}
     # security events per site in this batch (attack.detected webhook, SPEC §14.3.3)
     security: dict[int, dict[str, int]] = {}
@@ -536,7 +565,13 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         sid = _site_for_host(it.host, domains)
         if sid is None:
             continue
+        if sid in foreign:  # M1: an edge reports only for the sites of its own group
+            dropped["foreign_group"] += 1
+            continue
         hour = _naive(it.hour).replace(minute=0, second=0, microsecond=0)
+        if hour > newest or hour < oldest:  # M1: no future hours, nothing older than the window
+            dropped["out_of_window"] += 1
+            continue
         a = agg.setdefault((sid, hour), {"b": 0, "r": 0, "h": 0, "d": {}})
         # tunnels are charged in both directions: `bytes` is what the edge sent to the client
         a["b"] += it.bytes + (it.tunnel.bytes_up if it.tunnel else 0)
@@ -549,6 +584,7 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
             if v > 0:
                 src = security.setdefault(sid, {})
                 src[k] = src.get(k, 0) + v
+    agg, dropped["implausible"] = _plausible(db, edge, agg)
     for (sid, hour), a in agg.items():
         row = db.scalar(select(UsageHourly).where(
             UsageHourly.site_id == sid, UsageHourly.edge_id == edge.id, UsageHourly.hour == hour))
@@ -568,7 +604,7 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
     event_counts: dict[int, int] = {}
     for ev in body.events:
         sid = _site_for_host(ev.host, domains)
-        if sid is None:
+        if sid is None or sid in foreign:
             continue
         db.add(SecurityEvent(site_id=sid, edge_id=edge.id, ts=_naive(ev.t), ip=ev.ip, country=ev.country.upper(),
                              method=ev.method, host=ev.host.lower(), path=ev.path, action=ev.action,
@@ -579,7 +615,7 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
     live_buckets = 0
     if body.live:
         live_buckets = live.ingest(db, [{**it.model_dump(), "minute": _naive(it.minute)} for it in body.live],
-                                   lambda h: _site_for_host(h, domains), _merge_details)
+                                   lambda h: _own(_site_for_host(h, domains), foreign), _merge_details)
     # attack.detected: the counters are authoritative; events (a sample) cover agents without them
     for sid in set(security) | set(event_counts):
         n = max(sum(security.get(sid, {}).values()), event_counts.get(sid, 0))
@@ -596,8 +632,65 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
             row.value = str(int(row.value or "0") + 1)
         except ValueError:
             row.value = "1"
+    if sum(dropped.values()):
+        row = db.get(State, "metrics:usage_dropped")
+        if row is None:
+            db.add(State(key="metrics:usage_dropped", value=str(sum(dropped.values()))))
+        else:
+            row.value = str(num(row.value) + sum(dropped.values()))
     db.commit()
-    return {"ok": True, "accepted": len(agg), "events": accepted_events, "live": live_buckets}
+    if dropped["implausible"] or dropped["out_of_window"]:
+        log.warning("edge %s: dropped usage items %s", edge.name, dropped)
+        alerts.raise_alert(f"usage_implausible:{edge.id}", f"گزارش مصرف غیرعادی از لبه {edge.name}",
+                           f"لبه {edge.name} مصرفی گزارش کرد که از ظرفیت آن بیشتر است یا ساعتش خارج از بازه است؛ "
+                           f"این موارد اعمال نشدند: {dropped}. اگر لبه به خطر افتاده باشد، توکن آن را عوض و "
+                           "لبه را غیرفعال کنید.", "critical")
+    return {"ok": True, "accepted": len(agg), "events": accepted_events, "live": live_buckets,
+            "dropped": dropped}
+
+
+def _own(sid: int | None, foreign: set[int]) -> int | None:
+    return None if sid is None or sid in foreign else sid
+
+
+def _own_group_sites(db: Session, edge: Edge) -> tuple[dict[str, int], set[int]]:
+    """({domain: site id} of every site, {ids of sites of ANOTHER edge group}) — M1: an edge may
+    report usage / events / live data only for sites of its own group (a general edge serving a
+    tunnel site in DNS fail-open is not billed for it)."""
+    group = dnsbuild.edge_group(edge)
+    domains, foreign = {}, set()
+    for sid, domain, features in db.execute(select(Site.id, Site.domain, Site.features)).all():
+        domains[domain] = sid
+        if dnsbuild.site_edge_group(SimpleNamespace(features=features)) != group:
+            foreign.add(sid)
+    return domains, foreign
+
+
+def usage_ceiling(edge: Edge) -> tuple[int, int]:
+    """(bytes, requests) one edge can plausibly serve in one hour (M1, see config.py)."""
+    mbps = int(edge.capacity_mbps or 0)
+    bits = mbps * 1_000_000 if mbps > 0 else settings.usage_max_gbps * 1_000_000_000
+    return int(bits / 8 * 3600 * settings.usage_safety_factor), int(settings.usage_max_rps * 3600)
+
+
+def _plausible(db: Session, edge: Edge, agg: dict) -> tuple[dict, int]:
+    """Keep the (site, hour) aggregates that fit, with what this edge already reported for that
+    hour, under the edge's hourly ceiling (smallest first); the rest is dropped (M1)."""
+    max_b, max_r = usage_ceiling(edge)
+    kept, n_dropped = {}, 0
+    for hour in sorted({h for _, h in agg}):
+        used_b, used_r = db.execute(select(func.coalesce(func.sum(UsageHourly.bytes), 0),
+                                           func.coalesce(func.sum(UsageHourly.requests), 0))
+                                    .where(UsageHourly.edge_id == edge.id, UsageHourly.hour == hour)).one()
+        used_b, used_r = int(used_b or 0), int(used_r or 0)
+        for key, a in sorted(((k, v) for k, v in agg.items() if k[1] == hour), key=lambda kv: (kv[1]["b"], kv[0])):
+            if used_b + a["b"] > max_b or used_r + a["r"] > max_r:
+                n_dropped += 1
+                continue
+            used_b += a["b"]
+            used_r += a["r"]
+            kept[key] = a
+    return kept, n_dropped
 
 
 # ------------------------------------------------------------------ log export (SPEC §14.3.2)

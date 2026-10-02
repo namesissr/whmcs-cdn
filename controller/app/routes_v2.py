@@ -23,7 +23,8 @@ from .db import get_db
 from .models import Incident, IncidentUpdate, Record, SecurityEvent, Site, UsageHourly, utcnow
 from .routes_admin import RecordIn, _record_from, bad, get_site
 from .services import lock_site, site_to_dict, sync_site_dns
-from .validation import ValidationError
+from .validation import ValidationError, num
+from .validation import obj as _obj
 
 router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 # unauthenticated: the platform origin-pull CA certificate (SPEC §14.2)
@@ -68,10 +69,10 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
     if section not in sections.SECTIONS:
         raise HTTPException(404, "بخش نامعتبر است")
     try:
-        outbound = section in sections.OUTBOUND_SECTIONS
+        outbound = section in sections.PRELOCK_SECTIONS
         if outbound:
-            # SSRF check of the outbound URLs first: it resolves DNS and needs no site state, so it
-            # must not run while the site row is locked
+            # SSRF check of the outbound URLs / origin host names first: it resolves DNS and needs no
+            # site state, so it must not run while the site row is locked
             parsed = sections.dump(sections.SECTIONS[section].model_validate(body))
             sections.check_targets(section, parsed)
         # every PUT rewrites the whole site.config document: validate and merge against the row as
@@ -512,9 +513,10 @@ SECURITY_SOURCES = ("waf", "firewall", "ratelimit", "challenge", "ddos", "hotlin
 
 def _loads(s: str) -> dict:
     try:
-        return json.loads(s or "{}")
+        v = json.loads(s or "{}")
     except ValueError:
         return {}
+    return v if isinstance(v, dict) else {}
 
 
 def site_analytics(db: Session, site: Site, period: str) -> dict:
@@ -544,22 +546,24 @@ def site_analytics(db: Session, site: Site, period: str) -> dict:
         totals["bytes"] += row.bytes
         totals["cache_hits"] += row.cache_hits
         d = _loads(row.details)
-        for k, v in d.get("status", {}).items():
-            totals["status"][k] = totals["status"].get(k, 0) + int(v)
-        for k, v in d.get("security", {}).items():
-            totals["security"][k] = totals["security"].get(k, 0) + int(v)
-        countries.update({k: int(v) for k, v in d.get("countries", {}).items()})
-        paths.update({k: int(v) for k, v in d.get("paths", {}).items()})
-        codes.update({k: int(v) for k, v in d.get("codes", {}).items()})
-        v = d.get("video") or {}
-        totals["video"]["bytes"] += int(v.get("bytes") or 0)
-        totals["video"]["requests"] += int(v.get("requests") or 0)
-        totals["video"]["cache_hits"] += int(v.get("cache_hits") or 0)
-        for app_id, c in (d.get("l4") or {}).items():
-            a = totals["l4"]["apps"].setdefault(app_id, {"bytes_in": 0, "bytes_out": 0, "sessions": 0})
+        # L5: details come from the edges; a malformed value counts as 0 instead of a 500
+        for k, v in _obj(d.get("status")).items():
+            totals["status"][k] = totals["status"].get(k, 0) + num(v)
+        for k, v in _obj(d.get("security")).items():
+            totals["security"][k] = totals["security"].get(k, 0) + num(v)
+        countries.update({str(k): num(v) for k, v in _obj(d.get("countries")).items()})
+        paths.update({str(k): num(v) for k, v in _obj(d.get("paths")).items()})
+        codes.update({str(k): num(v) for k, v in _obj(d.get("codes")).items()})
+        v = _obj(d.get("video"))
+        totals["video"]["bytes"] += num(v.get("bytes"))
+        totals["video"]["requests"] += num(v.get("requests"))
+        totals["video"]["cache_hits"] += num(v.get("cache_hits"))
+        for app_id, c in _obj(d.get("l4")).items():
+            c = _obj(c)
+            a = totals["l4"]["apps"].setdefault(str(app_id), {"bytes_in": 0, "bytes_out": 0, "sessions": 0})
             for k in ("bytes_in", "bytes_out", "sessions"):
-                a[k] += int(c.get(k) or 0)
-                totals["l4"][k] += int(c.get(k) or 0)
+                a[k] += num(c.get(k))
+                totals["l4"][k] += num(c.get(k))
 
     # zero-filled series so charts have a point per hour/day
     series, step = [], timedelta(hours=1) if hourly else timedelta(days=1)
@@ -612,12 +616,12 @@ def platform_analytics(period: str = "24h", db: Session = Depends(get_db)):
         site_requests[row.site_id] += row.requests
         site_bytes[row.site_id] += row.bytes
         d = _loads(row.details)
-        for k, v in d.get("status", {}).items():
-            totals["status"][k] = totals["status"].get(k, 0) + int(v)
-        for k, v in d.get("security", {}).items():
-            totals["security"][k] = totals["security"].get(k, 0) + int(v)
-            sec_buckets[key] += int(v)
-        countries.update({k: int(v) for k, v in d.get("countries", {}).items()})
+        for k, v in _obj(d.get("status")).items():
+            totals["status"][k] = totals["status"].get(k, 0) + num(v)
+        for k, v in _obj(d.get("security")).items():
+            totals["security"][k] = totals["security"].get(k, 0) + num(v)
+            sec_buckets[key] += num(v)
+        countries.update({str(k): num(v) for k, v in _obj(d.get("countries")).items()})
 
     # zero-filled series so charts have a point per hour/day
     series, security_series = [], []
@@ -681,8 +685,8 @@ def overview(db: Session = Depends(get_db)):
     for row in db.scalars(select(UsageHourly).where(UsageHourly.hour >= start)):
         usage[row.site_id] += row.bytes
         requests[row.site_id] += row.requests
-        for k, v in _loads(row.details).get("security", {}).items():
-            security[k] += int(v)
+        for k, v in _obj(_loads(row.details).get("security")).items():
+            security[k] += num(v)
     domains = dict(db.execute(select(Site.id, Site.domain)).all())
     online = {e.id for e in online_edges(db)}
     edges = list(db.scalars(select(Edge).order_by(Edge.id)))

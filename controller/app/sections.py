@@ -1,5 +1,6 @@
 """Per-site configuration sections (SPEC §2) — validation, defaults, plan limits."""
 
+import functools
 import hashlib
 import ipaddress
 import json
@@ -7,7 +8,7 @@ import re
 from typing import Literal
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from .validation import ValidationError
 
@@ -50,6 +51,9 @@ DEFAULT_FEATURES = {
     # SPEC §16.9: edge functions (section `functions`), sandboxed JS run by pcdn-fn on the edges
     "edge_functions": False,
     "max_functions": 0,
+    # security review H1: section `dns_secondary` (our nameservers AXFR the zone from the customer's
+    # primary) is a plan feature, off by default
+    "dns_secondary": False,
 }
 EDGE_GROUPS = ("general", "tunnel")
 WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
@@ -59,6 +63,17 @@ FUNCTIONS_MAX = 32  # hard cap of section `functions` items (the edge's FN_MAX_P
 
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+# validation context of data read back from the database (all_config, dns_secondary, l4): checks
+# added after the data may have been stored (security review wave 9: regex safety, strict public
+# origin addresses) are not applied there, so legacy data keeps parsing instead of silently falling
+# back to the section default; the edge config build and the origin guard filter such data instead
+STORED = {"stored": True}
+
+
+def _stored(info: ValidationInfo | None) -> bool:
+    return bool(info is not None and info.context and info.context.get("stored"))
 
 
 class Features(Strict):
@@ -87,6 +102,7 @@ class Features(Strict):
     storage_gb: int = Field(0, ge=0, le=1000000)
     edge_functions: bool = False
     max_functions: int = Field(0, ge=0, le=FUNCTIONS_MAX)
+    dns_secondary: bool = False
 
 
 # ------------------------------------------------------------------ sections
@@ -223,7 +239,7 @@ class Condition(Strict):
     name: str | None = None  # header name
 
     @model_validator(mode="after")
-    def _check(self):
+    def _check(self, info: ValidationInfo):
         values = self.value if isinstance(self.value, list) else [self.value]
         if len(values) > 500 or any(len(v) > 1024 for v in values):
             raise ValueError("مقدار شرط بیش از حد بزرگ است")
@@ -249,10 +265,15 @@ class Condition(Strict):
             elif isinstance(self.value, list):
                 raise ValueError("برای این عملگر یک مقدار متنی لازم است")
             if self.op == "regex":
-                try:
-                    re.compile(self.value)
-                except re.error as e:
-                    raise ValueError(f"عبارت منظم نامعتبر: {e}") from None
+                # H2: the edge runs this on every request of the site (njs, header / UA / path);
+                # same safety checks as transform / redirect regexes (length, nesting, ambiguity)
+                if _stored(info):
+                    try:
+                        re.compile(self.value)
+                    except re.error as e:
+                        raise ValueError(f"عبارت منظم نامعتبر: {e}") from None
+                else:
+                    _safe_regex(self.value)
             if self.field == "header":
                 if not self.name or not re.match(HEADER_NAME_RE, self.name):
                     raise ValueError("نام هدر لازم است")
@@ -372,8 +393,8 @@ class PoolOrigin(Strict):
 
     @field_validator("address")
     @classmethod
-    def _addr(cls, v):
-        return _origin_address(v)
+    def _addr(cls, v, info: ValidationInfo):
+        return _origin_address(v, lenient=_stored(info))
 
 
 class Health(Strict):
@@ -421,8 +442,8 @@ class TunnelOrigin(Strict):
 
     @field_validator("address")
     @classmethod
-    def _addr(cls, v):
-        return _origin_address(v)
+    def _addr(cls, v, info: ValidationInfo):
+        return _origin_address(v, lenient=_stored(info))
 
     @field_validator("sni")
     @classmethod
@@ -596,8 +617,8 @@ class L4Origin(Strict):
 
     @field_validator("address")
     @classmethod
-    def _addr(cls, v):
-        return _origin_address(v)
+    def _addr(cls, v, info: ValidationInfo):
+        return _origin_address(v, lenient=_stored(info))
 
 
 class L4App(Strict):
@@ -656,15 +677,17 @@ TSIG_NAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])
 TSIG_ALGORITHMS = ("hmac-sha256", "hmac-sha384", "hmac-sha512", "hmac-sha1", "hmac-md5")
 
 
-def _public_ip(v: str, what: str, cidr: bool = False) -> str:
+def _public_ip(v: str, what: str, cidr: bool = False, lenient: bool = False) -> str:
     v = str(v or "").strip()
     try:
         net = ipaddress.ip_network(v, strict=False) if cidr else None
         ip = net.network_address if net is not None else ipaddress.ip_address(v)
     except ValueError:
         raise ValueError(f"{what} نامعتبر است: {v}") from None
+    from .netguard import is_public_ip
+
     if ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local \
-            or ip.is_reserved:
+            or ip.is_reserved or (not lenient and not is_public_ip(str(ip))):
         raise ValueError(f"{what} باید آدرس عمومی باشد: {v}")
     if net is not None:
         return str(net)
@@ -717,13 +740,14 @@ class DnsSecondary(Strict):
 
     @field_validator("primaries")
     @classmethod
-    def _primaries(cls, v):
-        return list(dict.fromkeys(_public_ip(x, "آدرس سرور اصلی (primary)") for x in v))
+    def _primaries(cls, v, info: ValidationInfo):
+        return list(dict.fromkeys(_public_ip(x, "آدرس سرور اصلی (primary)", lenient=_stored(info)) for x in v))
 
     @field_validator("allow_axfr")
     @classmethod
-    def _axfr(cls, v):
-        return list(dict.fromkeys(_public_ip(x, "آدرس مجاز انتقال زون", cidr=True) for x in v))
+    def _axfr(cls, v, info: ValidationInfo):
+        return list(dict.fromkeys(_public_ip(x, "آدرس مجاز انتقال زون", cidr=True, lenient=_stored(info))
+                                  for x in v))
 
     @model_validator(mode="after")
     def _check(self):
@@ -1055,6 +1079,22 @@ def _safe_regex(v: str | None) -> re.Pattern:
     elif re.search(r"\([^()]*[*+}][^()]*\)[*+{]", v) or re.search(r"\\[1-9]", v):
         raise ValueError("عبارت منظم کمیت‌سنج تودرتو یا ارجاع به گروه دارد و ممکن است بسیار کند اجرا شود")
     return compiled
+
+
+@functools.lru_cache(maxsize=4096)
+def regex_safe(v: str) -> bool:
+    """True when `v` passes _safe_regex (cached: the edge config build checks stored rules)."""
+    try:
+        _safe_regex(v)
+        return True
+    except ValueError:
+        return False
+
+
+def firewall_rule_safe(rule: dict) -> bool:
+    """A stored firewall rule whose regex conditions all pass the safety check (H2)."""
+    return all(regex_safe(c["value"]) for c in rule.get("conditions") or []
+               if c.get("op") == "regex" and isinstance(c.get("value"), str))
 
 
 def _check_refs(text: str, groups: int, allowed: bool):
@@ -1567,21 +1607,32 @@ SECTIONS: dict[str, type[BaseModel]] = {
 # section -> feature flag that must be on to write it
 FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
                  "tunnel": "tunnel", "logs": "log_export", "l4": "l4_proxy",
-                 "functions": "edge_functions"}
+                 "functions": "edge_functions", "dns_secondary": "dns_secondary"}
 
 
 # ------------------------------------------------------------------ helpers
 
-def _origin_address(v: str) -> str:
-    """Public IPv4, [IPv6] or hostname of an origin server."""
+def _origin_address(v: str, lenient: bool = False) -> str:
+    """Public IPv4, [IPv6] or hostname of an origin server (origin_guard.py: IP literals must be
+    globally routable; host names must be fully qualified and not special-use — whether they
+    RESOLVE to public addresses is checked on save by check_targets and re-checked periodically)."""
+    from . import origin_guard
     from .validation import validate_hostname, validate_ip
 
     v = (v or "").strip().lower().strip("[]")
     if ":" in v:
-        return "[" + validate_ip(v, 6) + "]"
-    if re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
+        return "[" + validate_ip(v, 6, strict=not lenient) + "]"
+    if lenient and re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
+        return validate_ip(v, 4, strict=False)
+    if not lenient and re.match(r"^[0-9.]+$", v):
         return validate_ip(v, 4)
-    return validate_hostname(v)
+    host = validate_hostname(v)
+    if lenient:
+        return host
+    problem = origin_guard.name_problem(host)
+    if problem:
+        raise ValueError(problem)
+    return host
 
 
 def _pattern(v: str) -> str:
@@ -1618,7 +1669,7 @@ def all_config(site) -> dict:
     out = {}
     for name, model in SECTIONS.items():
         try:
-            out[name] = dump(model.model_validate(stored.get(name, {})))
+            out[name] = dump(model.model_validate(stored.get(name, {}), context=STORED))
         except Exception:  # noqa: BLE001 - corrupt/legacy data falls back to defaults
             out[name] = dump(model())
     return redact(site, out)
@@ -1722,6 +1773,11 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
         _check_l4(site, value)
     if name == "dns_secondary" and value["tsig"] and not value["tsig"]["secret"] and not _same_tsig(site, value):
         raise ValidationError("کلید مخفی TSIG (tsig.secret) لازم است")
+    if name == "dns_secondary" and value["tsig"] and not _tsig_name_ok(site, value["tsig"]["name"]):
+        # L2: PowerDNS TSIG key names are global; a customer key lives under the site's own domain
+        # (a name stored before this rule is kept)
+        domain = getattr(site, "domain", "")
+        raise ValidationError(f"نام کلید TSIG باید زیر دامنهٔ همین سرویس باشد (مثل transfer.{domain})")
     if vet:
         check_targets(name, value)
     return value
@@ -1729,17 +1785,54 @@ def validate_section(site, name: str, data: dict, pools_in_use: set[str] | None 
 
 # sections whose values name outbound targets the controller itself contacts (SSRF guard)
 OUTBOUND_SECTIONS = ("logs", "webhooks")
+# sections whose values name origin hosts the EDGES connect to (origin_guard.py): host names are
+# resolved on save and refused when any address is not public
+ORIGIN_SECTIONS = ("pools", "tunnel", "l4")
+# checked by check_targets (DNS lookups) before the site row is locked
+PRELOCK_SECTIONS = OUTBOUND_SECTIONS + ORIGIN_SECTIONS
+
+
+def origin_hosts(name: str, value: dict, include_ips: bool = False) -> list[tuple[str, str]]:
+    """(host name, label) of every origin host name in a pools / tunnel / l4 section value. IP
+    literals are left out unless include_ips (on save the model validates them as public)."""
+    out = []
+
+    def add(addr: str, label: str):
+        a = (addr or "").strip("[]")
+        if a and (include_ips or (not re.match(r"^[0-9.]+$", a) and ":" not in a)):
+            out.append((a, label))
+
+    if name == "pools":
+        for p in value.get("pools") or []:
+            for o in p.get("origins") or []:
+                add(o.get("address"), f"استخر {p.get('name')}")
+    elif name == "tunnel":
+        for p in value.get("paths") or []:
+            if p.get("origin"):
+                add(p["origin"].get("address"), f"مسیر تونل {p.get('id')}")
+    elif name == "l4":
+        for a in value.get("apps") or []:
+            add((a.get("origin") or {}).get("address"), f"برنامه {a.get('id')}")
+    return out
 
 
 def check_targets(name: str, value: dict) -> None:
     """SSRF check of a section's outbound URLs (SPEC §14.3.2/§14.3.3): https, host resolving only
-    to public addresses. Needs no site state, so writers run it BEFORE locking the site row (DNS can
-    be slow). Raises ValidationError."""
+    to public addresses; and of its origin host names (origin_guard.py). Needs no site state, so
+    writers run it BEFORE locking the site row (DNS can be slow). Raises ValidationError."""
     if name == "logs" and value["s3_endpoint"]:
         _vet_url(value["s3_endpoint"], "آدرس S3")
     if name == "webhooks":
         for i, item in enumerate(value["items"]):
             _vet_url(item["url"], f"وب‌هوک شماره {i + 1}")
+    if name in ORIGIN_SECTIONS:
+        from . import origin_guard
+
+        hosts = origin_hosts(name, value)
+        problems = origin_guard.check_hosts([h for h, _ in hosts])
+        for host, label in hosts:
+            if host in problems:
+                raise ValidationError(f"{label}: {problems[host]}")
 
 
 def _has_logs_secret(site) -> bool:
@@ -1920,6 +2013,17 @@ def _same_tsig(site, value: dict) -> bool:
     return old.get("name") == value["tsig"]["name"]
 
 
+def _tsig_name_ok(site, name: str) -> bool:
+    domain = getattr(site, "domain", "") or ""
+    if domain and (name == domain or name.endswith("." + domain)):
+        return True
+    try:
+        old = (json.loads(site.config or "{}").get("dns_secondary") or {}).get("tsig") or {}
+    except (ValueError, AttributeError):
+        old = {}
+    return bool(old) and old.get("name") == name
+
+
 def _is_enabled(name: str, value: dict) -> bool:
     if name == "waf":
         return value["mode"] != "off"
@@ -1935,6 +2039,8 @@ def _is_enabled(name: str, value: dict) -> bool:
         return value["enabled"]
     if name == "functions":
         return value["enabled"] or bool(value["items"])
+    if name == "dns_secondary":
+        return value["mode"] != "off" or bool(value["allow_axfr"]) or value["tsig"] is not None
     return True
 
 

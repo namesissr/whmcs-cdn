@@ -2,8 +2,19 @@
 
 Authenticated by a per-service key (`Authorization: Bearer pcdn_...`), NOT the admin key.
 The key resolves to exactly one site and every call is scoped to that site only; each key
-carries a subset of the scopes {purge, stats, dns} and an endpoint checks its scope (403
-otherwise). All logic (purge, analytics, events, records, config) is reused from the admin
+carries a subset of the scopes (403 otherwise):
+
+* ``purge``: cache purges;
+* ``stats``: analytics, events, tunnel reports, function statistics (read only);
+* ``dns``: DNS records and the `dns_secondary` section;
+* ``config``: every other configuration section, redirect CSV import, image transform secret;
+* ``functions``: the `functions` section (edge function code).
+
+Security review M3: `dns` used to cover every config section and function code. Keys that existed
+before the split (migration 0019) got `config` added to `dns`, but NOT `functions`.
+
+M2: while the site is suspended a key can still READ (GET, analytics …) but every write (purge,
+record / config changes, secret rotation) answers 403. All logic (purge, analytics, events, records, config) is reused from the admin
 routes so behaviour/validation never drifts between the two surfaces.
 
 SPEC §14.3.5: `GET /capi/v1/site` (any scope), `GET /capi/v1/analytics/live` (stats) and the
@@ -112,15 +123,32 @@ def resolve_key(credentials: HTTPAuthorizationCredentials | None = Depends(beare
     return key
 
 
-def require_scope(scope: str):
-    """Dependency: resolve the key and require it to carry `scope` (403 otherwise)."""
+def check_scope(key: ApiKey, scope: str, write: bool = False) -> ApiKey:
+    """403 unless the key carries `scope`; for a write also 403 while the site is suspended (M2)."""
+    if scope not in key.scope_list:
+        raise HTTPException(403, f"این کلید دسترسی «{scope}» را ندارد")
+    if write and key.site is not None and key.site.suspended:
+        raise HTTPException(403, "سرویس معلق است؛ تا رفع تعلیق فقط خواندن از طریق API مجاز است")
+    return key
+
+
+def require_scope(scope: str, write: bool = False):
+    """Dependency: resolve the key and require it to carry `scope` (403 otherwise); `write` also
+    refuses a suspended site (M2)."""
 
     def dep(key: ApiKey = Depends(resolve_key)) -> ApiKey:
-        if scope not in key.scope_list:
-            raise HTTPException(403, f"این کلید دسترسی «{scope}» را ندارد")
-        return key
+        return check_scope(key, scope, write)
 
     return dep
+
+
+def section_scope(section: str) -> str:
+    """The scope a config section needs (M3): functions -> functions, dns_secondary -> dns, else config."""
+    if section == "functions":
+        return "functions"
+    if section == "dns_secondary":
+        return "dns"
+    return "config"
 
 
 def _site(key: ApiKey) -> Site:
@@ -165,7 +193,7 @@ def site_info(key: ApiKey = Depends(resolve_key)):
 # ------------------------------------------------------------------ purge (scope: purge)
 
 @router.post("/purge")
-def purge(body: PurgeIn, request: Request, key: ApiKey = Depends(require_scope("purge")),
+def purge(body: PurgeIn, request: Request, key: ApiKey = Depends(require_scope("purge", write=True)),
           db: Session = Depends(get_db)):
     result = purge_site(db, _site(key), body)
     _audit(db, request, key, "purge",
@@ -221,7 +249,7 @@ def functions_stats(hours: int = 24, key: ApiKey = Depends(require_scope("stats"
     return functions_stats_of(db, _site(key), hours)
 
 
-# ------------------------------------------------------------------ records + config (scope: dns)
+# ------------------------------------------------------------------ records (scope: dns), config (config / functions)
 
 @router.get("/records")
 def list_records(key: ApiKey = Depends(require_scope("dns"))):
@@ -229,7 +257,7 @@ def list_records(key: ApiKey = Depends(require_scope("dns"))):
 
 
 @router.post("/records", status_code=201)
-def add_record(body: RecordIn, request: Request, key: ApiKey = Depends(require_scope("dns")),
+def add_record(body: RecordIn, request: Request, key: ApiKey = Depends(require_scope("dns", write=True)),
                db: Session = Depends(get_db)):
     result = add_record_of(db, _site(_rate_limit_config(key)), body)
     _audit(db, request, key, "record.create", {"type": body.type})
@@ -238,14 +266,14 @@ def add_record(body: RecordIn, request: Request, key: ApiKey = Depends(require_s
 
 @router.patch("/records/{record_id}")
 def update_record(record_id: int, body: RecordIn, request: Request,
-                  key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
+                  key: ApiKey = Depends(require_scope("dns", write=True)), db: Session = Depends(get_db)):
     result = update_record_of(db, _site(_rate_limit_config(key)), record_id, body)
     _audit(db, request, key, "record.update", {"record_id": record_id, "type": body.type})
     return result
 
 
 @router.delete("/records/{record_id}")
-def delete_record(record_id: int, request: Request, key: ApiKey = Depends(require_scope("dns")),
+def delete_record(record_id: int, request: Request, key: ApiKey = Depends(require_scope("dns", write=True)),
                   db: Session = Depends(get_db)):
     result = delete_record_of(db, _site(_rate_limit_config(key)), record_id)
     _audit(db, request, key, "record.delete", {"record_id": record_id})
@@ -253,13 +281,15 @@ def delete_record(record_id: int, request: Request, key: ApiKey = Depends(requir
 
 
 @router.get("/config/{section}")
-def read_section(section: str, key: ApiKey = Depends(require_scope("dns"))):
+def read_section(section: str, key: ApiKey = Depends(resolve_key)):
+    check_scope(key, section_scope(section))
     return read_section_of(_site(key), section)
 
 
 @router.put("/config/{section}")
 def write_section(section: str, body: dict, response: Response, request: Request,
-                  key: ApiKey = Depends(require_scope("dns")), db: Session = Depends(get_db)):
+                  key: ApiKey = Depends(resolve_key), db: Session = Depends(get_db)):
+    check_scope(key, section_scope(section), write=True)
     result = write_section_of(db, _site(_rate_limit_config(key)), section, body, response)
     _audit(db, request, key, "config.update", config_audit(section, result))
     return result
@@ -267,7 +297,7 @@ def write_section(section: str, body: dict, response: Response, request: Request
 
 @router.post("/redirects/import")
 def import_redirects(request: Request, response: Response, mode: str | None = None,
-                     body: dict = Depends(csv_body), key: ApiKey = Depends(require_scope("dns")),
+                     body: dict = Depends(csv_body), key: ApiKey = Depends(require_scope("config", write=True)),
                      db: Session = Depends(get_db)):
     """Bulk CSV import of redirect rules (SPEC §14.2), same rules as the admin endpoint."""
     mode = body["mode"] or mode or "append"
@@ -277,7 +307,7 @@ def import_redirects(request: Request, response: Response, mode: str | None = No
 
 
 @router.post("/image/transform-secret")
-def image_secret_create(request: Request, key: ApiKey = Depends(require_scope("dns")),
+def image_secret_create(request: Request, key: ApiKey = Depends(require_scope("config", write=True)),
                         db: Session = Depends(get_db)):
     """Generate a new signed-URL key for image transforms (SPEC §16.6); shown this once."""
     result = image_secret_create_of(db, _site(_rate_limit_config(key)))
@@ -286,7 +316,7 @@ def image_secret_create(request: Request, key: ApiKey = Depends(require_scope("d
 
 
 @router.delete("/image/transform-secret")
-def image_secret_delete(request: Request, key: ApiKey = Depends(require_scope("dns")),
+def image_secret_delete(request: Request, key: ApiKey = Depends(require_scope("config", write=True)),
                         db: Session = Depends(get_db)):
     result = image_secret_delete_of(db, _site(_rate_limit_config(key)))
     _audit(db, request, key, "image.transform_secret", {"mode": "remove"})
@@ -308,6 +338,8 @@ def openapi():
             title="Pasargad CDN customer API", version="1",
             description="Per-service API (SPEC §10.1 / §14.3.5). Authenticate with "
                         "`Authorization: Bearer pcdn_…`; every call acts on that key's site only. "
-                        "Scopes: purge, stats, dns.",
+                        "Scopes: purge, stats, dns (records, secondary DNS), config (configuration "
+                        "sections), functions (edge function code). Writes answer 403 while the "
+                        "service is suspended.",
             routes=[r for r in router.routes if getattr(r, "path", "").startswith(router.prefix + "/")])
     return _openapi

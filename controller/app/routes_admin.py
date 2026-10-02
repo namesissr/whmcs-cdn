@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import bundle, dnsbuild, l4, nscheck, pdns, sections, webhooks
+from . import bundle, dnsbuild, l4, nscheck, origin_guard, pdns, sections, tenancy, webhooks
 from .audit import record_audit
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
@@ -100,6 +100,9 @@ class FeaturesIn(BaseModel):
     # edge functions (SPEC §16.9): section `functions` and how many items it may hold
     edge_functions: bool | None = None
     max_functions: int | None = Field(default=None, ge=0, le=sections.FUNCTIONS_MAX)
+    # security review H1: section `dns_secondary` (our nameservers transfer the zone from the
+    # customer's primary) is a plan feature, off by default
+    dns_secondary: bool | None = None
 
 
 class Plan(BaseModel):
@@ -118,6 +121,22 @@ class SiteCreate(BaseModel):
     # reseller sub-site tag (SPEC §10.5), set by WHMCS
     reseller_client_id: int | None = Field(default=None, ge=1)
     reseller_label: str | None = None
+    # owning WHMCS client (userid) of a normal service; decides the parent/child zone rule (tenancy.py)
+    client_id: int | None = Field(default=None, ge=1)
+
+
+class DomainCheckIn(BaseModel):
+    """Would POST /sites accept this domain for this owner? (WHMCS cart / reseller pre-check)"""
+    model_config = ConfigDict(extra="forbid")
+    domain: str
+    client_id: int | None = Field(default=None, ge=1)
+    reseller_client_id: int | None = Field(default=None, ge=1)
+
+
+class OwnerIn(BaseModel):
+    """Set or clear the owning WHMCS client of a site (tenancy.py); null clears it."""
+    model_config = ConfigDict(extra="forbid")
+    client_id: int | None = Field(default=None, ge=1)
 
 
 class ResellerIn(BaseModel):
@@ -258,10 +277,13 @@ def create_site(body: SiteCreate, request: Request, db: Session = Depends(get_db
         origin = validate_ip(body.origin_ip, 4) if body.origin_ip else None
     except ValidationError as e:
         bad(e)
-    if db.scalar(select(Site).where(Site.domain == domain)):
-        raise HTTPException(409, "این دامنه قبلاً ثبت شده است")
+    # C1: no public suffix, no parent/child of another owner's site (409 only for "already exists":
+    # WHMCS treats a 409 as a re-run of Create on its own site)
+    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id))
+    if problem is not None:
+        raise HTTPException(409 if problem[0] == "exists" else 422, problem[1])
     site = Site(domain=domain, external_id=body.external_id,
-                reseller_client_id=body.reseller_client_id,
+                reseller_client_id=body.reseller_client_id, client_id=body.client_id,
                 reseller_label=_clean_label(body.reseller_label))
     apply_plan(site, body.plan)
     if origin:
@@ -272,9 +294,24 @@ def create_site(body: SiteCreate, request: Request, db: Session = Depends(get_db
     db.add(site)
     db.commit()
     _audit(db, request, "site.create", site.domain,
-           {"external_id": body.external_id, "reseller_client_id": body.reseller_client_id})
+           {"external_id": body.external_id, "reseller_client_id": body.reseller_client_id,
+            "client_id": body.client_id})
     err = sync_site_dns(db, site)
     return {**site_to_dict(db, site), "dns_error": err}
+
+
+@router.post("/domain-check")
+def domain_check(body: DomainCheckIn, db: Session = Depends(get_db)):
+    """The checks of POST /sites without creating anything: {"ok", "code", "error", "domain"}.
+    code: invalid | public_suffix | exists | nested (tenancy.py)."""
+    try:
+        domain = normalize_domain(body.domain)
+    except ValidationError as e:
+        return {"ok": False, "code": "invalid", "error": str(e), "domain": None}
+    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id))
+    if problem is not None:
+        return {"ok": False, "code": problem[0], "error": problem[1], "domain": domain}
+    return {"ok": True, "code": None, "error": None, "domain": domain}
 
 
 @router.get("/sites")
@@ -291,6 +328,7 @@ def list_sites(reseller: int | None = None, db: Session = Depends(get_db)):
         ]
     return [
         {"domain": s.domain, "status": s.effective_status, "external_id": s.external_id,
+         "client_id": s.client_id,
          "reseller_client_id": s.reseller_client_id, "reseller_label": s.reseller_label}
         for s in db.scalars(stmt)
     ]
@@ -347,12 +385,35 @@ def update_reseller(domain: str, body: ResellerIn, request: Request, db: Session
     site = get_site(db, domain)
     fields = body.model_fields_set
     if "reseller_client_id" in fields:
+        _check_owner_change(db, site, tenancy.owner_of(site.client_id, body.reseller_client_id))
         site.reseller_client_id = body.reseller_client_id
     if "reseller_label" in fields:
         site.reseller_label = _clean_label(body.reseller_label)
     db.commit()
     _audit(db, request, "reseller.flag", site.domain,
            {"reseller_client_id": site.reseller_client_id, "reseller_label": site.reseller_label})
+    return site_to_dict(db, site)
+
+
+def _check_owner_change(db: Session, site: Site, owner: int | None) -> None:
+    """422 when the new owner would turn a same-owner parent/child pair into a pair of different
+    owners (C1). Pairs that already had different owners (legacy data) are left as they are."""
+    before = tenancy.site_owner(site)
+    for other in tenancy.related_sites(db, site.domain, exclude_id=site.id):
+        if tenancy.same_owner(before, other) and not tenancy.same_owner(owner, other):
+            raise HTTPException(422, f"سایت مرتبط {other.domain} متعلق به مالک دیگری است؛ مالک این سایت را "
+                                     "نمی‌توان به این مقدار تغییر داد")
+
+
+@router.patch("/sites/{domain}/owner")
+def update_owner(domain: str, body: OwnerIn, request: Request, db: Session = Depends(get_db)):
+    """Set the owning WHMCS client (C1, tenancy.py). Refused (422) when the change would put the
+    site in a parent/child relation with a site of a different owner."""
+    site = get_site(db, domain)
+    _check_owner_change(db, site, tenancy.owner_of(body.client_id, site.reseller_client_id))
+    site.client_id = body.client_id
+    db.commit()
+    _audit(db, request, "site.owner", site.domain, {"client_id": site.client_id})
     return site_to_dict(db, site)
 
 
@@ -430,9 +491,11 @@ def delete_site(domain: str, request: Request, db: Session = Depends(get_db)):
 @router.post("/sites/{domain}/ns-check")
 def ns_check(domain: str, db: Session = Depends(get_db)):
     site = get_site(db, domain)
-    ok, found = nscheck.check_and_update(site)
+    ok, found, reason = nscheck.check_and_update_reason(site)
     db.commit()
-    return {"ok": ok, "found": found, "expected": settings.nameservers, "status": site.effective_status}
+    # reason (when not ok): nameservers | parent_delegation | parent_site:<domain> (C1)
+    return {"ok": ok, "found": found, "expected": settings.nameservers, "status": site.effective_status,
+            "reason": reason}
 
 
 @router.post("/sites/{domain}/ssl")
@@ -520,7 +583,9 @@ def all_usage(month: str | None = None, db: Session = Depends(get_db)):
 
 # ------------------------------------------------------------------ customer API keys (SPEC §10.1)
 
-CAPI_SCOPES = ("purge", "stats", "dns")
+# security review M3: `dns` = records (+ secondary DNS); `config` = configuration sections;
+# `functions` = edge function code (routes_capi.section_scope)
+CAPI_SCOPES = ("purge", "stats", "dns", "config", "functions")
 MAX_API_KEYS = 5
 
 
@@ -645,6 +710,13 @@ def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> d
         raise ValidationError("مبدأ فضای ذخیره‌سازی (storage) فقط برای رکوردهای A، AAAA و CNAME پروکسی‌شده مجاز است")
     if rtype == "CNAME" and name == "@" and not proxied:
         raise ValidationError("CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است؛ از ALIAS استفاده کنید")
+    if proxied and rtype == "CNAME" and not body.storage and not (
+            content == site.domain or content.endswith("." + site.domain)):
+        # the edges connect to this host: it must be public (origin_guard.py); in-zone targets are
+        # followed inside the zone's own (validated) records
+        problem = origin_guard.host_problem(content)
+        if problem:
+            raise ValidationError(problem)
     if rtype == "NS" and name == "@":
         raise ValidationError("نیم‌سرورهای ریشه به‌صورت خودکار مدیریت می‌شوند")
     weighted = body.weight is not None
@@ -829,8 +901,8 @@ def _edge_install(edge: Edge, token: str) -> str:
 @router.post("/edges", status_code=201)
 def create_edge(body: EdgeIn, request: Request, db: Session = Depends(get_db)):
     try:
-        ipv4 = validate_ip(body.ipv4, 4)
-        ipv6 = validate_ip(body.ipv6, 6) if body.ipv6 else None
+        ipv4 = validate_ip(body.ipv4, 4, strict=False)
+        ipv6 = validate_ip(body.ipv6, 6, strict=False) if body.ipv6 else None
     except ValidationError as e:
         bad(e)
     if db.scalar(select(Edge).where(Edge.name == body.name)):
@@ -998,7 +1070,7 @@ def add_edge_address(edge_id: int, body: EdgeAddressIn, request: Request, db: Se
     when the address already belongs to any edge."""
     edge = _get_edge(db, edge_id)
     try:
-        ip = validate_ip(body.ip, body.family)
+        ip = validate_ip(body.ip, body.family, strict=False)
     except ValidationError as e:
         bad(e)
     if _address_in_use(db, ip):
@@ -1025,7 +1097,7 @@ def update_edge_address(edge_id: int, address_id: int, body: EdgeAddressPatch, r
         bad(ValidationError("هیچ تغییری ارسال نشده است"))
     if changes.get("ip") is not None:
         try:
-            ip = validate_ip(changes["ip"], a.family)  # family cannot change on edit
+            ip = validate_ip(changes["ip"], a.family, strict=False)  # family cannot change on edit
         except ValidationError as e:
             bad(e)
         if _address_in_use(db, ip, exclude_id=a.id):

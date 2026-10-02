@@ -1,6 +1,7 @@
 # Secondary nameserver (ns2) on a separate server.
 # The controller writes every zone to it through the API (no zone transfer needed).
-#   PDNS_API_KEY=<same key as the controller> docker compose -f ns2-compose.yml up -d
+#   PDNS_API_KEY=<same key as the controller> PDNS_API_ALLOW_FROM=<controller-ip>/32 \
+#     docker compose -f ns2-compose.yml up -d
 # Then restrict port 8081 to the controller's IP. NOTE: ufw does NOT protect ports
 # published by Docker; use:  sudo ./ns2-firewall.sh <controller-ip>
 # and add http://THIS_SERVER_IP:8081 to PDNS_API_URL in the controller's .env.
@@ -10,6 +11,9 @@ services:
     restart: unless-stopped
     environment:
       PDNS_AUTH_API_KEY: ${PDNS_API_KEY}
+    # dns/pdns.conf only allows private networks to reach the API (security review M5); ns2 is reached
+    # from the controller's address, so name it explicitly, e.g. PDNS_API_ALLOW_FROM=203.0.113.10/32
+    command: ["--webserver-allow-from=${PDNS_API_ALLOW_FROM:?set PDNS_API_ALLOW_FROM to the controller IP/32}"]
     ports:
       - "53:53/udp"
       - "53:53/tcp"

@@ -188,7 +188,7 @@ def test_records_crud_via_capi_mirrors_admin(client, fake_pdns):
 
 def test_config_read_write_via_capi_mirrors_admin(client):
     make_site(client)
-    key = new_key(client, scopes=["dns"])["key"]
+    key = new_key(client, scopes=["config"])["key"]
 
     fw = {"default_action": "allow", "rules": [
         {"id": "r1", "action": "block",

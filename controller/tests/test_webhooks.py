@@ -510,7 +510,7 @@ def test_no_hooks_no_rows(client):
 
 def test_capi_config_returns_new_secrets_and_hides_them(client):
     make_site(client)
-    key = client.post(f"{S}/apikeys", json={"name": "k", "scopes": ["dns"]}).json()["key"]
+    key = client.post(f"{S}/apikeys", json={"name": "k", "scopes": ["config"]}).json()["key"]
     r = client.put("/capi/v1/config/webhooks", json={"items": [hook("https://hooks.public.example/c")]},
                    headers=auth(key))
     assert r.status_code == 200, r.text

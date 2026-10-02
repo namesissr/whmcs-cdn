@@ -53,7 +53,8 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0008: sites.reseller_client_id / reseller_label; 0014: custom origin client certificate
     # (authenticated origin pulls, SPEC §14.2); 0015: integration secrets + quota warning (SPEC §14.3)
     site_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "sites")
-    assert site_added == ["integration_secrets", "origin_client_cert", "origin_client_expires_at",
+    # 0019: sites.client_id (owning WHMCS client, security review C1)
+    assert site_added == ["client_id", "integration_secrets", "origin_client_cert", "origin_client_expires_at",
                           "origin_client_key", "quota_warned_at", "reseller_client_id", "reseller_label"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
     # 0010: edge_addresses (multi-address edges / health-based failover);

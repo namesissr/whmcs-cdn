@@ -429,7 +429,7 @@ def test_csv_import_via_customer_api(client):
     mk_site(client)
     routes_capi._hits.clear()
     routes_capi._config_hits.clear()
-    full = client.post(f"{S}/apikeys", json={"name": "ci", "scopes": ["dns"]}).json()["key"]
+    full = client.post(f"{S}/apikeys", json={"name": "ci", "scopes": ["config"]}).json()["key"]
     stats = client.post(f"{S}/apikeys", json={"name": "ro", "scopes": ["stats"]}).json()["key"]
     r = client.post(f"{CAPI}/redirects/import", json={"csv": "/a,/b"}, headers={"Authorization": f"Bearer {stats}"})
     assert r.status_code == 403

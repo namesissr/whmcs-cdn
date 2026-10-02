@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from . import kv
 from .models import AnalyticsMinute, Site, utcnow
+from .validation import num, obj
 
 RETENTION = timedelta(hours=24)
 MAX_MINUTES = 1440
@@ -97,7 +98,7 @@ def _iso(dt: datetime) -> str:
 def _status(d: dict | None = None) -> dict:
     out = {k: 0 for k in STATUS_CLASSES}
     for k, v in (d or {}).items():
-        out[str(k)] = out.get(str(k), 0) + int(v)
+        out[str(k)] = out.get(str(k), 0) + num(v)
     return out
 
 
@@ -127,8 +128,8 @@ def series(db: Session, site: Site, minutes: int, now: datetime | None = None) -
         totals["cache_hits"] += int(row.cache_hits)
         for k, v in status.items():
             totals["status"][k] = totals["status"].get(k, 0) + v
-        paths.update({str(k): int(v) for k, v in (d.get("paths") or {}).items()})
-        countries.update({str(k): int(v) for k, v in (d.get("countries") or {}).items()})
+        paths.update({str(k): num(v) for k, v in obj(d.get("paths")).items()})
+        countries.update({str(k): num(v) for k, v in obj(d.get("countries")).items()})
     out, t = [], start
     while t <= end:
         out.append(buckets.get(t) or {"t": _iso(t), "requests": 0, "bytes": 0, "cache_hits": 0,

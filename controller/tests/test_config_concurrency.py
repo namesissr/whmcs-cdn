@@ -114,7 +114,7 @@ def test_concurrent_section_writes_never_lose_an_update_pg(pg_url):
 
 def test_capi_rate_limit_429_has_retry_after(client, monkeypatch):
     make_site(client)
-    key = client.post(f"{S}/apikeys", json={"name": "k", "scopes": ["stats", "dns"]}).json()["key"]
+    key = client.post(f"{S}/apikeys", json={"name": "k", "scopes": ["stats", "config"]}).json()["key"]
     monkeypatch.setattr(settings, "capi_config_rate", 1)
     assert client.put("/capi/v1/config/bots", json={"mode": "log"}, headers=auth(key)).status_code == 200
     r = client.put("/capi/v1/config/bots", json={"mode": "off"}, headers=auth(key))

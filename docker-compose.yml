@@ -13,6 +13,9 @@ x-controller: &controller
   env_file: .env
   environment:
     DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn}
+    # L3: X-Forwarded-For / -Proto are trusted only from Caddy (and other proxies) on private
+    # networks, never from a client reaching port 8000 directly (uvicorn reads FORWARDED_ALLOW_IPS)
+    FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     BACKUP_DIR: /data/backups
     BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
     EDGE_BUNDLE_DIR: /srv/edge         # secret-free edge bundle served for one-command node install (SPEC §11.1)
@@ -66,6 +69,9 @@ services:
     restart: unless-stopped
     environment:
       PDNS_AUTH_API_KEY: ${PDNS_API_KEY}
+    # M5: who may use the HTTP API (8081, never published here). Command-line settings override the
+    # config files; default = loopback + the private ranges Docker networks use (docs/SECURITY.md)
+    command: ["--webserver-allow-from=${PDNS_API_ALLOW_FROM:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"]
     ports:
       - "53:53/udp"
       - "53:53/tcp"

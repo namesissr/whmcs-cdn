@@ -579,3 +579,11 @@ def check_pdns(db) -> None:
                 "critical",
             )
     sync("pdns_down:", down, lambda c: "API سرور PowerDNS دوباره در دسترس است.")
+    insecure = pdns.insecure_api_urls()
+    if insecure:
+        raise_alert("pdns_insecure", "API پاورDNS بدون رمزنگاری روی شبکهٔ عمومی",
+                    "این آدرس‌های PDNS_API_URL با http:// ساده به آدرسی غیرخصوصی وصل می‌شوند و کلید API بدون "
+                    "رمزنگاری جابه‌جا می‌شود: " + "، ".join(insecure) + "\nاز شبکهٔ خصوصی (WireGuard) یا https "
+                    "استفاده کنید (docs/SECURITY.md).", "warning")
+    else:
+        resolve_alert("pdns_insecure", notify=False)

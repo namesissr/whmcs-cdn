@@ -38,9 +38,14 @@ def _stored(site) -> dict | None:
     if raw is None:
         return None
     try:
-        return sections.dump(sections.DnsSecondary.model_validate(raw))
+        return sections.dump(sections.DnsSecondary.model_validate(raw, context=sections.STORED))
     except Exception:  # noqa: BLE001 - corrupt: treat as off
         return sections.dump(sections.DnsSecondary())
+
+
+def configured(site) -> bool:
+    """The site has a stored dns_secondary section (it uses or once used secondary DNS)."""
+    return _stored(site) is not None
 
 
 def spec(site, force: bool = False) -> dict | None:
