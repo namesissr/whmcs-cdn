@@ -302,7 +302,10 @@ final class Sharing
         $mine = strtolower((string) Capsule::table('tblclients')->where('id', $clientId)->value('email')) === (string) $r->email;
         $h = '<div class="panel panel-default" data-invite-state="' . ($mine ? 'ok' : 'wrong-email') . '"><div class="panel-body"><p>'
             . self::e(self::tx(Shares::ownerName($r) . ' شما را برای مدیریت ', Shares::ownerName($r) . ' invited you to manage ')) . '<strong dir="ltr">' . self::e($r->domain) . '</strong> '
-            . self::e(self::tx('دعوت کرده است — نقش: ', '— role: ')) . self::roleBadge((string) $r->role) . '</p>';
+            . self::e(self::tx('دعوت کرده است — نقش: ', '— role: ')) . self::roleBadge((string) $r->role) . '</p>'
+            . '<p class="text-muted" data-role-help="1">' . self::e(Shares::roleHelp((string) $r->role, self::lang())) . '</p>'
+            . '<p class="text-muted small">' . self::e(self::tx('بعد از پذیرش، این دامنه در منوی «سرویس‌ها ← دامنه‌های اشتراکی»، صفحهٔ اصلی و کادر کناری «سرویس‌های من» دیده می‌شود؛ روی «مدیریت» کنار آن کلیک کنید.',
+                'After accepting, the domain shows under "Services → Shared domains", on the home page and in the "My Services" sidebar; click "Manage" next to it.')) . '</p>';
         if (!$mine) {
             return $h . '<div class="alert alert-danger">' . self::e(I18n::tr('این دعوت برای ایمیل دیگری است؛ با حسابی وارد شوید که ایمیل اصلی آن همان ایمیل دعوت است.')) . '</div></div></div>';
         }

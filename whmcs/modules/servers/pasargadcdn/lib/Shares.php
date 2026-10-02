@@ -450,12 +450,38 @@ class Shares
         return [
             self::EMAIL_INVITE => ['دعوت به مدیریت دامنه {$share_domain}',
                 $fa('<p>{$share_owner} شما را برای مدیریت CDN دامنهٔ <strong dir="ltr">{$share_domain}</strong> با نقش «{$share_role}» دعوت کرده است.</p>'
-                    . '<p><a href="{$share_link}">پذیرش یا رد دعوت</a> — این پیوند تا {$share_expires} معتبر است و فقط با حسابی که ایمیل اصلی آن همین ایمیل است پذیرفته می‌شود.</p>'
-                    . '<p>با پذیرش، صورت‌حساب و مالکیت دامنه تغییری نمی‌کند.</p>'),
+                    . '<p><strong>با این نقش چه کاری می‌توانید بکنید؟</strong> {$share_role_help}</p>'
+                    . '<p style="margin:16px 0"><a href="{$share_link}" style="display:inline-block;background:#1d5fd6;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:6px;font-weight:bold">برای پذیرش دعوت روی این نوشته کلیک کنید</a></p>'
+                    . '<p style="margin:0 0 6px"><strong>نحوهٔ کار در سه قدم:</strong></p>'
+                    . '<ol style="margin:0 0 12px;padding-right:20px">'
+                    . '<li>روی نوشتهٔ بالا کلیک کنید و با حساب کاربری‌ای وارد شوید که ایمیل اصلی آن همین ایمیل است.</li>'
+                    . '<li>در صفحهٔ باز شده دکمهٔ «پذیرش» را بزنید.</li>'
+                    . '<li>کنار نام دامنه روی «مدیریت» کلیک کنید؛ پنل CDN همان دامنه مثل پنل سرویس‌های خودتان باز می‌شود.</li>'
+                    . '</ol>'
+                    . '<p><strong>بعد از پذیرش، دامنه را کجا پیدا کنم؟</strong> این دامنه سرویسِ حساب شما نیست (صورت‌حساب و مالکیت آن نزد مالک می‌ماند)، '
+                    . 'پس در فهرست «سرویس‌های من» به‌عنوان سرویس دیده نمی‌شود. آن را در منوی بالای ناحیهٔ کاربری «سرویس‌ها ← دامنه‌های اشتراکی»، '
+                    . 'در کادر «دامنه‌های اشتراکی» صفحهٔ اصلی و در کادر کناری صفحهٔ «سرویس‌های من» پیدا می‌کنید.</p>'
+                    . '<p><a href="{$share_list_link}">برای رفتن به دامنه‌های اشتراکی روی این نوشته کلیک کنید</a></p>'
+                    . '<p style="color:#52606d;font-size:13px">هر تغییری که بدهید با نام شما در «گزارش تغییرات» مالک ثبت می‌شود. مالک هر زمان می‌تواند نقش شما را تغییر دهد یا دسترسی را لغو کند، '
+                    . 'و خودتان هم با دکمهٔ «خروج» در صفحهٔ دامنه‌های اشتراکی کنار می‌روید. این دعوت تا {$share_expires} معتبر است و فقط یک بار قابل استفاده است. '
+                    . 'اگر این دعوت را انتظار نداشتید، کافی است کاری نکنید.</p>'),
                 'Invitation to manage {$share_domain}',
                 $en('<p>{$share_owner} invited you to manage the CDN of <strong>{$share_domain}</strong> with the role "{$share_role}".</p>'
-                    . '<p><a href="{$share_link}">Accept or decline the invitation</a> — the link is valid until {$share_expires} and can only be accepted by the account whose primary e-mail is this address.</p>'
-                    . '<p>Accepting does not change the domain\'s billing or ownership.</p>')],
+                    . '<p><strong>What this role can do:</strong> {$share_role_help}</p>'
+                    . '<p style="margin:16px 0"><a href="{$share_link}" style="display:inline-block;background:#1d5fd6;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:6px;font-weight:bold">Click here to accept the invitation</a></p>'
+                    . '<p style="margin:0 0 6px"><strong>How it works, in three steps:</strong></p>'
+                    . '<ol style="margin:0 0 12px;padding-left:20px">'
+                    . '<li>Click the link above and log in with the account whose primary e-mail is this address.</li>'
+                    . '<li>Press "Accept" on the page that opens.</li>'
+                    . '<li>Click "Manage" next to the domain; the CDN panel of that domain opens just like the panel of your own services.</li>'
+                    . '</ol>'
+                    . '<p><strong>Where is the domain after I accept?</strong> It is not a service of your account (billing and ownership stay with the owner), '
+                    . 'so it is not listed under "My Services". You find it in the client-area menu "Services → Shared domains", in the "Shared domains" box '
+                    . 'on the home page, and in the sidebar of "My Services".</p>'
+                    . '<p><a href="{$share_list_link}">Click here to go to your shared domains</a></p>'
+                    . '<p style="color:#52606d;font-size:13px">Every change you make is recorded under your name in the owner\'s change log. The owner can change your role or '
+                    . 'remove your access at any time, and you can leave with the "Leave" button on the shared domains page. This invitation is valid until {$share_expires} '
+                    . 'and can be used once. If you did not expect it, simply ignore this e-mail.</p>')],
             self::EMAIL_ACCEPTED => ['دعوت مدیریت {$share_domain} پذیرفته شد',
                 $fa('<p>{$share_member} دعوت شما برای مدیریت دامنهٔ <strong dir="ltr">{$share_domain}</strong> با نقش «{$share_role}» را پذیرفت. اعضا را از صفحهٔ «اشتراک دامنه» در پنل CDN مدیریت کنید.</p>'),
                 'Invitation to manage {$share_domain} accepted',
@@ -463,13 +489,26 @@ class Shares
         ];
     }
 
+    /**
+     * sha1 of the message bodies an earlier release created; such an unedited copy is replaced by the current
+     * text, an edited one is never touched.
+     */
+    const LEGACY_BODIES = [
+        // first release of «دعوت به مدیریت دامنه» (fa, english)
+        '5268fb5d51cf40f1ec09ee84633361dbf8fddfc6', 'e728848fccb785d78f7439d955ebf5c591610496',
+    ];
+
     /** Creates the templates (fa + english, type general) when missing; never overwrites an edited one. */
     public static function ensureTemplates(): void
     {
         $now = date('Y-m-d H:i:s');
         foreach (self::templates() as $name => [$faSub, $faBody, $enSub, $enBody]) {
             foreach (['' => [$faSub, $faBody], 'english' => [$enSub, $enBody]] as $lang => [$sub, $body]) {
-                if (Capsule::table('tblemailtemplates')->where('type', 'general')->where('name', $name)->where('language', $lang)->exists()) {
+                $cur = Capsule::table('tblemailtemplates')->where('type', 'general')->where('name', $name)->where('language', $lang)->first(['id', 'message']);
+                if ($cur) {
+                    if (in_array(sha1((string) $cur->message), self::LEGACY_BODIES, true)) {
+                        Capsule::table('tblemailtemplates')->where('id', (int) $cur->id)->update(['message' => $body, 'subject' => $sub]);
+                    }
                     continue;
                 }
                 $row = ['type' => 'general', 'name' => $name, 'subject' => $sub, 'message' => $body, 'attachments' => '', 'fromname' => '',
@@ -497,6 +536,28 @@ class Shares
             $u = '';
         }
         return $u === '' ? '' : rtrim($u, '/') . '/';
+    }
+
+    /** The member's «دامنه‌های اشتراکی» page (for e-mails). */
+    public static function listLink(): string
+    {
+        return self::systemUrl() . 'index.php?m=pasargadcdn_admin&page=shared';
+    }
+
+    /** One sentence on what a role may do (e-mails, invite pages). */
+    public static function roleHelp(string $role, string $lang = 'fa'): string
+    {
+        $fa = [
+            'viewer' => 'همهٔ تنظیمات، آمار و گزارش‌های دامنه را می‌بینید و صورت‌حساب مصرف را دانلود می‌کنید، ولی چیزی را تغییر نمی‌دهید.',
+            'dns' => 'رکوردهای DNS دامنه را اضافه، ویرایش و حذف می‌کنید؛ بقیهٔ بخش‌ها برای شما فقط قابل مشاهده‌اند.',
+            'editor' => 'همهٔ تنظیمات فنی دامنه (DNS، SSL، کش، فایروال و WAF، قوانین، تونل، پاک‌سازی کش و …) را تغییر می‌دهید؛ صورت‌حساب و ارتقا، لغو سرویس، انتقال، کلیدهای API و مدیریت اعضا فقط در اختیار مالک است.',
+        ];
+        $en = [
+            'viewer' => 'You can see every setting, statistic and report of the domain and download usage statements, but you cannot change anything.',
+            'dns' => 'You can add, edit and delete the domain\'s DNS records; every other section is view-only for you.',
+            'editor' => 'You can change every technical setting of the domain (DNS, SSL, cache, firewall and WAF, rules, tunnel, purge, …); billing and upgrades, cancellation, transfer, API keys and member management stay with the owner.',
+        ];
+        return ($lang === 'en' ? $en : $fa)[$role] ?? '';
     }
 
     public static function inviteLink(string $token): string
@@ -527,7 +588,8 @@ class Shares
         }
         $lang = strtolower((string) ($client->language ?? '')) === 'english' ? 'en' : 'fa';
         return self::mail(self::EMAIL_INVITE, (int) $client->id, ['share_domain' => (string) $row->domain, 'share_role' => self::roleLabel((string) $row->role, $lang),
-            'share_owner' => $ownerName, 'share_link' => self::inviteLink($token), 'share_expires' => substr((string) $row->expires_at, 0, 10)]);
+            'share_role_help' => self::roleHelp((string) $row->role, $lang), 'share_owner' => $ownerName, 'share_link' => self::inviteLink($token),
+            'share_list_link' => self::listLink(), 'share_expires' => substr((string) $row->expires_at, 0, 10)]);
     }
 
     /** Owner notice when an invite was accepted (setting «share_notify_owner», default on; operator sites: none). */
