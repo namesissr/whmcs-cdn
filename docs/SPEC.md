@@ -1479,6 +1479,29 @@ by their reseller tooling only (422 here, clear message).
   client app shows the new owner a one-time banner: «این دامنه به حساب شما منتقل شد — کلید API،
   وب‌هوک‌ها و ارسال لاگ را دوباره تنظیم کنید».
 
+### 19.3 Customer-initiated transfer (client area)
+The owner of a CDN service can start a transfer to another client account from the client app; the
+recipient must accept; the same complete client→client transfer as §19.2 then runs.
+- Page «انتقال دامنه» in the client app (owner, and owner-side team members with manage rights only;
+  never shared members or read-only team users; not for reseller sub-sites, operator sites or a
+  service that is not Active). Form: recipient e-mail, optional message (≤300 chars, plain text),
+  explicit confirmation checkbox, then a summary of what moves (service, billing cycle, next due date,
+  recurring amount, unpaid invoices of this service, all settings) and what is revoked (API keys,
+  webhooks/log export secrets, access sessions, storage keys, domain shares by default).
+- One open request per service. Token 32 random bytes (stored hashed), 7-day expiry, single use.
+  The owner can cancel it until accepted. Limits: 5 requests per owner per day.
+- Recipient: must be an existing WHMCS client whose primary e-mail matches (case-insensitive); not the
+  owner itself. Gets an e-mail (accept link, what will move to them incl. next due date and amount)
+  and a client-area home card; the page shows the same summary and Accept / Decline (session + CSRF).
+- Accept executes the §19.2 client→client transfer with the customer defaults: unpaid invoices that
+  contain only this service move with it; paid invoices and credit never move; shares revoked; no
+  billing anchor reset (the whole service with its month moves). Errors roll back as in §19.2.
+- Addon setting «انتقال توسط مشتری» (on by default) and «تأیید مدیر لازم است» (off by default): when
+  on, an accepted request waits in the admin «انتقال دامنه» tab (approve / reject) before executing.
+- E-mails: request to the recipient, result to the owner (accepted/declined/expired/approved/rejected),
+  admin notice. Every step logged (activity log of both clients + transfer ledger with
+  `initiated_by: client`), visible in the admin «انتقال‌های اخیر» history.
+
 ## 20. Domain sharing (collaborators from other accounts)
 The owner of a CDN service (or the operator, for operator sites) can share one domain with another
 WHMCS client account so that person manages the domain's settings from their own client area — like
