@@ -78,6 +78,8 @@ services:
     image: powerdns/pdns-auth-49:latest
     environment:
       PDNS_AUTH_API_KEY: staging-pdns-key
+    # dns/pdns.conf only lets private networks reach the API; the staging network looks public
+    command: ["--webserver-allow-from=${STAGING_NET:-11.200.0}.0/24,127.0.0.1,::1"]
     volumes:
       - ../../dns/pdns.conf:/etc/powerdns/pdns.d/pcdn.conf:ro
     healthcheck:
@@ -104,6 +106,8 @@ services:
       # delegation check asks our own PowerDNS (the .test zones exist nowhere else)
       NS_RESOLVERS: ${STAGING_NET:-11.200.0}.53
       NS_CHECK_INTERVAL: "10"
+      # .test is not delegated anywhere: skip the registered-parent walk (security review C1)
+      NS_CHECK_PARENT: "false"
       LUA_SELECTOR: all
       SCHEDULER_INTERVAL: "5"
       EDGE_OFFLINE_SECONDS: "60"
