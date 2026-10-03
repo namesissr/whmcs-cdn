@@ -265,7 +265,10 @@ class Agent:
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
         try:   # SPEC §22.1 / §22.3: node.drain and node.probe are agent-side only (never rendered)
-            ev = apply_config_drain(st, norm_drain(body))
+            nd = norm_drain(body)
+            if nd is not None:   # kept: re-evaluated every tick (the config may then be a 304)
+                st["ctl_drain"] = nd
+            ev = apply_config_drain(st, nd)
             if ev:
                 log.info("node drain %s by the controller", "started" if ev == "start" else "ended")
                 if ev == "end":
@@ -548,6 +551,8 @@ class Agent:
         after 180 s) and, while draining, check every DRAIN_CHECK_S whether the node is drained."""
         now = time.time() if now is None else now
         st = self.state
+        if isinstance(st.get("ctl_drain"), dict) and apply_config_drain(st, st["ctl_drain"], now) == "end":
+            log.info("node drain ended by the controller")
         d = st.get("drain") if isinstance(st.get("drain"), dict) else {}
         active = d.get("state") in DRAIN_STATES
         want = active and refuse_now(d, now)
@@ -588,6 +593,7 @@ class Agent:
             log.warning("upgrade undrain: controller not reachable (%s); retrying", type(e).__name__)
             return
         end_drain(st, time.time())
+        st.pop("ctl_drain", None)   # stale until the next config shows the stop
         self.__dict__["upgrade_restart"] = False
         log.info("upgrade finished: node undrained")
         self.drain_step()

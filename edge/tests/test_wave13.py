@@ -225,12 +225,15 @@ def test_config_drain_transitions():
     # an extension from the controller moves `until`
     nd2 = dict(nd, until=nd["until"] + 600)
     assert agent.apply_config_drain(st, nd2, now + 10) is None and st["drain"]["until"] == "2030-01-01T00:20:00Z"
-    # the controller no longer shows it: a fresh local (CLI) drain survives the propagation lag ...
+    # the controller no longer shows a drain it has shown: ended at once (kept for §22.12)
     off = agent.norm_drain({"node": {"drain": {"state": ""}}})
-    assert agent.apply_config_drain(st, off, now + 20) is None and st["drain"]["state"] == "draining"
-    # ... an older one ends (and is kept for the §22.12 classification)
-    assert agent.apply_config_drain(st, off, now + 500) == "end"
+    assert agent.apply_config_drain(st, off, now + 20) == "end"
     assert st["drain"]["state"] == "" and st["drain_log"][-1]["u"] == "2030-01-01T00:20:00Z"
+    # a drain the CLI just started (the controller has not shown it yet) survives the propagation lag ...
+    st["drain"] = {"state": "draining", "since": agent.iso(now), "by": "edge", "at": now}
+    assert agent.apply_config_drain(st, off, now + 20) is None and st["drain"]["state"] == "draining"
+    # ... until DRAIN_LAG_S after its start
+    assert agent.apply_config_drain(st, off, now + 500) == "end" and st["drain"]["state"] == ""
     assert agent.norm_drain({"node": {}}) is None and agent.norm_drain({"node": {"drain": "x"}})["state"] == ""
     assert agent.refuse_now({"state": "draining", "refuse_after": agent.iso(100)}, 99) is False
     assert agent.refuse_now({"state": "draining", "refuse_after": agent.iso(100)}, 100) is True
@@ -1334,3 +1337,63 @@ def test_controller_path_shape_with_null_keys(tmp_path):
     assert agent.norm_drain(body)["state"] == ""
     assert agent.render_tree(body, make_cfg(tmp_path))[1] == agent.render_tree(
         dict(body, node={"name": "n", "capacity_mbps": 0, "fair_share_pct": 25}), make_cfg(tmp_path))[1]
+
+
+
+def test_controller_undrain_ends_a_drained_node_promptly(tmp_path, monkeypatch):
+    """CI regression: drain -> the node turns "drained" (bumping `at`) -> the admin undrains. The agent
+    must end the drain on the next config, and keep honouring the controller's view while later config
+    polls are 304s (it used to wait DRAIN_LAG_S after `at` and was never re-evaluated on a 304)."""
+    flags = []
+    monkeypatch.setattr(agent, "set_flag", lambda c, on, opener=None: flags.append(on) or True)
+    monkeypatch.setattr(agent, "public_conns", lambda c: 0)
+    a = bare_agent(make_cfg(tmp_path))
+    on = {"state": "draining", "refuse_after": 1100.0, "until": 9000.0}
+    a.state["ctl_drain"] = on
+    assert agent.apply_config_drain(a.state, on, 1000) == "start"
+    a.drain_step(1000)
+    a.drain_step(1010)                       # 0 connections twice -> drained (at = 1010)
+    assert a.state["drain"]["state"] == "drained"
+    a.drain_step(1100)                       # grace over: refusing
+    assert flags[-1] is True
+    # the admin undrains at 1110; the next config (a full fetch) shows it 10 s after `at` was bumped
+    a.state["ctl_drain"] = {"state": "", "refuse_after": None, "until": None}
+    assert agent.apply_config_drain(a.state, a.state["ctl_drain"], 1120) == "end"
+    a.drain_step(1120)
+    assert a.state["drain"]["state"] == "" and flags[-1] is False and "drain_flag" not in a.state
+    # a later 304 poll never revives it; drain_step alone re-evaluates the kept controller view
+    a.drain_step(1130)
+    assert a.state["drain"]["state"] == "" and flags[-1] is False
+    # the CLI starts a new drain: the stale controller view is dropped until a fresh config shows it
+    a.state["ctl_drain"] = on
+    agent.merge_disk_drain(a.state, {"drain": {"state": "", "at": 2000.0}})
+    assert "ctl_drain" not in a.state
+
+
+def test_sync_config_304_still_ends_a_drain(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "set_flag", lambda c, on, opener=None: True)
+    monkeypatch.setattr(agent, "apply_config", lambda config, cfg_, files=None, digest=None:
+                        agent.write_tree(cfg_["NGINX_DIR"].rstrip("/"), files))
+
+    class Ctl(SeqCtl):
+        def __init__(self):
+            super().__init__()
+            self.not_modified = False
+
+        def call(self, method, path, body=None, headers=None, timeout=30):
+            if path == "/edge/v1/config" and self.not_modified:
+                return 304, {}, None
+            return super().call(method, path, body, headers, timeout)
+    a = bare_agent(make_cfg(tmp_path), Ctl())
+    now = time.time()
+    a.ctl.serve("v1", [MINSITE], node={"drain": {"state": "draining", "refuse_after": agent.iso(now - 10),
+                                                 "until": agent.iso(now + 600)}})
+    a.sync_config()
+    a.state["drain"]["state"], a.state["drain"]["at"] = "drained", time.time()
+    a.ctl.serve("v2", [MINSITE], node={"drain": {"state": ""}})
+    a.sync_config()
+    assert a.state["drain"]["state"] == ""
+    a.ctl.not_modified = True
+    a.sync_config()
+    a.drain_step()
+    assert a.state["drain"]["state"] == ""

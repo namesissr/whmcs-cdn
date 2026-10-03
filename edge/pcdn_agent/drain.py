@@ -94,6 +94,7 @@ def merge_disk_drain(state: dict, disk: dict) -> bool:
     d, cur = disk.get("drain"), state.get("drain")
     if isinstance(d, dict) and float(d.get("at") or 0) > float((cur or {}).get("at") or 0):
         state["drain"] = d
+        state.pop("ctl_drain", None)   # the controller's view predates the CLI's call: wait for a fresh one
         return True
     return False
 
@@ -145,12 +146,20 @@ def apply_config_drain(state: dict, nd: dict | None, now: float | None = None) -
         upd = {"refuse_after": iso(nd["refuse_after"]), "until": iso(nd["until"])}
         if not active:
             state["drain"] = dict(upd, state="draining", since=iso(now), by=cur.get("by") or "admin",
-                                  upgrade=False, ok=0, at=now)
+                                  upgrade=False, ok=0, ctl=True, at=now)
             return "start"
-        if any(cur.get(k) != v for k, v in upd.items() if v):
-            state["drain"] = dict(cur, **{k: v for k, v in upd.items() if v}, at=now)
+        if not cur.get("ctl") or any(cur.get(k) != v for k, v in upd.items() if v):
+            # "ctl": the controller has shown this drain, so its disappearance later is an undrain
+            state["drain"] = dict(cur, **{k: v for k, v in upd.items() if v}, ctl=True, at=now)
         return None
-    if active and now - float(cur.get("at") or 0) > DRAIN_LAG_S:
+    if not active:
+        return None
+    # The controller no longer shows the drain. A drain it HAS shown ends at once (admin / edge undrain,
+    # auto-undrain). Only a drain the CLI just started and the controller has not shown yet (config fetched
+    # before the POST) survives, for DRAIN_LAG_S after its start - never measured from `at`, which local
+    # transitions (drained) bump.
+    started = parse_iso(cur.get("since")) or float(cur.get("at") or 0)
+    if cur.get("ctl") or now - started > DRAIN_LAG_S:
         end_drain(state, now)
         return "end"
     return None

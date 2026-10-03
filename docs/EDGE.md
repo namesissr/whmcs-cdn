@@ -526,6 +526,9 @@ traffic. `/__pcdn_drain` (internal) answers `503`, `Retry-After: 30`, `Connectio
 (heartbeat sent at once). Heartbeat `drain: {state, conns, since}`; capability `drain: true`.
 CLI: `pcdn-agent drain --minutes N [--reason R] [--wait] [--timeout S]` (POST `/edge/v1/drain`; exit 0 ok,
 3 `last_edge` (EN + FA message), 2 other errors incl. an older controller's 404) and `pcdn-agent undrain`.
+A drain the controller has shown ends as soon as a config no longer shows it (the last `node.drain`
+is kept and re-evaluated every tick, so a 304 poll never delays it); only a CLI-started drain the
+controller has not shown yet survives a stale config for 120 s after its start.
 The CLI writes `state["drain"]` under `STATE_FILE.lock`; the running agent adopts it on its next tick and never
 overwrites it (merge by `at`). `install.sh/bootstrap.sh --upgrade --drain[=1..120]` (default 15; refused
 without `--upgrade` or out of range) drain BEFORE nginx / the agent are touched: an agent too old for
