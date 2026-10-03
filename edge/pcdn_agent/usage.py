@@ -141,6 +141,8 @@ def classify_tunnel(e: dict) -> str | None:
     if code == 101 or 200 <= code < 300:
         return "session"
     us = _last_value(e.get("us"))
+    if e.get("pg") == "drain" and not us:   # SPEC §22.1: refused while the node drains (edge decision)
+        return "edge"
     if code == 499:
         return "session" if _ACCEPTED.match(us) else None
     if not us:
@@ -175,7 +177,74 @@ def connect_ms(e: dict) -> int | None:
 
 def _new_tpath() -> dict:
     return {"sessions": 0, "seconds": 0.0, "bytes_up": 0, "bytes_down": 0, "abnormal": 0, "connect_ms_sum": 0,
-            "connect_n": 0, "errors": dict.fromkeys(TUNNEL_ERRORS, 0)}
+            "connect_n": 0, "errors": dict.fromkeys(TUNNEL_ERRORS, 0),
+            # SPEC §22.7 / §22.12: reused upstream connections; session ends by reason (access-log part)
+            # and the error-log matches (idle_timeout / origin / other) subtracted from "normal" at send time
+            "reused_n": 0, "ends": dict.fromkeys(TUNNEL_END_KEYS, 0), "ends_err": dict.fromkeys(END_ERR_KEYS, 0)}
+
+
+# ---- "why did my connection drop?" (SPEC §22.12)
+TUNNEL_END_KEYS = ("normal", "idle_timeout", "origin", "node_reload", "node_drain", "other")
+END_ERR_KEYS = ("idle_timeout", "origin", "other")   # classified from the nginx error log (nodelogs)
+END_RELOAD_SLACK = 5          # s around R + worker_shutdown_timeout / a forced worker shutdown
+END_DRAIN_BEFORE, END_DRAIN_AFTER = 3, 120   # s around a drain's `until` (or the upgrade restart)
+
+
+def _ts(v) -> float | None:
+    """Epoch seconds of a number or an ISO-8601 string (None when neither)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    if isinstance(v, str) and v:
+        try:
+            return _utc(v.replace("Z", "+00:00")).timestamp()
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+def ends_context(state: dict) -> dict:
+    """What session-end classification needs from the agent state: reload times + the
+    worker_shutdown_timeout (wst_s), forced worker shutdowns (memory guard) and drain windows
+    ([start, until, upgrade restart] of state["drain_log"] and the drain in progress)."""
+    drains = []
+    log_ = list(state.get("drain_log") or [])
+    d = state.get("drain")
+    if isinstance(d, dict) and d.get("state") in ("draining", "drained"):
+        log_.append({"s": d.get("since"), "u": d.get("until"), "r": d.get("restart_at")})
+    for x in log_:
+        if isinstance(x, dict) and _ts(x.get("s")) is not None:
+            drains.append((_ts(x.get("s")), _ts(x.get("u")), _ts(x.get("r"))))
+    wst = state.get("wst_s")
+    return {"reloads": [float(r) for r in state.get("reload_times") or [] if isinstance(r, (int, float))],
+            "wst": int(wst) if isinstance(wst, int) and wst > 0 else None,
+            "forced": [float(f["t"]) for f in state.get("forced_shutdowns") or []
+                       if isinstance(f, dict) and isinstance(f.get("t"), (int, float))],
+            "drains": drains}
+
+
+def end_reason(ctx: dict | None, start: float, end: float) -> str | None:
+    """node_drain / node_reload for an accepted session [start, end], else None (first match wins):
+    node_drain: started before a drain start and ended within [until - 3 s, until + 120 s], or ended
+      after the drain started within 120 s of the agent's restart for an upgrade drain;
+    node_reload: started before a reload R and ended within 5 s of R + worker_shutdown_timeout (the
+      forced end of the old worker generation), or within 5 s of a forced worker shutdown."""
+    if not ctx:
+        return None
+    for ds, du, restart in ctx["drains"]:
+        if start >= ds:
+            continue
+        if du is not None and du - END_DRAIN_BEFORE <= end <= du + END_DRAIN_AFTER:
+            return "node_drain"
+        if restart is not None and end >= ds and abs(end - restart) <= END_DRAIN_AFTER:
+            return "node_drain"
+    if ctx["wst"]:
+        for r in ctx["reloads"]:
+            if start < r and abs(end - (r + ctx["wst"])) <= END_RELOAD_SLACK:
+                return "node_reload"
+    for f in ctx["forced"]:
+        if start < f and abs(end - f) <= END_RELOAD_SLACK:
+            return "node_reload"
+    return None
 
 
 def _tpath(t: dict, pid: str) -> dict | None:
@@ -654,7 +723,8 @@ def waf_learn_item(L: dict | None, H: dict | None) -> dict:
 
 
 def _account(e: dict, pending: dict, events: list, live: dict | None = None, cutoff: str = "",
-             ship=None, raw: bytes | None = None, vhosts: dict | None = None, learn: dict | None = None):
+             ship=None, raw: bytes | None = None, vhosts: dict | None = None, learn: dict | None = None,
+             ends: dict | None = None):
     """Fold one access-log record into the host-hour (`pending`), the security `events`, the
     host-minute `live` buckets (SPEC §14.3.1; minutes before `cutoff` skipped) and, for sites with
     log export, the sampler `ship` (SPEC §14.3.2; `raw` is the log line, the sampling key)."""
@@ -686,7 +756,7 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
     tcls = live_tn = None
     if tn in TUNNEL_PROTOCOLS:
         tcls = classify_tunnel(e)
-        _account_tunnel(a, e, tn, code, tcls)
+        _account_tunnel(a, e, tn, code, tcls, ends)
         if e.get("tp"):
             live_tn = tcls or ""
     if vhosts and not tn and VIDEO_EXT.search(path) and video_host(vhosts, host):
@@ -810,7 +880,7 @@ def _nsum(v) -> int:
     return sum(int(x) for x in re.findall(r"\d+", str(v or "")))
 
 
-def _account_tunnel(a: dict, e: dict, proto: str, code: int, tcls: str | None = None):
+def _account_tunnel(a: dict, e: dict, proto: str, code: int, tcls: str | None = None, ends: dict | None = None):
     """Tunnel counters of a host-hour (SPEC §7.3). One log line = one tunnel request: a whole
     WebSocket / HTTPUpgrade session or gRPC / h2 stream, or one XHTTP request.
     Bytes from the client: $request_length counts request bodies (HTTP/1.1 and HTTP/2) but not
@@ -844,15 +914,27 @@ def _account_tunnel(a: dict, e: dict, proto: str, code: int, tcls: str | None = 
     if tcls == "session":
         p["sessions"] += 1
         try:
-            p["seconds"] += max(0.0, float(e.get("rt") or 0))
+            rt = max(0.0, float(e.get("rt") or 0))
         except (TypeError, ValueError):
-            pass
+            rt = 0.0
+        p["seconds"] += rt
+        # SPEC §22.12: why the session ended (node drain / reload windows; "normal" otherwise, minus the
+        # error-log matches at send time)
+        try:
+            end = _utc(e["t"]).timestamp()
+            why = end_reason(ends, end - rt, end) or "normal"
+        except (KeyError, TypeError, ValueError, OverflowError):
+            why = "normal"
+        en = p.setdefault("ends", dict.fromkeys(TUNNEL_END_KEYS, 0))
+        en[why] = en.get(why, 0) + 1
     elif tcls in TUNNEL_ERRORS:
         p["errors"][tcls] = p["errors"].get(tcls, 0) + 1
     ms = connect_ms(e)
     if ms is not None:   # every tunnel request whose (last) upstream connect succeeded, whatever came next
         p["connect_ms_sum"] += ms
         p["connect_n"] += 1
+    if str(e.get("uct") or "") == "0.000":   # SPEC §22.7: ready in < 1 ms ~ a reused keepalive connection
+        p["reused_n"] = p.get("reused_n", 0) + 1
 
 
 def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float | None = None,
@@ -868,6 +950,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
     vh = state.get("video_hosts") or None
     vhosts = dict(vh, _set=frozenset(vh.get("exact") or ())) if isinstance(vh, dict) else None
     learn = _learn_ctx(state) if state.get("learn_hosts") else None
+    ends = ends_context(state)   # SPEC §22.12
     read = 0
     with open(path, "rb", buffering=1 << 20) as f:
         f.seek(pos)
@@ -877,7 +960,7 @@ def _consume(path: str, pos: int, state: dict, max_bytes: int, deadline: float |
             pos += len(raw)
             read += len(raw)
             try:
-                _account(json.loads(raw), pending, events, live, cutoff, ship, raw, vhosts, learn)
+                _account(json.loads(raw), pending, events, live, cutoff, ship, raw, vhosts, learn, ends)
             except (ValueError, KeyError, TypeError, AttributeError):
                 pass
             if read >= max_bytes or (deadline is not None and time.monotonic() > deadline):
@@ -1055,10 +1138,19 @@ def tpath_item(p: dict) -> dict:
         except (TypeError, ValueError):
             return 0
     errs = p.get("errors") or {}
+    ends, err = p.get("ends") or {}, p.get("ends_err") or {}
+    out_ends = {k: n(ends.get(k)) for k in TUNNEL_END_KEYS}
+    sub = 0
+    for k in END_ERR_KEYS:   # error-log matched ends move out of "normal" (never below 0)
+        out_ends[k] += n(err.get(k))
+        sub += n(err.get(k))
+    out_ends["normal"] = max(0, out_ends["normal"] - sub)
     return {"sessions": n(p.get("sessions")), "seconds": n(p.get("seconds")), "bytes_up": n(p.get("bytes_up")),
             "bytes_down": n(p.get("bytes_down")), "abnormal": n(p.get("abnormal")),
             "connect_ms_sum": n(p.get("connect_ms_sum")), "connect_n": n(p.get("connect_n")),
-            "errors": {k: n(errs.get(k)) for k in TUNNEL_ERRORS}}
+            "errors": {k: n(errs.get(k)) for k in TUNNEL_ERRORS},
+            # SPEC §22.7 / §22.12 (pre-wave-13 agents omit both)
+            "reused_n": n(p.get("reused_n")), "ends": out_ends}
 
 
 def usage_items(pending: dict, learn_hours: dict | None = None) -> list[dict]:

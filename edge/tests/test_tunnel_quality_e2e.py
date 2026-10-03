@@ -368,9 +368,9 @@ def test_real_nginx_lines_classify(tq):
     assert items["lim.test"]["tunnel"]["paths"]["t"]["errors"]["limit"] >= 1
     for p in paths.values():   # wire shape: integers >= 0, all seven error keys
         assert set(p) == {"sessions", "seconds", "bytes_up", "bytes_down", "abnormal", "connect_ms_sum", "connect_n",
-                          "errors"}
-        assert set(p["errors"]) == set(agent.TUNNEL_ERRORS)
-        assert all(isinstance(v, int) and v >= 0 for k, v in p.items() if k != "errors")
+                          "errors", "reused_n", "ends"}   # + SPEC §22.7 / §22.12
+        assert set(p["errors"]) == set(agent.TUNNEL_ERRORS) and set(p["ends"]) == set(agent.TUNNEL_END_KEYS)
+        assert all(isinstance(v, int) and v >= 0 for k, v in p.items() if k not in ("errors", "ends"))
     live = [i for i in agent.live_items(state["live"], agent.live_cutoff()) if i["host"] == "q.test"]
     lines = [e for e in tq.log() if e["h"] == "q.test" and e.get("tp")]
     assert sum(i.get("tunnel_attempts", 0) for i in live) == len(lines)

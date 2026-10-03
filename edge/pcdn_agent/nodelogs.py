@@ -106,6 +106,22 @@ def read_error_log(state: dict, path: str, raw_hook=None) -> list[dict]:
 # The line is attributed to the path id by host + longest tunnel prefix of its request path.
 ABNORMAL_RE = re.compile(r'^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[error\] .* while (?:proxying upgraded connection|'
                          r'reading upstream), .*?request: "[A-Z]{1,16} (\S+) [^"]*".*, host: "([^"]+)"\s*$')
+# SPEC §22.12 session-end reasons from the same lines (plus the [info] "client timed out" of an idle
+# upgraded session, when the error log keeps info): "timed out" -> idle_timeout, reset / premature close /
+# broken pipe -> origin, any other abnormal end -> other. Each match moves one end out of "normal".
+END_RE = re.compile(r'^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(error|info)\] \d+#\d+: (?:\*\d+ )?(.*?) while '
+                    r'(?:proxying upgraded connection|reading upstream), .*?request: "[A-Z]{1,16} (\S+) [^"]*".*, '
+                    r'host: "([^"]+)"\s*$')
+_END_ORIGIN = re.compile(r"reset by peer|prematurely closed|broken pipe|connection reset", re.I)
+
+
+def end_class(level: str, msg: str) -> str | None:
+    """The §22.12 reason of an abnormal-end error-log line (None: not a session end we count)."""
+    if "timed out" in msg:
+        return "idle_timeout"
+    if level != "error":
+        return None
+    return "origin" if _END_ORIGIN.search(msg) else "other"
 
 
 def tunnel_map(config: dict) -> dict:
@@ -149,10 +165,15 @@ def account_abnormal(state: dict, text: str) -> int:
     pending = state.setdefault("pending", {})
     n = 0
     for raw in text.splitlines():
-        m = ABNORMAL_RE.match(raw.strip())
-        if not m:
+        raw = raw.strip()
+        em = END_RE.match(raw)
+        m = ABNORMAL_RE.match(raw)
+        if not m and not em:
             continue
-        ts, uri, host = m.groups()
+        ts, uri, host = m.groups() if m else (em.group(1), em.group(4), em.group(5))
+        why = end_class(em.group(2), em.group(3)) if em else None
+        if not m and not why:
+            continue
         pid = _tmap_lookup(tmap, host, uri.split("?", 1)[0])
         if not pid:
             continue
@@ -165,8 +186,12 @@ def account_abnormal(state: dict, text: str) -> int:
         t = a.setdefault("tunnel", {"sessions": 0, "seconds": 0.0, "bytes_up": 0, "bytes_down": 0, "by_protocol": {}})
         p = _tpath(t, pid)
         if p is not None:
-            p["abnormal"] += 1
-            n += 1
+            if m:
+                p["abnormal"] += 1
+                n += 1
+            if why:
+                e = p.setdefault("ends_err", {})
+                e[why] = e.get(why, 0) + 1
     return n
 
 

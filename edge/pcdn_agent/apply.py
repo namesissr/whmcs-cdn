@@ -27,7 +27,7 @@ def run(cmd: str) -> tuple[int, str]:
 def write_tree(root: str, files: dict):
     os.makedirs(os.path.join(root, "sites"), exist_ok=True)
     os.makedirs(os.path.join(root, "certs"), mode=0o700, exist_ok=True)
-    for d in ("mtls", "storage"):
+    for d in ("mtls", "storage", "tickets"):
         if any(rel.startswith(d + "/") for rel in files):
             os.makedirs(os.path.join(root, d), mode=0o700, exist_ok=True)
     for rel, content in files.items():
@@ -37,10 +37,11 @@ def write_tree(root: str, files: dict):
         # so are the origin-pull client certificates (mtls/, mtls.conf; SPEC §14.2) and the object-
         # storage read tokens (storage/; SPEC §16.8) and the controller token of the access OTP hop
         # (edge-auth.conf; SPEC §18.2)
+        # SPEC §22.8: the session-ticket keys (tickets/, raw bytes) are secrets of the master too
         mode = 0o600 if (rel.endswith(".key") or rel in ("js/sites.js", "shield.conf", "mtls.conf", "edge-auth.conf")
-                         or rel.startswith(("mtls/", "storage/"))) else 0o644
+                         or rel.startswith(("mtls/", "storage/", "tickets/"))) else 0o644
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "wb" if isinstance(content, bytes) else "w") as f:
             f.write(content)
 
 

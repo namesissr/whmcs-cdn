@@ -8,7 +8,8 @@ from ..reload import CONFVER_MARKER, tree_digest
 from ..settings import asset
 from ..validation.rules import norm_bot_ranges, norm_origin_pull
 from ..capabilities import has_module
-from .http import norm_node, render_bots, render_gates, render_http, render_mtls_resizer
+from .http import TICKET_FILES, norm_node, norm_tickets, render_bots, render_gates, render_http, render_mtls_resizer
+from .probe import render_probe
 from .shield import norm_shield, render_shield
 from .site import _render_site, render_edge_auth
 from .stream import render_l4
@@ -26,8 +27,9 @@ def render_all(config: dict, cfg: dict) -> dict:
     platform = norm_origin_pull(config)   # node-wide platform client certificate (SPEC §14.2)
     platform_pair = (platform["cert"], platform["key"]) if platform else None
     resizer_pairs, platform_used, fn_any, sto_fetch = {}, False, False, False
+    node = norm_node(config, cfg)
     for site in config.get("sites", []):
-        text, extra, js, meta = _render_site(site, cfg, shield, platform_pair)
+        text, extra, js, meta = _render_site(site, cfg, shield, platform_pair, node)
         fn_any = fn_any or bool(meta.get("functions"))
         sto_fetch = sto_fetch or bool(meta.get("storage_fetch"))
         files[f"sites/{int(site['id'])}.conf"] = text
@@ -39,7 +41,7 @@ def render_all(config: dict, cfg: dict) -> dict:
         if js:
             js_sites[str(int(site["id"]))] = js
             for p in js["pools"].values():
-                if p["health"]["enabled"]:
+                if p["health"]["enabled"] and p["health"].get("type") != "tcp":   # tcp: agent-checked
                     max_timeout = max(max_timeout, p["health"]["timeout"])
     sto_port = (_int(cfg.get("STORAGE_FETCH_PORT"), 8091, 1, 65535),) if sto_fetch else ()
     files.update(render_l4(config, cfg, sto_port))   # SPEC §16.4 ({} without L4 apps)
@@ -56,8 +58,12 @@ def render_all(config: dict, cfg: dict) -> dict:
     mtls_conf = render_mtls_resizer(resizer_pairs)
     if mtls_conf:
         files["mtls.conf"] = mtls_conf
+    # SPEC §22.8 shared session-ticket keys (raw 80-byte files, 0600; a GLOBAL change: one reload each)
+    tickets = norm_tickets(config) or []
+    for rel, key in zip(TICKET_FILES, tickets):
+        files[rel] = key
     files["http.conf"] = render_http(cfg, max_timeout + 1, shield, bool(bots_conf), bool(mtls_conf),
-                                     norm_node(config, cfg))
+                                     node, render_probe(cfg), len(tickets))
     if fn_any:   # SPEC §16.9: the fetch() socket answers 421 for any host without a fetch server
         files["http.conf"] += ("\n# edge functions fetch() socket (SPEC §16.9): unknown hosts\nserver {\n"
                                f"    listen unix:{cfg.get('FN_FETCH_SOCKET') or '/run/pcdn-fnfetch/fetch.sock'} "

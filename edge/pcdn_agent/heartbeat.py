@@ -2,7 +2,9 @@
 and the capabilities object."""
 
 import os
+import signal
 import time
+from datetime import datetime, timezone
 
 from .capabilities import guard_installed, image_capabilities, l4_ready, nginx_capabilities
 from .common import VIRTUAL_IFACES, _int, default_iface
@@ -28,7 +30,11 @@ def heartbeat_capabilities(cfg: dict) -> dict:
             "avif": image_capabilities(cfg)["avif"], "image_transform": image_capabilities(cfg)["transform"],
             "net_guard": guard_installed(cfg),
             # SPEC §16.9: true only while pcdn-fn runs and its sandbox self-test passes
-            "edge_functions": functions_ready(cfg)}
+            "edge_functions": functions_ready(cfg),
+            # SPEC §22 (wave 13): node drain flag, synthetic tunnel probe, multi-origin tunnel paths and
+            # re-resolved keepalive upstreams for host-name origins (nginx >= 1.27.3)
+            "drain": True, "tunnel_probe": True, "tunnel_multi_origin": True,
+            "upstream_resolve": bool(c.get("upstream_resolve"))}
 
 
 def net_bytes(iface: str | None, dev_path: str = "/proc/net/dev") -> tuple[int, int] | None:
@@ -182,3 +188,96 @@ def mem_pct(meminfo: str = "/proc/meminfo") -> float | None:
         return round((total - avail) * 100 / total, 1)
     except (OSError, ValueError, IndexError):
         return None
+
+
+# ----------------------------------------------------------------- reload metrics (SPEC §22.2)
+
+RELOAD_TIMES_MAX, RELOAD_KEEP_S = 500, 48 * 3600
+FORCED_MAX = 200
+
+
+def _iso(ts: float | None) -> str | None:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
+
+
+def prune_times(times: list, keep_s: int, cap: int, now: float) -> list:
+    """Epoch timestamps of the last keep_s seconds, at most cap (newest kept)."""
+    out = [t for t in times or [] if isinstance(t, (int, float)) and now - t <= keep_s]
+    return out[-cap:]
+
+
+def reload_stats(state: dict, wst_s: int | None, now: float | None = None, mono: float | None = None) -> dict:
+    """The heartbeat `reloads` object: successful reloads in the last hour / day, the last one, config
+    versions superseded before being applied (coalesced) in the last hour, the age of the pending
+    version, whether a reload is being deferred, worker_shutdown_timeout and forced worker shutdowns."""
+    now = time.time() if now is None else now
+    mono = time.monotonic() if mono is None else mono
+    rt = [t for t in state.get("reload_times") or [] if isinstance(t, (int, float))]
+    co = [t for t in state.get("coalesced_times") or [] if isinstance(t, (int, float))]
+    fs = [f.get("t") for f in state.get("forced_shutdowns") or [] if isinstance(f, dict)]
+    pending = 0
+    if state.get("pending_version") and isinstance(state.get("pending_first", state.get("pending_since")), (int, float)):
+        pending = max(0, int(mono - state.get("pending_first", state.get("pending_since"))))
+    return {"count_1h": sum(1 for t in rt if now - t <= 3600), "count_24h": sum(1 for t in rt if now - t <= 86400),
+            "last_at": _iso(max(rt)) if rt else None, "coalesced_1h": sum(1 for t in co if now - t <= 3600),
+            "pending_s": pending, "deferred": bool(state.get("reload_deferred")),
+            "wst_s": wst_s, "forced_shutdowns_24h": sum(1 for t in fs if isinstance(t, (int, float)) and now - t <= 86400)}
+
+
+# ----------------------------------------------------------------- memory guard (SPEC §22.2)
+
+def shutting_down_workers(proc: str = "/proc") -> list[tuple[int, int]]:
+    """[(start time in clock ticks, pid)] of nginx workers of OLD generations ("worker process is
+    shutting down"), oldest first. Never the master or a current-generation worker."""
+    out = []
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return out
+    for pid in names:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, pid, "cmdline"), "rb") as f:
+                if b"worker process is shutting down" not in f.read():
+                    continue
+            with open(os.path.join(proc, pid, "stat")) as f:
+                stat = f.read()
+            # field 22 (starttime) counted after the ")" that closes the command name
+            start = int(stat.rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError):
+            continue
+        out.append((start, int(pid)))
+    return sorted(out)
+
+
+def memory_guard(state: dict, cfg: dict, mem: float | None, now: float | None = None, kill=os.kill) -> int | None:
+    """Called once per heartbeat. When mem_pct >= MEM_GUARD_PCT for 2 consecutive heartbeats and old
+    worker generations are still draining, SIGTERM the oldest shutting-down worker (at most one per 60 s)
+    and record it in state["forced_shutdowns"] (session-end classification). -> the pid or None."""
+    now = time.time() if now is None else now
+    pct = _int(cfg.get("MEM_GUARD_PCT"), 92, 0, 99)
+    if pct and pct < 50:
+        pct = 50
+    if not pct or mem is None or mem < pct:
+        state["mem_high"] = 0
+        return None
+    state["mem_high"] = int(state.get("mem_high") or 0) + 1
+    if state["mem_high"] < 2 or now - float(state.get("mem_guard_at") or 0) < 60:
+        return None
+    victims = shutting_down_workers(cfg.get("PROC_DIR", "/proc"))
+    if not victims:
+        return None
+    pid = victims[0][1]
+    try:
+        kill(pid, signal.SIGTERM)
+    except OSError as e:
+        log.warning("memory guard: cannot stop old nginx worker %d: %s", pid, e)
+        return None
+    log.warning("memory guard: memory at %.1f %% (>= %d %%): stopped the oldest shutting-down nginx worker %d",
+                mem, pct, pid)
+    state["mem_guard_at"] = now
+    fs = [f for f in state.get("forced_shutdowns") or [] if isinstance(f, dict) and now - f.get("t", 0) <= RELOAD_KEEP_S]
+    fs.append({"t": now, "pid": pid})
+    state["forced_shutdowns"] = fs[-FORCED_MAX:]
+    return pid

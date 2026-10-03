@@ -505,3 +505,147 @@ New agent.conf keys (kept by `--upgrade`): `CAPACITY_MBPS` (0), `FAIR_SHARE_PCT`
 - New agent.conf keys: `L4_PORT_RANGE`, `L4_ACCESS_LOG`, `NGINX_CONF`, `IMAGED`, `IMAGE_PORT`,
   `IMAGE_WORKERS`, `IMAGE_MAX_SOURCE_MB`, `GUARD*`, `AVIF`, `STORAGE_FETCH_PORT`, `FUNCTIONS`, `FN_*`
   (all kept by `--upgrade`).
+
+
+## Wave 13: tunnel speed and stability (SPEC §22)
+
+Hard constraint (SPEC §22): nothing here evades filtering, hides / rotates node addresses, obfuscates or
+fragments traffic, or picks nodes by "what is not blocked". The probe tests only the node's own health over
+loopback (or an operator-run echo origin); node selection stays health / load / capacity driven.
+
+**Drain (§22.1).** `node.drain = {state, refuse_after, until}` from the controller is agent-side only (never
+rendered, never a reload). While draining, after the DNS grace (`refuse_after`; fallback start + 330 s) the
+agent sets the njs flag `drain` in `pcdn_fair` (`/__pcdn/fair?drain=1`, refreshed every tick, expires after
+180 s → fail open). Every tunnel location renders, right after the fair-share line,
+`if ($pcdn_tn_drain) { error_page 503 = /__pcdn_drain; return 503; }`; `pcdn.tunnelDrain` is `"1"` only for
+the first request of a client connection (`$connection_requests = 1`) that is not an xhttp POST, so upgraded
+sessions, new h2 streams on an existing connection and xhttp packet POSTs are never refused, nor is web
+traffic. `/__pcdn_drain` (internal) answers `503`, `Retry-After: 30`, `Connection: close`
+(`keepalive_timeout 0`) and is logged with `"pg":"drain"` → counted as `errors.edge`. The agent checks every
+10 s: ≤ `DRAIN_IDLE_CONNS` (10) ESTABLISHED public connections twice in a row, or `until` reached → `drained`
+(heartbeat sent at once). Heartbeat `drain: {state, conns, since}`; capability `drain: true`.
+CLI: `pcdn-agent drain --minutes N [--reason R] [--wait] [--timeout S]` (POST `/edge/v1/drain`; exit 0 ok,
+3 `last_edge` (EN + FA message), 2 other errors incl. an older controller's 404) and `pcdn-agent undrain`.
+The CLI writes `state["drain"]` under `STATE_FILE.lock`; the running agent adopts it on its next tick and never
+overwrites it (merge by `at`). `install.sh/bootstrap.sh --upgrade --drain[=1..120]` (default 15; refused
+without `--upgrade` or out of range) drain BEFORE nginx / the agent are touched: an agent too old for
+`drain` (its `drain --help`, run with `PCDN_CONFIG=/nonexistent`, does not exit 0) or a failed drain → warning,
+upgrade without drain; exit 3 → upgrade aborted. A failed upgrade after the drain runs `undrain` (EXIT trap).
+After the restart the new agent ends an UPGRADE drain (`reason upgrade`) itself once its first config apply
+succeeded and the first tunnel probe passed (or the probe is unsupported); an admin drain is never ended by
+the agent. `--drain` never changes `worker_shutdown_timeout`.
+
+**Fewer reloads (§22.2).** `RELOAD_MAX_WAIT` (900 s, 60..3600): the oldest unapplied version is applied on the
+next poll whatever back-pressure / `RELOAD_MIN_INTERVAL` / F21 say (back-pressure is capped at it).
+`node.drain`, `node.probe`, `node.dns_weight` never reach the rendered tree (F20 skip, no reload); shared
+ticket keys are a global file (one reload per rotation). The F21 global digest now masks the tree digest
+embedded in `/__pcdn/confver` (it changed with every site, so F21 never deferred anything before).
+Heartbeat `reloads: {count_1h, count_24h, last_at, coalesced_1h, pending_s, deferred, wst_s,
+forced_shutdowns_24h}` (`state["reload_times"]`: 48 h, ≤ 500; `wst_s` parsed from `NGINX_CONF`).
+**Memory guard:** `mem_pct ≥ MEM_GUARD_PCT` (92; 0 = off) on 2 heartbeats while old worker generations
+drain → `SIGTERM` to the oldest "worker process is shutting down" (start time from `/proc/<pid>/stat`), at
+most one per 60 s, logged, recorded in `state["forced_shutdowns"]`; never the master or a current worker.
+**worker_shutdown_timeout:** `install.sh --shutdown-timeout auto` (default): RAM < 4 GiB `30m`, 4–8 GiB `2h`,
+≥ 8 GiB `4h`. An explicit value (never seconds below 60) is stored as `SHUTDOWN_TIMEOUT` and kept by
+`--upgrade`; an `--upgrade` of an edge without that line keeps nginx.conf's existing value.
+
+**Synthetic tunnel probe (§22.3).** `http.conf` gains a server on the public HTTPS listener
+(`server_name probe.pcdn.invalid`, self-signed EC P-256 cert in `PROBE_DIR` — install.sh: `/etc/pcdn/probe`,
+key 0600 — `allow 127.0.0.0/8; allow ::1; deny all;`, `access_log off`) whose `/__pcdn_probe/ws` and
+`/__pcdn_probe/grpc` locations are built by the same `tunnel_pass_lines` as customer ws / grpc paths
+(`proxy_bind` / `grpc_bind` INTERNAL_SRC), plus a loopback h2c server on `PROBE_H2C_PORT` (8093) that answers
+any method with 200 `application/grpc`, `PROBE_BYTES` bytes (`PROBE_DIR/body.bin`) and `grpc-status 0`. The
+agent runs the WS echo origin on `127.0.0.1:PROBE_ECHO_PORT` (8092; both ports are in `internal_ports()`)
+and, every `PROBE_INTERVAL` (60 s, or `node.probe.interval`) in a background thread with a 10 s budget:
+WS (TLS to 127.0.0.1:HTTPS_PORT, SNI probe.pcdn.invalid, upgrade, 3 × 1 KiB echoes, `down:`/`up:` of
+`PROBE_BYTES`) and gRPC (`curl --http2`, only when `curl -V` lists HTTP2). A probe fails on an error, an echo
+mismatch or `setup_ms > 3000`; errors never contain addresses. Heartbeat `tunnel_probe: {at, ok, ws, grpc,
+consecutive_fail}` (omitted when no probe is supported: probe off, no openssl, not rendered yet); capability
+`tunnel_probe: true`. `node.probe.origin` (controller `TUNNEL_PROBE_ORIGIN`) is reached through a relay in
+the local echo port, so it never changes the rendered tree; operators run that origin with
+`pcdn-agent echo-origin --listen 0.0.0.0:<port>` (same protocol: binary echo, `down:<n>`, `up:<n>`, ≤ 4 MiB,
+16 connections, idle 30 s).
+
+**Multi-origin tunnel paths (§22.4).** A path with `origins` becomes the internal pool `tn.<path id>`
+(`failover` / `round_robin` → weighted with the backup flags as sent, `sticky_ip` → ip_hash; members with a
+different tls / verify / sni are skipped; members the origin policy refuses are dropped, a path left
+without members is dropped) and renders exactly like a pool path (`$pcdn_tn_pool "tn.<id>"`,
+`tunnelUpstream`, F1 affinity, F11 keepalive upstreams), TLS name = the shared `sni` or `$host`. Old
+controllers / single `origin` paths render as before; capability `tunnel_multi_origin: true`. Pools with
+`health.type = tcp` (internal and customer pools) are checked by the agent's TCP health thread
+(`ORIGIN_TCP_HEALTH`, ≤ 64 concurrent connects, every `interval`, origin guard applied to the resolved
+addresses) and pushed to nginx with `POST /__pcdn/hc` (localhost-only, `pcdn.hcSet`,
+`{"<site>|<pool>|<host:port>": <consecutive failures>}`, ≤ 4096 keys); njs `health()` skips tcp pools.
+Entries age out of `pcdn_hc` (3600 s) and a missing entry counts as up (fail open). Established sessions
+are never moved.
+
+**Timeouts (§22.5).** Path `idle_timeout` (60..86400, null = the site's) drives every per-location
+timeout; `send_timeout` at server level stays `min(site idle, 300)`. Edge timer contract
+(`render/site.py EDGE_TUNNEL_TIMERS`): `client_idle_s` 600, `max_connection_age_s` 21600, `h2_max_streams`
+512, `tcp_keepalive` 120/30/4, `connect_timeout_s` 10.
+
+**Kernel tuning profile (§22.6).** `pcdn-agent tune --write` writes the RAM-scaled
+`/etc/sysctl.d/999-pcdn.mem.conf` (rmem/wmem/tcp_rmem/tcp_wmem max 8 / 32 / 64 MiB and `nf_conntrack_max`
+262144 / 524288 / 1048576 for < 2 / 2–8 / ≥ 8 GiB, `tcp_notsent_lowat` 131072) and loads it (`sysctl -p`);
+idempotent; `TUNE_PROFILE=off` removes it. (The SPEC's name `999-pcdn-mem.conf` would sort BEFORE
+`999-pcdn.conf` — "-" < "." — and be overridden at boot, so the file is `999-pcdn.mem.conf`.)
+`pcdn-agent tune --check` prints the profile and the check as JSON. At start and hourly the agent compares
+every key of `999-pcdn.conf`, `999-pcdn-conntrack.conf` and the mem file with `PROC_SYS` (keys without a
+/proc/sys entry cannot be verified and are skipped), checks bbr availability when `TCP_CC=bbr`, the qdisc of
+the default interface (`tc`) and the nginx master's `Max open files` → heartbeat `tuning: {profile, ram_mb,
+ok, cc, qdisc, nofile, mismatches ≤ 20}`.
+
+**Upstream keepalive for host names (§22.7).** On nginx ≥ 1.27.3 (capability `upstream_resolve`) host-name
+origins of xhttp/grpc/h2 paths (single origin, `origins` members, pool members) get
+`upstream pcdn_tn_<sid>_h<n> { zone …; server <host>:<port> resolve max_fails=0; keepalive … }` instead of
+request-time resolution. WS / HTTPUpgrade connections are never reused. Usage `tunnel.paths[id].reused_n`
+counts tunnel requests whose `uct` is exactly `0.000` (an approximation of a reused connection).
+
+**TLS (§22.8).** `node.tls_tickets = {id, keys: [current, next, previous]}` (base64 of 80 bytes each) →
+`tickets/0..2.key` (raw, 0600, dir 0700, global files) and `ssl_session_tickets on;` +
+`ssl_session_ticket_key` lines (first key encrypts); null / malformed → `ssl_session_tickets off;` and no
+files. Key material never appears in logs (a malformed block is logged without content), the heartbeat or
+the node logs. Per site `ssl.cert_rsa` / `ssl.key_rsa` → `certs/<sid>.rsa.crt|.rsa.key` and a second
+certificate pair; `ssl.ocsp = true` renders `ssl_stapling on; ssl_stapling_verify on;
+ssl_trusted_certificate <CA_BUNDLE>;` only when the leaf certificate really names an OCSP responder.
+
+**HTTP/3 switch (§22.9).** QUIC is rendered only when the nginx build can (`caps.http3`) and `node.http3` is
+not `false` (default server and every site).
+
+**"Why did my connection drop?" (§22.12).** Each `tunnel.paths[id]` gains `ends: {normal, idle_timeout,
+origin, node_reload, node_drain, other}` over the accepted sessions. At access-log time (start = `t − rt`):
+`node_drain` = started before a drain start and ended within [until − 3 s, until + 120 s], or within 120 s
+of the agent restart of an upgrade drain (`state["drain_log"]`, ≤ 50, 48 h); `node_reload` = started before a
+reload R and ended within ±5 s of R + `worker_shutdown_timeout`, or within ±5 s of a forced worker shutdown;
+else `normal`. Error-log lines of the same host+path ("… while proxying upgraded connection / reading
+upstream"; `timed out` → `idle_timeout`, reset / premature close / broken pipe → `origin`, any other
+`[error]` → `other`; `[info] client timed out` counts when the log keeps info) are added to their reason and
+subtracted from `normal` when the item is sent (never below 0) — a documented approximation. `abnormal`
+keeps its §15.8 meaning.
+
+**New agent.conf keys** (all kept by `--upgrade`, `SHUTDOWN_TIMEOUT` only when explicit):
+
+| key | default | meaning |
+|---|---|---|
+| `RELOAD_MAX_WAIT` | 900 | s; hard upper bound for a pending config version (60..3600) |
+| `MEM_GUARD_PCT` | 92 | memory guard threshold (50..99, 0 = off) |
+| `SHUTDOWN_TIMEOUT` | — | explicit `worker_shutdown_timeout` written by install.sh |
+| `DRAIN_IDLE_CONNS` | 10 | drained at or below this many public connections (2 checks) |
+| `PROBE_ENABLED` | yes | synthetic tunnel probe |
+| `PROBE_INTERVAL` | 60 | s (30..600; `node.probe.interval` wins) |
+| `PROBE_BYTES` | 262144 | download / upload size (16384..4194304) |
+| `PROBE_ECHO_PORT` | 8092 | loopback WS echo origin (agent) |
+| `PROBE_H2C_PORT` | 8093 | loopback h2c body server (nginx) |
+| `PROBE_DIR` | `probe/` next to `STATE_FILE` | probe certificate + body (install.sh: `/etc/pcdn/probe`) |
+| `ORIGIN_TCP_HEALTH` | yes | TCP health thread |
+| `TUNE_PROFILE` | auto | `auto` / `off` (999-pcdn.mem.conf) |
+| `PROC_SYS` | /proc/sys | read by the tuning check (tests) |
+| `SYSCTL_DIR` | /etc/sysctl.d | where the tuning files live (tests) |
+| `NGINX_PID_FILE` | /run/nginx.pid | nginx master (open-files check) |
+
+Tests: `edge/tests/test_wave13.py` (unit: njs drain predicate / hcSet / pick, CLI exit codes with a fake
+controller, upgrade auto-undrain, install.sh / bootstrap.sh argument blocks, RELOAD_MAX_WAIT, non-rendered
+keys, WST parser + auto table, memory guard on a fake /proc, echo protocol, probe render, multi-origin pools,
+TCP checker, tuning with a fake /proc/sys, upstream resolve, tickets, dual cert / OCSP, HTTP/3 gate, session
+ends) and `edge/tests/test_tunnel_speed_e2e.py` (real nginx: WS + gRPC probe, 403 for non-loopback clients,
+drain refusal semantics, multi-origin failover with TCP health, ticket resumption).

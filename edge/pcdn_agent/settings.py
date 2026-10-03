@@ -235,6 +235,33 @@ DEFAULTS = {
     "ORIGIN_GUARD": "no",
     "ORIGIN_GUARD_FILE": "/etc/pcdn/origin-guard.nft",
     "INTERNAL_SRC": "127.0.0.2",
+    # ---- SPEC §22 (wave 13: tunnel speed and stability)
+    # §22.2: a pending config version older than this (s, 60..3600) is applied on the next poll whatever
+    # the back-pressure doubling / F21 foreign deferral say
+    "RELOAD_MAX_WAIT": "900",
+    # §22.2 memory guard: mem_pct >= this for 2 heartbeats while old worker generations drain -> SIGTERM
+    # the oldest shutting-down worker (at most one per 60 s). 0 = off, else 50..99
+    "MEM_GUARD_PCT": "92",
+    # §22.2: worker_shutdown_timeout chosen by install.sh (empty = auto by RAM / kept from nginx.conf)
+    "SHUTDOWN_TIMEOUT": "",
+    # §22.1 drain: "drained" once ESTABLISHED client connections <= this for 2 checks (10 s apart)
+    "DRAIN_IDLE_CONNS": "10",
+    # §22.3 synthetic tunnel probe (own nginx -> loopback echo origin), every PROBE_INTERVAL s
+    "PROBE_ENABLED": "yes",
+    "PROBE_INTERVAL": "60",
+    "PROBE_BYTES": "262144",
+    "PROBE_ECHO_PORT": "8092",
+    "PROBE_H2C_PORT": "8093",
+    # probe certificate / gRPC body directory (empty = "probe" next to STATE_FILE; install.sh: /etc/pcdn/probe)
+    "PROBE_DIR": "",
+    # §22.4 TCP health checks of pool / multi-origin tunnel members (agent thread -> pcdn_hc via /__pcdn/hc)
+    "ORIGIN_TCP_HEALTH": "yes",
+    # §22.6 kernel tuning profile: auto (RAM-scaled 999-pcdn-mem.conf) | off; PROC_SYS for the checks
+    "TUNE_PROFILE": "auto",
+    "PROC_SYS": "/proc/sys",
+    "SYSCTL_DIR": "/etc/sysctl.d",
+    # nginx master pid file (§22.6 open-files check)
+    "NGINX_PID_FILE": "/run/nginx.pid",
 }
 
 

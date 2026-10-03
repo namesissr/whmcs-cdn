@@ -2,12 +2,15 @@
 server, the mTLS resizer upstreams, the verified-crawler ranges (bots.conf), and the node block
 (fair share, speed-test node tag)."""
 
+import base64
+import binascii
 import hashlib
+import re
 import socket
 
 from ..capabilities import geoip_present, image_capabilities, module_blocks, nginx_capabilities
 from ..common import SAFE_FSPATH, SAFE_RESOLVER, SAFE_SIZE, _int, _v6
-from ..settings import asset
+from ..settings import asset, log
 from ..validation.origin import internal_src
 from ..validation.rules import BOT_ENGINES
 
@@ -41,7 +44,50 @@ def norm_node(config: dict, cfg: dict) -> dict:
     cap = _int(n.get("capacity_mbps"), 0, 0, 10_000_000) or _int(cfg.get("CAPACITY_MBPS"), 0, 0, 10_000_000)
     return {"capacity_mbps": cap,
             "fair_share_pct": _int(n.get("fair_share_pct", cfg.get("FAIR_SHARE_PCT")), 25, 1, 100),
-            "name": name[:253]}
+            "name": name[:253],
+            # SPEC §22.9 per-node HTTP/3 switch (absent = on where the nginx build has HTTP/3)
+            "http3": n.get("http3") is not False}
+
+
+# ----------------------------------------------------------------- TLS session tickets (SPEC §22.8)
+
+TICKET_KEY_LEN = 80   # nginx AES-256 ticket key format
+TICKET_FILES = ("tickets/0.key", "tickets/1.key", "tickets/2.key")
+_TICKET_ID = re.compile(r"^[0-9a-f]{8}$")
+
+
+def norm_tickets(config: dict) -> list[bytes] | None:
+    """node.tls_tickets = {"id": "<8 hex>", "keys": [b64 current, b64 next, b64 previous]} -> the raw
+    80-byte keys in that order (nginx encrypts with the first, decrypts with all), or None (tickets off)
+    when absent / null / malformed. Key material is never logged."""
+    n = config.get("node") if isinstance(config.get("node"), dict) else {}
+    t = n.get("tls_tickets")
+    if not isinstance(t, dict):
+        return None
+    keys = t.get("keys")
+    if not _TICKET_ID.match(str(t.get("id") or "")) or not isinstance(keys, list) or not 1 <= len(keys) <= 3:
+        log.warning("node.tls_tickets ignored: malformed (tickets stay off)")
+        return None
+    out = []
+    for k in keys:
+        try:
+            raw = base64.b64decode(str(k), validate=True)
+        except (binascii.Error, ValueError):
+            raw = b""
+        if len(raw) != TICKET_KEY_LEN:
+            log.warning("node.tls_tickets ignored: a key is not %d bytes (tickets stay off)", TICKET_KEY_LEN)
+            return None
+        out.append(raw)
+    return out
+
+
+def tickets_conf(cfg: dict, n: int) -> str:
+    """http-level session-ticket directives: off, or on with the n key files (first = encryption key)."""
+    if not n:
+        return "ssl_session_tickets off;"
+    root = cfg["NGINX_DIR"].rstrip("/")
+    return "ssl_session_tickets on;\n" + "\n".join(f"ssl_session_ticket_key {root}/{TICKET_FILES[i]};"
+                                                    for i in range(n))
 
 
 def node_tag(name: str) -> str:
@@ -52,12 +98,15 @@ def node_tag(name: str) -> str:
 
 
 def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bots: bool = False,
-                mtls: bool = False, node: dict | None = None) -> str:
+                mtls: bool = False, node: dict | None = None, probe: str = "", tickets: int = 0) -> str:
     """The base http-context config (from the template), see nginx/pcdn-base.conf.
     hc_interval: js_periodic tick for pool health checks (> the largest check timeout).
     shield: the node's normalised shield section (norm_shield) or None.
     bots / mtls: bots.conf / mtls.conf were rendered and are included (SPEC §14.2).
-    node: the normalised node block (norm_node); its name feeds the speed-test X-Pcdn-Node tag."""
+    node: the normalised node block (norm_node); its name feeds the speed-test X-Pcdn-Node tag and
+    node.http3 false turns QUIC off (SPEC §22.9).
+    probe: the synthetic tunnel probe servers (render_probe, SPEC §22.3; "" = none).
+    tickets: number of shared session-ticket key files (SPEC §22.8; 0 = tickets off)."""
     with open(asset(cfg, "BASE_TEMPLATE", "nginx/pcdn-base.conf")) as f:
         text = f.read()
     caps = nginx_capabilities(cfg)
@@ -71,7 +120,7 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
     extra = []
     if caps["http2_directive"]:
         extra.append("    http2 on;")
-    if caps["http3"]:
+    if caps["http3"] and (node or {}).get("http3") is not False:
         # one `quic reuseport` per address (on the default server); site servers add plain `quic`
         extra += [f"    listen {sport} quic default_server reuseport;",
                   f"    listen [::]:{sport} quic default_server reuseport;"]
@@ -110,6 +159,8 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
         "HTTPS_DEFAULT_EXTRA": "\n".join(extra),
         "NODE_TAG": node_tag((node or norm_node({}, cfg))["name"]),
         "RESIZER": render_resizer(cfg),
+        "PROBE": probe,
+        "SSL_TICKETS": tickets_conf(cfg, tickets),
     }
     if not SAFE_FSPATH.match(subst["NGINX_DIR"]):
         raise ValueError("unsafe NGINX_DIR")

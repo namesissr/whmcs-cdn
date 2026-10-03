@@ -728,12 +728,16 @@ def test_tunnel_paths_aggregation_and_wire_shape(tmp_path):
     assert w1 == {"sessions": 2, "seconds": 151, "bytes_up": 9000 * 4 + 200, "bytes_down": 500 * 2 + 300 + 500 + 150,
                   "abnormal": 0, "connect_ms_sum": 4 + 10 + 20, "connect_n": 3,
                   "errors": {"origin_refused": 2, "origin_timeout": 0, "origin_error": 0, "limit": 0,
-                             "country": 0, "protocol": 1, "edge": 0}}
+                             "country": 0, "protocol": 1, "edge": 0},
+                  # SPEC §22.7 / §22.12: no reload / drain windows in this state -> both ends are normal
+                  "reused_n": 0, "ends": {"normal": 2, "idle_timeout": 0, "origin": 0, "node_reload": 0,
+                                          "node_drain": 0, "other": 0}}
     g1 = paths["g1"]
     assert g1["sessions"] == 1 and g1["seconds"] == 5 and g1["errors"]["origin_timeout"] == 1
     assert g1["connect_n"] == 1 and g1["connect_ms_sum"] == 2 and g1["bytes_up"] == 40000 + 200
     for p in paths.values():   # the controller rejects the whole POST on a negative / non-numeric counter
-        assert all(type(v) is int and v >= 0 for k, v in p.items() if k != "errors")
+        assert all(type(v) is int and v >= 0 for k, v in p.items() if k not in ("errors", "ends"))
+        assert list(p["ends"]) == list(agent.TUNNEL_END_KEYS) and sum(p["ends"].values()) == p["sessions"]
         assert list(p["errors"]) == list(agent.TUNNEL_ERRORS) and all(type(v) is int for v in p["errors"].values())
     json.dumps(state)
     # by_protocol (bytes) and the path bytes add up for lines with a path id
@@ -847,9 +851,9 @@ def test_fair_hot_hysteresis_and_node_block(tmp_path):
     assert agent.fair_hot(810, 1000, True) and not agent.fair_hot(799, 1000, True)
     assert not agent.fair_hot(10_000, 0, True)                      # unknown capacity: never hot
     cfg = make_cfg(tmp_path, NODE_NAME="ir-1", CAPACITY_MBPS="900", FAIR_SHARE_PCT="30")
-    assert agent.norm_node({}, cfg) == {"capacity_mbps": 900, "fair_share_pct": 30, "name": "ir-1"}
+    assert agent.norm_node({}, cfg) == {"capacity_mbps": 900, "fair_share_pct": 30, "name": "ir-1", "http3": True}
     assert agent.norm_node({"node": {"capacity_mbps": 2000, "fair_share_pct": 500, "name": "x"}}, cfg) == \
-        {"capacity_mbps": 2000, "fair_share_pct": 100, "name": "x"}
+        {"capacity_mbps": 2000, "fair_share_pct": 100, "name": "x", "http3": True}
     assert agent.norm_node({"node": "junk"}, make_cfg(tmp_path))["fair_share_pct"] == 25
     tag = agent.node_tag("ir-1")
     assert re.fullmatch(r"[0-9a-f]{8}", tag) and tag == agent.node_tag("ir-1") != agent.node_tag("ir-2")

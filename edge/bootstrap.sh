@@ -29,7 +29,10 @@
 #   --http3              nginx.org mainline nginx with HTTP/3 (QUIC); open UDP/<https-port>
 #   --no-http3           back to the distro nginx (default)
 #   --cc bbr|cubic       TCP congestion control (default bbr)
-#   --upgrade            update an installed edge in place
+#   --upgrade            update an installed edge in place (controller URL from /etc/pcdn/agent.conf)
+#   --drain[=minutes]    with --upgrade only (SPEC §22.1): drain the node first (1..120, default 15), upgrade
+#                        once drained; the new agent undrains itself (install.sh calls the controller)
+#   --shutdown-timeout auto|<time>  nginx worker_shutdown_timeout (SPEC §22.2, default auto by RAM)
 #   --harden-net         opt-in nftables host guard (SPEC §16.3); --no-harden-net removes it
 #   --no-avif            do not install libavif-bin (AVIF image output)
 #   --functions          opt-in edge functions (SPEC §16.9, sandboxed QuickJS service pcdn-fn);
@@ -43,6 +46,7 @@ TOKEN="${PCDN_EDGE_TOKEN:-}"
 TOKEN_FILE=""
 INSECURE_HTTP=no
 UPGRADE=no
+DRAIN=""
 PASS=()   # flags forwarded to install.sh
 
 while [ $# -gt 0 ]; do
@@ -52,8 +56,10 @@ while [ $# -gt 0 ]; do
     --token-file) TOKEN_FILE="${2:-}"; shift 2 ;;
     --insecure-http) INSECURE_HTTP=yes; PASS+=("$1"); shift ;;
     --upgrade) UPGRADE=yes; PASS+=("$1"); shift ;;
-    --region|--role|--cache-size|--http-port|--https-port|--cc)
+    --region|--role|--cache-size|--http-port|--https-port|--shutdown-timeout|--cc)
       PASS+=("$1" "${2:-}"); shift 2 ;;
+    --drain) DRAIN=15; shift ;;            # SPEC §22.1 upgrade drain (validated below, forwarded)
+    --drain=*) DRAIN="${1#--drain=}"; shift ;;
     --no-ipv6|--no-geoip|--http3|--no-http3|--harden-net|--no-harden-net|--avif|--no-avif)
       PASS+=("$1"); shift ;;
     --functions|--no-functions)   # SPEC §16.9 edge functions (opt-in)
@@ -63,6 +69,16 @@ while [ $# -gt 0 ]; do
     *) echo "bootstrap: unknown option: $1" >&2; exit 1 ;;
   esac
 done
+# >>> pcdn bootstrap drain check (edge/tests/test_install_agent.py runs this block)
+if [ -n "$DRAIN" ]; then
+  [ "$UPGRADE" = yes ] || { echo "bootstrap: --drain is only valid together with --upgrade" >&2; exit 1; }
+  case "$DRAIN" in ''|*[!0-9]*) echo "bootstrap: --drain=<minutes> must be 1..120" >&2; exit 1 ;; esac
+  if [ "$((10#$DRAIN))" -lt 1 ] || [ "$((10#$DRAIN))" -gt 120 ]; then
+    echo "bootstrap: --drain=<minutes> must be 1..120" >&2; exit 1
+  fi
+  PASS+=("--drain=$((10#$DRAIN))")
+fi
+# <<< pcdn bootstrap drain check
 
 [ "$(id -u)" -eq 0 ] || { echo "bootstrap: run as root (use: sudo bash)" >&2; exit 1; }
 if [ -n "$TOKEN_FILE" ]; then

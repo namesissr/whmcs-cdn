@@ -18,7 +18,8 @@ def tree_digest(files: dict) -> str:
     digest and the agent can skip the write/test/reload."""
     h = hashlib.sha256()
     for rel in sorted(files):
-        h.update(rel.encode() + b"\0" + files[rel].encode() + b"\0")
+        v = files[rel]
+        h.update(rel.encode() + b"\0" + (v if isinstance(v, bytes) else v.encode()) + b"\0")
     return h.hexdigest()
 
 
@@ -44,13 +45,24 @@ def cert_digests(files: dict) -> dict:
 
 
 GLOBAL_FILES = ("http.conf", "js/pcdn.js", "shield.conf", "bots.conf", "mtls.conf", "mtls/platform.crt",
-                "mtls/platform.key", "l4/stream.conf")
+                "mtls/platform.key", "l4/stream.conf",
+                # SPEC §22.8 shared TLS session-ticket keys (raw bytes): one reload per rotation
+                "tickets/0.key", "tickets/1.key", "tickets/2.key")
+
+
+_CONFVER_VALUE = re.compile(r'return 200 "([0-9a-f]{64})";')
 
 
 def global_digest(files: dict) -> str:
     """Digest of the node-global rendered files (base http.conf + njs module + shield.conf): any
-    change here affects every site and must not be deferred (F21)."""
-    return tree_digest({k: files[k] for k in GLOBAL_FILES if k in files})
+    change here affects every site and must not be deferred (F21). http.conf carries the digest of the
+    WHOLE tree at /__pcdn/confver (F29), which changes with any site; it is masked here, otherwise every
+    change would look global and F21 could never defer anything."""
+    g = {k: files[k] for k in GLOBAL_FILES if k in files}
+    m = _CONFVER_VALUE.search(g["http.conf"]) if isinstance(g.get("http.conf"), str) else None
+    if m:   # every place the marker was substituted (the endpoint and the template's own comment)
+        g["http.conf"] = g["http.conf"].replace(m.group(1), CONFVER_MARKER)
+    return tree_digest(g)
 
 
 def verify_reload(cfg: dict, digest: str) -> bool:
@@ -70,3 +82,28 @@ def verify_reload(cfg: dict, digest: str) -> bool:
             pass
         time.sleep(0.3)
     return False
+
+
+# ----------------------------------------------------------------- worker_shutdown_timeout (SPEC §22.2)
+
+_WST_RE = re.compile(r"^\s*worker_shutdown_timeout\s+(\d+)\s*(ms|s|m|h|d)?\s*;", re.M)
+_WST_UNIT = {None: 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_wst(text: str) -> int | None:
+    """worker_shutdown_timeout of an nginx.conf in seconds (`1h` / `30m` / `600s` / `600` forms; the
+    last one wins like in nginx); None when absent."""
+    val = None
+    for m in _WST_RE.finditer(text or ""):
+        n, unit = int(m.group(1)), m.group(2)
+        val = n // 1000 if unit == "ms" else n * _WST_UNIT[unit]
+    return val
+
+
+def wst_seconds(cfg: dict) -> int | None:
+    """worker_shutdown_timeout of NGINX_CONF (None when absent / unreadable)."""
+    try:
+        with open(cfg.get("NGINX_CONF") or "/etc/nginx/nginx.conf") as f:
+            return parse_wst(f.read())
+    except OSError:
+        return None

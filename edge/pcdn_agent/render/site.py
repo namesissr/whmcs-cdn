@@ -37,9 +37,102 @@ def decoy_page(cfg: dict, domain: str) -> str:
     return text.replace("{{NAME}}", name).replace("{{YEAR}}", str(datetime.now(timezone.utc).year))
 
 
-def render_site(site: dict, cfg: dict, shield: dict | None = None, platform_pull: tuple | None = None) -> tuple[str, dict]:
+# SPEC §22.5: the edge's tunnel timers, one documented contract (the controller mirrors them in
+# tunnel.py EDGE_TUNNEL_TIMERS for GET .../tunnel/profile; edge/tests pin the rendered values)
+EDGE_TUNNEL_TIMERS = {"client_idle_s": 600, "max_connection_age_s": 21600, "h2_max_streams": 512,
+                      "tcp_keepalive": {"idle_s": 120, "interval_s": 30, "count": 4},
+                      "connect_timeout_s": 10}
+
+
+def _dur(seconds: int) -> str:
+    """nginx time value: whole hours / minutes as such, else seconds (6h, 600s)."""
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{seconds}s"
+
+
+def tunnel_pass_lines(kind: str, dest: str, tls: bool, sni: str, verify: bool, idle: int, req_hdrs, cfg: dict,
+                      brotli_ok: bool) -> list[str]:
+    """The data-path directives of a tunnel location (body / timeouts / buffers / headers / failover /
+    TLS / *_pass), shared by every customer tunnel path and the synthetic tunnel probe (SPEC §22.3), so
+    the probe exercises the real directives. req_hdrs(directive, conn) -> header lines."""
+    grpc = kind in ("grpc", "h2")
+    h2buf = kind in ("grpc", "h2", "xhttp")          # HTTP/2 body path (F3)
+    h2_buf = cfg.get("TUNNEL_H2_BODY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_H2_BODY_BUFFER") or "") else "256k"
+    relay_buf = cfg.get("TUNNEL_RELAY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_RELAY_BUFFER") or "") else "16k"
+    L = ["client_max_body_size 0;"]
+    if h2buf:  # F3: raise per-stream in-flight upload capacity above the 64k default window
+        L.append(f"client_body_buffer_size {h2_buf};")
+    L += [f"client_body_timeout {idle}s;", f"send_timeout {idle}s;",
+          "tcp_nodelay on;", "gzip off;"] + (["brotli off;"] if brotli_ok else []) + [
+          f"http2_chunk_size {relay_buf};"]  # F14: larger client-facing HTTP/2 DATA frames
+    if grpc:
+        L += req_hdrs("grpc_set_header", conn=())
+        L += [f"grpc_read_timeout {idle}s;", f"grpc_send_timeout {idle}s;", "grpc_socket_keepalive on;",
+              f"grpc_buffer_size {relay_buf};",  # F14
+              # F28: allow the safe connect-failure failover (a stream is still never replayed)
+              "grpc_next_upstream error timeout;", "grpc_next_upstream_tries 2;",
+              "grpc_next_upstream_timeout 15s;", "grpc_intercept_errors off;"]
+        if tls:
+            L += ["grpc_ssl_server_name on;", f"grpc_ssl_name {sni};"]
+            if verify:
+                L += ["grpc_ssl_verify on;", f"grpc_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
+                      "grpc_ssl_verify_depth 4;"]
+        L.append(f"grpc_pass {'grpcs' if tls else 'grpc'}://{dest};")
+    else:
+        conn = (("Connection", '""'),) if kind == "xhttp" else (
+            ("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))
+        L += ["proxy_http_version 1.1;"] + req_hdrs("proxy_set_header", conn)
+        L += ["proxy_buffering off;", "proxy_request_buffering off;", "proxy_cache off;",
+              f"proxy_buffer_size {relay_buf};",  # F14
+              f"proxy_read_timeout {idle}s;", f"proxy_send_timeout {idle}s;", "proxy_socket_keepalive on;",
+              # F28: allow the safe connect-failure failover (a stream is still never replayed)
+              "proxy_next_upstream error timeout;", "proxy_next_upstream_tries 2;",
+              "proxy_next_upstream_timeout 15s;", "proxy_intercept_errors off;"]
+        if tls:
+            L += ["proxy_ssl_server_name on;", f"proxy_ssl_name {sni};"]
+            L += (["proxy_ssl_verify on;", f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
+                   "proxy_ssl_verify_depth 4;"] if verify else ["proxy_ssl_verify off;"])
+        L.append(f"proxy_pass {'https' if tls else 'http'}://{dest};")
+    return L
+
+
+# SPEC §22.8 OCSP stapling: the leaf certificate's AIA carries an OCSP responder (id-ad-ocsp,
+# 1.3.6.1.5.5.7.48.1, DER-encoded OID); certificates without one (Let's Encrypt since 2025) never staple
+_OCSP_OID = bytes.fromhex("06082b06010505073001")
+
+
+def cert_has_ocsp(pem: str) -> bool:
+    """True when the first certificate of a PEM chain names an OCSP responder (cheap DER scan)."""
+    import base64
+    m = re.search(r"-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----", pem or "", re.S)
+    if not m:
+        return False
+    try:
+        der = base64.b64decode("".join(m.group(1).split()), validate=False)
+    except ValueError:
+        return False
+    return _OCSP_OID in der
+
+
+def norm_ssl_extra(ssl) -> dict:
+    """SPEC §22.8 per-site certificate extras: the optional RSA fallback pair and OCSP stapling (only
+    when the controller asks for it AND the leaf really names an OCSP responder)."""
+    out = {"rsa": None, "ocsp": False}
+    if not isinstance(ssl, dict):
+        return out
+    crt, key = ssl.get("cert_rsa"), ssl.get("key_rsa")
+    if (isinstance(crt, str) and isinstance(key, str) and "-----BEGIN CERTIFICATE-----" in crt
+            and "PRIVATE KEY-----" in key):
+        out["rsa"] = (crt, key)
+    out["ocsp"] = ssl.get("ocsp") is True and cert_has_ocsp(str(ssl.get("cert") or ""))
+    return out
+
+
+def render_site(site: dict, cfg: dict, shield: dict | None = None, platform_pull: tuple | None = None,
+                node: dict | None = None) -> tuple[str, dict]:
     """Return (nginx config text, {relative_path: content}) for one site."""
-    text, files, _, _ = _render_site(site, cfg, shield, platform_pull)
+    text, files, _, _ = _render_site(site, cfg, shield, platform_pull, node)
     return text, files
 
 
@@ -165,9 +258,10 @@ def access_locations(cfg: dict) -> list[str]:
 
 
 def _render_site(site: dict, cfg: dict, shield: dict | None = None,
-                 platform_pull: tuple | None = None) -> tuple[str, dict, dict | None, dict]:
+                 platform_pull: tuple | None = None, node: dict | None = None) -> tuple[str, dict, dict | None, dict]:
     """-> (config text, extra files, sites.js entry or None, meta). platform_pull: the node's
-    (cert, key) platform client certificate for authenticated origin pulls (SPEC §14.2), or None."""
+    (cert, key) platform client certificate for authenticated origin pulls (SPEC §14.2), or None.
+    node: the normalised node block (norm_node; SPEC §22.9 node.http3)."""
     sid = int(site["id"])
     domain = site["domain"]
     files = {}
@@ -186,9 +280,12 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         out.append(f"limit_req_zone $pcdn_rl_key zone=pcdn_rlk_{sid}:1m rate={rps}r/s;")
 
     ssl = site.get("ssl")
+    ssl_x = norm_ssl_extra(ssl)
     if ssl:
         files[f"certs/{sid}.crt"] = ssl["cert"]
         files[f"certs/{sid}.key"] = ssl["key"]
+        if ssl_x["rsa"]:   # SPEC §22.8 RSA fallback pair (nginx picks by what the client supports)
+            files[f"certs/{sid}.rsa.crt"], files[f"certs/{sid}.rsa.key"] = ssl_x["rsa"]
 
     status = site.get("status", "active")
     # F35: tunnel path prefixes the controller keeps sending while a site is suspended / over_quota,
@@ -226,7 +323,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     h3_flag = sslo.get("http3")
     if h3_flag is None and isinstance(site.get("ssl"), dict):
         h3_flag = site["ssl"].get("http3")
-    h3 = bool(caps["http3"] and ssl and h3_flag is not False)
+    # SPEC §22.9: the node switch (node.http3 false) turns QUIC off on this node for every site
+    h3 = bool(caps["http3"] and ssl and h3_flag is not False and (node or {}).get("http3") is not False)
     alt_svc = f"add_header Alt-Svc 'h3=\":{sport}\"; ma=86400' always;"
     # SPEC §14.1 origin shield
     shield_self = bool(shield and shield.get("self"))
@@ -639,6 +737,11 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
 
     # --- tunnel mode (SPEC §7): per-site http-context parts
     tunnel = guard_tunnel(norm_tunnel(site, pools), cfg, sid)
+    for tp in (tunnel or {}).get("paths") or ():
+        if tp.get("pool_def"):   # SPEC §22.4: a multi-origin path renders like a pool path ("tn.<id>")
+            pools[tp["pool"]] = tp["pool_def"]
+    # SPEC §22.7: host-name tunnel origins get re-resolved keepalive upstreams where nginx can do it
+    resolve_ok = bool(caps.get("upstream_resolve"))
     fallback = tunnel["fallback"] if tunnel else "origin"
     image_on = image_on and fallback == "origin"  # decoy / 404 sites never fetch origin content
     webp_on = webp_on and fallback == "origin"
@@ -651,7 +754,6 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     vprefetch = bool(video and video["prefetch"] and njs_ok and not rewrites)
     geo_ok = geoip_present(cfg)
     ka = _int(cfg.get("TUNNEL_KEEPALIVE"), 64, 1, 4096)
-    h2_buf = cfg.get("TUNNEL_H2_BODY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_H2_BODY_BUFFER") or "") else "256k"
     relay_buf = cfg.get("TUNNEL_RELAY_BUFFER") if SAFE_SIZE.match(cfg.get("TUNNEL_RELAY_BUFFER") or "") else "16k"
     resolver = cfg["RESOLVER"] if SAFE_RESOLVER.match(cfg.get("RESOLVER") or "") else "1.1.1.1"
     tn_upstreams = {}  # (h2?, host:port) -> upstream name (keepalive towards IP-literal origins)
@@ -741,21 +843,27 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         out.append(f'map {tf_uri} $pcdn_bu_{sid} {{\n    "~." {tf_uri};\n    default $request_uri;\n}}')
         body_uri = f"$pcdn_bu_{sid}"
 
-    def _upstream_block(name, hp, h2):
+    def _upstream_block(name, hp, h2, resolve=False):
         # one server: never marked down (max_fails=0). A warm pool of idle keepalive connections to
         # the VPN origin removes the TCP+TLS handshake across the border from the next stream;
         # keepalive_requests/keepalive_time keep long VPN sessions from recycling a connection mid-use.
         # Separate names per (h2, hp): a cached keepalive connection must never cross protocols.
+        # SPEC §22.7: a host-name origin (nginx >= 1.27.3) is re-resolved by the upstream itself
+        # (`resolve` needs a shared zone and the http-level resolver) instead of per request.
         if name not in _up_rendered:
             _up_rendered.add(name)
-            out.append(f"upstream {name} {{\n    server {hp} max_fails=0;\n    keepalive {ka};\n"
+            zone, res = (f"    zone {name} 64k;\n", " resolve") if resolve else ("", "")
+            out.append(f"upstream {name} {{\n{zone}    server {hp}{res} max_fails=0;\n    keepalive {ka};\n"
                        f"    keepalive_timeout 300s;\n    keepalive_requests 1000000;\n"
                        f"    keepalive_time 1h;\n}}")
         return name
 
     def tn_upstream(hp, h2):
         if (h2, hp) not in tn_upstreams:
-            tn_upstreams[(h2, hp)] = _upstream_block(f"pcdn_tn_{sid}_{len(tn_upstreams)}", hp, h2)
+            if IP_LITERAL.match(hp.rsplit(":", 1)[0]):
+                tn_upstreams[(h2, hp)] = _upstream_block(f"pcdn_tn_{sid}_{len(tn_upstreams)}", hp, h2)
+            else:
+                tn_upstreams[(h2, hp)] = _upstream_block(f"pcdn_tn_{sid}_h{len(tn_upstreams)}", hp, h2, True)
         return tn_upstreams[(h2, hp)]
 
     # F1/F11: give IP-literal pool members keepalive upstreams and session affinity. For every pool
@@ -770,23 +878,24 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         need_h1 = "xhttp" in kinds
         for pi, pname in enumerate(pool_names):
             for oi, o in enumerate(pools[pname]["origins"]):
-                if not IP_LITERAL.match(o["hp"].rsplit(":", 1)[0]):
+                ip = bool(IP_LITERAL.match(o["hp"].rsplit(":", 1)[0]))
+                if not ip and not resolve_ok:
                     o["up"] = None
                     continue
                 up = {"h1": None, "h2": None}
-                base = f"pcdn_tn_{sid}_p{pi}_{oi}"
+                base = f"pcdn_tn_{sid}_p{pi}_{oi}" if ip else f"pcdn_tn_{sid}_hp{pi}_{oi}"
                 if need_h2:
-                    up["h2"] = _upstream_block(base + "_h2", o["hp"], True)
+                    up["h2"] = _upstream_block(base + "_h2", o["hp"], True, not ip)
                 if need_h1:
-                    up["h1"] = _upstream_block(base, o["hp"], False)
+                    up["h1"] = _upstream_block(base, o["hp"], False, not ip)
                 o["up"] = up if (up["h1"] or up["h2"]) else None
 
     def tunnel_loc(p, proto, pool, target):
         """One `location ^~ <path>` for a tunnel path; host defaults: proto / pool / target."""
-        kind, idle = p["protocol"], tunnel["idle_timeout"]
+        # SPEC §22.5: a path's own idle_timeout wins over the site's
+        kind, idle = p["protocol"], p.get("idle_timeout") or tunnel["idle_timeout"]
         grpc = kind in ("grpc", "h2")
         keepalive_ok = kind in ("xhttp", "grpc", "h2")  # upgraded (ws) connections are never reused
-        h2buf = kind in ("grpc", "h2", "xhttp")          # HTTP/2 body path (F3)
         resolved = False   # dest resolved at request time via the nginx resolver
         L = [f"set $pcdn_tn {kind};", f"set $pcdn_tp {p['id']};"]   # SPEC §15.1 access-log "tp"
         # F13: count only the session-opening request against limit_conn. ws/grpc/h2 sessions and
@@ -806,16 +915,26 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             # share of the node's NEW tunnel sessions (pcdn.js tunnelFair); refuses only a new session
             # (never an established one; xhttp packet POSTs are never refused), 429 like limit_conn.
             L.append("if ($pcdn_tn_fair) { return 429; }")
+            # SPEC §22.1 drain: after the DNS grace, the FIRST request of a new client connection is
+            # refused (503, Retry-After 30, Connection: close; pcdn.js tunnelDrain); requests on
+            # existing connections, new h2 streams and xhttp POSTs pass. A njs flag, never a reload.
+            L.append("if ($pcdn_tn_drain) { error_page 503 = /__pcdn_drain; return 503; }")
         o = p["origin"]
         if o:
             tls, sni, verify = o["tls"], o["sni"] or "$host", o["verify"]
             if o["ip"] and keepalive_ok:
                 dest = tn_upstream(o["hp"], grpc)
+            elif keepalive_ok and resolve_ok:   # SPEC §22.7: a re-resolved keepalive upstream
+                dest = tn_upstream(o["hp"], grpc)
+                resolved = True
             else:
                 L.append(f"set $pcdn_tn_target {_q(o['hp'])};")  # variable: resolved at request time
                 dest, resolved = "$pcdn_tn_target", not o["ip"]
         elif p["pool"]:
-            tls, sni, verify = pools[p["pool"]]["protocol"] == "https", "$host", bool(sslo.get("origin_verify"))
+            pd = pools[p["pool"]]
+            tls, sni, verify = pd["protocol"] == "https", "$host", bool(sslo.get("origin_verify"))
+            if p.get("pool_def"):   # SPEC §22.4 internal pool: the members' shared TLS name / verification
+                sni, verify = pd.get("sni") or "$host", bool(pd.get("verify"))
             # F1: prefix + pool set before $pcdn_tn_target so the js_set tunnelUpstream (lazy, cached
             # on first reference) sees them; xhttp/h2 then stick every request of a session to one
             # origin via a rendezvous hash on the session id parsed out of the path.
@@ -852,40 +971,7 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         # unbuffered proxying (proxy_buffering off, every grpc_pass) and never applies it to
         # upgraded (101) connections, where a limit_rate delay on the 101 response even makes
         # nginx miss the client's close. See docs/EDGE.md.
-        L += ["client_max_body_size 0;"]
-        if h2buf:  # F3: raise per-stream in-flight upload capacity above the 64k default window
-            L.append(f"client_body_buffer_size {h2_buf};")
-        L += [f"client_body_timeout {idle}s;", f"send_timeout {idle}s;",
-              "tcp_nodelay on;", "gzip off;"] + (["brotli off;"] if brotli_ok else []) + [
-              f"http2_chunk_size {relay_buf};"]  # F14: larger client-facing HTTP/2 DATA frames
-        if grpc:
-            L += req_hdrs("grpc_set_header", conn=())
-            L += [f"grpc_read_timeout {idle}s;", f"grpc_send_timeout {idle}s;", "grpc_socket_keepalive on;",
-                  f"grpc_buffer_size {relay_buf};",  # F14
-                  # F28: allow the safe connect-failure failover (a stream is still never replayed)
-                  "grpc_next_upstream error timeout;", "grpc_next_upstream_tries 2;",
-                  "grpc_next_upstream_timeout 15s;", "grpc_intercept_errors off;"]
-            if tls:
-                L += ["grpc_ssl_server_name on;", f"grpc_ssl_name {sni};"]
-                if verify:
-                    L += ["grpc_ssl_verify on;", f"grpc_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
-                          "grpc_ssl_verify_depth 4;"]
-            L.append(f"grpc_pass {'grpcs' if tls else 'grpc'}://{dest};")
-        else:
-            conn = (("Connection", '""'),) if kind == "xhttp" else (
-                ("Upgrade", "$http_upgrade"), ("Connection", "$pcdn_connection_upgrade"))
-            L += ["proxy_http_version 1.1;"] + req_hdrs("proxy_set_header", conn)
-            L += ["proxy_buffering off;", "proxy_request_buffering off;", "proxy_cache off;",
-                  f"proxy_buffer_size {relay_buf};",  # F14
-                  f"proxy_read_timeout {idle}s;", f"proxy_send_timeout {idle}s;", "proxy_socket_keepalive on;",
-                  # F28: allow the safe connect-failure failover (a stream is still never replayed)
-                  "proxy_next_upstream error timeout;", "proxy_next_upstream_tries 2;",
-                  "proxy_next_upstream_timeout 15s;", "proxy_intercept_errors off;"]
-            if tls:
-                L += ["proxy_ssl_server_name on;", f"proxy_ssl_name {sni};"]
-                L += (["proxy_ssl_verify on;", f"proxy_ssl_trusted_certificate {cfg['CA_BUNDLE']};",
-                       "proxy_ssl_verify_depth 4;"] if verify else ["proxy_ssl_verify off;"])
-            L.append(f"proxy_pass {'https' if tls else 'http'}://{dest};")
+        L += tunnel_pass_lines(kind, dest, tls, sni, verify, idle, req_hdrs, cfg, brotli_ok)
         return [f"    location ^~ {_q(p['path'])} {{"] + ["        " + x for x in L] + ["    }"]
 
     def video_locs():
@@ -1072,6 +1158,12 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
                 s.append(f"    {alt_svc}")
             s.append(f"    ssl_certificate {cfg['NGINX_DIR']}/certs/{sid}.crt;")
             s.append(f"    ssl_certificate_key {cfg['NGINX_DIR']}/certs/{sid}.key;")
+            if ssl_x["rsa"]:
+                s.append(f"    ssl_certificate {cfg['NGINX_DIR']}/certs/{sid}.rsa.crt;")
+                s.append(f"    ssl_certificate_key {cfg['NGINX_DIR']}/certs/{sid}.rsa.key;")
+            if ssl_x["ocsp"]:   # SPEC §22.8: only for a leaf with an OCSP responder URL
+                s += ["    ssl_stapling on;", "    ssl_stapling_verify on;",
+                      f"    ssl_trusted_certificate {cfg['CA_BUNDLE']};"]
         s.append(f"    server_name {name};")
         # F23: buffer the access log so a tunnel stream/packet request does not write an unbuffered
         # line from the worker event loop; flush often enough that usage accounting barely lags.
@@ -1089,8 +1181,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             # tunnels are not closed after 75 s and stream-heavy XHTTP/gRPC connections are not
             # forced to GOAWAY + reconnect at the 100000-stream cap. Bounded, not unlimited.
             kreq = _int(cfg.get("TUNNEL_KEEPALIVE_REQUESTS"), 10000000, 1000, 2 ** 31 - 1)
-            s.append("    keepalive_timeout 600s;")
-            s.append("    keepalive_time 6h;")
+            s.append(f"    keepalive_timeout {EDGE_TUNNEL_TIMERS['client_idle_s']}s;")
+            s.append(f"    keepalive_time {_dur(EDGE_TUNNEL_TIMERS['max_connection_age_s'])};")
             s.append(f"    keepalive_requests {kreq};")
             s.append(f"    send_timeout {min(tunnel['idle_timeout'], 300)}s;")
             if fallback in ("decoy", "404") and ssl:
@@ -1158,6 +1250,11 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             s.append("    proxy_intercept_errors on;")
 
         s.append("    location ^~ /__pcdn/ { return 404; }")
+        if tunnel and njs_ok:
+            # SPEC §22.1: the drain refusal ("pg":"drain" in the access log; keepalive_timeout 0 closes
+            # the client connection after the answer so the client re-resolves)
+            s.append("    location = /__pcdn_drain { internal; keepalive_timeout 0; "
+                     "add_header Retry-After 30 always; return 503; }")
         s += speed_locations(cfg, njs_ok, brotli_ok, bool(caps.get("flv")))
         if njs_ok:
             s.append("    location ^~ /__pcdn/deny/ { internal; js_content pcdn.deny; }")

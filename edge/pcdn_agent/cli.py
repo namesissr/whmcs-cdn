@@ -13,7 +13,14 @@ events. Standard library only, so it runs on any stock Debian/Ubuntu python3.
     pcdn-agent guard [--synproxy]
                           print the nftables host guard ruleset (install.sh --harden-net)
     pcdn-agent origin-guard
-                          print the nftables origin guard ruleset (install.sh, default on)"""
+                          print the nftables origin guard ruleset (install.sh, default on)
+    pcdn-agent drain --minutes N [--reason R] [--wait] [--timeout S]
+                          drain this node (SPEC §22.1; exit 0 ok, 3 last active node, 2 error)
+    pcdn-agent undrain    end this node's drain
+    pcdn-agent echo-origin [--listen HOST:PORT]
+                          the tunnel probe's WS echo origin (SPEC §22.3; operator-run origin)
+    pcdn-agent tune [--write|--check]
+                          RAM-scaled kernel tuning profile (SPEC §22.6)"""
 
 import logging
 import os
@@ -22,9 +29,12 @@ import sys
 
 from .agent import Agent
 from .apply import bootstrap
+from .drain import drain_main, undrain_main
 from .imaged import run_imaged
+from .probe import echo_origin_main
 from .render.guards import render_guard, render_origin_guard
 from .settings import AGENT_ERRORS, AGENT_LOGS, load_config, log
+from .tuning import tune_main
 
 
 def main():
@@ -53,6 +63,20 @@ def main():
             log.error("%s", e)
             sys.exit(1)
         return
+    if cmd == "drain":    # SPEC §22.1 (install.sh / bootstrap.sh --upgrade --drain)
+        sys.exit(drain_main(cfg, sys.argv[2:]))
+    if cmd == "undrain":
+        sys.exit(undrain_main(cfg, sys.argv[2:]))
+    if cmd == "echo-origin":   # SPEC §22.3 operator-run echo origin
+        sys.exit(echo_origin_main(sys.argv[2:]))
+    if cmd == "tune":     # SPEC §22.6 (install.sh: tune --write)
+        sys.exit(tune_main(cfg, sys.argv[2:]))
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if cmd not in ("", "once"):
+        log.error("unknown command %r (see pcdn-agent --help in docs/EDGE.md)", cmd)
+        sys.exit(2)
     if not cfg["CONTROLLER_URL"] or not cfg["EDGE_TOKEN"]:
         log.error("CONTROLLER_URL and EDGE_TOKEN must be set in /etc/pcdn/agent.conf")
         sys.exit(1)

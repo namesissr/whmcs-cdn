@@ -15,16 +15,27 @@ from .apply import (
 from .capabilities import geoip_present, has_module
 from .common import MAX_EVENTS, MAX_ITEMS, _int
 from .controller import Controller
+from .drain import (
+    DRAIN_CHECK_S, DRAIN_STATES, apply_config_drain, drained_check, end_drain, heartbeat_drain, iso,
+    merge_disk_drain, norm_drain, public_conns, refuse_now, set_flag, state_lock,
+)
 from .functions import functions_enabled, read_fn_usage, sync_functions
-from .heartbeat import collect_metrics, count_draining_workers, heartbeat_capabilities, net_sample
+from .heartbeat import (
+    RELOAD_KEEP_S, RELOAD_TIMES_MAX, collect_metrics, count_draining_workers, heartbeat_capabilities, memory_guard,
+    net_sample, prune_times, reload_stats,
+)
 from .logship import LogShip
 from .nodelogs import collect_logs, tunnel_map
+from .probe import EchoServer, ProbeRunner, norm_probe_node
 from .purge import do_purge
-from .reload import cert_digests, global_digest, site_digests
+from .reload import cert_digests, global_digest, site_digests, wst_seconds
 from .render.http import fair_hot, norm_node
+from .render.probe import PROBE_HOST, ensure_probe_files, probe_enabled
 from .render.shield import norm_shield
 from .render.tree import render_tree
 from .settings import AGENT_ERRORS, agent_source_files, log
+from .tcphealth import TcpHealth, tcp_targets
+from .tuning import TuningCheck
 from .usage import (
     gate_hour_merge, learn_hosts, live_cutoff, live_items, read_l4_usage, read_usage, trim_live_backlog, usage_item,
     video_hosts,
@@ -58,6 +69,13 @@ def save_state(path: str, state: dict):
         except OSError:
             pass
     os.replace(tmp, path)
+
+
+def _file_id(path: str) -> tuple:
+    """Identity of the state file as last written (save_state replaces it: a new inode every time), so
+    the agent notices a rewrite by `pcdn-agent drain|undrain` even within one timestamp tick."""
+    st = os.stat(path)
+    return st.st_ino, st.st_mtime_ns, st.st_size
 
 
 def _new_batch_id() -> str:
@@ -115,6 +133,35 @@ class Agent:
         self.last_heartbeat = 0.0
         self.net_prev = None
         self.wr_stats = None
+        # SPEC §22.1: started after an upgrade drain (install.sh --upgrade --drain) -> undrain once the
+        # first config apply and the first tunnel probe succeeded
+        d = self.state.get("drain")
+        if isinstance(d, dict) and d.get("state") in DRAIN_STATES and d.get("upgrade"):
+            self.upgrade_restart = True
+            d.setdefault("restart_at", iso(time.time()))
+        self.tcp_hc.set_targets(self.state.get("hc_targets") or [])
+
+    # --- wave-13 helpers, created on first use (tests build agents with Agent.__new__)
+    def _lazy(self, name, factory):
+        v = self.__dict__.get(name)
+        if v is None:
+            v = self.__dict__[name] = factory()
+        return v
+
+    @property
+    def probe_runner(self) -> ProbeRunner:
+        """SPEC §22.3 synthetic tunnel probe (background thread started by loop())."""
+        return self._lazy("_probe", lambda: ProbeRunner(self.cfg))
+
+    @property
+    def tcp_hc(self) -> TcpHealth:
+        """SPEC §22.4 TCP health checker (background thread started by loop())."""
+        return self._lazy("_tcp_hc", lambda: TcpHealth(self.cfg))
+
+    @property
+    def tuning_check(self) -> TuningCheck:
+        """SPEC §22.6 tuning verification (hourly, cached)."""
+        return self._lazy("_tuning", lambda: TuningCheck(self.cfg))
 
     @property
     def logship(self) -> LogShip:
@@ -169,9 +216,13 @@ class Agent:
         st["site_digests"], st["cert_digests"] = site_digests(files), cert_digests(files)
         st["global_digest"] = global_digest(files)
         st["keyinfo"] = key_infos(body)   # cache-key shapes for exact-URL purges (SPEC §14.1)
-        for k in ("pending_version", "pending_since"):
+        for k in ("pending_version", "pending_since", "pending_first", "reload_deferred"):
             st.pop(k, None)
         st["last_reload"] = time.monotonic()
+        # SPEC §22.2 reload counters / §22.12 node_reload windows (epoch seconds, 48 h, <= 500)
+        now = time.time()
+        st["reload_times"] = prune_times((st.get("reload_times") or []) + [now], RELOAD_KEEP_S, RELOAD_TIMES_MAX, now)
+        self.__dict__["first_apply_ok"] = True
 
     def sync_config(self):
         cfg, st = self.cfg, self.state
@@ -186,6 +237,8 @@ class Agent:
             headers["If-None-Match"] = st["etag"]
         code, hdrs, body = self.ctl.call("GET", "/edge/v1/config", headers=headers)
         if code == 304:
+            if not st.get("last_error"):
+                self.__dict__["first_apply_ok"] = True
             return
         try:   # SPEC §14.3.2: log-export settings are agent-side only (never rendered, no reload)
             self.logship.update_config(body)
@@ -211,6 +264,20 @@ class Agent:
                 st.pop("wr_sites", None)
         except Exception as e:  # noqa: BLE001
             log.error("tunnel map / node block update failed: %s", e)
+        try:   # SPEC §22.1 / §22.3: node.drain and node.probe are agent-side only (never rendered)
+            ev = apply_config_drain(st, norm_drain(body))
+            if ev:
+                log.info("node drain %s by the controller", "started" if ev == "start" else "ended")
+                if ev == "end":
+                    self.drain_step()
+            pn = norm_probe_node(body)
+            self.probe_runner.interval = pn["interval"]
+            echo = self.__dict__.get("_echo")
+            if echo is not None:
+                echo.relay = pn["origin"]
+            self.__dict__["_probe_origin"] = pn["origin"]
+        except Exception as e:  # noqa: BLE001
+            log.error("drain / probe node block update failed: %s", e)
         try:   # origin guard: private shield peers stay reachable (agent-side only, never rendered)
             sh = norm_shield(body)
             st["shield_peers"] = sh["peers"] if sh else []
@@ -223,8 +290,14 @@ class Agent:
         version = body["version"]
         etag = hdrs.get("ETag") or hdrs.get("etag")
         body = with_cached_bot_ranges(body, st)   # SPEC §14.2: keep the last good crawler ranges
+        ensure_probe_files(cfg)   # SPEC §22.3 (once; outside the tree; the probe server needs them)
         files, digest = render_tree(body, cfg)
         now = time.monotonic()
+        try:   # SPEC §22.4: the tcp-checked pool members of this tree (agent-side; persisted for restarts)
+            st["hc_targets"] = tcp_targets(files)
+            self.tcp_hc.set_targets(st["hc_targets"])
+        except Exception as e:  # noqa: BLE001
+            log.error("tcp health targets: %s", e)
 
         # F20: an identical rendered tree needs no write/test/reload (covers controller version bumps
         # for fields the agent never renders, and agent upgrades that change nothing).
@@ -233,8 +306,9 @@ class Agent:
             ensure_cache_dirs(body, cfg)
             st["etag"], st["version"], st["render_rev"] = etag, version, rev
             st["keyinfo"] = key_infos(body)
-            for k in ("pending_version", "pending_since"):
+            for k in ("pending_version", "pending_since", "pending_first", "reload_deferred"):
                 st.pop(k, None)
+            self.__dict__["first_apply_ok"] = True
             self._report(version, None)
             return
 
@@ -256,9 +330,20 @@ class Agent:
         # has been pending for RELOAD_MIN_INTERVAL, and never reload more often than that interval.
         settled = st.get("pending_version") == version
         if not settled:
+            if st.get("pending_version"):   # SPEC §22.2: superseded before it was applied
+                t = time.time()
+                st["coalesced_times"] = prune_times((st.get("coalesced_times") or []) + [t], 3600, 500, t)
             st["pending_version"], st["pending_since"] = version, now
+            st.setdefault("pending_first", now)
         age = now - st.get("pending_since", now)
-        min_interval = self._reload_min_interval()
+        # SPEC §22.2 hard upper bound: the oldest unapplied change waits at most RELOAD_MAX_WAIT, whatever
+        # back-pressure, the min interval or the F21 foreign deferral say
+        max_wait = _int(cfg.get("RELOAD_MAX_WAIT"), 900, 60, 3600)
+        if now - st.get("pending_first", now) >= max_wait:
+            log.info("config %s pending for %.0fs (>= RELOAD_MAX_WAIT %ds): applying now", version[:12],
+                     now - st.get("pending_first", now), max_wait)
+            return apply_now()
+        min_interval = min(self._reload_min_interval(), max_wait)
         debounce = _int(cfg.get("RELOAD_DEBOUNCE"), 5, 0, 3600)
         if age < debounce or not (settled or age >= min_interval):
             return
@@ -267,6 +352,7 @@ class Agent:
         defer = self._foreign_defer(body, files)   # F21
         if defer and age < defer:
             log.info("deferring foreign-group config %s (%.0fs/%ds)", version[:12], age, defer)
+            st["reload_deferred"] = True
             self._report(st.get("version"), st.get("last_error"))   # heartbeat during the deferral
             return
         apply_now()
@@ -346,7 +432,7 @@ class Agent:
         # so a crash or restart replays the SAME batch rather than a different one. A save failure is
         # non-fatal (skip pushing this tick) so state persistence issues never kill the agent.
         try:
-            save_state(self.cfg["STATE_FILE"], self.state)
+            self._save()
         except OSError as e:
             log.error("state save before usage push failed, skipping push: %s", e)
             return
@@ -425,9 +511,135 @@ class Agent:
             log.debug("fair share signal: %s", e)
         if self.wr_stats:   # SPEC §18.1: per-site waiting-room state of this node
             extra[HB_WAITING_ROOM] = self.wr_stats
+        extra.update(self.wave13_heartbeat(m))
         self.ctl.call("POST", "/edge/v1/heartbeat", self._hb(applied_version=self.state.get("version"),
                                                              error=self.state.get("last_error"),
                                                              metrics=m, **extra))
+
+    def wave13_heartbeat(self, m: dict) -> dict:
+        """SPEC §22 heartbeat objects: drain, tunnel_probe (only with a supported probe), reloads, tuning;
+        runs the memory guard (§22.2) on the same metrics. Never raises."""
+        st, out = self.state, {}
+        try:
+            out["drain"] = heartbeat_drain(st.get("drain"), m.get("connections") or 0)
+        except Exception as e:  # noqa: BLE001
+            log.debug("drain heartbeat: %s", e)
+        pr = self.probe_runner.result
+        if pr:
+            out["tunnel_probe"] = pr
+        try:
+            st["wst_s"] = wst_seconds(self.cfg)
+            out["reloads"] = reload_stats(st, st["wst_s"])
+        except Exception as e:  # noqa: BLE001
+            log.debug("reload stats: %s", e)
+        tn = self.tuning_check.get()
+        if tn:
+            out["tuning"] = tn
+        try:
+            memory_guard(st, self.cfg, m.get("mem_pct"))
+        except Exception as e:  # noqa: BLE001 - the guard is best-effort
+            log.warning("memory guard: %s", e)
+        return out
+
+    # ----------------------------------------------------------------- drain (SPEC §22.1)
+
+    def drain_step(self, now: float | None = None):
+        """Keep the njs drain flag in line with state["drain"] (refreshed while on: it expires in nginx
+        after 180 s) and, while draining, check every DRAIN_CHECK_S whether the node is drained."""
+        now = time.time() if now is None else now
+        st = self.state
+        d = st.get("drain") if isinstance(st.get("drain"), dict) else {}
+        active = d.get("state") in DRAIN_STATES
+        want = active and refuse_now(d, now)
+        if (want or st.get("drain_flag")) and has_module(self.cfg, "njs"):
+            if set_flag(self.cfg, want):
+                if want and not st.get("drain_flag"):
+                    log.info("drain: refusing new tunnel connections (DNS grace over)")
+                if want:
+                    st["drain_flag"] = True
+                else:
+                    st.pop("drain_flag", None)
+        if d.get("state") == "draining" and now - self.__dict__.get("last_drain_check", 0.0) >= DRAIN_CHECK_S - 0.5:
+            self.__dict__["last_drain_check"] = now
+            if drained_check(d, public_conns(self.cfg), _int(self.cfg.get("DRAIN_IDLE_CONNS"), 10, 0, 100000), now):
+                d["state"], d["at"] = "drained", now
+                log.info("drain: node drained (%s connections)", d.get("conns"))
+                self.last_heartbeat = 0.0   # tell the controller at once
+
+    def maybe_upgrade_undrain(self):
+        """SPEC §22.1: after the restart of an upgrade drain, end it once the first config apply succeeded
+        and the first tunnel probe passed (or is unsupported). An admin drain is never ended here."""
+        if not self.__dict__.get("upgrade_restart"):
+            return
+        st = self.state
+        d = st.get("drain") if isinstance(st.get("drain"), dict) else {}
+        if d.get("state") not in DRAIN_STATES or not d.get("upgrade"):
+            self.__dict__["upgrade_restart"] = False
+            return
+        if not self.__dict__.get("first_apply_ok") or not self.probe_runner.first_passed_or_unsupported():
+            return
+        try:
+            self.ctl.call("POST", "/edge/v1/drain", {"action": "stop"})
+        except urllib.error.HTTPError as e:
+            if e.code != 404:   # an old controller has no endpoint: the local drain ends anyway
+                log.warning("upgrade undrain: controller answered HTTP %d; retrying", e.code)
+                return
+        except (urllib.error.URLError, OSError) as e:
+            log.warning("upgrade undrain: controller not reachable (%s); retrying", type(e).__name__)
+            return
+        end_drain(st, time.time())
+        self.__dict__["upgrade_restart"] = False
+        log.info("upgrade finished: node undrained")
+        self.drain_step()
+
+    def _adopt_disk_drain(self):
+        """A `pcdn-agent drain|undrain` run rewrote state["drain"] in the state file: adopt it."""
+        path = self.cfg["STATE_FILE"]
+        try:
+            mt = _file_id(path)
+        except OSError:
+            return
+        if mt == self.__dict__.get("_saved_mtime"):
+            return
+        with state_lock(path):
+            if merge_disk_drain(self.state, load_state(path)):
+                log.info("drain state changed by pcdn-agent %s", "drain" if (self.state.get("drain") or {}).get("state")
+                         else "undrain")
+        self.__dict__["_saved_mtime"] = mt
+
+    def _save(self):
+        """save_state under the state lock, keeping a drain the CLI wrote meanwhile."""
+        path = self.cfg["STATE_FILE"]
+        with state_lock(path):
+            try:
+                changed = _file_id(path) != self.__dict__.get("_saved_mtime")
+            except OSError:
+                changed = False
+            if changed:
+                merge_disk_drain(self.state, load_state(path))
+            save_state(path, self.state)
+            try:
+                self.__dict__["_saved_mtime"] = _file_id(path)
+            except OSError:
+                pass
+
+    def start_background(self):
+        """SPEC §22.3 / §22.4: the loopback echo origin, the probe thread and the TCP health thread."""
+        if probe_enabled(self.cfg) and self.__dict__.get("_echo") is None:
+            try:
+                self.__dict__["_echo"] = EchoServer("127.0.0.1", _int(self.cfg.get("PROBE_ECHO_PORT"), 8092, 1, 65535),
+                                                    self.__dict__.get("_probe_origin")).start()
+            except OSError as e:
+                log.warning("tunnel probe echo origin not started: %s", e)
+        self.probe_runner.start()
+        self.tcp_hc.start()
+
+    def _probe_rendered(self) -> bool:
+        try:
+            with open(os.path.join(self.cfg["NGINX_DIR"].rstrip("/"), "http.conf")) as f:
+                return f"server_name {PROBE_HOST};" in f.read()
+        except OSError:
+            return False
 
     def fair_signal(self, m: dict):
         """SPEC §15.2: tell nginx (localhost /__pcdn/fair, pcdn.js tunnelFair) whether the node is hot:
@@ -471,11 +683,21 @@ class Agent:
         return "$pcdn_rz_bind" not in text and "no image resizer" not in text
 
     def tick(self):
+        try:
+            self._adopt_disk_drain()
+        except Exception as e:  # noqa: BLE001
+            log.error("drain state read failed: %s", e)
         for step in (self.sync_config, self.sync_purges):
             try:
                 step()
             except Exception as e:  # noqa: BLE001
                 log.error("%s failed: %s", step.__name__, e)
+        for step in (self.drain_step, self.maybe_upgrade_undrain):   # SPEC §22.1
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001
+                log.error("%s failed: %s", step.__name__, e)
+        self.probe_runner.rendered = self._probe_rendered()
         try:
             sync_origin_guard_peers(self.cfg, self.state, self.state.get("shield_peers") or [])
         except Exception as e:  # noqa: BLE001 - never let the guard sync break the loop
@@ -503,14 +725,20 @@ class Agent:
         except Exception as e:  # noqa: BLE001 - log export is best-effort
             log.error("logship failed: %s", e)
         try:  # F8: a persistence failure must not exit the process (systemd would restart-and-replay)
-            save_state(self.cfg["STATE_FILE"], self.state)
+            self._save()
         except OSError as e:
             log.error("state save failed: %s", e)
 
     def loop(self):
+        self.start_background()
         while self.running:
             self.tick()
-            for _ in range(int(self.cfg["POLL_INTERVAL"])):
+            for i in range(int(self.cfg["POLL_INTERVAL"])):
                 if not self.running:
                     break
                 time.sleep(1)
+                if i % DRAIN_CHECK_S == DRAIN_CHECK_S - 1 and (self.state.get("drain") or {}).get("state") in DRAIN_STATES:
+                    try:   # SPEC §22.1: the drained check runs every 10 s while draining
+                        self.drain_step()
+                    except Exception as e:  # noqa: BLE001
+                        log.error("drain step failed: %s", e)

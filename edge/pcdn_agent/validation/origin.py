@@ -148,6 +148,16 @@ def guard_tunnel(tunnel: dict | None, cfg: dict, sid) -> dict | None:
             log.warning("site %s: tunnel path %s skipped: origin %s is not a public address (ORIGIN_PRIVATE_ALLOW)",
                         sid, p["path"], p["origin"]["hp"])
             continue
+        if p.get("pool_def"):   # SPEC §22.4: members the address policy refuses are dropped
+            pd = p["pool_def"]
+            keep = [o for o in pd["origins"] if origin_hp_allowed(o["hp"], cfg)]
+            for o in pd["origins"]:
+                if o not in keep:
+                    log.warning("site %s: tunnel path %s origin %s skipped: not a public address "
+                                "(ORIGIN_PRIVATE_ALLOW)", sid, p["path"], o["hp"])
+            if not keep:
+                continue
+            p = dict(p, pool_def=dict(pd, origins=keep))
         paths.append(p)
     return dict(tunnel, paths=paths) if paths else None
 
@@ -192,16 +202,76 @@ def norm_pools(site: dict) -> dict:
         h = p.get("health") or {}
         hpath = str(h.get("path") or "/")
         hhost = str(h.get("host") or "").lower()
+        health = {"enabled": bool(h.get("enabled")), "path": hpath if SAFE_PATTERN.match(hpath) else "/",
+                  "interval": _int(h.get("interval"), 10, 1, 3600), "timeout": _int(h.get("timeout"), 3, 1, 10),
+                  "expect": str(h.get("expect") or "2xx,3xx")[:100],
+                  "host": hhost if hhost and SAFE_NAME.match(hhost) and "*" not in hhost else None}
+        if h.get("type") == "tcp":   # SPEC §22.4: checked by the agent (TCP connect), not by njs
+            health["type"] = "tcp"
+            health["timeout"] = _int(h.get("timeout"), 3, 1, 30)
         out[name] = {
             "method": "ip_hash" if p.get("method") == "ip_hash" else "weighted",
             "protocol": proto,
             "origins": origins,
-            "health": {"enabled": bool(h.get("enabled")), "path": hpath if SAFE_PATTERN.match(hpath) else "/",
-                       "interval": _int(h.get("interval"), 10, 1, 3600), "timeout": _int(h.get("timeout"), 3, 1, 10),
-                       "expect": str(h.get("expect") or "2xx,3xx")[:100],
-                       "host": hhost if hhost and SAFE_NAME.match(hhost) and "*" not in hhost else None},
+            "health": health,
         }
     return out
+
+
+TUNNEL_ORIGINS_MAX = 10   # SPEC §22.4: 2..10 origins per tunnel path (plan max_tunnel_origins)
+INTERNAL_POOL_PREFIX = "tn."   # internal pools of multi-origin tunnel paths ("tn.<path id>")
+
+
+def _tunnel_origin(o) -> dict | None:
+    """One validated tunnel origin ({address, port, tls, sni, verify}) -> {hp, ip, tls, sni, verify}."""
+    if not isinstance(o, dict):
+        return None
+    addr = str(o.get("address") or "").lower()
+    port = o.get("port")
+    sni = str(o.get("sni") or "").lower()
+    if (not SAFE_ORIGIN.match(addr) or isinstance(port, bool) or not (isinstance(port, int) or str(port).isdigit())
+            or not 1 <= int(port) <= 65535 or (sni and (not SAFE_NAME.match(sni) or "*" in sni))):
+        return None
+    return {"hp": _hp(addr, port), "ip": bool(IP_LITERAL.match(addr)), "tls": bool(o.get("tls")),
+            "sni": sni or None, "verify": bool(o.get("verify"))}
+
+
+def norm_tunnel_origins(p: dict) -> dict | None:
+    """SPEC §22.4: the internal pool ("tn.<path id>") of a tunnel path with `origins`, or None when the
+    path has no usable `origins` (the single `origin` then applies, as for an old controller).
+    balance failover / round_robin -> weighted with the backup flags as sent (the controller already
+    turned "failover" into first-primary + backups), sticky_ip -> ip_hash. Members that differ from the
+    first one in tls / verify / sni are skipped (the controller refuses them); at least one primary."""
+    items = p.get("origins")
+    if not isinstance(items, list) or not items:
+        return None
+    members, first, seen = [], None, set()
+    for o in items[:TUNNEL_ORIGINS_MAX]:
+        t = _tunnel_origin(o)
+        if t is None or t["hp"] in seen:
+            continue
+        if first is None:
+            first = t
+        elif (t["tls"], t["verify"], t["sni"]) != (first["tls"], first["verify"], first["sni"]):
+            continue
+        seen.add(t["hp"])
+        members.append({"hp": t["hp"], "weight": _int(o.get("weight"), 1, 1, 100), "backup": o.get("backup") is True})
+    if not members or all(m["backup"] for m in members):
+        return None
+    h = p.get("health") if isinstance(p.get("health"), dict) else {}
+    htype = "http" if h.get("type") == "http" else "tcp"
+    interval = _int(h.get("interval"), 10, 5, 300)
+    timeout = min(_int(h.get("timeout"), 3, 1, 30), max(1, interval - 1))
+    hpath = str(h.get("path") or "/")
+    health = {"enabled": True, "type": htype, "path": hpath if SAFE_PATTERN.match(hpath) else "/",
+              "interval": interval, "timeout": timeout if htype == "tcp" else min(timeout, 10),
+              "expect": str(h.get("expect") or "2xx,3xx,4xx")[:100], "host": None}
+    if htype == "http":   # njs health(): pools without "type" are HTTP-checked
+        del health["type"]
+    return {"method": "ip_hash" if p.get("balance") == "sticky_ip" else "weighted",
+            "protocol": "https" if first["tls"] else "http", "origins": members, "health": health,
+            # tunnel_loc: TLS name / verification of the members (one setting for all of them)
+            "sni": first["sni"], "verify": first["verify"]}
 
 
 def norm_tunnel(site: dict, pools: dict) -> dict | None:
@@ -218,16 +288,18 @@ def norm_tunnel(site: dict, pools: dict) -> dict | None:
                 or proto not in TUNNEL_PROTOCOLS or path in seen):
             continue
         entry = {"id": pid, "path": path, "protocol": proto, "origin": None, "pool": None}
+        # SPEC §22.5 per-path idle timeout (None = the site's idle_timeout)
+        pit = p.get("idle_timeout")
+        if not isinstance(pit, bool) and (isinstance(pit, int) or str(pit or "").isdigit()):
+            entry["idle_timeout"] = _int(pit, 3600, 60, 86400)
         o, pool = p.get("origin"), p.get("pool")
-        if isinstance(o, dict):
-            addr = str(o.get("address") or "").lower()
-            port = o.get("port")
-            sni = str(o.get("sni") or "").lower()
-            if (not SAFE_ORIGIN.match(addr) or not (isinstance(port, int) or str(port).isdigit())
-                    or not 1 <= int(port) <= 65535 or (sni and (not SAFE_NAME.match(sni) or "*" in sni))):
+        multi = norm_tunnel_origins(p) if pool is None else None
+        if multi is not None:   # SPEC §22.4: rendered exactly like a pool path
+            entry["pool"], entry["pool_def"] = INTERNAL_POOL_PREFIX + pid, multi
+        elif isinstance(o, dict):
+            entry["origin"] = _tunnel_origin(o)
+            if entry["origin"] is None:
                 continue
-            entry["origin"] = {"hp": _hp(addr, port), "ip": bool(IP_LITERAL.match(addr)), "tls": bool(o.get("tls")),
-                               "sni": sni or None, "verify": bool(o.get("verify"))}
         elif pool is not None:
             if str(pool) not in pools:
                 continue
@@ -262,6 +334,9 @@ def internal_src(cfg: dict) -> str:
 
 def internal_ports(cfg: dict) -> list[int]:
     """The edge's own loopback services the nginx workers connect to: the image resizer (an nginx
-    server), the image transformer (pcdn-imaged) and the object-storage fetch server (nginx)."""
+    server), the image transformer (pcdn-imaged), the object-storage fetch server (nginx) and the
+    tunnel probe's echo origin (agent) and h2c body server (nginx)."""
     return sorted({_int(cfg.get(k), d, 1, 65535) for k, d in
-                   (("RESIZE_PORT", 8089), ("IMAGE_PORT", 8090), ("STORAGE_FETCH_PORT", 8091))})
+                   (("RESIZE_PORT", 8089), ("IMAGE_PORT", 8090), ("STORAGE_FETCH_PORT", 8091),
+                    # SPEC §22.3 synthetic tunnel probe: the agent's WS echo origin and the h2c body server
+                    ("PROBE_ECHO_PORT", 8092), ("PROBE_H2C_PORT", 8093))})

@@ -38,7 +38,9 @@ LEGACY_CAPS = {"nginx": None, "http3": False, "early_hints": False, "http2_direc
                "webp_convert": False, "webp_mode": WEBP_MODE, "modules": sorted(MODULE_FILES), "flv": True,
                # SPEC §16.4 / §16.5: ngx_stream_module (libnginx-mod-stream was not installed before
                # wave 8, so an undetectable nginx is assumed without it) and the slice module
-               "stream": False, "slice": True}
+               "stream": False, "slice": True,
+               # SPEC §22.7: `server ... resolve` in upstream{} (open-source nginx >= 1.27.3)
+               "upstream_resolve": False}
 _CAPS_CACHE: dict = {}
 
 
@@ -78,7 +80,9 @@ def parse_nginx_v(text: str, modules_dir: str | None = None, exists=os.path.isfi
             # SPEC §16.4: stream compiled in (nginx.org) or the dynamic module file (libnginx-mod-stream)
             "stream": bool(re.search(r"(?:^|\s)--with-stream(?:\s|$)", args)) or exists(os.path.join(mdir, STREAM_SO)),
             # SPEC §16.5: byte-range slicing of large mp4 files (static module only)
-            "slice": bool(re.search(r"(?:^|\s)--with-http_slice_module(?:\s|$)", args))}
+            "slice": bool(re.search(r"(?:^|\s)--with-http_slice_module(?:\s|$)", args)),
+            # SPEC §22.7: dynamic re-resolution of upstream server names (needs a zone)
+            "upstream_resolve": ver >= (1, 27, 3)}
 
 
 def nginx_capabilities(cfg: dict) -> dict:

@@ -839,10 +839,11 @@ def test_controller_node_block_and_fair_share_field(tmp_path):
     """Exactly what the controller sends (services.build_edge_config / sections.Tunnel)."""
     cfg = make_cfg(tmp_path, NODE_NAME="local", CAPACITY_MBPS="300")
     body = {"node": {"name": "ir-thr-1", "capacity_mbps": 1000, "fair_share_pct": 25}}
-    assert agent.norm_node(body, cfg) == {"capacity_mbps": 1000, "fair_share_pct": 25, "name": "ir-thr-1"}
+    assert agent.norm_node(body, cfg) == {"capacity_mbps": 1000, "fair_share_pct": 25, "name": "ir-thr-1",
+                                          "http3": True}
     # capacity 0 / name "" from the controller = unknown: the agent.conf fallbacks apply
     assert agent.norm_node({"node": {"name": "", "capacity_mbps": 0, "fair_share_pct": 25}}, cfg) == \
-        {"capacity_mbps": 300, "fair_share_pct": 25, "name": "local"}
+        {"capacity_mbps": 300, "fair_share_pct": 25, "name": "local", "http3": True}
     http = agent.render_all(dict(body, sites=[]), cfg)["http.conf"]
     assert agent.node_tag("ir-thr-1") in http and "ir-thr-1" not in http
     for flag, want in ((None, True), (True, True), (False, False)):
@@ -1107,7 +1108,10 @@ def test_heartbeat_reports_capabilities(tmp_path):
                                     # SPEC §16.3-§16.6 (wave 8)
                                     "l4": False, "l4_port_range": "20000-29999", "slice": True, "video": True,
                                     "avif": False, "image_transform": True, "net_guard": False,
-                                    "edge_functions": False}
+                                    "edge_functions": False,
+                                    # SPEC §22 (wave 13)
+                                    "drain": True, "tunnel_probe": True, "tunnel_multi_origin": True,
+                                    "upstream_resolve": False}
     json.dumps(body)
 
 

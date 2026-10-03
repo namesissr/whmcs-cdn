@@ -315,7 +315,8 @@ def test_render_origin_guard(tmp_path):
     assert "ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept" in r
     assert "ip daddr 9.9.9.9 meta l4proto { tcp, udp } th dport 5353 accept" in r
     assert "ip6 daddr 2606:4700::1111 meta l4proto { tcp, udp } th dport 53 accept" in r
-    assert "ip saddr 127.0.0.9 ip daddr 127.0.0.1 tcp dport { 8189, 8190, 8191 } accept" in r
+    # + the tunnel probe's echo origin / h2c body server (SPEC §22.3)
+    assert "ip saddr 127.0.0.9 ip daddr 127.0.0.1 tcp dport { 8092, 8093, 8189, 8190, 8191 } accept" in r
     assert "elements = { 10.1.0.0/16 }" in r and "elements = { fd00:1::/32 }" in r
     assert "ip daddr @peers4 tcp dport 9443 accept" in r and "udp sport { 8443, 20000-29999 }" in r
     for want in ("127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "10.0.0.0/8", "172.16.0.0/12",

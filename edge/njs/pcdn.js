@@ -9,7 +9,9 @@
 //   upstream js_set $pcdn_upstream — "host:port" chosen from a load-balancer pool
 //   tunnelUpstream js_set $pcdn_tn_upstream — same for the pool of a tunnel path ($pcdn_tn_pool)
 //   tunnelFair js_set $pcdn_tn_fair — "1" refuses a NEW tunnel session while the node is hot (SPEC §15.2)
-//   fairSet                        — js_content of the localhost-only /__pcdn/fair (agent: hot flag)
+//   fairSet                        — js_content of the localhost-only /__pcdn/fair (agent: hot / drain flags)
+//   tunnelDrain js_set $pcdn_tn_drain — "1" refuses the first request of a new connection while draining (SPEC §22.1)
+//   hcSet                          — js_content of the localhost-only /__pcdn/hc (agent TCP health, SPEC §22.4)
 //   speedDown / speedUp            — js_content of /__pcdn/speed/down|up (SPEC §15.6)
 //   imgW/imgH/imgQ js_set          — image resize / transform parameters ("" = none; SPEC §2, §16.6)
 //   videoNext js_set $pcdn_vnext   — next HLS/DASH segment to prefetch ("" = none; SPEC §16.5)
@@ -494,7 +496,8 @@ function prepSite(id, s) {
         P.pools[name] = {
             name: name, method: p.method === 'ip_hash' ? 'ip_hash' : 'weighted', protocol: p.protocol === 'https' ? 'https' : 'http',
             origins: (p.origins || []).map(function (o) { return { hp: o.hp, weight: Math.max(1, +o.weight || 1), backup: !!o.backup, up: o.up || null }; }),
-            health: { enabled: !!h.enabled, path: h.path || '/', interval: Math.max(1, +h.interval || 10),
+            // type "tcp" (SPEC §22.4): checked by the agent, results arrive through hcSet
+            health: { enabled: !!h.enabled, tcp: h.type === 'tcp', path: h.path || '/', interval: Math.max(1, +h.interval || 10),
                 timeout: Math.min(10, Math.max(1, +h.timeout || 3)), expect: String(h.expect || '2xx,3xx').toLowerCase().split(','),
                 host: h.host || s.domain },
         };
@@ -710,10 +713,18 @@ function tunnelFair(r) {
     return '';
 }
 
-// /__pcdn/fair?hot=<pct> (localhost only, default server): 1..100 = hot with that fair_share_pct, 0 = not
+// /__pcdn/fair?hot=<pct>&drain=0|1 (localhost only, default server): hot 1..100 = hot with that
+// fair_share_pct, 0 = not; drain=1 sets the node drain flag (SPEC §22.1), 0 clears it. A parameter that
+// is absent leaves its flag as it is. Both flags expire with the zone timeout (agent gone: fail open).
 function fairSet(r) {
-    const d = ngx.shared.pcdn_fair, pct = Math.floor(+r.args.hot || 0);
-    if (pct >= 1 && pct <= 100) d.set('hot', pct); else d.delete('hot');
+    const d = ngx.shared.pcdn_fair;
+    if (r.args.hot !== undefined) {
+        const pct = Math.floor(+r.args.hot || 0);
+        if (pct >= 1 && pct <= 100) d.set('hot', pct); else d.delete('hot');
+    }
+    if (r.args.drain !== undefined) {
+        if (r.args.drain === '1') d.set('drain', 1); else d.delete('drain');
+    }
     if (r.args.wr === '1') {   // the agent's heartbeat: per-site waiting-room state (SPEC §18.1)
         let out = {};
         try { out = wrStats(); } catch (e) { r.error('pcdn wr stats: ' + e); }
@@ -721,6 +732,22 @@ function fairSet(r) {
         return r.return(200, JSON.stringify(out));
     }
     r.return(204);
+}
+
+// ------------------------------------------------------------------ node drain (SPEC §22.1)
+// While the node drains (after the DNS grace) a tunnel request that OPENS a client connection
+// ($connection_requests = 1) is refused with 503 so the client reconnects to another node. Requests on
+// an existing connection (upgraded sessions are never re-checked, new h2 streams) and xhttp POSTs
+// (packets of a session that already exists) always pass. Any error fails open.
+function tunnelDrain(r) {
+    try {
+        const d = ngx.shared.pcdn_fair;
+        if (!d || d.get('drain') !== 1) return '';
+        const v = r.variables;
+        if (v.pcdn_tn === 'xhttp' && r.method !== 'GET') return '';
+        if (String(v.connection_requests) !== '1') return '';
+        return '1';
+    } catch (e) { return ''; }
 }
 
 // ------------------------------------------------------------------ speed test (SPEC §15.6)
@@ -1059,6 +1086,7 @@ function fnv(s) {
 function hcKey(site, pool, o) { return site.id + '|' + pool.name + '|' + o.hp; }
 
 function isUp(site, pool, o) {
+    // a missing entry (never checked, or aged out after the agent stopped) counts as up: fail open
     if (!pool.health.enabled) return true;
     return (ngx.shared.pcdn_hc.get(hcKey(site, pool, o)) || 0) < HC_FALL;
 }
@@ -1149,7 +1177,7 @@ async function health() {
         if (!site) return;
         Object.keys(site.pools).forEach(function (name) {
             const pool = site.pools[name];
-            if (!pool.health.enabled) return;
+            if (!pool.health.enabled || pool.health.tcp) return;   // tcp: the agent checks (hcSet)
             pool.origins.forEach(function (o) {
                 const nk = 'n|' + hcKey(site, pool, o);
                 if ((hc.get(nk) || 0) > t) return;
@@ -1159,6 +1187,28 @@ async function health() {
         });
     });
     await Promise.all(jobs);
+}
+
+// /__pcdn/hc (localhost only, POST): {"<site>|<pool>|<host:port>": <consecutive failures>, ...} from the
+// agent's TCP health checker (SPEC §22.4), at most HC_SET_MAX keys per call; counts like checkOrigin's.
+const HC_SET_MAX = 4096;
+const HC_KEY = /^[0-9]{1,12}\|[a-z0-9._-]{1,40}\|[a-z0-9.:\[\]-]{1,300}$/;
+
+function hcSet(r) {
+    if (r.method !== 'POST') return r.return(405);
+    let body;
+    try { body = JSON.parse(r.requestText || '{}'); } catch (e) { return r.return(400); }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return r.return(400);
+    const hc = ngx.shared.pcdn_hc, keys = Object.keys(body);
+    if (keys.length > HC_SET_MAX) return r.return(413);
+    let n = 0;
+    keys.forEach(function (k) {
+        const v = Math.floor(+body[k]);
+        if (!HC_KEY.test(k) || !(v >= 0)) return;
+        hc.set(k, Math.min(v, 1000));
+        n++;
+    });
+    r.return(200, String(n));
 }
 
 // ------------------------------------------------------------------ image resize / transform parameters
@@ -2139,5 +2189,5 @@ function accessLogout(r) {
 }
 
 export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
-    bodyNeed, bodyInspect, tfHeaders, tunnelFair, fairSet, speedDown, speedUp, videoNext,
+    bodyNeed, bodyInspect, tfHeaders, tunnelFair, tunnelDrain, fairSet, hcSet, speedDown, speedUp, videoNext,
     accessEmail, accessLogin, accessSend, accessVerify, accessLogout };

@@ -19,13 +19,18 @@ Modules, lowest layer first (a module imports only from modules listed before it
     render.http         http.conf, resizer, mTLS resizer, bots.conf, node block
     render.njs          sites.js entries
     render.site         per-site vhosts
+    render.probe        synthetic tunnel probe servers + their certificate / body files (SPEC §22.3)
     render.tree         the whole rendered tree
     logship             log export
     nodelogs            centralized node logs
-    heartbeat           metrics and the capabilities object
+    tuning              kernel tuning profile and its runtime check (SPEC §22.6)
+    heartbeat           metrics, the capabilities object, reload metrics and the memory guard
+    probe               tunnel probe clients, echo origin and probe thread (SPEC §22.3)
+    tcphealth           TCP health checks of pool members (SPEC §22.4)
     purge               cache purges
     apply               write / test / reload / roll back, bootstrap, origin guard peers
     controller          controller API client
+    drain               node drain: state lock, flag, drain / undrain commands (SPEC §22.1)
     imaged              `pcdn-agent imaged` image transformer
     agent               the Agent loop
     cli                 `pcdn-agent` command line
@@ -43,8 +48,9 @@ import types
 # every module, lowest layer first (as in the table above)
 _MODULE_NAMES = ("settings", "common", "capabilities", "reload", "validation.origin", "validation.storage",
                  "validation.regex", "validation.rules", "validation.gates", "usage", "functions", "render.stream",
-                 "render.guards", "render.shield", "render.http", "render.njs", "render.site", "render.tree", "logship",
-                 "nodelogs", "heartbeat", "purge", "apply", "controller", "imaged", "agent", "cli")
+                 "render.guards", "render.shield", "render.http", "render.njs", "render.site", "render.probe", "render.tree",
+                 "logship", "nodelogs", "tuning", "heartbeat", "probe", "tcphealth", "purge", "apply", "controller",
+                 "drain", "imaged", "agent", "cli")
 _MODULES = tuple(importlib.import_module(f"{__name__}.{m}") for m in _MODULE_NAMES)
 _MISSING = object()
 

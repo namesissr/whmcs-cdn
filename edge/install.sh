@@ -53,6 +53,17 @@
 #                      network: list it in ORIGIN_PRIVATE_ALLOW=10.1.0.0/16,... in agent.conf, then run
 #                      --upgrade. --origin-guard re-installs it; --upgrade keeps the installed state.
 #   --insecure-http    accept a plain http:// controller URL (isolated test networks only)
+#   --drain[=minutes]  only with --upgrade (SPEC §22.1): before anything is touched, drain this node
+#                      (`pcdn-agent drain --minutes N --reason upgrade --wait`, 1..120, default 15): DNS
+#                      stops sending clients here, new tunnel connections are refused after the DNS grace,
+#                      the upgrade starts once the node is drained (or N minutes passed); the new agent
+#                      undrains itself after its first good config apply + tunnel probe. The last active
+#                      node of a group is refused (exit 1: upgrade without --drain); an older agent or
+#                      controller without drain support -> warning, upgrade without drain.
+#   --shutdown-timeout auto|<time>  worker_shutdown_timeout (SPEC §22.2). auto (default): RAM < 4 GiB 30m,
+#                      4-8 GiB 2h, >= 8 GiB 4h. An explicit value (e.g. 1h; never seconds below 60) is
+#                      kept in agent.conf (SHUTDOWN_TIMEOUT) for later --upgrades; an --upgrade of an edge
+#                      without that line keeps the value already in nginx.conf.
 # L4 proxy (SPEC §16.4): the stream module is installed (libnginx-mod-stream / built into nginx.org) and
 # nginx.conf includes /etc/nginx/pcdn/l4/*.conf at the main context. Open L4_PORT_RANGE (default
 # 20000-29999, TCP and UDP) in the host / provider firewall. Images v2: python3-pil + service
@@ -71,9 +82,11 @@ UPGRADE=no
 HTTP3=""     # yes | no ("" = not given: no, or the installed value on --upgrade)
 TCP_CC=""    # bbr | cubic ("" = not given: bbr, or the installed value on --upgrade)
 KEEP_CONF="" # operator-tuned agent.conf lines carried over by --upgrade (log export, SPEC §14.3.2)
-# F6: worker_shutdown_timeout — bounds how many draining worker generations pile up after reloads.
-# 1h matches the default tunnel idle_timeout; use 20-30m on <=4GB nodes. Never seconds (a hard cut).
-SHUTDOWN_TIMEOUT=1h
+# F6 / SPEC §22.2: worker_shutdown_timeout — bounds how many draining worker generations pile up after
+# reloads. "" = not given: auto by RAM (fresh install), or kept on --upgrade (see --shutdown-timeout).
+SHUTDOWN_TIMEOUT=""
+SHUTDOWN_STORE=no  # yes: write SHUTDOWN_TIMEOUT= to agent.conf (an explicit / previously stored value)
+DRAIN=""           # --drain[=minutes] (SPEC §22.1; only with --upgrade)
 HARDEN_NET=""  # yes | no ("" = not given: no, or the installed GUARD value on --upgrade)
 AVIF=""        # yes | no ("" = not given: yes, or the installed value on --upgrade)
 FUNCTIONS=""   # yes | no ("" = not given: no, or the installed value on --upgrade)
@@ -100,7 +113,10 @@ while [ $# -gt 0 ]; do
     --cache-size) CACHE_SIZE="$2"; shift 2 ;;
     --http-port) HTTP_PORT="$2"; shift 2 ;;
     --https-port) HTTPS_PORT="$2"; shift 2 ;;
-    --shutdown-timeout) SHUTDOWN_TIMEOUT="$2"; shift 2 ;;
+    --shutdown-timeout) SHUTDOWN_TIMEOUT="${2:-}"; shift 2
+      [ "$SHUTDOWN_TIMEOUT" = auto ] || SHUTDOWN_STORE=yes ;;
+    --drain) DRAIN=15; shift ;;
+    --drain=*) DRAIN="${1#--drain=}"; shift ;;
     --no-geoip) GEOIP=no; shift ;;
     --upgrade) UPGRADE=yes; shift ;;
     --harden-net) HARDEN_NET=yes; shift ;;
@@ -112,7 +128,39 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1"; exit 1 ;;
   esac
 done
-export SHUTDOWN_TIMEOUT
+# >>> pcdn wst (edge/tests/test_install_agent.py runs this block)
+# SPEC §22.2 worker_shutdown_timeout: auto by RAM (MemTotal; PCDN_MEMINFO overrides the path for tests)
+wst_auto() {
+  local kb
+  kb="$(awk '/^MemTotal:/{print $2; exit}' "${PCDN_MEMINFO:-/proc/meminfo}" 2>/dev/null || true)"
+  case "$kb" in ''|*[!0-9]*) kb=0 ;; esac
+  if [ "$kb" -lt 4194304 ]; then echo 30m; elif [ "$kb" -lt 8388608 ]; then echo 2h; else echo 4h; fi
+}
+# an nginx time value; a seconds-only value below 60 would cut live tunnels at every reload: refused
+wst_valid() {
+  case "$1" in ''|*[!0-9smhd]*) return 1 ;; esac
+  local n="${1%%[smhd]*}"
+  local u="${1#"$n"}"
+  [ -n "$n" ] || return 1
+  case "$u" in
+    ""|s) [ "$n" -ge 60 ] ;;
+    ms) [ "$n" -ge 60000 ] ;;
+    m|h|d) [ "$n" -ge 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+# <<< pcdn wst
+# >>> pcdn arg checks (edge/tests/test_install_agent.py runs this block)
+if [ -n "$DRAIN" ]; then
+  [ "$UPGRADE" = yes ] || { echo "--drain is only valid together with --upgrade"; exit 1; }
+  case "$DRAIN" in ''|*[!0-9]*) echo "--drain=<minutes> must be 1..120"; exit 1 ;; esac
+  if [ "$((10#$DRAIN))" -lt 1 ] || [ "$((10#$DRAIN))" -gt 120 ]; then echo "--drain=<minutes> must be 1..120"; exit 1; fi
+  DRAIN="$((10#$DRAIN))"
+fi
+if [ -n "$SHUTDOWN_TIMEOUT" ] && [ "$SHUTDOWN_TIMEOUT" != auto ] && ! wst_valid "$SHUTDOWN_TIMEOUT"; then
+  echo "--shutdown-timeout must be auto or an nginx time like 30m / 2h (never seconds below 60: a hard cut)"; exit 1
+fi
+# <<< pcdn arg checks
 
 case "${REGION:-}" in ""|home|global) ;; *) echo "--region must be home or global"; exit 1 ;; esac
 case "${ROLE:-}" in ""|general|tunnel) ;; *) echo "--role must be general or tunnel"; exit 1 ;; esac
@@ -134,6 +182,10 @@ if [ "$UPGRADE" = yes ]; then
   if [ -z "$HTTP3" ]; then v="$(conf HTTP3)"; case "$v" in yes|no) HTTP3="$v" ;; esac; fi
   # wave 8: the host guard (SPEC §16.3) and AVIF tooling (§16.6) stay as installed unless a flag says
   if [ -z "${HARDEN_NET:-}" ]; then v="$(conf GUARD)"; case "$v" in yes|no) HARDEN_NET="$v" ;; esac; fi
+  # SPEC §22.2: a stored explicit worker_shutdown_timeout survives the upgrade (a flag still wins)
+  if [ -z "${SHUTDOWN_TIMEOUT:-}" ]; then
+    v="$(conf SHUTDOWN_TIMEOUT)"; [ -n "$v" ] && { SHUTDOWN_TIMEOUT="$v"; SHUTDOWN_STORE=yes; }
+  fi
   if [ -z "${AVIF:-}" ]; then v="$(conf AVIF)"; case "$v" in yes|no) AVIF="$v" ;; esac; fi
   # SPEC §16.9 edge functions stay as installed unless --functions / --no-functions says otherwise
   if [ -z "${FUNCTIONS:-}" ]; then v="$(conf FUNCTIONS)"; case "$v" in yes|no) FUNCTIONS="$v" ;; esac; fi
@@ -145,7 +197,7 @@ if [ "$UPGRADE" = yes ]; then
   # kept across --upgrade: log-export tunables (SPEC §14.3.2) and the wave-7 node settings an operator
   # may have added (SPEC §15.2 fair-share capacity / share, §15.6 speed-test node name / file)
   # and the wave-8 settings (SPEC §16.3 GUARD_* values, §16.4 L4_*, §16.6 IMAGE*/IMAGED)
-  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS)|ORIGIN_PRIVATE_ALLOW|INTERNAL_SRC)=' \
+  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS)|ORIGIN_PRIVATE_ALLOW|INTERNAL_SRC|RELOAD_MAX_WAIT|MEM_GUARD_PCT|DRAIN_IDLE_CONNS|PROBE_(ENABLED|INTERVAL|BYTES|ECHO_PORT|H2C_PORT)|ORIGIN_TCP_HEALTH|TUNE_PROFILE)=' \
     /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
@@ -168,6 +220,36 @@ case "$HTTP_PORT$HTTPS_PORT" in *[!0-9]*) echo "ports must be numeric"; exit 1 ;
 if [ "${ID:-}" != ubuntu ] || [ "${VERSION_ID%%.*}" -lt 24 ]; then
   echo "warning: tested on Ubuntu 24.04; continuing on ${PRETTY_NAME:-unknown}"
 fi
+
+# >>> pcdn upgrade drain (SPEC §22.1; edge/tests/test_install_agent.py runs this block with a fake agent)
+# before nginx or the agent is touched. An installed agent too old for `drain` (its `drain --help` does not
+# exit 0; PCDN_CONFIG=/nonexistent makes an old agent exit at once instead of starting its loop) or a
+# controller without the endpoint -> warning, upgrade without drain. Exit 3 = last active node: abort.
+DRAINED=no
+UPGRADE_DONE=no
+AGENT_BIN="${AGENT_BIN:-/usr/local/bin/pcdn-agent}"
+if [ -n "$DRAIN" ]; then
+  if [ -f "$AGENT_BIN" ] && PCDN_CONFIG=/nonexistent timeout 20 /usr/bin/python3 "$AGENT_BIN" drain --help >/dev/null 2>&1; then
+    echo "==> draining this node before the upgrade (at most $DRAIN min)"
+    rc=0
+    PCDN_CONFIG="${PCDN_AGENT_CONF:-/etc/pcdn/agent.conf}" /usr/bin/python3 "$AGENT_BIN" drain --minutes "$DRAIN" \
+      --reason upgrade --wait || rc=$?
+    case "$rc" in
+      0) DRAINED=yes ;;
+      3) echo "این آخرین نود فعال گروه است؛ بدون --drain به‌روزرسانی کنید"
+         echo "this is the last active node of its group; upgrade without --drain"
+         exit 1 ;;
+      *) echo "warning: the node could not be drained (exit $rc); upgrading without drain" ;;
+    esac
+  else
+    echo "warning: the installed agent does not support drain (older version); upgrading without drain"
+  fi
+fi
+# an upgrade that fails after the drain gives the node back (the new agent undrains itself on success)
+trap 'if [ "$DRAINED" = yes ] && [ "$UPGRADE_DONE" != yes ]; then
+        echo "upgrade failed: ending the drain"; PCDN_CONFIG="${PCDN_AGENT_CONF:-/etc/pcdn/agent.conf}" \
+        /usr/bin/python3 "$AGENT_BIN" undrain || true; fi' EXIT
+# <<< pcdn upgrade drain
 
 echo "==> packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -304,6 +386,17 @@ install -m 644 "$HERE/systemd/pcdn-imaged.service" /etc/systemd/system/pcdn-imag
 echo 'include /etc/nginx/pcdn/http.conf;' > /etc/nginx/conf.d/00-pcdn.conf
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
 
+# SPEC §22.2 worker_shutdown_timeout: explicit / stored value, else auto by RAM; an --upgrade of an edge
+# without a stored value keeps whatever nginx.conf already has (no silent change of an operator's WST)
+WST_KEEP=no
+if [ -z "$SHUTDOWN_TIMEOUT" ] && [ "$UPGRADE" = yes ] \
+   && grep -q '^[[:space:]]*worker_shutdown_timeout' /etc/nginx/nginx.conf 2>/dev/null; then
+  WST_KEEP=yes
+elif [ -z "$SHUTDOWN_TIMEOUT" ] || [ "$SHUTDOWN_TIMEOUT" = auto ] || ! wst_valid "$SHUTDOWN_TIMEOUT"; then
+  SHUTDOWN_TIMEOUT="$(wst_auto)"
+  SHUTDOWN_STORE=no
+fi
+export SHUTDOWN_TIMEOUT WST_KEEP
 # >>> nginx.conf edits (idempotent; edge/tests/test_agent.py runs this block against the stock file)
 # directives that our http.conf sets would be "duplicate" next to the stock nginx.conf ones
 sed -i -E 's/^([[:space:]]*)(gzip[[:space:]]+on;|ssl_protocols[[:space:]]|ssl_prefer_server_ciphers[[:space:]]|keepalive_timeout[[:space:]])/\1# pcdn (set in pcdn http.conf): \2/' /etc/nginx/nginx.conf
@@ -332,7 +425,9 @@ fi
 # pinned indefinitely by long-lived tunnels (grows memory until the OOM killer drops tunnels).
 _SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-1h}"
 if grep -q '^[[:space:]]*worker_shutdown_timeout' /etc/nginx/nginx.conf; then
-  sed -i "s/^[[:space:]]*worker_shutdown_timeout.*/worker_shutdown_timeout ${_SHUTDOWN_TIMEOUT};/" /etc/nginx/nginx.conf
+  if [ "${WST_KEEP:-no}" != yes ]; then
+    sed -i "s/^[[:space:]]*worker_shutdown_timeout.*/worker_shutdown_timeout ${_SHUTDOWN_TIMEOUT};/" /etc/nginx/nginx.conf
+  fi
 else
   sed -i "1a worker_shutdown_timeout ${_SHUTDOWN_TIMEOUT};" /etc/nginx/nginx.conf
 fi
@@ -378,6 +473,9 @@ ERROR_LOG=/var/log/nginx/error.log
 TCP_CC=$TCP_CC
 HTTP3=$HTTP3
 EOF
+# SPEC §22.3: the tunnel probe's certificate / gRPC body; SPEC §22.2: an explicit worker_shutdown_timeout
+echo "PROBE_DIR=/etc/pcdn/probe" >> /etc/pcdn/agent.conf
+[ "$SHUTDOWN_STORE" = yes ] && echo "SHUTDOWN_TIMEOUT=$SHUTDOWN_TIMEOUT" >> /etc/pcdn/agent.conf
 # region / role (maps to the edge group): the agent reports these so a fresh node self-registers
 # into the right pool (SPEC §11.1). Written only when given; the controller already holds them
 # from when the token was minted, and never re-writes them once an operator edits the panel.
@@ -494,6 +592,10 @@ net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 86400
 EOF
 rm -f /etc/sysctl.d/99-pcdn-conntrack.conf
+# SPEC §22.6: RAM-scaled socket buffers / conntrack limit in /etc/sysctl.d/999-pcdn.mem.conf (sorts after
+# 999-pcdn.conf, overrides only those keys; TUNE_PROFILE=off in agent.conf removes it). Idempotent.
+PCDN_CONFIG=/etc/pcdn/agent.conf /usr/bin/python3 /usr/local/bin/pcdn-agent tune --write >/dev/null \
+  || echo "warning: pcdn-agent tune --write failed; the static 999-pcdn.conf values apply"
 sysctl --system >/dev/null 2>&1 || true
 
 # F30: verify the values actually took effect (a stray /etc/sysctl.conf entry, or the module not
@@ -692,6 +794,11 @@ else
 fi
 # <<< pcdn imaged
 
+UPGRADE_DONE=yes
+if [ "$DRAINED" = yes ]; then
+  echo "==> the node stays drained until the new agent applied its config and passed the tunnel probe;"
+  echo "    it then undrains itself (journalctl -u pcdn-agent -f; manual: pcdn-agent undrain)"
+fi
 echo
 echo "Edge installed. Check: systemctl status pcdn-agent ; journalctl -u pcdn-agent -f"
 echo "Health: curl -H 'Host: health.pcdn' http://127.0.0.1:$HTTP_PORT/__pcdn/health"
