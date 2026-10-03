@@ -87,6 +87,21 @@ DNS, rollouts or provisioning — enforced by an import test).
   `PCDN_ENVIRONMENT=staging` and `PCDN_VERSION`; docs `RELEASE.md` (new), ROLLOUT / LOADTEST / STAGING /
   TERRAFORM / CLI updated.
 
+### Added — wave 14, WHMCS
+- Settings history page with version diff and restore (shared domains: editor role only).
+- Customer alerts page (e-mail / SMS / Bale / Telegram channels, subscriptions, quiet hours) and an
+  AlertMail cron that delivers the controller's e-mail outbox.
+- ArvanCloud / Cloudflare import wizard with a dry-run mapping report (the API key is only passed through).
+- RUM page with charts and settings (auto/manual injection, SPA).
+- Diagnostics report the customer reviews before it opens a support ticket.
+- Tunnel quality table shows city labels («نود تهران») instead of node names; owner edits made in the
+  panel appear as «شما» in the change log.
+- Addon 1.7.0: «عملیات» tab (releases/rollouts with pause/resume/abort/rollback, backups, abuse desk,
+  SLO, provisioning approve/reject), public abuse report page, node version and display-city columns,
+  plan feature labels / pricing rows for rum, alert_sms, alert_messengers, max_alert_subscriptions,
+  fa/en alert e-mail templates, settings alert_email / support_department / abuse_page.
+- Repo-local customer-text test (`node --test whmcs/tests/*.test.js`).
+
 ### Changed — wave 14
 
 - Docs: API, OPERATIONS (§۱۰), MONITORING, SECURITY (§۱۲), UPGRADE («۱۲) موج ۱۴ — انتشار ایمن، عملیات و

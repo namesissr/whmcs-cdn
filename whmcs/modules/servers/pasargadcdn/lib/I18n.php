@@ -176,6 +176,21 @@ class I18n
         // templates/clientarea.tpl
         'برای مدیریت CDN، جاوااسکریپت مرورگر را فعال کنید.' => 'Enable JavaScript in your browser to manage the CDN.',
         'در حال بارگذاری پنل CDN…' => 'Loading the CDN panel…',
+        // SPEC §23.8 (wave 14): the diagnostics report dialog (lib/Diagnostics.php)
+        'گزارش عیب‌یابی روی این سرور فعال نیست.' => 'Diagnostics reports are not available on this server.',
+        'تعداد گزارش‌های عیب‌یابی این ساعت به سقف رسیده است؛ کمی بعد دوباره تلاش کنید.' => 'The hourly limit of diagnostics reports is reached; try again a little later.',
+        'پاسخ سرور CDN گزارش معتبری نبود.' => 'The CDN server did not return a valid report.',
+        'این گزارش منقضی شده یا معتبر نیست؛ گزارش را دوباره بگیرید.' => 'This report has expired or is not valid; create the report again.',
+        'توضیح شما حداکثر ۲۰۰۰ نویسه است.' => 'Your note can be at most 2000 characters.',
+        'ثبت تیکت در حال حاضر ممکن نیست؛ دوباره تلاش کنید.' => 'A ticket cannot be opened right now; try again.',
+        'تیکت یافت نشد.' => 'Ticket not found.',
+        'افزودن گزارش به تیکت ممکن نشد؛ دوباره تلاش کنید.' => 'The report could not be added to the ticket; try again.',
+        'بخش پشتیبانی برای ثبت تیکت تعریف نشده است.' => 'No support department is set up for tickets.',
+        'ثبت تیکت ممکن نشد؛ دوباره تلاش کنید.' => 'The ticket could not be opened; try again.',
+        // SPEC §23.4 / §23.5 / §23.6 controller details (translated by controller(), see below)
+        'نسخه یافت نشد' => 'Version not found',
+        'نشست انتقال منقضی شده است؛ دوباره پیش‌نمایش بگیرید' => 'The import session has expired; run the preview again',
+        'کد تأیید نادرست است' => 'The verification code is wrong',
     ];
 
     /** WHMCS language name (or our own code) → 'fa' | 'en'; anything unknown is Persian. */

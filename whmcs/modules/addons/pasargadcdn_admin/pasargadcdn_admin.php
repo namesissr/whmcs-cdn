@@ -22,6 +22,14 @@ use PasargadCdn\Admin\Env;
 function pasargadcdn_admin_config()
 {
     $servers = ['0' => 'خودکار (اولین سرور فعال Pasargad CDN)'];
+    $depts = ['0' => 'اولین بخش پشتیبانی'];
+    try {
+        foreach (WHMCS\Database\Capsule::table('tblticketdepartments')->orderBy('order')->get(['id', 'name']) as $d) {
+            $depts[(string) $d->id] = (string) $d->name . ' (#' . $d->id . ')';
+        }
+    } catch (\Throwable $e) {
+        // config page still renders without the list
+    }
     try {
         foreach (WHMCS\Database\Capsule::table('tblservers')->where('type', 'pasargadcdn')->orderBy('id')->get(['id', 'name', 'hostname']) as $s) {
             $servers[(string) $s->id] = ($s->name ?: 'Pasargad CDN') . ' (#' . $s->id . ' — ' . $s->hostname . ')';
@@ -35,7 +43,8 @@ function pasargadcdn_admin_config()
             . 'به ماژول سرور Pasargad CDN (modules/servers/pasargadcdn) نیاز دارد.',
         'author' => 'Pasargad Mizban',
         'language' => 'english',
-        'version' => '1.6.0',
+        // 1.7.0 (SPEC §23, wave 14): alert e-mail outbox + templates, support department, public abuse page
+        'version' => '1.7.0',
         'fields' => [
             'server' => [
                 'FriendlyName' => 'سرور کنترلر',
@@ -250,6 +259,26 @@ function pasargadcdn_admin_config()
                 'Default' => '',
                 'Description' => 'درخواست پذیرفته‌شده تا تأیید یا رد مدیر در زبانهٔ «انتقال دامنه» افزونه منتظر می‌ماند',
             ],
+            // SPEC §23 (wave 14)
+            'alert_email' => [
+                'FriendlyName' => 'ایمیل هشدارهای مشتری',
+                'Type' => 'yesno',
+                'Default' => 'on',
+                'Description' => 'کران WHMCS صف ایمیل هشدارهای مشتری (قطعی سرور اصلی، انقضای SSL، ترافیک، رخدادهای سکو، اطلاعیهٔ تخلف) را از کنترلر می‌خواند و با قالب «Pasargad CDN Alert» / «Pasargad CDN Abuse Notice» می‌فرستد؛ پیامک، بله و تلگرام را خود کنترلر می‌فرستد',
+            ],
+            'support_department' => [
+                'FriendlyName' => 'بخش پشتیبانی گزارش عیب‌یابی',
+                'Type' => 'dropdown',
+                'Options' => $depts,
+                'Default' => '0',
+                'Description' => 'تیکت‌هایی که مشتری با «ارسال گزارش عیب‌یابی به پشتیبانی» از پنل CDN باز می‌کند به این بخش می‌روند',
+            ],
+            'abuse_page' => [
+                'FriendlyName' => 'صفحهٔ عمومی گزارش تخلف',
+                'Type' => 'yesno',
+                'Default' => '',
+                'Description' => 'فرم بدون نیاز به ورود index.php?m=pasargadcdn_admin&page=abuse (با اثبات کار در مرورگر) و پیگیری وضعیت با شناسه؛ روی کنترلر هم باید ABUSE_ENABLED=true باشد',
+            ],
             'reserved' => [
                 'FriendlyName' => 'دامنه‌های رزرو',
                 'Type' => 'text',
@@ -265,6 +294,7 @@ function pasargadcdn_admin_activate()
 {
     try {
         Env::ensureTable();
+        pasargadcdn_admin_w14();
         return ['status' => 'success', 'description' => 'ماژول فعال شد. در System Settings → Addon Modules به نقش‌های مدیر دسترسی بدهید، سپس از «پلن‌ها و قیمت‌گذاری» محصولات را بسازید.'];
     } catch (\Throwable $e) {
         return ['status' => 'error', 'description' => 'ساخت جدول ' . Env::KV_TABLE . ' ناموفق بود: ' . $e->getMessage()];
@@ -284,6 +314,27 @@ function pasargadcdn_admin_upgrade($vars)
     } catch (\Throwable $e) {
         if (function_exists('logActivity')) {
             logActivity('Pasargad CDN: addon upgrade could not create ' . Env::KV_TABLE . ': ' . $e->getMessage());
+        }
+    }
+    // 1.7.0 (SPEC §23): alert e-mail claim table + the «Pasargad CDN Alert» / «Pasargad CDN Abuse Notice» templates (idempotent)
+    $from = is_array($vars) ? (string) ($vars['version'] ?? '') : '';
+    if ($from === '' || version_compare($from, '1.7.0', '<')) {
+        pasargadcdn_admin_w14();
+    }
+}
+
+/** SPEC §23 (wave 14) schema + templates; never throws (logged). Idempotent: safe on every activation / upgrade. */
+function pasargadcdn_admin_w14(): void
+{
+    try {
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/TunnelAlerts.php';
+        require_once __DIR__ . '/lib/AlertMail.php';
+        PasargadCdn\Admin\AlertMail::ensure();
+        PasargadCdn\Admin\AlertMail::ensureTemplates();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: 1.7.0 upgrade (alert e-mails) failed: ' . $e->getMessage());
         }
     }
 }
@@ -349,6 +400,12 @@ function pasargadcdn_admin_clientarea($vars)
         PasargadCdn\Admin\Env::loadServerModule();
         return PasargadCdn\Admin\CustomerTransfer::clientArea($get, array_filter($_POST, 'is_scalar'), strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')), $clientId);
     }
+    // SPEC §23.10: the public abuse report form + status lookup (no login; off unless the setting «صفحهٔ عمومی گزارش تخلف» is on)
+    if (($get['page'] ?? '') === 'abuse') {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/AbusePage.php';
+        return PasargadCdn\Admin\AbusePage::clientArea($get, array_filter($_POST, 'is_scalar'), strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
+    }
     if (($get['page'] ?? 'pricing') === 'referral') {
         $lang = PasargadCdn\Admin\Pricing::lang($get);
         $title = PasargadCdn\Admin\Referrals::tx('title', $lang);
@@ -366,7 +423,8 @@ function pasargadcdn_admin_sidebar($vars)
     $link = htmlspecialchars((string) ($vars['modulelink'] ?? 'addonmodules.php?module=pasargadcdn_admin'), ENT_QUOTES, 'UTF-8');
     $items = ['dashboard' => 'داشبورد', 'sites' => 'سایت‌ها', 'edges' => 'نودها', 'plans' => 'پلن‌ها و قیمت‌گذاری',
         'operator' => 'دامنه‌های اپراتور', 'transfer' => 'انتقال دامنه', 'analytics' => 'آنالیتیکس', 'usage' => 'گزارش مصرف', 'resellers' => 'نمایندگان', 'events' => 'رویدادهای امنیتی',
-        'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'referrals' => 'معرفی‌ها', 'shares' => 'اشتراک‌ها', 'settings' => 'تنظیمات و سلامت'];
+        'status' => 'وضعیت و رخدادها', 'health' => 'سلامت سامانه', 'audit' => 'حسابرسی', 'referrals' => 'معرفی‌ها', 'shares' => 'اشتراک‌ها',
+        'releases' => 'عملیات (انتشار، پشتیبان، SLO)', 'abuse' => 'گزارش‌های تخلف', 'settings' => 'تنظیمات و سلامت'];
     $h = '<span class="header"><i class="fas fa-bolt"></i> CDN پاسارگاد</span><ul class="menu" dir="rtl" style="text-align:right">';
     foreach ($items as $page => $label) {
         $h .= '<li><a href="' . $link . '&amp;page=' . $page . '">' . $label . '</a></li>';

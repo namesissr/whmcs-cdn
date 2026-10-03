@@ -44,6 +44,18 @@ final class Pricing
         'access' => ['دسترسی محافظت‌شده', 'Protected access', 'bool'],
     ];
 
+    /**
+     * SPEC §23.15 (wave 14) plan features that products do not set yet (no module setting / configurable option this wave —
+     * the controller defaults or a per-domain override give them): a row is shown only when at least one listed plan
+     * carries the key, so the table never claims «ندارد» / 0 for a value the controller would fill in.
+     */
+    const OPTIONAL_FEATURES = [
+        'rum' => ['پایش تجربهٔ کاربران (RUM)', 'Real user monitoring', 'bool'],
+        'alert_sms' => ['هشدار پیامکی', 'SMS alerts', 'bool'],
+        'alert_messengers' => ['هشدار در بله و تلگرام', 'Bale & Telegram alerts', 'bool'],
+        'max_alert_subscriptions' => ['حداکثر اشتراک هشدار', 'Alert subscriptions', 'num'],
+    ];
+
     const T = [
         'title' => ['قیمت پلن‌های CDN', 'CDN plans and pricing'],
         'lead' => ['سرعت بیشتر و امنیت بالاتر برای سایت شما، با نیم‌سرورها و نودهای داخل ایران.', 'A faster, safer site with nameservers and edge nodes inside Iran.'],
@@ -187,6 +199,11 @@ final class Pricing
             foreach (self::FEATURES as $k => [, , $kind]) {
                 $feat[$k] = $kind === 'bool' ? !empty($f[$k]) : (int) ($f[$k] ?? 0);
             }
+            foreach (self::OPTIONAL_FEATURES as $k => [, , $kind]) {
+                if (array_key_exists($k, $f)) {
+                    $feat[$k] = $kind === 'bool' ? !empty($f[$k]) : (int) $f[$k];
+                }
+            }
             // SPEC §22.4: a tunnel plan without the «Tunnel Origins» option gets the controller default (1 origin per path)
             if (!empty($f['tunnel']) && $feat['max_tunnel_origins'] <= 0) {
                 $feat['max_tunnel_origins'] = 1;
@@ -225,7 +242,7 @@ final class Pricing
         }
         unset($p);
         $labels = [];
-        foreach (self::FEATURES as $k => [$fa, $en]) {
+        foreach (self::FEATURES + self::OPTIONAL_FEATURES as $k => [$fa, $en]) {
             $labels[$k] = ['fa' => $fa, 'en' => $en];
         }
         return (string) json_encode(['lang' => $lang] + $data + ['feature_labels' => $labels],
@@ -317,6 +334,20 @@ final class Pricing
                 $h .= '<td>' . ($kind === 'bool' ? '<span class="' . ($v ? 'pp-y' : 'pp-n') . '" role="img" aria-label="' . self::e(self::tx($v ? 'yes' : 'no', $lang))
                     . '" title="' . self::e(self::tx($v ? 'yes' : 'no', $lang)) . '">' . ($v ? '✓' : '✗') . '</span>'
                     : self::e($v > 0 ? self::num($v, $lang) : ($k === 'max_tunnel_paths' || $k === 'max_tunnel_origins' || $k === 'max_records' ? self::tx('na', $lang) : self::num(0, $lang)))) . '</td>';
+            }
+            $h .= '</tr>';
+        }
+        foreach (self::OPTIONAL_FEATURES as $k => [$fa, $en, $kind]) {
+            if (!array_filter($data['plans'], function ($p) use ($k) {
+                return array_key_exists($k, $p['features']);
+            })) {
+                continue;
+            }
+            $h .= '<tr data-opt-row="' . $k . '"><th scope="row">' . self::e($lang === 'en' ? $en : $fa) . '</th>';
+            foreach ($data['plans'] as $p) {
+                $v = $p['features'][$k] ?? null;
+                $h .= '<td>' . ($v === null ? self::e(self::tx('na', $lang)) : ($kind === 'bool' ? '<span class="' . ($v ? 'pp-y' : 'pp-n') . '" role="img" aria-label="'
+                    . self::e(self::tx($v ? 'yes' : 'no', $lang)) . '">' . ($v ? '✓' : '✗') . '</span>' : self::e(self::num((int) $v, $lang)))) . '</td>';
             }
             $h .= '</tr>';
         }

@@ -20,7 +20,9 @@ final class Admin
 {
     // SPEC §19: «دامنه‌های اپراتور» (operator), its full manager (opmanage) and the «انتقال دامنه» wizard (transfer)
     const PAGES = ['dashboard', 'sites', 'edges', 'plans', 'analytics', 'usage', 'resellers', 'events', 'status', 'health', 'audit', 'referrals', 'settings', 'manage', 'api',
-        'operator', 'opmanage', 'transfer', 'shares', 'features'];
+        'operator', 'opmanage', 'transfer', 'shares', 'features',
+        // SPEC §23 (wave 14): the «عملیات» pages (Ops)
+        'releases', 'backups', 'abuse', 'slo', 'provisioning'];
 
     /** @var callable|null tests: receives [status, content type, body, filename] instead of exit */
     public static $sink = null;
@@ -146,6 +148,14 @@ final class Admin
             case 'manage':
                 $body = Pages::manage((int) ($get['service'] ?? 0));
                 break;
+            case 'releases':
+            case 'backups':
+            case 'abuse':
+            case 'slo':
+            case 'provisioning':
+                require_once __DIR__ . '/Ops.php';
+                $body = Ops::page($page, $get, $state);
+                break;
             default:
                 $body = Pages::dashboard();
         }
@@ -153,7 +163,8 @@ final class Admin
         $clean = $method === 'POST' ? View::url(array_filter(['page' => $page, 'view' => $get['view'] ?? null, 'id' => $get['id'] ?? null,
             'service' => in_array($page, ['transfer', 'shares', 'features'], true) ? ($get['service'] ?? null) : null,
             'domain' => in_array($page, ['transfer', 'features'], true) ? ($get['domain'] ?? null) : null,
-            'q' => $get['q'] ?? null, 'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null], 'is_string'), false) : '';
+            'q' => $get['q'] ?? null, 'status' => $get['status'] ?? null, 'pid' => $get['pid'] ?? null, 'cdn' => $get['cdn'] ?? null, 'p' => $get['p'] ?? null,
+            'month' => $page === 'slo' ? ($get['month'] ?? null) : null, 'category' => $page === 'abuse' ? ($get['category'] ?? null) : null], 'is_string'), false) : '';
         return Pages::layout($page, $body, $flash, $clean);
     }
 
@@ -249,6 +260,11 @@ final class Admin
             require_once __DIR__ . '/FeatureEditor.php';
             return FeatureEditor::action($action, $post, $admin);
         }
+        if (strpos($action, 'ops_') === 0) {
+            // SPEC §23 (wave 14): rollouts, backups, abuse desk, provisioning
+            require_once __DIR__ . '/Ops.php';
+            return Ops::action($action, $post, $admin);
+        }
         if ($action === 'share_revoke') {
             require_once __DIR__ . '/Sharing.php';
             return [[Sharing::adminRevoke((int) ($post['id'] ?? 0), $admin)], []];
@@ -282,6 +298,8 @@ final class Admin
                 return self::edgeEdit($post, $admin);
             case 'edge_shield':
                 return self::edgeShield($post, $admin);
+            case 'edge_city':
+                return self::edgeCity($post, $admin);
             case 'edge_toggle':
             case 'edge_rotate':
             case 'edge_delete':
@@ -623,6 +641,35 @@ final class Admin
         Pages::reset();
         return [[['ok', 'تنظیمات نود ' . View::ltr($name) . ' ذخیره شد (گروه ' . ($group === 'tunnel' ? 'تونل' : 'عمومی') . '، ظرفیت '
             . ($cap ? View::n($cap) . ' Mbps' : 'نامشخص') . ').']], []];
+    }
+
+    /**
+     * SPEC §23.12.5: the customer-visible city of a node — PATCH /api/v1/edges/{id} {"display_city", "display_city_en"} (≤ 32 letters,
+     * spaces or ZWNJ; "" = back to the region default «ایران» / «بین‌المللی»). Customers then see «نود {شهر}» instead of any name.
+     */
+    private static function edgeCity(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $fa = trim(preg_replace('/\s+/u', ' ', Env::input($post['display_city'] ?? '')));
+        $en = trim(preg_replace('/\s+/u', ' ', Env::input($post['display_city_en'] ?? '')));
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        $re = '/^[\p{L}\p{M} \x{200C}]{0,32}$/u';
+        if (!preg_match($re, $fa) || !preg_match($re, $en) || mb_strlen($fa) > 32 || mb_strlen($en) > 32) {
+            return [[['bad', 'نام شهر فقط حروف، فاصله و نیم‌فاصله و حداکثر ۳۲ نویسه است.']], []];
+        }
+        try {
+            $r = Env::api(10)->request('PATCH', '/api/v1/edges/' . $id, ['display_city' => $fa, 'display_city_en' => $en]);
+        } catch (\Throwable $e) {
+            return [[['bad', View::e('ذخیرهٔ شهر نمایشی ناموفق بود: ' . $e->getMessage())]], []];
+        }
+        $edge = is_array($r['edge'] ?? null) ? $r['edge'] : $r;
+        $name = (string) ($edge['name'] ?? '#' . $id);
+        Env::log('edge ' . $name . ' display city set to "' . $fa . '"' . ($en !== '' ? ' / "' . $en . '"' : '') . ' by admin #' . $admin);
+        Pages::reset();
+        $label = is_string($edge['display_label'] ?? null) ? $edge['display_label'] : ($fa !== '' ? 'نود ' . $fa : '');
+        return [[['ok', 'شهر نمایشی نود ' . View::ltr($name) . ' ذخیره شد' . ($label !== '' ? '؛ مشتری‌ها «' . View::e($label) . '» می‌بینند.' : '.')]], []];
     }
 
     /** Origin-shield role of an edge (SPEC §14.1): PATCH /api/v1/edges/{id} with {"shield": bool}. */

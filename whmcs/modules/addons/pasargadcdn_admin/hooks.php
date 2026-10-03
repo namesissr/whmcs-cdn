@@ -291,6 +291,18 @@ add_hook('AfterCronJob', 1, function ($vars) {
             logActivity('Pasargad CDN: tunnel/add-on cron hook error: ' . $e->getMessage());
         }
     }
+    // SPEC §23.5 / §23.10 (wave 14): customer alert e-mails from the controller's outbox (AlertMail) — independent pass
+    try {
+        require_once __DIR__ . '/lib/Env.php';
+        require_once __DIR__ . '/lib/View.php';
+        require_once __DIR__ . '/lib/TunnelAlerts.php';
+        require_once __DIR__ . '/lib/AlertMail.php';
+        \PasargadCdn\Admin\AlertMail::onCron();
+    } catch (\Throwable $e) {
+        if (function_exists('logActivity')) {
+            logActivity('Pasargad CDN: alert e-mail cron hook error: ' . $e->getMessage());
+        }
+    }
     // Growth: free-trial reminders / end of trial, and the scheduled e-mail reports — independent passes
     try {
         require_once __DIR__ . '/lib/Env.php';

@@ -79,7 +79,8 @@ class ClientApi
     // Wave 6B (SPEC §14.2) added transform, redirects and bots; Wave 6D (§14.3) logs and webhooks;
     // Wave 8 (§16.4/§16.5/§16.7) l4 (TCP/UDP apps), video and dns_secondary; §16.9 functions (edge functions).
     // Wave 10 (SPEC §18.1/§18.2): waiting_room and access (bodies re-checked by sectionBody()).
-    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary|functions|waiting_room|access';
+    // Wave 14 (SPEC §23.7): rum (real user monitoring, gated by the plan feature `rum`).
+    const SECTIONS = 'cache|ssl|waf|ddos|firewall|ratelimit|pagerules|pools|headers|hotlink|image|errorpages|tunnel|transform|redirects|bots|logs|webhooks|l4|video|dns_secondary|functions|waiting_room|access|rum';
 
     /** Webhook ids are assigned by the controller: "wh_" + 8 hex (SPEC §14.3.3). */
     const WEBHOOK_ID = 'wh_[0-9a-f]{8}';
@@ -122,6 +123,9 @@ class ClientApi
             // SPEC §22.11 / §22.12 (wave 13): recommended client settings per path (edge timers, keepalive, mux, HTTP/3
             // availability — never a node name or address) and the «why did my connection drop?» report (read-only)
             self::W16_PROFILE, self::W16_DROPS,
+            // SPEC §23.4 / §23.7 / §23.8 (wave 14): settings history (list, one version, diff), RUM report, diagnostics report
+            // (customer audience only — the `audience` query is refused, see QUERY_DENY)
+            self::W17_HISTORY, self::W17_VERSION, self::W17_DIFF, self::W17_RUM, self::W17_DIAG,
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
@@ -132,13 +136,18 @@ class ClientApi
             // SPEC §17.3: apply the chosen learning-mode proposals — body re-checked by applyBody()
             'waf/learning/apply',
             // SPEC §18.2: new access secret (all sign-in sessions end) — body must be empty, see sectionBody()
-            self::W10_ACCESS_ROTATE],
+            self::W10_ACCESS_ROTATE,
+            // SPEC §23.4: restore a version ({sections|null, dry_run}); §23.6: provider import preview (the customer's key passes
+            // through to the controller only — never logged, see ApiClient::quiet) and apply — bodies re-checked by w17Body()
+            self::W17_RESTORE, self::W17_IMPORT_PREVIEW, self::W17_IMPORT_APPLY],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
         'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'apikeys/[1-9][0-9]{0,9}', 'ssl/origin-client',
             // Wave 8 (SPEC §16.6): forget the image transform secret (unsigned transforms allowed again)
             'image/transform-secret',
             // SPEC §16.8: delete an (empty, unused) bucket — 409 otherwise
-            'storage/buckets/' . self::BUCKET],
+            'storage/buckets/' . self::BUCKET,
+            // SPEC §23.6: forget an import session (the fetched provider data) before it expires
+            self::W17_IMPORT_SESSION],
     ];
 
     /**
@@ -171,7 +180,58 @@ class ClientApi
         self::W10_WAITING_ROOM => ['hours' => '/^([1-9]|[1-9][0-9]|1[0-5][0-9]|16[0-8])$/D'],
         // SPEC §22.12: drops report hours 1..744, same rule as tunnel/quality (the app uses 24/168/720). tunnel/profile takes no query.
         self::W16_DROPS => ['hours' => '/^([1-9]|[1-9][0-9]|[1-6][0-9]{2}|7[0-3][0-9]|74[0-4])$/D'],
+        // SPEC §23.4: history page size 1..200, `before` a version number; §23.7: RUM window and breakdown
+        self::W17_HISTORY => ['limit' => '/^([1-9][0-9]?|1[0-9]{2}|200)$/D', 'before' => '/^[0-9]{1,9}$/D'],
+        self::W17_RUM => ['hours' => '/^(24|168|720)$/D', 'by' => '/^(country|isp|region|device|path)$/D'],
     ];
+
+    /** Query rules of parametrised sub-paths (regex => [key => value regex]); exact QUERY keys win. */
+    const QUERY_RE = [
+        // SPEC §23.4: diff against `current` or another version, optionally one section
+        self::W17_DIFF => ['against' => '/^(current|[0-9]{1,9})$/D', 'section' => '/^(' . self::SECTIONS . ')$/D'],
+    ];
+
+    /**
+     * Query keys that make the whole call invalid (400) instead of being dropped: SPEC §23.8 — the client app never asks for
+     * the admin audience of the diagnostics report (`internal` node facts); only the admin addon calls it with the admin key.
+     */
+    const QUERY_DENY = [self::W17_DIAG => ['audience']];
+
+    // ------------------------------------------------------------------ wave 14 (SPEC §23) — release safety, operations, customer experience
+    /** GET ?limit&before → {versions: [{version, at, actor: {kind, label, id}, source, sections, restored_from, restorable}], current, retention} */
+    const W17_HISTORY = 'config/history';
+    /** GET → {version, at, actor, source, sections, config: {section: redacted value}} */
+    const W17_VERSION = 'config/history/[0-9]{1,9}';
+    /** GET ?against=current|N&section → {from, to, sections: {name: [ops]}, redacted} */
+    const W17_DIFF = 'config/history/[0-9]{1,9}/diff';
+    /** POST {sections: [..]|null, dry_run: bool} → {version|null, restored_from, applied, unchanged, dropped, warnings} */
+    const W17_RESTORE = 'config/history/[0-9]{1,9}/restore';
+    /** GET ?hours&by → {enabled, sample_rate, n, metrics, thresholds, by, series, cdn_impact, has_data} (404 = plan has no rum) */
+    const W17_RUM = 'rum';
+    /** GET → customer-audience report (labels, never node names / IPs); the ticket flow uses the session-bound local op `diag` */
+    const W17_DIAG = 'diagnostics';
+    /** POST {provider: arvan|cloudflare, api_key, zone?} → {session_id, expires_at, provider, zone, report} */
+    const W17_IMPORT_PREVIEW = 'import/preview';
+    /** POST {session_id, records, replace_records, record_names, sections} → {records, sections, config_version, dns_error} */
+    const W17_IMPORT_APPLY = 'import/apply';
+    /** DELETE → 204 */
+    const W17_IMPORT_SESSION = 'import/imp_[0-9a-f]{16}';
+    /** Sections an import may apply (§23.6 mapping table). */
+    const W17_IMPORT_SECTIONS = ['cache', 'ssl', 'firewall', 'redirects', 'ddos', 'ratelimit'];
+
+    /**
+     * SPEC §23.5 account-level alert routes (relative to /api/v1/accounts/{client id}/alerts — the client id is ALWAYS the
+     * session's own, never input): method => [regex, ...]. Proxied by accountOp() with the service's controller.
+     */
+    const ACCOUNT_ROUTES = [
+        'GET' => ['', 'targets/link/[A-Z2-9]{8}'],
+        'PUT' => ['subscriptions'],
+        'POST' => ['targets/sms', 'targets/[1-9][0-9]{0,9}/verify', 'targets/(?:bale|telegram)/link', 'test'],
+        'DELETE' => ['targets/[1-9][0-9]{0,9}'],
+    ];
+    const ALERT_CHANNELS = ['email', 'sms', 'bale', 'telegram'];
+    const ALERT_EVENT = '/^[a-z][a-z_]{1,24}\\.[a-z][a-z_]{1,24}$/D';
+    const HHMM = '/^([01][0-9]|2[0-3]):[0-5][0-9]$/D';
 
     // ------------------------------------------------------------------ wave 13 (SPEC §22) — tunnel speed and stability
     /** GET → {edge: {...timers}, http3: {site, nodes, nodes_h3, available}, paths: [{id, idle_timeout_s, recommended, http3, …}]} (§22.11) */
@@ -227,9 +287,13 @@ class ClientApi
      */
     const SHARE_EDITOR = [
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'redirects/import', 'logs/test',
-            'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)', 'image/transform-secret', 'storage/buckets', 'waf/learning/apply', self::W10_ACCESS_ROTATE],
+            'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)', 'image/transform-secret', 'storage/buckets', 'waf/learning/apply', self::W10_ACCESS_ROTATE,
+            // SPEC §23.4: restoring a version needs the edit role (viewers and DNS managers see history and diffs only);
+            // §23.6: a provider import writes DNS records AND sections, so it is an editor action too
+            self::W17_RESTORE, self::W17_IMPORT_PREVIEW, self::W17_IMPORT_APPLY],
         'PUT' => ['config/(?:' . self::SECTIONS . ')', 'records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client'],
-        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client', 'image/transform-secret', 'storage/buckets/' . self::BUCKET],
+        'DELETE' => ['records/[1-9][0-9]{0,9}', 'ssl/custom', 'ssl/origin-client', 'image/transform-secret', 'storage/buckets/' . self::BUCKET,
+            self::W17_IMPORT_SESSION],
     ];
 
     /** May a member with $role call $method $path (already on the whitelist)? */
@@ -302,6 +366,10 @@ class ClientApi
         $rop = (string) ($req['reseller_op'] ?? '');
         if ($rop !== '') {
             return self::resellerOp($rop, $req, $clientFactory);
+        }
+        // SPEC §23.5: account-level alert channels / subscriptions of the logged-in client (api.php `acct=<sub-path>`)
+        if (array_key_exists('account_path', $req) && $req['account_path'] !== null) {
+            return self::accountOp(is_string($req['account_path']) ? $req['account_path'] : "\0", $req, $admin, $clientFactory);
         }
         if (!self::allowed($method, $path)) {
             return self::fail(404, 'مسیر نامعتبر است.');
@@ -424,11 +492,24 @@ class ClientApi
                     return [422, ['detail' => $bad]];
                 }
             }
+            // Wave 14 (SPEC §23.4 / §23.6 / §23.7): restore, import and rum bodies carry exactly the contract's keys. The import
+            // preview body holds the customer's provider key: an invalid one is refused WITHOUT echoing anything back.
+            if (($method === 'POST' && self::w17Post($path)) || ($method === 'PUT' && $path === 'config/rum')) {
+                $data = self::w17Body($method, $path, $data);
+                if ($data === null) {
+                    return self::fail(400, 'پارامتر نامعتبر است.');
+                }
+            }
             // Re-encoded, so only well-formed JSON ever reaches the controller.
             $body = json_encode($data === [] ? new \stdClass() : $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
 
         $query = self::query($path, (array) ($req['query'] ?? []));
+        foreach (self::QUERY_DENY[$path] ?? [] as $deny) {
+            if (array_key_exists($deny, (array) ($req['query'] ?? []))) {
+                $query = null;
+            }
+        }
         if ($query === null) {
             return self::fail(400, 'پارامتر نامعتبر است.');
         }
@@ -466,6 +547,13 @@ class ClientApi
             if ($share && method_exists($api, 'setActor')) {
                 // SPEC §20.3: the controller records it as `on_behalf_of` in the audit detail
                 $api->setActor(self::actor($req));
+            } elseif (!$admin && (int) ($req['client_id'] ?? 0) > 0 && method_exists($api, 'setActor')) {
+                // SPEC §23.4: the owner's own writes say `client:<id>` so the settings history shows «شما» (sent on writes only)
+                $api->setActor('client:' . (int) $req['client_id']);
+            }
+            if ($method === 'POST' && $path === self::W17_IMPORT_PREVIEW && method_exists($api, 'quiet')) {
+                // SPEC §23.6: the preview body carries the customer's provider key — never in the module log (nor the answer)
+                $api->quiet(true);
             }
             if (isset(self::PUBLIC_FILES[$path])) {
                 return self::pemFile($api, self::PUBLIC_FILES[$path]);
@@ -503,7 +591,351 @@ class ClientApi
             // SPEC §16.10: a known controller detail (e.g. the §16.8 storage refusals) in the app's language
             $data['detail'] = I18n::controller($data['detail']);
         }
+        if ($code < 300 && $method === 'GET' && ($path === self::W17_HISTORY || preg_match('#^' . self::W17_VERSION . '$#D', $path))) {
+            // SPEC §23.4: who changed it — «شما» / «همکار: نام» are resolved here (the controller only knows ids)
+            $data = self::historyActors($data, $domain, $req);
+        }
         return [$code, $data];
+    }
+
+    // ------------------------------------------------------------------ wave 14 (SPEC §23) helpers
+
+    /** POST sub-paths whose body is re-checked by w17Body(). */
+    private static function w17Post(string $path): bool
+    {
+        return $path === self::W17_IMPORT_PREVIEW || $path === self::W17_IMPORT_APPLY || (bool) preg_match('#^' . self::W17_RESTORE . '$#D', $path);
+    }
+
+    private static function isBool($v): bool
+    {
+        return is_bool($v);
+    }
+
+    /** A list of distinct section names (SECTIONS), ≤ $max; null when anything else. */
+    private static function sectionList($v, int $max, array $only = []): ?array
+    {
+        if (!self::isList($v) || count($v) > $max) {
+            return null;
+        }
+        $out = [];
+        foreach ($v as $x) {
+            if (!is_string($x) || !preg_match('/^(' . self::SECTIONS . ')$/D', $x) || ($only && !in_array($x, $only, true))) {
+                return null;
+            }
+            $out[$x] = true;
+        }
+        return array_keys($out);
+    }
+
+    /**
+     * Cleaned body of a wave-14 write, or null when it does not match the contract:
+     *  - POST config/history/N/restore {sections: [names]|null, dry_run: bool} (§23.4);
+     *  - POST import/preview {provider: arvan|cloudflare, api_key: 1..512 printable chars, zone?: hostname} (§23.6);
+     *  - POST import/apply {session_id, records, replace_records, record_names: [..]|null, sections: [..]} (§23.6);
+     *  - PUT config/rum {enabled, sample_rate 0.01..1, inject auto|manual, exclude_paths ≤ 20, spa} (§23.7).
+     */
+    public static function w17Body(string $method, string $path, array $d): ?array
+    {
+        if ($method === 'PUT' && $path === 'config/rum') {
+            // SPEC §23.7 names the keys sample_rate / exclude_paths; the controller also answers with the edge names sample / exclude —
+            // whichever the controller returned is sent back (same checks)
+            foreach (['sample' => 'sample_rate', 'exclude' => 'exclude_paths'] as $alias => $k) {
+                if (array_key_exists($alias, $d)) {
+                    if (array_key_exists($k, $d)) {
+                        return null;
+                    }
+                    $chk = self::w17Body('PUT', 'config/rum', [$k => $d[$alias]]);
+                    if ($chk === null) {
+                        return null;
+                    }
+                }
+            }
+            if (array_diff(array_keys($d), ['enabled', 'sample_rate', 'inject', 'exclude_paths', 'spa', 'sample', 'exclude'])) {
+                return null;
+            }
+            if ((array_key_exists('enabled', $d) && !is_bool($d['enabled'])) || (array_key_exists('spa', $d) && !is_bool($d['spa']))
+                || (array_key_exists('inject', $d) && !in_array($d['inject'], ['auto', 'manual'], true))
+                || (array_key_exists('sample_rate', $d) && (!(is_int($d['sample_rate']) || is_float($d['sample_rate'])) || $d['sample_rate'] < 0.01 || $d['sample_rate'] > 1))) {
+                return null;
+            }
+            if (array_key_exists('exclude_paths', $d)) {
+                if (!self::isList($d['exclude_paths']) || count($d['exclude_paths']) > 20) {
+                    return null;
+                }
+                foreach ($d['exclude_paths'] as $p) {
+                    if (!is_string($p) || !preg_match('~^/[^\s?#]{0,199}$~D', $p)) {
+                        return null;
+                    }
+                }
+            }
+            return $d;
+        }
+        if ($path === self::W17_IMPORT_PREVIEW) {
+            $key = $d['api_key'] ?? null;
+            if (array_diff(array_keys($d), ['provider', 'api_key', 'zone']) || !in_array($d['provider'] ?? null, ['arvan', 'cloudflare'], true)
+                || !is_string($key) || $key === '' || strlen($key) > 512 || preg_match('/[\x00-\x1f\x7f]/', $key)) {
+                return null;
+            }
+            $out = ['provider' => $d['provider'], 'api_key' => $key];
+            if (isset($d['zone']) && $d['zone'] !== '') {
+                $z = is_string($d['zone']) ? strtolower(trim($d['zone'])) : '';
+                if (!preg_match('/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/D', $z)) {
+                    return null;
+                }
+                $out['zone'] = $z;
+            }
+            return $out;
+        }
+        if ($path === self::W17_IMPORT_APPLY) {
+            if (array_diff(array_keys($d), ['session_id', 'records', 'replace_records', 'record_names', 'sections'])
+                || !is_string($d['session_id'] ?? null) || !preg_match('/^imp_[0-9a-f]{16}$/D', $d['session_id'])) {
+                return null;
+            }
+            $out = ['session_id' => $d['session_id'], 'records' => $d['records'] ?? true, 'replace_records' => $d['replace_records'] ?? false,
+                'record_names' => $d['record_names'] ?? null, 'sections' => $d['sections'] ?? []];
+            if (!is_bool($out['records']) || !is_bool($out['replace_records'])) {
+                return null;
+            }
+            if ($out['record_names'] !== null) {
+                if (!self::isList($out['record_names']) || count($out['record_names']) > 10000) {
+                    return null;
+                }
+                foreach ($out['record_names'] as $n) {
+                    if (!is_string($n) || $n === '' || strlen($n) > 300 || preg_match('/[\x00-\x1f\x7f]/', $n)) {
+                        return null;
+                    }
+                }
+            }
+            $out['sections'] = self::sectionList($out['sections'], 10, self::W17_IMPORT_SECTIONS);
+            return $out['sections'] === null ? null : $out;
+        }
+        // restore
+        if (array_diff(array_keys($d), ['sections', 'dry_run']) || (array_key_exists('dry_run', $d) && !is_bool($d['dry_run']))) {
+            return null;
+        }
+        $out = ['sections' => null, 'dry_run' => (bool) ($d['dry_run'] ?? false)];
+        if (isset($d['sections'])) {
+            $out['sections'] = self::sectionList($d['sections'], 40);
+            if ($out['sections'] === null || !$out['sections']) {
+                return null;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * SPEC §23.4 actor names for the history timeline. `self` marks the viewer's own changes («شما»); a collaborator of THIS
+     * domain gets `name` (first + last name or company) — only members of a share row of this domain are looked up, so the
+     * proxy never reveals another account's name. Never fails: an unknown member keeps its id only.
+     */
+    public static function historyActors($data, string $domain, array $req)
+    {
+        if (!is_array($data)) {
+            return $data;
+        }
+        $viewer = (int) ($req['client_id'] ?? 0);
+        $share = self::shareCtx($req);
+        $names = [];
+        $fix = function ($a) use ($viewer, $share, $domain, &$names) {
+            if (!is_array($a)) {
+                return $a;
+            }
+            $kind = (string) ($a['kind'] ?? '');
+            $id = is_scalar($a['id'] ?? null) && ctype_digit((string) $a['id']) ? (int) $a['id'] : 0;
+            if ($viewer > 0 && $id === $viewer && (($kind === 'client' && !$share) || ($kind === 'collaborator' && $share))) {
+                $a['self'] = true;
+            }
+            if ($kind === 'collaborator' && $id > 0) {
+                if (!array_key_exists($id, $names)) {
+                    $names[$id] = null;
+                    try {
+                        require_once __DIR__ . '/Shares.php';
+                        $row = Capsule::table(Shares::TABLE)->where('domain', strtolower($domain))->where('member_client_id', $id)->first();
+                        if ($row) {
+                            $c = Capsule::table('tblclients')->where('id', $id)->first(['firstname', 'lastname', 'companyname']);
+                            $n = $c ? trim(trim((string) ($c->firstname ?? '') . ' ' . (string) ($c->lastname ?? '')) ?: (string) ($c->companyname ?? '')) : '';
+                            $names[$id] = $n !== '' ? mb_substr($n, 0, 80) : null;
+                        }
+                    } catch (\Throwable $e) {
+                        $names[$id] = null;
+                    }
+                }
+                if ($names[$id] !== null) {
+                    $a['name'] = $names[$id];
+                }
+            }
+            return $a;
+        };
+        if (isset($data['versions']) && is_array($data['versions'])) {
+            foreach ($data['versions'] as $i => $v) {
+                if (is_array($v) && array_key_exists('actor', $v)) {
+                    $data['versions'][$i]['actor'] = $fix($v['actor']);
+                }
+            }
+        } elseif (array_key_exists('actor', $data)) {
+            $data['actor'] = $fix($data['actor']);
+        }
+        return $data;
+    }
+
+    /**
+     * SPEC §23.5: account-level alerts of the logged-in client — /api/v1/accounts/{client id}/alerts[/sub-path] on the
+     * controller of one of the client's OWN CDN services (`id`). The client id is the session's, never input; admins,
+     * shared members (collaborators get no subscriptions in this wave) and reseller sub-sites have no account op.
+     * Read-only team users may read (writes were refused by handle()).
+     */
+    private static function accountOp(string $sub, array $req, bool $admin, ?callable $clientFactory): array
+    {
+        $method = strtoupper((string) ($req['method'] ?? 'GET'));
+        $cid = (int) ($req['client_id'] ?? 0);
+        if ($admin || $cid <= 0 || array_key_exists('context', $req) || (int) ($req['reseller_site_id'] ?? 0) > 0) {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $ok = false;
+        foreach (self::ACCOUNT_ROUTES[$method] ?? [] as $re) {
+            $ok = $ok || preg_match('#^' . $re . '$#D', $sub) === 1;
+        }
+        if (!$ok) {
+            return self::fail(404, 'مسیر نامعتبر است.');
+        }
+        $id = (string) ($req['id'] ?? '');
+        if (!preg_match('/^[1-9][0-9]{0,9}$/D', $id)) {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $svc = Capsule::table('tblhosting')->where('id', (int) $id)->first(['id', 'userid', 'packageid', 'server', 'domain', 'domainstatus']);
+        if (!$svc || (int) $svc->userid !== $cid) {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $product = Capsule::table('tblproducts')->where('id', (int) $svc->packageid)->first(['servertype']);
+        if (!$product || $product->servertype !== 'pasargadcdn' || !in_array((string) $svc->domainstatus, ['Active', 'Suspended'], true)) {
+            return self::fail(404, 'سرویس یافت نشد.');
+        }
+        $server = Capsule::table('tblservers')->where('id', (int) $svc->server)
+            ->first(['type', 'hostname', 'ipaddress', 'secure', 'port', 'accesshash', 'password']);
+        if (!$server || ($server->type ?? '') !== 'pasargadcdn') {
+            return self::fail(502, 'سرور CDN برای این سرویس تنظیم نشده است.');
+        }
+        $body = null;
+        if ($method === 'POST' || $method === 'PUT') {
+            $raw = (string) ($req['body'] ?? '');
+            if (strlen($raw) > self::MAX_BODY) {
+                return self::fail(413, 'حجم درخواست بیش از حد مجاز است.');
+            }
+            $data = $raw === '' ? [] : json_decode($raw, true, 32);
+            if (!is_array($data)) {
+                return self::fail(400, 'بدنه درخواست باید JSON معتبر باشد.');
+            }
+            $data = self::alertBody($method, $sub, $data);
+            if ($data === null) {
+                return self::fail(400, 'پارامتر نامعتبر است.');
+            }
+            $body = json_encode($data === [] ? new \stdClass() : $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        $target = '/api/v1/accounts/' . $cid . '/alerts' . ($sub === '' ? '' : '/' . $sub);
+        try {
+            $params = ['serverhostname' => $server->hostname, 'serverip' => $server->ipaddress, 'serversecure' => $server->secure,
+                'serverport' => $server->port, 'serveraccesshash' => $server->accesshash,
+                'serverpassword' => (trim((string) $server->accesshash) === '' && function_exists('decrypt')) ? decrypt($server->password) : ''];
+            $api = $clientFactory ? $clientFactory($params) : ApiClient::fromParams($params, 20);
+            if (method_exists($api, 'setActor')) {
+                $api->setActor('client:' . $cid);
+            }
+            [$code, $data] = $api->raw($method, $target, $body);
+        } catch (\Throwable $e) {
+            self::log($method . ' ' . $target, $e->getMessage());
+            return self::fail(502, 'اتصال به سرور CDN برقرار نشد.');
+        }
+        if ($code >= 500 || $code < 200 || ($code >= 300 && $code < 400)) {
+            self::log($method . ' ' . $target, 'HTTP ' . $code);
+            return self::fail(502, I18n::tr('خطای سرور CDN (HTTP %s)', $code));
+        }
+        if (!is_array($data)) {
+            return $code < 300 ? [$code, ['ok' => true]] : self::fail($code, I18n::tr('درخواست توسط سرور CDN رد شد (HTTP %s)', $code));
+        }
+        if ($code >= 400 && isset($data['detail']) && is_string($data['detail'])) {
+            $data['detail'] = I18n::controller($data['detail']);
+        }
+        return [$code, $data];
+    }
+
+    /** Cleaned body of an account alert write (§23.5), or null. */
+    public static function alertBody(string $method, string $sub, array $d): ?array
+    {
+        if ($method === 'PUT') {   // subscriptions: full replace
+            if (array_keys($d) !== ['items'] || !self::isList($d['items']) || count($d['items']) > 100) {
+                return null;
+            }
+            $items = [];
+            foreach ($d['items'] as $it) {
+                if (!is_array($it) || array_diff(array_keys($it), ['id', 'site', 'events', 'channels', 'lang', 'quiet_hours', 'enabled'])) {
+                    return null;
+                }
+                $x = [];
+                if (isset($it['id'])) {
+                    if (!is_int($it['id']) || $it['id'] <= 0) {
+                        return null;
+                    }
+                    $x['id'] = $it['id'];
+                }
+                $site = $it['site'] ?? null;
+                if ($site !== null && (!is_string($site) || !preg_match('/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/D', $site))) {
+                    return null;
+                }
+                $x['site'] = $site;
+                $ev = $it['events'] ?? null;
+                if (!self::isList($ev) || !$ev || count($ev) > 30) {
+                    return null;
+                }
+                foreach ($ev as $e) {
+                    if (!is_string($e) || !preg_match(self::ALERT_EVENT, $e)) {
+                        return null;
+                    }
+                }
+                $ch = $it['channels'] ?? null;
+                if (!self::isList($ch) || !$ch || array_diff($ch, self::ALERT_CHANNELS) || count(array_unique($ch)) !== count($ch)) {
+                    return null;
+                }
+                $x['events'] = array_values(array_unique($ev));
+                $x['channels'] = array_values($ch);
+                $x['lang'] = in_array($it['lang'] ?? 'fa', ['fa', 'en'], true) ? ($it['lang'] ?? 'fa') : null;
+                if ($x['lang'] === null) {
+                    return null;
+                }
+                $q = $it['quiet_hours'] ?? null;
+                if ($q !== null) {
+                    if (!is_array($q) || array_diff(array_keys($q), ['start', 'end', 'bypass_critical']) || !is_string($q['start'] ?? null) || !is_string($q['end'] ?? null)
+                        || !preg_match(self::HHMM, $q['start']) || !preg_match(self::HHMM, $q['end']) || $q['start'] === $q['end']
+                        || (array_key_exists('bypass_critical', $q) && !is_bool($q['bypass_critical']))) {
+                        return null;
+                    }
+                    $q = ['start' => $q['start'], 'end' => $q['end'], 'bypass_critical' => $q['bypass_critical'] ?? true];
+                }
+                $x['quiet_hours'] = $q;
+                if (array_key_exists('enabled', $it) && !is_bool($it['enabled'])) {
+                    return null;
+                }
+                $x['enabled'] = $it['enabled'] ?? true;
+                $items[] = $x;
+            }
+            return ['items' => $items];
+        }
+        if ($sub === 'targets/sms') {
+            return array_keys($d) === ['phone'] && is_string($d['phone']) && preg_match('/^\+[1-9][0-9]{7,14}$/D', $d['phone']) ? ['phone' => $d['phone']] : null;
+        }
+        if (preg_match('#^targets/[1-9][0-9]{0,9}/verify$#D', $sub)) {
+            return array_keys($d) === ['code'] && is_string($d['code']) && preg_match('/^[0-9]{6}$/D', $d['code']) ? ['code' => $d['code']] : null;
+        }
+        if (preg_match('#^targets/(?:bale|telegram)/link$#D', $sub)) {
+            return $d === [] ? [] : null;
+        }
+        if ($sub === 'test') {
+            if (array_diff(array_keys($d), ['channel', 'target_id']) || !in_array($d['channel'] ?? null, self::ALERT_CHANNELS, true)
+                || (array_key_exists('target_id', $d) && (!is_int($d['target_id']) || $d['target_id'] <= 0))) {
+                return null;
+            }
+            return $d;
+        }
+        return null;
     }
 
     /**
@@ -1281,7 +1713,17 @@ class ClientApi
     private static function query(string $path, array $in): ?string
     {
         $out = [];
-        foreach (self::QUERY[$path] ?? [] as $key => $re) {
+        $rules = self::QUERY[$path] ?? null;
+        if ($rules === null) {
+            $rules = [];
+            foreach (self::QUERY_RE as $pre => $r) {
+                if (preg_match('#^' . $pre . '$#D', $path)) {
+                    $rules = $r;
+                    break;
+                }
+            }
+        }
+        foreach ($rules as $key => $re) {
             if (!isset($in[$key])) {
                 continue;
             }

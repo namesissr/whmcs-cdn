@@ -24,6 +24,10 @@ class ApiClient
     private int $timeout;
     /** SPEC §20.3: X-PCDN-Actor of a shared member's write (`share:<client id>:<role>`), '' = none */
     private string $actor = '';
+    /** SPEC §23.6: true = the module log gets method, path and status only (never the request or response body) */
+    private bool $quiet = false;
+    /** SPEC §23.10: X-PCDN-Reporter-IP of a public abuse report (hashed by the controller at once), '' = none */
+    private string $reporterIp = '';
 
     public function __construct(string $baseUrl, string $apiKey, int $timeout = 20)
     {
@@ -80,6 +84,23 @@ class ApiClient
     public function setActor(string $actor): self
     {
         $this->actor = preg_match('/^[a-z0-9:_-]{1,64}$/D', $actor) ? $actor : '';
+        return $this;
+    }
+
+    /**
+     * SPEC §23.6: the import preview carries the customer's provider API key — with quiet(true) raw() logs neither the
+     * request body nor the answer (method, path and HTTP status only).
+     */
+    public function quiet(bool $on = true): self
+    {
+        $this->quiet = $on;
+        return $this;
+    }
+
+    /** SPEC §23.10: the reporter's address for the controller's rate limit (sent on writes only; validated as an IP). */
+    public function setReporterIp(string $ip): self
+    {
+        $this->reporterIp = filter_var($ip, FILTER_VALIDATE_IP) ? $ip : '';
         return $this;
     }
 
@@ -159,6 +180,9 @@ class ApiClient
         if ($this->actor !== '' && $method !== 'GET') {
             $headers[] = 'X-PCDN-Actor: ' . $this->actor;
         }
+        if ($this->reporterIp !== '' && $method !== 'GET') {
+            $headers[] = 'X-PCDN-Reporter-IP: ' . $this->reporterIp;
+        }
         $opts = [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,
@@ -233,7 +257,11 @@ class ApiClient
         curl_close($ch);
 
         if (function_exists('logModuleCall')) {
-            logModuleCall('pasargadcdn', $method . ' ' . $path, self::redact($payload), self::redact($raw), null, [$this->apiKey]);
+            if ($this->quiet) {
+                logModuleCall('pasargadcdn', $method . ' ' . $path, '(request body not logged)', $raw === false ? 'no answer' : 'HTTP ' . $code . ' (body not logged)', null, [$this->apiKey]);
+            } else {
+                logModuleCall('pasargadcdn', $method . ' ' . $path, self::redact($payload), self::redact($raw), null, [$this->apiKey]);
+            }
         }
         if ($raw === false) {
             throw new ApiException(I18n::tr('اتصال به سرور CDN برقرار نشد: %s', $err));
@@ -322,7 +350,9 @@ class ApiClient
             return $text;
         }
         // SPEC §18.1/§18.2: the per-site waiting-room / access secrets never leave the controller, masked anyway
-        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key|transform_secret|tsig_secret|access_secret|wr_secret)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        // SPEC §23.6: a customer's provider key (import preview); §23.5: the customer's phone number; §23.9: one-time join tokens
+        $text = (string) preg_replace('/"(token|key|secret|secret_key|access_key|transform_secret|tsig_secret|access_secret|wr_secret|api_key|phone|join_token|status_token)"\s*:\s*"(?:[^"\\\\]|\\\\.)*"/', '"$1":"***"', $text);
+        $text = (string) preg_replace('/jt_[0-9a-f]{16,}/', 'jt_***', $text);
         $text = (string) preg_replace('/"new_secrets"\s*:\s*\{[^{}]*\}/', '"new_secrets":"***"', $text);
         // possessive: linear on megabytes of escaped JavaScript; a PCRE failure logs nothing rather than the code
         $text = preg_replace('/"code"\s*:\s*"(?:[^"\\\\]++|\\\\.)*+"/', '"code":"***"', $text);

@@ -64,6 +64,11 @@ final class FeatureEditor
         'features.dns_secondary' => 'DNS ثانویه',
         'features.waiting_room' => 'اتاق انتظار',
         'features.access' => 'دسترسی محافظت‌شده',
+        // SPEC §23.15 (wave 14)
+        'features.rum' => 'پایش تجربهٔ کاربران (RUM)',
+        'features.alert_sms' => 'هشدار پیامکی',
+        'features.alert_messengers' => 'هشدار در بله و تلگرام',
+        'features.max_alert_subscriptions' => 'حداکثر اشتراک هشدار',
     ];
     /** Types of the top-level fields when the live plan has no value for them. */
     const TOP_TYPES = ['bandwidth_limit_gb' => 0, 'max_records' => 100, 'ssl_allowed' => false, 'rate_limit_rps' => 0];

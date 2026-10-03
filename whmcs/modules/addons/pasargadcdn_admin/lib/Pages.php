@@ -42,6 +42,8 @@ final class Pages
         'referrals' => ['معرفی‌ها', 'users'],
         // SPEC §20.4: domain sharing
         'shares' => ['اشتراک‌ها', 'link'],
+        // SPEC §23 (wave 14): releases / backups / abuse desk / SLO / provisioning — one tab with a sub-navigation (Ops::nav)
+        'releases' => ['عملیات', 'sync'],
         'settings' => ['تنظیمات و سلامت', 'settings'],
     ];
 
@@ -99,7 +101,8 @@ final class Pages
             . self::serverChip() . '</header>';
         $h .= '<nav class="pcdna-tabs" aria-label="بخش‌های مدیریت CDN">';
         foreach (self::TABS as $id => [$label, $icon]) {
-            $cur = $id === $page || ($page === 'manage' && $id === 'sites') || ($page === 'opmanage' && $id === 'operator');
+            $cur = $id === $page || ($page === 'manage' && $id === 'sites') || ($page === 'opmanage' && $id === 'operator')
+                || ($id === 'releases' && in_array($page, ['backups', 'abuse', 'slo', 'provisioning'], true));
             $h .= '<a class="pcdna-tab' . ($cur ? ' is-active' : '') . '" href="' . View::url(['page' => $id]) . '"'
                 . ($cur ? ' aria-current="page"' : '') . '>' . View::icon($icon) . '<span>' . View::e($label) . '</span></a>';
         }
@@ -326,8 +329,11 @@ final class Pages
     {
         $ping = self::ping();
         $ov = $edges = $events = $sites = $alerts = null;
+        $ctlVersion = '';
         if ($ping['ok']) {
-            $r = self::fetch(['/api/v1/overview', '/api/v1/edges', '/api/v1/events?limit=8', '/api/v1/sites', '/api/v1/alerts/status']);
+            // SPEC §23.1: /healthz carries the controller's platform version (`version`, wave 14)
+            $r = self::fetch(['/api/v1/overview', '/api/v1/edges', '/api/v1/events?limit=8', '/api/v1/sites', '/api/v1/alerts/status', '/healthz']);
+            $ctlVersion = self::ok($r['/healthz']) && is_string($r['/healthz']['data']['version'] ?? null) ? (string) $r['/healthz']['data']['version'] : '';
             $ov = self::ok($r['/api/v1/overview']) ? $r['/api/v1/overview']['data'] : null;
             $edges = self::ok($r['/api/v1/edges']) ? $r['/api/v1/edges']['data'] : null;
             $events = self::ok($r['/api/v1/events?limit=8']) ? $r['/api/v1/events?limit=8']['data'] : null;
@@ -385,6 +391,10 @@ final class Pages
 
         // warnings
         $warn = self::warnings($ping, $ov, $sites);
+        // SPEC §23.10: open abuse reports (overview.abuse_open, wave 14)
+        if ((int) ($ov['abuse_open'] ?? 0) > 0) {
+            $warn[] = ['warn', View::n((int) $ov['abuse_open']) . ' گزارش تخلف باز منتظر رسیدگی است. <a href="' . View::url(['page' => 'abuse']) . '" data-abuse-open="' . (int) $ov['abuse_open'] . '">گزارش‌های تخلف</a>'];
+        }
         foreach (self::saturated((array) $edges) as $e) {
             $warn[] = [!empty($e['shed']) ? 'bad' : 'warn', 'نود ' . View::ltr($e['name'] ?? '') . (!empty($e['shed']) ? ' اشباع شده و موقتاً از DNS خارج است.' : ' بیش از ۸۰٪ ظرفیت بار دارد.')
                 . ' <a href="' . View::url(['page' => 'edges']) . '">نودها</a>'];
@@ -407,6 +417,7 @@ final class Pages
                 . '<div><dt>وضعیت</dt><dd>' . View::badge('در دسترس', 'ok') . '</dd></div>'
                 . '<div><dt>زمان پاسخ</dt><dd>' . View::n($ping['ms']) . ' میلی‌ثانیه</dd></div>'
                 . '<div><dt>نشانی</dt><dd>' . View::ltr(Env::controllerUrl()) . '</dd></div>'
+                . ($ctlVersion !== '' ? '<div data-ctl-version="' . View::e($ctlVersion) . '"><dt>نسخهٔ کنترلر</dt><dd>' . View::ltr('v' . ltrim($ctlVersion, 'v'), 'pcdna-code') . '</dd></div>' : '')
                 . '<div><dt>نیم‌سرورها</dt><dd>' . ($ns ? implode(' ', array_map(function ($n) {
                     return View::ltr($n, 'pcdna-code');
                 }, $ns)) : '—') . '</dd></div></dl>';
@@ -731,6 +742,81 @@ final class Pages
     }
 
     /** HH:MM (server time zone, Persian digits) of an ISO time; «—» when invalid. */
+    /** SPEC §23 (wave 14): the controller reports release / display-city fields (edge_to_dict). */
+    public static function wave14(array $edges): bool
+    {
+        foreach ($edges as $e) {
+            if (is_array($e) && (array_key_exists('display_city', $e) || array_key_exists('release', $e) || array_key_exists('public_tag', $e))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * SPEC §23.12.5 mirror of the controller's data/cities.json (Persian → English) for the «شهر نمایشی» datalist and the live
+     * label preview; any other city can be typed (its English name then defaults to the Persian one, or the admin's override).
+     */
+    const CITIES = ['تهران' => 'Tehran', 'مشهد' => 'Mashhad', 'شیراز' => 'Shiraz', 'تبریز' => 'Tabriz', 'اصفهان' => 'Isfahan', 'کرج' => 'Karaj',
+        'اهواز' => 'Ahvaz', 'قم' => 'Qom', 'کرمانشاه' => 'Kermanshah', 'رشت' => 'Rasht', 'ارومیه' => 'Urmia', 'یزد' => 'Yazd', 'کرمان' => 'Kerman',
+        'زاهدان' => 'Zahedan', 'همدان' => 'Hamadan', 'اراک' => 'Arak', 'قزوین' => 'Qazvin', 'ساری' => 'Sari', 'بندرعباس' => 'Bandar Abbas',
+        'گرگان' => 'Gorgan', 'سنندج' => 'Sanandaj', 'بوشهر' => 'Bushehr', 'زنجان' => 'Zanjan', 'خرم‌آباد' => 'Khorramabad', 'اردبیل' => 'Ardabil',
+        'بیرجند' => 'Birjand', 'سمنان' => 'Semnan', 'یاسوج' => 'Yasuj', 'شهرکرد' => 'Shahrekord', 'ایلام' => 'Ilam', 'بجنورد' => 'Bojnurd'];
+
+    /** «نسخه»: the node's release (or the short bundle hash), with «≠ نسخهٔ پین‌شده (vX)» when its group has a different pin. */
+    public static function releaseCell(array $e): string
+    {
+        $rel = is_string($e['release'] ?? null) && $e['release'] !== '' ? (string) $e['release'] : null;
+        $h = $rel !== null ? View::ltr($rel, 'pcdna-code') : (!empty($e['bundle_version'])
+            ? '<span class="pcdna-muted" title="نسخهٔ انتشار گزارش نشده؛ شناسهٔ بسته">' . View::ltr(substr((string) $e['bundle_version'], 0, 8), 'pcdna-code') . '</span>' : '<span class="pcdna-muted">—</span>');
+        $pin = is_string($e['pinned_release'] ?? null) && $e['pinned_release'] !== '' ? (string) $e['pinned_release'] : null;
+        if ($pin !== null && ($e['release_ok'] ?? null) === false) {
+            $h .= '<div>' . View::badge('≠ نسخهٔ پین‌شده (' . $pin . ')', 'warn', ' data-release-diff="' . View::e($pin) . '"') . '</div>';
+        }
+        $up = is_array($e['upgrade'] ?? null) ? $e['upgrade'] : null;
+        if ($up && in_array($up['state'] ?? '', ['downloading', 'installing', 'failed'], true)) {
+            $h .= '<div class="pcdna-small' . (($up['state'] ?? '') === 'failed' ? ' pcdna-err' : ' pcdna-muted') . '">'
+                . View::e(['downloading' => 'در حال دریافت ', 'installing' => 'در حال نصب ', 'failed' => 'ارتقای ناموفق '][$up['state']]) . View::ltr((string) ($up['release'] ?? '')) . '</div>';
+        }
+        return $h;
+    }
+
+    /** «شهر نمایشی»: the customer label, the public tag and an inline editor with a live label preview (admin.js). */
+    public static function cityCell(array $e, int $id): string
+    {
+        $fa = is_string($e['display_city'] ?? null) ? (string) $e['display_city'] : '';
+        $en = is_string($e['display_city_en'] ?? null) ? (string) $e['display_city_en'] : '';
+        $label = is_string($e['display_label'] ?? null) ? (string) $e['display_label'] : '';
+        $labelEn = is_string($e['display_label_en'] ?? null) ? (string) $e['display_label_en'] : '';
+        $h = '<div data-display-label="' . View::e($label) . '">' . ($label !== '' ? View::e($label) : '<span class="pcdna-muted">—</span>')
+            . ($labelEn !== '' ? '<div class="pcdna-small pcdna-muted" dir="ltr">' . View::e($labelEn) . '</div>' : '')
+            . ($fa === '' ? '<div class="pcdna-small pcdna-muted">پیش‌فرض منطقه</div>' : '') . '</div>';
+        if (!empty($e['public_tag'])) {
+            $h .= '<div class="pcdna-small" title="شناسهٔ عمومی نود — همان مقدار هدر X-Served-By">' . View::ltr((string) $e['public_tag'], 'pcdna-code') . '</div>';
+        }
+        $q = ['page' => 'edges'];
+        $h .= '<details class="pcdna-menu pcdna-city-edit"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="' . View::e('شهر نمایشی نود ' . ($e['name'] ?? '')) . '" title="شهر نمایشی">'
+            . View::icon('globe') . '</summary><div class="pcdna-menu-list"><form method="post" action="' . View::url($q) . '" class="pcdna-edge-form" data-city-form="' . $id . '">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_city"><input type="hidden" name="id" value="' . $id . '">'
+            . '<label><span>شهر (فارسی؛ خالی = پیش‌فرض منطقه)</span><input class="pcdna-input" name="display_city" maxlength="32" list="pcdna-cities" data-city-input="1" value="' . View::e($fa) . '"></label>'
+            . '<label><span>نام انگلیسی (اختیاری)</span><input class="pcdna-input" name="display_city_en" dir="ltr" maxlength="32" data-city-en="1" placeholder="Tehran" value="' . View::e($en) . '"></label>'
+            . '<p class="pcdna-small">پیش‌نمایش برای مشتری: <strong data-city-preview="1">' . View::e($label !== '' ? $label : ($fa !== '' ? 'نود ' . $fa : '—')) . '</strong>'
+            . ' · <span dir="ltr" data-city-preview-en="1">' . View::e($labelEn) . '</span></p>'
+            . '<p class="pcdna-small pcdna-muted">اگر چند نود یک شهر داشته باشند، شماره می‌گیرند (نود تهران ۱، نود تهران ۲). نام داخلی و آی‌پی نود هرگز به مشتری نشان داده نمی‌شود.</p>'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-sm pcdna-btn-primary">' . View::icon('check') . '<span>ذخیره</span></button></form></div></details>';
+        return $h;
+    }
+
+    /** <datalist> of the known cities (once per page) — data-en carries the English name for the preview. */
+    public static function cityList(): string
+    {
+        $h = '<datalist id="pcdna-cities">';
+        foreach (self::CITIES as $fa => $en) {
+            $h .= '<option value="' . View::e($fa) . '" data-en="' . View::e($en) . '"></option>';
+        }
+        return $h . '</datalist>';
+    }
+
     public static function hm($iso): string
     {
         $t = is_string($iso) && $iso !== '' ? strtotime($iso) : false;
@@ -954,8 +1040,17 @@ final class Pages
             return '<div data-d="' . View::e($k) . '"><dt>' . View::e($label) . '</dt><dd>' . $val . '</dd></div>';
         };
         $na = '<span class="pcdna-muted">—</span>';
+        // SPEC §23.12.2: the public tag support uses to map a customer's X-Served-By header to this node, and the customer label
+        $ident = '';
+        if (self::wave14([$e])) {
+            $ident = View::card('شناسهٔ عمومی و نام نمایشی', '<dl class="pcdna-dl pcdna-dl-cols" data-detail="identity">'
+                . $row('tag', 'شناسهٔ عمومی (X-Served-By)', !empty($e['public_tag']) ? View::ltr((string) $e['public_tag'], 'pcdna-code') : $na)
+                . $row('label', 'نام برای مشتری', !empty($e['display_label']) ? View::e((string) $e['display_label']) . (!empty($e['display_label_en']) ? ' · <span dir="ltr">' . View::e((string) $e['display_label_en']) . '</span>' : '') : $na)
+                . $row('release', 'نسخه', self::releaseCell($e)) . '</dl>'
+                . '<p class="pcdna-small pcdna-muted">مشتری فقط نام نمایشی را می‌بیند. برای پیدا کردن نود از روی هدر مشتری، از «جست‌وجو با شناسه» در صفحهٔ نودها استفاده کنید.</p>', '', '', 'tag');
+        }
         if (!self::wave13([$e])) {
-            return View::card('پایداری تونل نود ' . $name, View::alert('info', 'کنترلر فعلی جزئیات تخلیه، پروب تونل، بارگذاری مجدد و تنظیمات هسته را گزارش نمی‌کند؛ برای این بخش کنترلر را به موج ۱۳ به‌روزرسانی کنید.'), $back, '', 'activity');
+            return $ident . View::card('پایداری تونل نود ' . $name, View::alert('info', 'کنترلر فعلی جزئیات تخلیه، پروب تونل، بارگذاری مجدد و تنظیمات هسته را گزارش نمی‌کند؛ برای این بخش کنترلر را به موج ۱۳ به‌روزرسانی کنید.'), $back, '', 'activity');
         }
         $h = '';
         $force = self::drainForceCard([$e], $q);
@@ -1051,7 +1146,7 @@ final class Pages
             . $row('cap_multi', 'چند مبدأ برای مسیر تونل', $flag('tunnel_multi_origin')) . $row('cap_resolve', 'اتصال ماندگار به مبدأ دامنه‌ای', $flag('upstream_resolve'))
             . '</dl>';
         $h .= View::card('شبکه، HTTP/3 و وزن', $body, '', '', 'zap');
-        return '<div class="pcdna-detail-head">' . $back . '<h2 class="pcdna-detail-title">پایداری تونل نود ' . View::ltr($name) . '</h2></div>' . $force
+        return '<div class="pcdna-detail-head">' . $back . '<h2 class="pcdna-detail-title">پایداری تونل نود ' . View::ltr($name) . '</h2></div>' . $force . $ident
             . '<div class="pcdna-grid-2 pcdna-edge-detail">' . $h . '</div>';
     }
 
@@ -1077,8 +1172,10 @@ final class Pages
             return View::emptyState('هنوز نودی ثبت نشده است', 'برای شروع، از صفحه «نودها» اولین نود را اضافه کنید.', 'server');
         }
         $w13 = $actions && self::wave13($edges);
+        $w14 = $actions && self::wave14($edges);
         $multiFleet = $w13 && self::$multiSites > 0;
-        $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-edges"><thead><tr><th>نام / IP</th><th>منطقه / گروه</th><th>وضعیت</th>'
+        $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-edges"><thead><tr><th>نام / IP</th><th>منطقه / گروه</th>'
+            . ($w14 ? '<th>نسخه</th><th>شهر نمایشی</th>' : '') . '<th>وضعیت</th>'
             . ($w13 ? '<th>پروب تونل</th>' : '') . '<th>بار لحظه‌ای</th><th>در دسترس‌بودن</th><th>آخرین ارتباط</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
         foreach ($edges as $e) {
             $online = self::edgeOnline($e);
@@ -1095,6 +1192,7 @@ final class Pages
                 . ($actions ? self::edgeCapBadges($e) : '') . '</td>'
                 . '<td><span class="pcdna-badges">' . (($e['region'] ?? '') === 'home' ? View::badge('ایران', 'brand') : View::badge('خارج', 'violet'))
                 . View::badge($gl, $gt === 'violet' ? 'violet' : 'muted', ' data-group="' . View::e($e['group'] ?? 'general') . '"') . '</span></td>'
+                . ($w14 ? '<td class="pcdna-release-cell">' . self::releaseCell($e) . '</td><td class="pcdna-city-cell">' . self::cityCell($e, $id) . '</td>' : '')
                 // «Shield» (SPEC §14.1) sits under the status badge: the status column has room, the group column does not.
                 . '<td>' . $status . (!$actions && !empty($e['shield']) ? ' ' . View::badge('Shield', 'ok', ' title="لایهٔ کش میانی (Origin Shield)"') : '')
                 . ($actions && $shieldKnown ? '<div class="pcdna-shield-cell">' . self::edgeShieldToggle($e, $id) . '</div>' : '')
@@ -1156,11 +1254,34 @@ final class Pages
             }
             $h .= '</tr>';
             if ($err !== '') {
-                $h .= '<tr class="pcdna-errrow"><td colspan="' . (($actions ? 7 : 6) + ($w13 ? 1 : 0)) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
+                $h .= '<tr class="pcdna-errrow"><td colspan="' . (($actions ? 7 : 6) + ($w13 ? 1 : 0) + ($w14 ? 2 : 0)) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
                     . '<code dir="ltr" title="' . View::e(View::clip($err, 600)) . '">' . View::e(View::clip($err, 300)) . '</code></td></tr>';
             }
         }
         return $h . '</tbody></table></div>';
+    }
+
+    /** «جست‌وجو با شناسه»: GET /api/v1/edges?tag=<8 hex> — maps a customer's X-Served-By / X-Pcdn-Node value to a node. */
+    private static function tagSearch(string $tag): string
+    {
+        $res = '';
+        if ($tag !== '') {
+            $p = '/api/v1/edges?tag=' . $tag;
+            $r = self::fetch([$p]);
+            $list = self::ok($r[$p]) ? array_values(array_filter((array) $r[$p]['data'], 'is_array')) : [];
+            $list = array_values(array_filter($list, function ($e) use ($tag) {
+                return !isset($e['public_tag']) || strtolower((string) $e['public_tag']) === $tag;
+            }));
+            $res = $list ? '<p data-tag-result="' . View::e($tag) . '">' . View::icon('check') . ' شناسهٔ ' . View::ltr($tag, 'pcdna-code') . ' = نود '
+                . implode('، ', array_map(function ($e) {
+                    return '<a href="' . View::url(['page' => 'edges', 'view' => 'detail', 'id' => (int) ($e['id'] ?? 0)]) . '">' . View::ltr((string) ($e['name'] ?? '')) . '</a>'
+                        . (!empty($e['display_label']) ? ' (' . View::e((string) $e['display_label']) . ')' : '');
+                }, $list)) . '</p>'
+                : '<p class="pcdna-err" data-tag-result="">نودی با شناسهٔ ' . View::ltr($tag, 'pcdna-code') . ' پیدا نشد.</p>';
+        }
+        return '<form method="get" action="addonmodules.php" class="pcdna-filters pcdna-tag-search"><input type="hidden" name="module" value="' . View::e(Env::MODULE) . '"><input type="hidden" name="page" value="edges">'
+            . '<label><span>جست‌وجو با شناسه (هدر X-Served-By مشتری)</span><input class="pcdna-input" name="tag" dir="ltr" maxlength="8" pattern="[0-9a-fA-F]{8}" placeholder="3fa91c0d" value="' . View::e($tag) . '"></label>'
+            . '<button type="submit" class="pcdna-btn">' . View::icon('search') . '<span>جست‌وجو</span></button></form>' . $res;
     }
 
     /** Per-group totals of online edges: [group => [online, edges, rx, tx, cap, conns]]. */
@@ -1249,6 +1370,11 @@ final class Pages
     {
         if (($get['view'] ?? '') === 'sync') {
             return self::sync();
+        }
+        if (($get['view'] ?? '') === 'diag') {
+            // SPEC §23.8: the admin-audience diagnostics report of one site («گزارش عیب‌یابی»)
+            require_once __DIR__ . '/Ops.php';
+            return Ops::siteDiag((int) ($get['service'] ?? 0));
         }
         $f = [
             'q' => View::clip(Env::input($get['q'] ?? ''), 100),
@@ -1407,6 +1533,8 @@ final class Pages
                 $menu .= View::postButton($q, 'create', ['service' => $sid], 'ساخت روی CDN (ModuleCreate)', 'pcdna-menu-item', 'سایت ' . $domain . ' روی کنترلر ساخته شود؟', 'plus');
             }
             $menu .= '<a class="pcdna-menu-item" href="' . View::e(Data::serviceUrl((int) $svc->userid, $sid)) . '">' . View::icon('external') . '<span>صفحه سرویس در WHMCS</span></a>';
+            // SPEC §23.8: admin-audience diagnostics report (serving nodes, ids) with copy / JSON download
+            $menu .= '<a class="pcdna-menu-item" data-diag-link="' . $sid . '" href="' . View::url(['page' => 'sites', 'view' => 'diag', 'service' => $sid]) . '">' . View::icon('info') . '<span>گزارش عیب‌یابی</span></a>';
             if ($live) {
                 // SPEC §19.2: «انتقال دامنه» to another client or to the operator
                 $menu .= '<a class="pcdna-menu-item" href="' . View::url(['page' => 'transfer', 'service' => $sid]) . '">' . View::icon('users') . '<span>انتقال دامنه</span></a>'
@@ -1587,6 +1715,8 @@ final class Pages
         if (!$ping['ok']) {
             return $h . self::ctlError($ping);
         }
+        $tag = strtolower(Env::input($get['tag'] ?? ''));
+        $tag = preg_match('/^[0-9a-f]{8}$/D', $tag) ? $tag : '';
         $r = self::fetch(['/api/v1/edges', '/edge/version', '/api/v1/overview']);
         // SPEC §22.4: how many sites use several origins per tunnel path (overview.tunnel_multi_origin_sites, wave 13)
         self::$multiSites = self::ok($r['/api/v1/overview']) && is_numeric($r['/api/v1/overview']['data']['tunnel_multi_origin_sites'] ?? null)
@@ -1599,6 +1729,14 @@ final class Pages
             $online += self::edgeOnline($e) ? 1 : 0;
         }
         $series = $edges !== null ? self::uptimeSeries($edges) : null;
+        if ($edges !== null && self::wave14($edges)) {
+            // SPEC §23.1 / §23.12: pinned releases + controller version, the customer-label city list and the tag lookup
+            require_once __DIR__ . '/Ops.php';
+            $rr = self::fetch(['/api/v1/releases', '/healthz']);
+            $h .= Ops::pinnedLine(self::ok($rr['/api/v1/releases']) ? $rr['/api/v1/releases']['data'] : null,
+                self::ok($rr['/healthz']) && is_string($rr['/healthz']['data']['version'] ?? null) ? $rr['/healthz']['data']['version'] : null);
+            $h .= self::cityList() . self::tagSearch($tag);
+        }
         if ($edges !== null) {
             $h .= self::drainForceCard($edges, ['page' => 'edges']);
             foreach (self::saturated($edges) as $e) {
@@ -3909,7 +4047,49 @@ final class Pages
         }
         $list .= '</ul>';
         $h .= View::card('بررسی سلامت', $list, View::postButton(['page' => 'settings'], 'clear_cache', [], 'بازخوانی ویجت', 'pcdna-btn pcdna-btn-sm', '', 'refresh'), '', 'check');
+        $h .= self::notifySettings();
         return $h;
+    }
+
+    /**
+     * SPEC §23.5 / §23.8 / §23.10 (wave 14): customer alert channels the controller can send (GET /api/v1/notifications/status —
+     * provider names and bot usernames only, never keys), the e-mail outbox cron, the support department of diagnostics tickets
+     * and the public abuse page.
+     */
+    public static function notifySettings(): string
+    {
+        $ping = self::ping();
+        $st = null;
+        $code = 0;
+        if ($ping['ok']) {
+            $r = self::fetch(['/api/v1/notifications/status']);
+            $code = (int) ($r['/api/v1/notifications/status']['code'] ?? 0);
+            $st = self::ok($r['/api/v1/notifications/status']) ? $r['/api/v1/notifications/status']['data'] : null;
+        }
+        $on = function ($v) {
+            return $v ? View::badge('پیکربندی شده', 'ok') : View::badge('خاموش', 'muted');
+        };
+        if ($st !== null) {
+            $sms = is_array($st['sms'] ?? null) ? $st['sms'] : [];
+            $dl = '<dl class="pcdna-dl pcdna-dl-cols" data-notify-status="1">'
+                . '<div><dt>ایمیل</dt><dd>' . View::badge('با کران WHMCS', 'ok') . '</dd></div>'
+                . '<div><dt>پیامک</dt><dd>' . $on(!empty($sms['configured'])) . (!empty($sms['provider']) ? ' ' . View::ltr((string) $sms['provider']) : '') . '</dd></div>';
+            foreach (['bale' => 'بله', 'telegram' => 'تلگرام'] as $k => $label) {
+                $x = is_array($st[$k] ?? null) ? $st[$k] : [];
+                $dl .= '<div><dt>' . $label . '</dt><dd>' . $on(!empty($x['configured'])) . (!empty($x['username']) ? ' ' . View::ltr('@' . ltrim((string) $x['username'], '@')) : '') . '</dd></div>';
+            }
+            $dl .= '</dl>';
+        } else {
+            $dl = View::alert('info', $code === 404 ? 'کنترلر فعلی هشدارهای مشتری (پیامک، بله، تلگرام) را پشتیبانی نمی‌کند.' : 'وضعیت کانال‌های هشدار در دسترس نیست.');
+        }
+        $last = Env::kvGet('alertmail_last');
+        $dept = (int) Env::setting('support_department', '0');
+        $dl .= '<ul class="pcdna-bullets"><li>ایمیل هشدارها با کران WHMCS از صف کنترلر خوانده و با قالب «Pasargad CDN Alert» فرستاده می‌شود'
+            . (Env::enabled('alert_email', true) ? '' : ' — <strong>خاموش (تنظیم «ایمیل هشدارهای مشتری»)</strong>')
+            . (is_array($last) && !empty($last['at']) ? ' (آخرین اجرا: ' . View::e(View::ago(gmdate('Y-m-d\TH:i:s\Z', (int) $last['at']))) . '، ' . View::n((int) ($last['sent'] ?? 0)) . ' ارسال)' : '') . '.</li>'
+            . '<li>بخش پشتیبانی تیکت‌های «گزارش عیب‌یابی»: ' . ($dept > 0 ? '#' . View::n($dept) : 'اولین بخش') . ' (تنظیم «بخش پشتیبانی گزارش عیب‌یابی»).</li>'
+            . '<li>صفحهٔ عمومی «گزارش تخلف»: ' . (Env::enabled('abuse_page', false) ? '<a href="../index.php?m=pasargadcdn_admin&amp;page=abuse" target="_blank" rel="noopener">روشن</a>' : 'خاموش') . '.</li></ul>';
+        return View::card('هشدارهای مشتری، پشتیبانی و گزارش تخلف', $dl, '', '', 'mail');
     }
 
     // ------------------------------------------------------------------ «مدیریت کامل» (admin mode of the client app)

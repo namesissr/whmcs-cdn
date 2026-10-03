@@ -219,3 +219,36 @@
     window.setInterval(tick, 1000);
   }
 })();
+
+// SPEC §23 (wave 14): live preview of the customer label of a node («نود {شهر}» / "{City} node") while the admin types,
+// and the 20-second refresh of a running rollout (paused while a form or menu is in use).
+(function () {
+  'use strict';
+  var root = document.querySelector('.pcdna');
+  if (!root) return;
+  var list = document.getElementById('pcdna-cities');
+  function en(fa) {
+    if (!list) return '';
+    var o = list.querySelector('option[value="' + String(fa).replace(/"/g, '') + '"]');
+    return o ? o.getAttribute('data-en') || '' : '';
+  }
+  root.addEventListener('input', function (ev) {
+    var f = ev.target && ev.target.closest ? ev.target.closest('form[data-city-form]') : null;
+    if (!f) return;
+    var fa = (f.querySelector('[data-city-input]') || {}).value || '';
+    var ov = (f.querySelector('[data-city-en]') || {}).value || '';
+    fa = fa.trim();
+    var p = f.querySelector('[data-city-preview]'), pe = f.querySelector('[data-city-preview-en]');
+    if (p) p.textContent = fa ? 'نود ' + fa : 'پیش‌فرض منطقه';
+    var e2 = ov.trim() || en(fa) || fa;
+    if (pe) pe.textContent = fa ? e2 + ' node' : '';
+  });
+  var live = root.querySelector('[data-autorefresh]');
+  if (live) {
+    var secs = parseInt(live.getAttribute('data-autorefresh'), 10) || 20;
+    window.setInterval(function () {
+      var busy = root.querySelector('details[open]') || (document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName));
+      if (!busy && !document.hidden) window.location.reload();
+    }, secs * 1000);
+  }
+})();

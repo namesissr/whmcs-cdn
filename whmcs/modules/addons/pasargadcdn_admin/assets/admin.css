@@ -651,3 +651,42 @@
 .pcdna .pcdna-detail-title { font-size: 18px; margin: 0; font-weight: 700; }
 .pcdna .pcdna-edge-detail .pcdna-form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; position: relative; }
 .pcdna .pcdna-probe-table td[dir="ltr"], .pcdna .pcdna-tuning-table td { white-space: nowrap; }
+
+/* ---------- SPEC §23 (wave 14): «عملیات» pages, node release / display city */
+.pcdna .pcdna-subnav { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.pcdna .pcdna-subnav-item { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--a-border); background: var(--a-surface); color: var(--a-text-2); text-decoration: none; }
+.pcdna .pcdna-subnav-item .pcdna-icon { width: 15px; height: 15px; }
+.pcdna .pcdna-subnav-item.is-active { background: var(--a-brand); border-color: var(--a-brand); color: #fff; }
+.pcdna .pcdna-pinned { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; padding: 8px 12px; border-radius: 10px; background: var(--a-brand-50); }
+.pcdna .pcdna-pinned .pcdna-icon { width: 16px; height: 16px; color: var(--a-brand); }
+.pcdna .pcdna-gates { display: flex; flex-wrap: wrap; gap: 4px; }
+.pcdna .pcdna-gate { display: inline-block; padding: 0 7px; border-radius: 6px; font-size: 12px; background: var(--a-surface-2); border: 1px solid var(--a-border); white-space: nowrap; }
+.pcdna .pcdna-gate.is-ok { color: var(--a-ok); background: var(--a-ok-50); }
+.pcdna .pcdna-gate.is-warn { color: var(--a-warn); background: var(--a-warn-50); }
+.pcdna .pcdna-gate.is-bad { color: var(--a-bad); background: var(--a-bad-50); }
+.pcdna .pcdna-ring-title { margin: 14px 0 6px; font-size: 14px; }
+.pcdna .pcdna-wide-menu { min-width: 300px; max-width: min(380px, 92vw); }
+.pcdna .pcdna-wide-menu .pcdna-check { display: inline-flex; gap: 6px; align-items: center; margin-inline-end: 10px; }
+.pcdna .pcdna-dl-cols { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+.pcdna .pcdna-slo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.pcdna .pcdna-slo-card { border: 1px solid var(--a-border); border-radius: 10px; padding: 12px; background: var(--a-surface); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.pcdna .pcdna-slo-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pcdna .pcdna-slo-val { font-size: 20px; font-weight: 800; }
+.pcdna .pcdna-slo-val small { font-size: 12px; font-weight: 400; color: var(--a-muted); }
+.pcdna .pcdna-slo-val .pcdna-t-ok { color: var(--a-ok); }
+.pcdna .pcdna-slo-val .pcdna-t-bad { color: var(--a-bad); }
+.pcdna .pcdna-slo-daily { margin-top: 12px; color: var(--a-text-2); }
+.pcdna .pcdna-slo-chart { width: 100%; height: 170px; display: block; }
+.pcdna .pcdna-legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; }
+.pcdna .pcdna-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-inline-end: 4px; vertical-align: middle; }
+.pcdna .pcdna-plan { direction: ltr; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; font-family: var(--a-mono); font-size: 12px; background: var(--a-surface-2); border: 1px solid var(--a-border); border-radius: 8px; padding: 10px; margin: 8px 0; }
+.pcdna .pcdna-join { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.pcdna .pcdna-evidence { margin: 6px 0 12px; padding-inline-start: 20px; }
+.pcdna .pcdna-evidence a, .pcdna .pcdna-evidence code { overflow-wrap: anywhere; }
+.pcdna .pcdna-pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--a-surface-2); border-radius: 8px; padding: 8px 10px; margin: 6px 0 12px; }
+.pcdna .pcdna-span-2 { grid-column: 1 / -1; }
+.pcdna .pcdna-input-sm { width: 80px; }
+.pcdna .pcdna-city-cell, .pcdna .pcdna-release-cell { min-width: 110px; }
+.pcdna .pcdna-tag-search { margin-bottom: 10px; }
+.pcdna h4 { margin: 12px 0 6px; font-size: 14px; }
+@media (max-width: 600px) { .pcdna .pcdna-subnav-item span { font-size: 12px; } .pcdna .pcdna-slo-grid { grid-template-columns: 1fr; } }

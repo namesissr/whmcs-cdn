@@ -105,8 +105,11 @@
     { title: t('SSL و هدرها'), items: ['ssl', 'headers', 'errorpages'] },
     // Wave 6D (SPEC §14.3): SLA report with the reports; webhooks + log export next to the API keys.
     // Wave 10 (SPEC §18.3): monthly PDF/CSV statement and the site's change log (w10.js).
-    { title: t('گزارش‌ها'), items: ['analytics', 'events', 'sla', 'usage', 'statement', 'monthly', 'changes', 'emailreports'] },
-    { title: t('یکپارچه‌سازی و API'), items: ['webhooks', 'logs', 'apikeys', 'sharing', 'xfer'] }
+    // Wave 14 (SPEC §23.7 / §23.4): «تجربهٔ کاربران واقعی» (rum.js, plan feature rum) and «تاریخچهٔ تنظیمات» (history.js, once the
+    // controller answers config/history).
+    { title: t('گزارش‌ها'), items: ['analytics', 'rum', 'events', 'sla', 'usage', 'statement', 'monthly', 'changes', 'history', 'emailreports'] },
+    // Wave 14 (SPEC §23.5): «هشدارها» (alerts.js, account-level; owner only)
+    { title: t('یکپارچه‌سازی و API'), items: ['alerts', 'webhooks', 'logs', 'apikeys', 'sharing', 'xfer'] }
   ];
   if (RESELLER) NAV.unshift({ title: t('نمایندگی'), items: ['reseller'] });
   var pages = P.pages = P.pages || {};
@@ -742,6 +745,8 @@
           if (z && z.setOpen) { z.setOpen(true); if (z.scrollIntoView) z.scrollIntoView({ block: 'start', behavior: reduced() ? 'auto' : 'smooth' }); }
         });
       } }));
+      // Wave 14 (SPEC §23.6): move records + settings from ArvanCloud straight from the onboarding guide
+      if (P.importer && P.importer.available()) acts.push(P.importer.button('arvan'));
       acts.push(tutLink('quickstart', t('آموزش شروع سریع')));
     } else if (st.id === 'ns') {
       out.push(h('p', { text: t('در پنل ثبت‌کننده دامنه (برای دامنه‌های ‎.ir سایت nic.ir) نیم‌سرورهای دامنه را دقیقاً به موارد زیر تغییر دهید و نیم‌سرورهای قبلی را حذف کنید:') }));
@@ -1005,6 +1010,8 @@
 
     // quick actions + security summary
     out.push(h('div', { className: 'pcdn-grid-2' }, quickActions(), h('div', { className: 'pcdn-stack' }, securitySummary(), planSummary())));
+    // Wave 14 (SPEC §23.8): «ارسال گزارش عیب‌یابی به پشتیبانی» (diag.js; shown once the wave-14 probe answered)
+    if (P.diag && P.diag.card) out.push(P.diag.card());
 
     ensureAnalytics('24h').then(function (res) {
       if (S.page !== 'overview' || !document.body.contains(spark)) return;
@@ -1283,6 +1290,8 @@
     S.drawRecords = function () { drawList(); };
     drawList();
     out.push(c);
+    // Wave 14 (SPEC §23.6): «انتقال از ابر آروان» / «انتقال از Cloudflare» (importer.js)
+    if (P.importer && P.importer.card) out.push(P.importer.card());
     out.push(importExportCard());
     return out;
   }
@@ -1730,7 +1739,10 @@
     statement: STATEMENT, money: money, webRoot: WEBROOT, addFundsUrl: ADDFUNDS_URL,
     reseller: RESELLER, openSubSite: openSubSite, exitSubSite: exitSubSite, inSubSite: function () { return !!RSITE; },
     onLeave: onLeave, share: SHARE, sharing: SHARE || ADMIN ? null : (boot.sharing || null),
-    xfer: SHARE || ADMIN || READONLY ? null : (boot.xfer || null), refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand
+    xfer: SHARE || ADMIN || READONLY ? null : (boot.xfer || null), refreshNav: refreshNav, recordModal: recordModal, refreshBrand: refreshBrand,
+    // Wave 14 (SPEC §23): account-level pages (alerts) and the diagnostics / import dialogs are the account's own — never in the admin
+    // view, a shared domain or a reseller's sub-site
+    admin: !!ADMIN, readonlyTeam: READONLY, reloadRecords: reloadRecords
   };
 
   // §14.3.7 / §20.1: modules ask A().readonly when they render — read-only team member or a role that cannot change this page
@@ -1755,4 +1767,10 @@
   // Wave 13 (SPEC §22.11): one background GET tunnel/profile on tunnel plans — an older controller 404s and the guide page,
   // per-path idle timeout, multi-origin editor, timeout checks and the HTTP/3 variant stay hidden.
   if (S.site && P.tprofile && P.tprofile.probe && features().tunnel) P.tprofile.probe().then(probed);
+  // Wave 14 (SPEC §23): one background GET config/history?limit=1 (settings history; also tells the diagnostics / import pieces that
+  // the controller is new enough) and, for the account itself, one GET of its alerts — an older controller 404s and they stay hidden.
+  var p14 = [];
+  if (S.site && P.alerts && P.alerts.probe && !ADMIN && !SHARE) p14.push(P.alerts.probe());
+  if (S.site && P.w17 && P.w17.probe) p14.push(P.w17.probe());
+  if (p14.length) Promise.all(p14).then(function (r) { if (P.w17 && P.w17.settle) P.w17.settle(); probed(r.indexOf(true) >= 0); });
 })();

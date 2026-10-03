@@ -637,6 +637,11 @@
     var roles = { viewer: t('مشاهده‌گر'), dns: t('مدیر DNS'), editor: t('ویرایشگر') };
     return h('div', { className: 'pcdn-w10-behalf', 'data-on-behalf': v }, P.badge(t('عضو اشتراکی #{0} — {1}', m[1], roles[m[2]]), 'violet'));
   }
+  function ownDetail(d) {
+    var o = {}, n = 0;
+    Object.keys(d).forEach(function (k) { if (k !== 'on_behalf_of') { o[k] = d[k]; n++; } });
+    return n ? o : null;
+  }
   function renderAudit(Aa, holder) {
     var st = { days: '30' };
     var c = P.card({ title: t('گزارش تغییرات'), icon: 'activity', id: 'w10-audit',
@@ -661,11 +666,16 @@
             h('thead', null, h('tr', null, h('th', { text: t('زمان') }), h('th', { text: t('تغییر') }), h('th', { text: t('توسط') }), h('th', { text: t('جزئیات') }))),
             h('tbody', null, rows.slice(0, 500).map(function (r) {
               var kind = String(r.actor_kind || String(r.actor || '').split(':')[0] || '');
+              // SPEC §23.3: the panel sends X-PCDN-Actor client:<id> for the owner's own changes — the controller records them as an
+              // admin-key write on_behalf_of the client: show «شما», not «پشتیبانی» with the panel's internal key name.
+              var own = isObj(r.detail) && typeof r.detail.on_behalf_of === 'string' && /^client:\d{1,10}$/.test(r.detail.on_behalf_of);
+              if (own) kind = 'client';
               var k = ACTOR_KINDS[kind] || [kind || '—', 'muted'];
-              return h('tr', null, h('td', { className: 'pcdn-nowrap', text: P.date(r.at || r.t) }),
+              var who = r.actor && !own ? String(r.actor).slice(0, 40) : '';
+              return h('tr', own ? { 'data-own': '1' } : null, h('td', { className: 'pcdn-nowrap', text: P.date(r.at || r.t) }),
                 h('td', null, ltr(String(r.action || '—')), r.target ? h('div', { className: 'pcdn-muted' }, ltr(String(r.target).slice(0, 80))) : null),
-                h('td', null, P.badge(k[0], k[1]), r.actor ? ' ' : null, r.actor ? ltr(String(r.actor).slice(0, 40)) : null, behalf(r.detail)),
-                h('td', { className: 'pcdn-w10-detail' }, ltr(auditDetail(r.detail))));
+                h('td', null, P.badge(k[0], k[1]), who ? ' ' : null, who ? ltr(who) : null, behalf(r.detail)),
+                h('td', { className: 'pcdn-w10-detail' }, ltr(auditDetail(own ? ownDetail(r.detail) : r.detail))));
             }))))]);
       });
     }

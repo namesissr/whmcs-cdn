@@ -218,7 +218,8 @@
       if (Q.data[hours] && alive()) draw(holder, Q.data[hours], Number(hours));
       if (Q.drops[hours] && alive()) drawDrops(dropsSlot, Q.drops[hours], Number(hours));
     };
-    return [bar, healthSlot, holder, dropsSlot];
+    // Wave 14 (SPEC §23.8): «ارسال گزارش عیب‌یابی به پشتیبانی» (diag.js, once the wave-14 probe answered)
+    return [bar, healthSlot, holder, dropsSlot, P.diag && P.diag.card ? P.diag.card() : null];
   }
   function skeletons() {
     return h('div', { className: 'pcdn-stack' }, h('div', { className: 'pcdn-kpis' }, [1, 2, 3, 4].map(function () { return h('div', { className: 'pcdn-kpi' }, P.skeleton(3)); })),
@@ -281,15 +282,16 @@
         { name: t('قطع غیرعادی'), color: C.COLORS.s4, values: pts.map(function (x) { return x.abnormal; }) }
       ], num, t('نمودار نشست‌ها، خطاها و قطع‌های غیرعادی تونل'));
     }
-    // per-edge table (node names only — never addresses)
+    // per-edge table — SPEC §23.12: city labels («نود تهران ۱» / "Tehran node 1"), never internal node names or addresses.
+    // `name` is the Persian label on a wave-14 controller (an older one still sends its internal name: shown as is, LTR).
     if (edges.length) {
       var ec = P.card({ title: t('کیفیت به تفکیک نود'), icon: 'server', tone: 'muted', id: 'tq-edges',
         subtitle: t('اگر فقط یک نود مشکل دارد، معمولاً مسیر شبکه‌ی آن نود تا سرور شما کند است و سیستم خودش ترافیک را به نودهای سالم می‌برد.') });
       var tbody = h('tbody');
       edges.forEach(function (e) {
         var tone = isNum(e.abnormal_pct) && e.abnormal_pct >= 10 ? 'is-bad' : '';
-        tbody.appendChild(h('tr', { className: tone, 'data-edge': String(e.name || '') },
-          h('td', { 'data-label': t('نود') }, h('bdi', { dir: 'ltr', text: String(e.name || '—') })),
+        tbody.appendChild(h('tr', { className: tone, 'data-edge': String(e.key || e.name || '') },
+          h('td', { 'data-label': t('نود') }, nodeLabel(e)),
           h('td', { 'data-label': t('نشست‌ها'), className: 'pcdn-num', text: num(e.sessions || 0) }),
           h('td', { 'data-label': t('قطع غیرعادی'), className: 'pcdn-num', text: pct(e.abnormal_pct) }),
           h('td', { 'data-label': t('زمان اتصال'), className: 'pcdn-num', text: ms(e.connect_ms_avg) }),
@@ -301,6 +303,14 @@
         tbody)));
       holder.appendChild(ec);
     }
+  }
+
+  /** SPEC §23.12: the node's city label in the page language; an older controller's internal name stays LTR. */
+  function nodeLabel(e) {
+    var fa = String(e.name || ''), en = typeof e.label_en === 'string' ? e.label_en : '';
+    if (P.isEn && en) return h('span', { className: 'pcdn-tq-node', text: en });
+    if (/[\u0600-\u06FF]/.test(fa)) return h('span', { className: 'pcdn-tq-node', text: P.isEn ? (en || t('نود')) : fa });
+    return h('bdi', { dir: 'ltr', text: fa || '—' });
   }
 
   function pathCard(p) {

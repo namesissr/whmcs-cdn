@@ -35,6 +35,8 @@ final class FeatureOverrides
         'features.max_webhooks' => [0, 50], 'features.sla_target' => [0, 100], 'features.max_l4_apps' => [0, 100],
         'features.storage_gb' => [0, 1000000], 'features.max_functions' => [0, 32],
         'features.max_tunnel_origins' => [1, 10],
+        // SPEC §23.15 (wave 14): alert subscriptions of the account (rum / alert_sms / alert_messengers are booleans)
+        'features.max_alert_subscriptions' => [0, 100],
     ];
     const ENUMS = ['features.edge_group' => ['general', 'tunnel']];
     const FIELD_RE = '/^(?:bandwidth_limit_gb|max_records|ssl_allowed|rate_limit_rps|features\.[a-z][a-z0-9_]{0,47})$/D';
