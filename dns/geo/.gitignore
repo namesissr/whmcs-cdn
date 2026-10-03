@@ -1,0 +1,4 @@
+*.mmdb
+*.tmp
+*.tmp.*
+build.tmp.*

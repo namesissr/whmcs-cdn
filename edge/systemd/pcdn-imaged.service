@@ -1,0 +1,44 @@
+[Unit]
+Description=Pasargad CDN image transformer (images v2, loopback only)
+After=network.target nginx.service
+
+[Service]
+Type=simple
+# settings: IMAGE_PORT / RESIZE_PORT / IMAGE_WORKERS / IMAGE_MAX_SOURCE_MB (written by install.sh;
+# world-readable, no secrets — the transformer never sees agent.conf)
+Environment=PCDN_CONFIG=/etc/pcdn/imaged.conf
+ExecStart=/usr/bin/python3 /usr/local/bin/pcdn-agent imaged
+Restart=always
+RestartSec=2
+# untrusted image decoding: no privileges, no filesystem, loopback-only network, bounded memory
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+MemoryMax=768M
+TasksMax=64
+Nice=5
+OOMScoreAdjust=600
+
+[Install]
+WantedBy=multi-user.target

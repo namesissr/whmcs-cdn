@@ -1,2 +1,7 @@
 -r requirements.txt
 pytest
+pyflakes==4.0.0
+# in-process SMTP server for the e-mail alert tests
+aiosmtpd==1.4.6
+# local S3 server (+ botocore's SigV4 signer) for the backup upload tests
+moto[server]==5.2.3

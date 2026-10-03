@@ -1,0 +1,149 @@
+# promtool test rules prometheus/tests/pcdn-alerts.test.yml   (run from deploy/monitoring)
+rule_files:
+  - ../rules/pcdn-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # controller unreachable from the monitoring host
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="pcdn-probe", probe="healthz", component="controller", instance="https://api.example/healthz"}'
+        values: '1 1 0 0 0 0 0'
+      - series: 'up{job="pcdn-controller", instance="api.example"}'
+        values: '1 1 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: PcdnControllerDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: PcdnControllerDown
+        exp_alerts:
+          - exp_labels: {severity: critical, source: probe, job: pcdn-probe, probe: healthz, component: controller, instance: "https://api.example/healthz"}
+            exp_annotations:
+              summary: "کنترلر از بیرون در دسترس نیست"
+              description: "GET https://api.example/healthz از میزبان مانیتورینگ ۲ دقیقه است پاسخ موفق نمی‌دهد (Caddy، کنترلر یا شبکه)."
+              runbook: docs/DISASTER_RECOVERY.md
+      - eval_time: 6m
+        alertname: PcdnControllerScrapeFailing
+        exp_alerts:
+          - exp_labels: {severity: critical, source: probe, job: pcdn-controller, instance: api.example}
+            exp_annotations:
+              description: "Prometheus نمی‌تواند api.example/metrics را بخواند. اگر PcdnControllerDown هم فعال نیست، METRICS_TOKEN را در هر دو طرف بررسی کنید (پاسخ 401)."
+              summary: "دریافت /metrics از کنترلر شکست می‌خورد"
+
+  # every edge offline (critical) vs one edge lost (warning)
+  - interval: 1m
+    input_series:
+      - series: 'pcdn_edges_total{job="pcdn-controller", instance="api.example"}'
+        values: '3x20'
+      - series: 'pcdn_edges_online{job="pcdn-controller", instance="api.example"}'
+        values: '3 3 3 2 2 2 2 2 2 2 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: PcdnEdgesOffline
+        exp_alerts:
+          - exp_labels: {severity: warning, source: metrics, job: pcdn-controller, instance: api.example}
+            exp_annotations:
+              description: "اکنون 2 نود آنلاین است. با پروفایل api-bridge، هشدار PcdnEdgeOffline نام نود را هم می‌گوید."
+              summary: "تعداد نودهای آنلاین کمتر از بیشینهٔ یک ساعت اخیر است"
+      - eval_time: 13m
+        alertname: PcdnEdgesAllOffline
+        exp_alerts:
+          - exp_labels: {severity: critical, source: metrics, job: pcdn-controller, instance: api.example}
+            exp_annotations:
+              description: "همهٔ نودهای فعال heartbeat نفرستاده‌اند. اتصال نودها به کنترلر را بررسی کنید (docs/NODES.md)."
+              runbook: "docs/NODES.md"
+              summary: "هیچ نود لبه‌ای آنلاین نیست"
+
+  # backups: warning after 26h, critical after 50h
+  - interval: 5m
+    input_series:
+      - series: 'pcdn_backup_last_success_age_seconds{job="pcdn-controller", instance="api.example"}'
+        values: '3600+300x700'
+    alert_rule_test:
+      - eval_time: 20h
+        alertname: PcdnBackupStale
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: PcdnBackupStale
+        exp_alerts:
+          - exp_labels: {severity: warning, source: metrics, job: pcdn-controller, instance: api.example}
+            exp_annotations:
+              description: "پشتیبان روزانه اجرا نشده یا شکست خورده است (docs/OPERATIONS.md §۳)."
+              runbook: "docs/OPERATIONS.md"
+              summary: "آخرین پشتیبان موفق 1d 7h 0m 0s پیش بوده است"
+      - eval_time: 55h
+        alertname: PcdnBackupVeryStale
+        exp_alerts:
+          - exp_labels: {severity: critical, source: metrics, job: pcdn-controller, instance: api.example}
+            exp_annotations:
+              description: "بدون پشتیبان تازه، بازیابی از فاجعه داده از دست می‌دهد (docs/DISASTER_RECOVERY.md)."
+              summary: "بیش از دو روز است پشتیبان موفقی گرفته نشده"
+
+  # one job keeps failing while the scheduler itself is alive
+  - interval: 1m
+    input_series:
+      - series: 'pcdn_scheduler_last_run_age_seconds{job="pcdn-controller", instance="api.example"}'
+        values: '30x30'
+      - series: 'pcdn_scheduler_job_last_run_age_seconds{job="pcdn-controller", exported_job="job_ssl", instance="api.example"}'
+        values: '1000+60x30'
+      - series: 'pcdn_scheduler_job_last_run_age_seconds{job="pcdn-controller", exported_job="job_edges", instance="api.example"}'
+        values: '30x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PcdnSchedulerJobFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, source: metrics, job: pcdn-controller, exported_job: job_ssl, instance: api.example}
+            exp_annotations:
+              description: "زمان‌بند کار می‌کند ولی job_ssl بیش از ۱۵ دقیقه است بدون خطا تمام نشده است. لاگ کنترلر را ببینید."
+              summary: "کار زمان‌بندی‌شدهٔ job_ssl مدتی است موفق نشده"
+
+  # /metrics answers but every DB-backed block failed
+  - interval: 1m
+    input_series:
+      - series: 'up{job="pcdn-controller", instance="api.example"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PcdnControllerMetricsIncomplete
+        exp_alerts:
+          - exp_labels: {severity: warning, source: metrics, job: pcdn-controller, instance: api.example}
+            exp_annotations:
+              description: "بلوک‌های /metrics جداگانه شکست می‌خورند (معمولاً دیتابیس). لاگ کنترلر (pcdn.metrics) را ببینید."
+              summary: "/metrics پاسخ می‌دهد ولی شمارش نودها ندارد"
+
+  # api-bridge: per-edge load as % of capacity (max of rx/tx)
+  - interval: 1m
+    input_series:
+      - series: 'pcdn_api_edge_tx_mbps{edge="de-fra-1", edge_id="3", group="general"}'
+        values: '450x30'
+      - series: 'pcdn_api_edge_rx_mbps{edge="de-fra-1", edge_id="3", group="general"}'
+        values: '1x30'
+      - series: 'pcdn_api_edge_capacity_mbps{edge="de-fra-1", edge_id="3", group="general"}'
+        values: '500x30'
+      - series: 'pcdn_api_edge_tx_mbps{edge="ir-thr-1", edge_id="1", group="general"}'
+        values: '80x30'
+      - series: 'pcdn_api_edge_rx_mbps{edge="ir-thr-1", edge_id="1", group="general"}'
+        values: '12x30'
+      - series: 'pcdn_api_edge_capacity_mbps{edge="ir-thr-1", edge_id="1", group="general"}'
+        values: '1000x30'
+      - series: 'pcdn_api_edge_online{edge="ir-thr-1", edge_id="1", group="general"}'
+        values: '1 1 0x20'
+      - series: 'pcdn_api_edge_enabled{edge="ir-thr-1", edge_id="1", group="general"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PcdnEdgeLoadHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, source: metrics, edge: de-fra-1, edge_id: "3", group: general}
+            exp_annotations:
+              description: "بیش از ۱۵ دقیقه بالای ۸۵٪ capacity_mbps؛ shedding خودکار نزدیک است."
+              summary: "نود de-fra-1 روی 90٪ ظرفیت کار می‌کند"
+      - eval_time: 10m
+        alertname: PcdnEdgeOffline
+        exp_alerts:
+          - exp_labels: {severity: warning, source: metrics, edge: ir-thr-1, edge_id: "1", group: general}
+            exp_annotations:
+              description: "این نود فعال است ولی در EDGE_OFFLINE_SECONDS اخیر heartbeat نفرستاده است."
+              summary: "نود ir-thr-1 (general) آفلاین است"

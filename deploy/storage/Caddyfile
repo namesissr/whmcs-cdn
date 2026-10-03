@@ -1,0 +1,41 @@
+# S3 endpoint of the object storage (SPEC §16.8): TLS by Let's Encrypt, everything proxied to MinIO.
+{
+	email {$ACME_EMAIL}
+}
+
+{$STORAGE_DOMAIN} {
+	# MinIO's admin API only from the controller(s); S3 itself is public (signed requests, or the
+	# edges' Referer-conditioned anonymous GET of buckets used as a CDN origin)
+	@admin_denied {
+		path /minio/admin/*
+		not remote_ip {$ADMIN_ALLOW_IPS}
+	}
+	respond @admin_denied 403
+
+	# metrics only from the controller network too (they need a token anyway)
+	@metrics_denied {
+		path /minio/v2/metrics/* /minio/metrics/*
+		not remote_ip {$ADMIN_ALLOW_IPS}
+	}
+	respond @metrics_denied 403
+
+	# no request body limit (multipart parts up to 5 GiB), stream both ways, keep the Host header
+	# (Caddy forwards it unchanged by default, which SigV4 needs), long transfers allowed
+	request_body {
+		max_size 6GB
+	}
+	reverse_proxy minio:9000 {
+		flush_interval -1
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 300s
+		}
+		health_uri /minio/health/live
+		health_interval 15s
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

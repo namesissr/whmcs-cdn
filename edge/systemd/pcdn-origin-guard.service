@@ -1,0 +1,20 @@
+[Unit]
+Description=Pasargad CDN origin guard (nftables table inet pcdn_origin_guard: nginx may not connect to internal addresses)
+# loaded after the distribution firewall so a `flush ruleset` there cannot drop it; restarted with it.
+# Before nginx, so no worker ever runs without it.
+After=network-pre.target nftables.service
+Before=nginx.service
+PartOf=nftables.service
+ConditionPathExists=/etc/pcdn/origin-guard.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# the file replaces any previous version of the table atomically (table / delete / table); the agent
+# re-adds the shield peers within 10 minutes (sets peers4 / peers6)
+ExecStart=/usr/sbin/nft -f /etc/pcdn/origin-guard.nft
+ExecReload=/usr/sbin/nft -f /etc/pcdn/origin-guard.nft
+ExecStop=-/usr/sbin/nft delete table inet pcdn_origin_guard
+
+[Install]
+WantedBy=multi-user.target

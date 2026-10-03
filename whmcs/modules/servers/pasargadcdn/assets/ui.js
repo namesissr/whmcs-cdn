@@ -9,6 +9,7 @@
 (function () {
   'use strict';
   var P = window.PCDN = window.PCDN || {};
+  var t = P.t;  // i18n.js (SPEC §16.10)
 
   // ------------------------------------------------------------------ DOM
 
@@ -41,8 +42,8 @@
     if (text !== undefined) el.textContent = String(text);
     return el;
   }
-  function ltr(t, cls) { return h('bdi', { className: 'pcdn-ltr' + (cls ? ' ' + cls : ''), dir: 'ltr', text: t }); }
-  function code(t) { return h('code', { className: 'pcdn-code', dir: 'ltr', text: t }); }
+  function ltr(tx, cls) { return h('bdi', { className: 'pcdn-ltr' + (cls ? ' ' + cls : ''), dir: 'ltr', text: tx }); }
+  function code(tx) { return h('code', { className: 'pcdn-code', dir: 'ltr', text: tx }); }
   function clone(o) { return o === undefined ? undefined : JSON.parse(JSON.stringify(o)); }
   function uid(prefix) { return prefix + Math.random().toString(36).slice(2, 8); }
 
@@ -109,10 +110,32 @@
     filter: 'M4 5h16l-6 7.5V19l-4 1.5v-8z',
     eye: 'M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z|M12 9.5a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5',
     grip: 'M9 6h.01|M15 6h.01|M9 12h.01|M15 12h.01|M9 18h.01|M15 18h.01',
+    wallet: 'M4 7h15a1.5 1.5 0 0 1 1.5 1.5v10A1.5 1.5 0 0 1 19 20H5a1.5 1.5 0 0 1-1.5-1.5v-12A2.5 2.5 0 0 1 6 4h11v3|M16 13.5h.01',
     star: 'M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.8z',
-    certificate: 'M4 4h16v11H4z|M8 8h8|M8 11h5|M16 14a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5|M14.5 18.5 14 22l2-1 2 1-.5-3.5'
+    certificate: 'M4 4h16v11H4z|M8 8h8|M8 11h5|M16 14a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5|M14.5 18.5 14 22l2-1 2 1-.5-3.5',
+    tunnel: 'M3 20V12a9 9 0 0 1 18 0v8|M7.5 20v-7.5a4.5 4.5 0 0 1 9 0V20|M2 20h20|M12 4v2',
+    qr: 'M4 4h6v6H4z|M14 4h6v6h-6z|M4 14h6v6H4z|M14 14h2.5v2.5H14z|M18 18h2v2h-2z|M18 14h2|M14 19.5h2',
+    // Wave 6B (SPEC §14.2)
+    bot: 'M5 8.5h14v11H5z|M12 4.5v4|M12 4.5h.01|M9 13h.01|M15 13h.01|M9.5 16.5h5|M2.5 12.5v3|M21.5 12.5v3',
+    redirect: 'M4 6.5h10a5 5 0 0 1 0 10H7|M10 13.5l-3 3 3 3',
+    swap: 'M7 4 3 8l4 4|M3 8h14|M17 12l4 4-4 4|M21 16H7',
+    package: 'M12 3 4 7v10l8 4 8-4V7z|M4 7l8 4 8-4|M12 11v10|M8 5l8 4',
+    // Wave 6D (SPEC §14.3)
+    webhook: 'M9.5 8.5a3 3 0 1 1 5.2 2.1L12 15|M6.2 13.6a3 3 0 1 0 3.3 4.4h5.5|M14.5 18a3 3 0 1 0 3.2-3.9L15 9.6',
+    send: 'M21 3 10.5 13.5|M21 3l-6.5 18-4-7.5L3 9.5z',
+    printer: 'M7 9V3.5h10V9|M7 17.5H4.5V10.5A1.5 1.5 0 0 1 6 9h12a1.5 1.5 0 0 1 1.5 1.5v7H17|M7 14h10v6.5H7z|M16.5 12h.01',
+    fileText: 'M6 3h8l4 4v14H6z|M14 3v4h4|M9 12h6|M9 15.5h6|M9 8.5h2',
+    // Wave 14 (SPEC §23.5): alerts
+    bell: 'M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z|M10 20.5a2 2 0 0 0 4 0',
+    calendar: 'M4 5.5h16V20H4z|M4 10h16|M8.5 3.5v4|M15.5 3.5v4|M8 14h.01|M12 14h.01|M16 14h.01',
+    // Wave 8 (SPEC §16.4 / §16.5)
+    port: 'M8 3.5v4.5|M16 3.5v4.5|M5.5 8h13v3.5a6.5 6.5 0 0 1-13 0z|M12 18v2.5',
+    play: C + '|M10 8.5v7l6-3.5z'
   };
+  // Direction-bound icons point the other way on an LTR (English) page.
+  var MIRROR = { arrowLeft: 'arrowRight', arrowRight: 'arrowLeft', chevronLeft: 'chevronRight', chevronRight: 'chevronLeft' };
   function icon(name, cls) {
+    if (P.isEn && MIRROR[name]) name = MIRROR[name];
     var svg = s('svg', { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor',
       'stroke-width': 1.8, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false',
       class: 'pcdn-icon' + (cls ? ' ' + cls : '') });
@@ -120,12 +143,13 @@
     return svg;
   }
 
-  // ------------------------------------------------------------------ formatting (Persian digits for user-facing numbers)
+  // ------------------------------------------------------------------ formatting (per language: Persian digits only in fa)
 
   var nf = null, nf1 = null;
-  try { nf = new Intl.NumberFormat('fa-IR'); nf1 = new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 1 }); } catch (e) { /* old browser */ }
+  try { nf = new Intl.NumberFormat(P.locale); nf1 = new Intl.NumberFormat(P.locale, { maximumFractionDigits: 1 }); } catch (e) { /* old browser */ }
   var FA_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
-  function fa(str) { return String(str).replace(/[0-9]/g, function (d) { return FA_DIGITS[+d]; }); }
+  /** Digits of a user-facing number in the page language (Persian digits in fa, unchanged in en). */
+  function fa(str) { return P.isEn ? String(str) : String(str).replace(/[0-9]/g, function (d) { return FA_DIGITS[+d]; }); }
   function num(n) { n = Number(n) || 0; return nf ? nf.format(n) : fa(n); }
   function num1(n) { n = Number(n) || 0; return nf1 ? nf1.format(n) : fa(Math.round(n * 10) / 10); }
   function bytes(b) {
@@ -136,54 +160,55 @@
   }
   function short(n) {
     n = Number(n) || 0;
-    if (n >= 1e9) return num1(n / 1e9) + ' میلیارد';
-    if (n >= 1e6) return num1(n / 1e6) + ' میلیون';
-    if (n >= 1e3) return num1(n / 1e3) + ' هزار';
+    if (n >= 1e9) return t('{0} میلیارد', num1(n / 1e9));
+    if (n >= 1e6) return t('{0} میلیون', num1(n / 1e6));
+    if (n >= 1e3) return t('{0} هزار', num1(n / 1e3));
     return num(Math.round(n));
   }
-  function pct(a, b) { return b > 0 ? num(Math.round(a * 100 / b)) + '٪' : '—'; }
+  function pct(a, b) { return b > 0 ? num(Math.round(a * 100 / b)) + t('٪') : '—'; }
   function dur(sec) {
     sec = Number(sec) || 0;
-    if (sec <= 0) return '۰ ثانیه';
-    var parts = [], units = [[31536000, 'سال'], [2592000, 'ماه'], [86400, 'روز'], [3600, 'ساعت'], [60, 'دقیقه'], [1, 'ثانیه']];
+    if (sec <= 0) return t('۰ ثانیه');
+    var parts = [], units = [[31536000, t('سال')], [2592000, t('ماه')], [86400, t('روز')], [3600, t('ساعت')], [60, t('دقیقه')], [1, t('ثانیه')]];
     for (var i = 0; i < units.length && parts.length < 2; i++) {
       var q = Math.floor(sec / units[i][0]);
-      if (q > 0) { parts.push(num(q) + ' ' + units[i][1]); sec -= q * units[i][0]; }
+      // English units are plural nouns ("hours"); one of a unit drops the s.
+      if (q > 0) { parts.push(num(q) + ' ' + (P.isEn && q === 1 ? units[i][1].replace(/s$/, '') : units[i][1])); sec -= q * units[i][0]; }
     }
-    return parts.join(' و ');
+    return parts.join(t(' و '));
   }
   function date(iso, opts) {
     if (!iso) return '—';
     var d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso);
-    try { return d.toLocaleString('fa-IR', opts || { dateStyle: 'medium', timeStyle: 'short' }); } catch (e) { return d.toISOString(); }
+    try { return d.toLocaleString(P.locale, opts || { dateStyle: 'medium', timeStyle: 'short' }); } catch (e) { return d.toISOString(); }
   }
   function rel(iso) {
     var d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso || '—');
     var sec = Math.round((Date.now() - d.getTime()) / 1000);
     if (sec < 0) sec = 0;
-    if (sec < 45) return 'همین الان';
-    if (sec < 3600) return num(Math.max(1, Math.round(sec / 60))) + ' دقیقه پیش';
-    if (sec < 86400) return num(Math.round(sec / 3600)) + ' ساعت پیش';
-    if (sec < 30 * 86400) return num(Math.round(sec / 86400)) + ' روز پیش';
+    if (sec < 45) return t('همین الان');
+    if (sec < 3600) return num(Math.max(1, Math.round(sec / 60))) + t(' دقیقه پیش');
+    if (sec < 86400) return num(Math.round(sec / 3600)) + t(' ساعت پیش');
+    if (sec < 30 * 86400) return num(Math.round(sec / 86400)) + t(' روز پیش');
     return date(iso, { dateStyle: 'medium' });
   }
   /** Search normalisation: Arabic ي/ك → Persian, drop ZWNJ/diacritics, lower-case. */
-  function norm(t) {
-    return String(t || '').toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/[‌ً-ٟ]/g, '')
+  function norm(tx) {
+    return String(tx || '').toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک').replace(/[‌ً-ٟ]/g, '')
       .replace(/[۰-۹]/g, function (c) { return String(c.charCodeAt(0) - 0x06f0); });
   }
 
   var COUNTRIES = {
-    IR: 'ایران', US: 'آمریکا', DE: 'آلمان', NL: 'هلند', GB: 'انگلستان', FR: 'فرانسه', CN: 'چین', RU: 'روسیه', TR: 'ترکیه',
-    AE: 'امارات', IQ: 'عراق', AF: 'افغانستان', CA: 'کانادا', SE: 'سوئد', FI: 'فنلاند', IN: 'هند', SG: 'سنگاپور', JP: 'ژاپن',
-    KR: 'کره جنوبی', UA: 'اوکراین', PL: 'لهستان', IT: 'ایتالیا', ES: 'اسپانیا', BR: 'برزیل', AM: 'ارمنستان', AZ: 'آذربایجان',
-    OM: 'عمان', QA: 'قطر', SA: 'عربستان', KW: 'کویت', BH: 'بحرین', PK: 'پاکستان', VN: 'ویتنام', HK: 'هنگ‌کنگ', RO: 'رومانی',
-    CH: 'سوئیس', AT: 'اتریش', BG: 'بلغارستان', CZ: 'چک', IE: 'ایرلند', AU: 'استرالیا', LT: 'لیتوانی', GE: 'گرجستان',
-    TM: 'ترکمنستان', TJ: 'تاجیکستان', UZ: 'ازبکستان', KZ: 'قزاقستان', ID: 'اندونزی', MY: 'مالزی', TH: 'تایلند', EG: 'مصر',
-    SY: 'سوریه', LB: 'لبنان', JO: 'اردن', BE: 'بلژیک', DK: 'دانمارک', NO: 'نروژ', CY: 'قبرس', GR: 'یونان', HU: 'مجارستان',
-    MX: 'مکزیک', AR: 'آرژانتین', ZA: 'آفریقای جنوبی', NG: 'نیجریه', IL: 'اسرائیل', TW: 'تایوان', PH: 'فیلیپین', BD: 'بنگلادش'
+    IR: t('ایران'), US: t('آمریکا'), DE: t('آلمان'), NL: t('هلند'), GB: t('انگلستان'), FR: t('فرانسه'), CN: t('چین'), RU: t('روسیه'), TR: t('ترکیه'),
+    AE: t('امارات'), IQ: t('عراق'), AF: t('افغانستان'), CA: t('کانادا'), SE: t('سوئد'), FI: t('فنلاند'), IN: t('هند'), SG: t('سنگاپور'), JP: t('ژاپن'),
+    KR: t('کره جنوبی'), UA: t('اوکراین'), PL: t('لهستان'), IT: t('ایتالیا'), ES: t('اسپانیا'), BR: t('برزیل'), AM: t('ارمنستان'), AZ: t('آذربایجان'),
+    OM: t('عمان'), QA: t('قطر'), SA: t('عربستان'), KW: t('کویت'), BH: t('بحرین'), PK: t('پاکستان'), VN: t('ویتنام'), HK: t('هنگ‌کنگ'), RO: t('رومانی'),
+    CH: t('سوئیس'), AT: t('اتریش'), BG: t('بلغارستان'), CZ: t('چک'), IE: t('ایرلند'), AU: t('استرالیا'), LT: t('لیتوانی'), GE: t('گرجستان'),
+    TM: t('ترکمنستان'), TJ: t('تاجیکستان'), UZ: t('ازبکستان'), KZ: t('قزاقستان'), ID: t('اندونزی'), MY: t('مالزی'), TH: t('تایلند'), EG: t('مصر'),
+    SY: t('سوریه'), LB: t('لبنان'), JO: t('اردن'), BE: t('بلژیک'), DK: t('دانمارک'), NO: t('نروژ'), CY: t('قبرس'), GR: t('یونان'), HU: t('مجارستان'),
+    MX: t('مکزیک'), AR: t('آرژانتین'), ZA: t('آفریقای جنوبی'), NG: t('نیجریه'), IL: t('اسرائیل'), TW: t('تایوان'), PH: t('فیلیپین'), BD: t('بنگلادش')
   };
   function country(code) { code = String(code || '').toUpperCase(); return COUNTRIES[code] || code || '—'; }
 
@@ -200,54 +225,91 @@
 
   // ------------------------------------------------------------------ API
 
-  var CFG = { api: '', csrf: '', serviceId: 0 };
+  var CFG = { api: '', csrf: '', serviceId: 0, rsid: 0 };
   function api(method, path, body, query) {
-    var url = CFG.api + '?id=' + encodeURIComponent(CFG.serviceId) + '&path=' + encodeURIComponent(path);
+    // The admin-mode endpoint (addonmodules.php?module=…) already has a query string.
+    var url = CFG.api + (CFG.api.indexOf('?') >= 0 ? '&' : '?') + 'id=' + encodeURIComponent(CFG.serviceId) + '&path=' + encodeURIComponent(path);
+    // Reseller sub-site context (SPEC §10.5): the server resolves the domain from the reseller's
+    // own sub-site row by this id; an explicit query.rop (reseller op) overrides it server-side.
+    if (CFG.rsid && !(query && query.rop)) url += '&rsid=' + encodeURIComponent(CFG.rsid);
     Object.keys(query || {}).forEach(function (k) { url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); });
-    var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'Accept': 'application/json' } };
-    if (body !== undefined) {
+    // X-PCDN-Lang: api.php answers its own error details in the app's language (SPEC §16.10).
+    var init = { method: method, credentials: 'same-origin', headers: { 'X-PCDN-CSRF': CFG.csrf, 'X-PCDN-Lang': P.lang || 'fa', 'Accept': 'application/json' } };
+    // a GET never carries a body (fetch() rejects one — the reseller report used to pass null)
+    if (body !== undefined && !(body === null && (method === 'GET' || method === 'HEAD'))) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
     return fetch(url, init).then(function (r) {
-      return r.json().catch(function () { return { detail: 'پاسخ نامعتبر از سرور (HTTP ' + r.status + ')' }; })
+      return r.json().catch(function () { return { detail: t('پاسخ نامعتبر از سرور (HTTP ') + r.status + ')' }; })
         .then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
     }, function () {
-      return { ok: false, status: 0, data: { detail: 'ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.' } };
+      return { ok: false, status: 0, data: { detail: t('ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.') } };
     });
   }
 
   var LOC = {
-    rules: 'قانون', conditions: 'شرط', pools: 'استخر', origins: 'سرور', exclusions: 'استثنا', request: 'هدر درخواست',
-    response: 'هدر پاسخ', value: 'مقدار', name: 'نام', id: 'شناسه', path: 'مسیر', content: 'مقدار', ttl: 'TTL', type: 'نوع',
-    priority: 'اولویت', pool: 'استخر', origin_port: 'پورت سرور اصلی', health_port: 'پورت بررسی سلامت', address: 'آدرس',
-    port: 'پورت', weight: 'وزن', pattern: 'الگو', redirect: 'ریدایرکت', url: 'آدرس', edge_ttl: 'مدت کش CDN',
-    browser_ttl: 'مدت کش مرورگر', requests: 'تعداد درخواست', period: 'بازه', block_seconds: 'مدت مسدودی', methods: 'متدها',
-    action: 'اقدام', field: 'فیلد', op: 'عملگر', rule_id: 'شناسه قانون', health: 'بررسی سلامت', interval: 'فاصله',
-    timeout: 'مهلت', expect: 'کدهای سالم', host: 'هاست', quality: 'کیفیت', max_width: 'حداکثر عرض', extensions: 'پسوندها',
-    allowed_referers: 'دامنه‌های مجاز', bypass_cookies: 'کوکی‌های عبور از کش', threshold_rps: 'آستانه', clearance_ttl: 'اعتبار مجوز',
-    max_age: 'max-age', hsts: 'HSTS', cert: 'گواهی', key: 'کلید خصوصی', zone: 'فایل زون', paranoia: 'سطح حساسیت', groups: 'گروه‌ها'
+    rules: t('قانون'), conditions: t('شرط'), pools: t('استخر'), origins: t('سرور'), exclusions: t('استثنا'), request: t('هدر درخواست'),
+    response: t('هدر پاسخ'), value: t('مقدار'), name: t('نام'), id: t('شناسه'), path: t('مسیر'), content: t('مقدار'), ttl: 'TTL', type: t('نوع'),
+    priority: t('اولویت'), pool: t('استخر'), origin_port: t('پورت سرور اصلی'), health_port: t('پورت بررسی سلامت'), address: t('آدرس'),
+    port: t('پورت'), weight: t('وزن'), pattern: t('الگو'), redirect: t('ریدایرکت'), url: t('آدرس'), edge_ttl: t('مدت کش CDN'),
+    browser_ttl: t('مدت کش مرورگر'), requests: t('تعداد درخواست'), period: t('بازه'), block_seconds: t('مدت مسدودی'), methods: t('متدها'),
+    action: t('اقدام'), field: t('فیلد'), op: t('عملگر'), rule_id: t('شناسه قانون'), health: t('بررسی سلامت'), interval: t('فاصله'),
+    timeout: t('مهلت'), expect: t('کدهای سالم'), host: t('هاست'), quality: t('کیفیت'), max_width: t('حداکثر عرض'), extensions: t('پسوندها'),
+    allowed_referers: t('دامنه‌های مجاز'), bypass_cookies: t('کوکی‌های عبور از کش'), threshold_rps: t('آستانه'), clearance_ttl: t('اعتبار مجوز'),
+    max_age: 'max-age', hsts: 'HSTS', cert: t('گواهی'), key: t('کلید خصوصی'), zone: t('فایل زون'), paranoia: t('سطح حساسیت'), groups: t('گروه‌ها'),
+    // Wave 6A (SPEC §14.1)
+    stale_while_revalidate: t('به‌روزرسانی در پس‌زمینه'), stale_if_error: t('نسخه قدیمی هنگام خطای سرور اصلی'), shield: 'Origin Shield',
+    key_device: t('نسخه جدا برای موبایل'), key_cookies: t('کوکی‌های کلید کش'), key_query_allow: t('پارامترهای مجاز کلید کش'),
+    http3: 'HTTP/3', auto_webp: t('تبدیل خودکار به WebP'), preload: 'Preload', as: t('نوع منبع'),
+    // Wave 6B (SPEC §14.2)
+    match: t('تطبیق'), actions: t('اقدام'), countries: t('کشورها'), regex: t('عبارت منظم'), replacement: t('مسیر جدید'), source: t('مبدأ'),
+    target: t('مقصد'), status: t('کد وضعیت'), preserve_query: t('حفظ Query String'), packs: t('بسته‌های آماده'), mode: t('حالت'),
+    allow_verified: t('ربات‌های تأییدشده'), block_empty_ua: t('User-Agent خالی'), origin_client_auth: t('احراز هویت مبدأ'), csv: 'CSV',
+    include_subdomains: t('زیردامنه‌ها'), enabled: t('فعال'),
+    // Wave 6D (SPEC §14.3)
+    s3_endpoint: t('نشانی سرویس'), region: t('ناحیه'), bucket: t('نام باکت'), prefix: t('پیشوند'), access_key: t('کلید دسترسی'),
+    secret_key: t('کلید مخفی'), anonymize_ip: t('ناشناس‌سازی آی‌پی'), sample_rate: t('نرخ نمونه‌برداری'), items: t('وب‌هوک'),
+    events: t('رویدادها'), description: t('توضیح'), minutes: t('بازه'), month: t('ماه'), limit: t('تعداد'),
+    // Wave 8 (SPEC §16.4–§16.7)
+    apps: t('برنامه'), protocol: t('پروتکل'), edge_port: t('پورت روی CDN'), origin: t('سرور مقصد'), proxy_protocol: 'PROXY protocol',
+    ip_allow: t('آی‌پی‌های مجاز'), idle_timeout: t('مهلت بیکاری'), segment_ttl: t('مدت کش قطعه‌ها'), manifest_ttl: t('مدت کش فهرست پخش'),
+    prefetch_next: t('پیش‌بارگذاری قطعهٔ بعدی'), avif: 'AVIF', smart_crop: t('برش هوشمند'), primaries: t('سرورهای اصلی'), tsig: 'TSIG',
+    algorithm: t('الگوریتم'), secret: t('کلید مخفی'), allow_axfr: t('آی‌پی‌های مجاز AXFR'), health_type: t('نوع بررسی سلامت'),
+    health_path: t('مسیر بررسی سلامت'), health_check: t('بررسی سلامت')
   };
+  var FA_RE = /[\u0600-\u06FF]/;
+  /**
+   * A message that came from the controller as-is. Its texts are Persian; on an English page a
+   * Persian one is shown unchanged after a localized lead-in (SPEC §16.10).
+   */
+  function ctlText(msg) {
+    msg = String(msg === null || msg === undefined ? '' : msg);
+    var lead = t('پیام سرور CDN:') + ' ';
+    return P.isEn && FA_RE.test(msg) && msg.indexOf(lead) !== 0 ? lead + msg : msg;
+  }
   /** Controller errors → {summary, items:[{path, label, msg}]}. */
   function parseErrors(data, status) {
     var d = data && data.detail;
     if (Array.isArray(d)) {
-      return { summary: 'اطلاعات واردشده معتبر نیست.', items: d.map(function (e) {
+      return { summary: t('اطلاعات واردشده معتبر نیست.'), items: d.map(function (e) {
         var loc = Array.isArray(e.loc) ? e.loc.filter(function (x, i) { return !(i === 0 && (x === 'body' || x === 'query')); }) : [];
         var label = [];
         loc.forEach(function (x) {
           if (typeof x === 'number' && label.length) label[label.length - 1] += ' ' + num(x + 1);
           else if (typeof x !== 'number') label.push(LOC[x] || String(x));
         });
-        return { path: loc.join('.'), label: label.join(' › '), msg: String(e.msg || '') };
+        label = label.join(' › ');
+        if (P.isEn && label) label = label.charAt(0).toUpperCase() + label.slice(1);
+        return { path: loc.join('.'), label: label, msg: String(e.msg || '') };
       }) };
     }
-    if (typeof d === 'string' && d) return { summary: d, items: [] };
-    return { summary: status === 0 ? 'ارتباط با سرور برقرار نشد.' : 'خطای ناشناخته (HTTP ' + status + ')', items: [] };
+    if (typeof d === 'string' && d) return { summary: ctlText(d), items: [] };
+    return { summary: status === 0 ? t('ارتباط با سرور برقرار نشد.') : t('خطای ناشناخته (HTTP ') + status + ')', items: [] };
   }
   function errorText(res) {
     var e = parseErrors(res.data, res.status);
-    return e.summary + (e.items.length ? ' ' + e.items.map(function (x) { return (x.label ? x.label + ': ' : '') + x.msg; }).join('؛ ') : '');
+    return e.summary + (e.items.length ? ' ' + e.items.map(function (x) { return (x.label ? x.label + ': ' : '') + x.msg; }).join(t('؛ ')) : '');
   }
   function errorBox(res, title) {
     var e = parseErrors(res.data, res.status);
@@ -263,10 +325,11 @@
   var layer = null, toasts = null;
   function getLayer() {
     if (!layer) {
-      layer = h('div', { className: 'pcdn pcdn-layer', dir: 'rtl', lang: 'fa' });
+      layer = h('div', { id: 'pcdn-layer', className: 'pcdn pcdn-layer', dir: P.dir || 'rtl', lang: P.lang || 'fa' });
       toasts = h('div', { className: 'pcdn-toasts', role: 'status', 'aria-live': 'polite' });
       layer.appendChild(toasts);
       document.body.appendChild(layer);
+      theme.attach(layer);
     }
     return layer;
   }
@@ -274,16 +337,16 @@
   function toast(msg, kind, action) {
     getLayer();
     kind = kind || 'success';
-    var t = h('div', { className: 'pcdn-toast pcdn-toast-' + kind, role: kind === 'error' ? 'alert' : null },
+    var tx = h('div', { className: 'pcdn-toast pcdn-toast-' + kind, role: kind === 'error' ? 'alert' : null },
       icon(kind === 'error' ? 'xCircle' : kind === 'warn' ? 'warn' : kind === 'info' ? 'info' : 'checkCircle'),
       h('div', { className: 'pcdn-toast-msg', text: msg }),
       action ? h('button', { type: 'button', className: 'pcdn-toast-act', text: action.label, onclick: function () { close(); action.fn(); } }) : null,
-      h('button', { type: 'button', className: 'pcdn-toast-x', 'aria-label': 'بستن', onclick: function () { close(); } }, icon('x')));
-    function close() { if (t.parentNode) t.parentNode.removeChild(t); }
-    toasts.appendChild(t);
+      h('button', { type: 'button', className: 'pcdn-toast-x', 'aria-label': t('بستن'), onclick: function () { close(); } }, icon('x')));
+    function close() { if (tx.parentNode) tx.parentNode.removeChild(tx); }
+    toasts.appendChild(tx);
     while (toasts.children.length > 4) toasts.removeChild(toasts.firstChild);
     setTimeout(close, kind === 'error' ? 9000 : 4500);
-    return t;
+    return tx;
   }
 
   var FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -299,7 +362,7 @@
     var titleId = uid('pcdn-dlg-');
     var body = h('div', { className: 'pcdn-dlg-body' });
     var foot = h('div', { className: 'pcdn-dlg-foot' });
-    var closeBtn = h('button', { type: 'button', className: 'pcdn-iconbtn', 'aria-label': 'بستن', onclick: function () { api2.close(); } }, icon('x'));
+    var closeBtn = h('button', { type: 'button', className: 'pcdn-iconbtn', 'aria-label': t('بستن'), onclick: function () { api2.close(); } }, icon('x'));
     var box = h('div', { className: 'pcdn-dlg pcdn-dlg-' + (o.kind || 'modal') + (o.wide ? ' is-wide' : ''), role: o.role || 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId },
       h('div', { className: 'pcdn-dlg-head' },
         o.icon ? h('span', { className: 'pcdn-dlg-icon pcdn-tone-' + (o.tone || 'brand') }, icon(o.icon)) : null,
@@ -349,8 +412,8 @@
       var d = dialog({ title: o.title, icon: o.icon || (o.danger ? 'warn' : 'info'), tone: o.danger ? 'danger' : 'brand', role: 'alertdialog',
         onClose: function () { if (!done) { done = true; resolve(false); } } });
       append(d.body, typeof o.body === 'string' ? h('p', { text: o.body }) : o.body);
-      var cancel = h('button', { type: 'button', className: 'pcdn-btn', text: o.cancel || 'انصراف', onclick: function () { d.close(); } });
-      var ok = h('button', { type: 'button', className: 'pcdn-btn ' + (o.danger ? 'pcdn-btn-danger' : 'pcdn-btn-primary'), text: o.ok || 'تأیید',
+      var cancel = h('button', { type: 'button', className: 'pcdn-btn', text: o.cancel || t('انصراف'), onclick: function () { d.close(); } });
+      var ok = h('button', { type: 'button', className: 'pcdn-btn ' + (o.danger ? 'pcdn-btn-danger' : 'pcdn-btn-primary'), text: o.ok || t('تأیید'),
         'data-confirm': '1', onclick: function () { done = true; d.close(true); resolve(true); } });
       append(d.foot, [ok, cancel]);
       (o.danger ? cancel : ok).focus();
@@ -395,22 +458,22 @@
   }
   function copyBtn(text, label, o) {
     o = o || {};
-    var b = h('button', { type: 'button', className: 'pcdn-copy' + (o.cls ? ' ' + o.cls : ''), 'aria-label': label || 'کپی', title: label || 'کپی',
+    var b = h('button', { type: 'button', className: 'pcdn-copy' + (o.cls ? ' ' + o.cls : ''), 'aria-label': label || t('کپی'), title: label || t('کپی'),
       'data-copy': '1', 'data-ro-ok': '1', onclick: function (e) {
         e.stopPropagation();
         var v = typeof text === 'function' ? text() : text;
         copyText(v).then(function () {
           b.classList.add('is-done');
           setTimeout(function () { b.classList.remove('is-done'); }, 1500);
-          toast(o.done || 'کپی شد', 'success');
-        }, function () { toast('کپی خودکار ممکن نشد؛ متن را دستی انتخاب کنید.', 'error'); });
+          toast(o.done || t('کپی شد'), 'success');
+        }, function () { toast(t('کپی خودکار ممکن نشد؛ متن را دستی انتخاب کنید.'), 'error'); });
       } }, icon('copy'), icon('check', 'pcdn-copy-ok'), o.text ? h('span', { text: o.text }) : null);
     return b;
   }
   /** LTR value with a copy button next to it. */
   function copyable(text, o) {
     o = o || {};
-    return h('span', { className: 'pcdn-copyable' + (o.block ? ' is-block' : '') }, h('code', { dir: 'ltr', text: text }), copyBtn(text, o.label || ('کپی ' + text)));
+    return h('span', { className: 'pcdn-copyable' + (o.block ? ' is-block' : '') }, h('code', { dir: 'ltr', text: text }), copyBtn(text, o.label || (t('کپی ') + text)));
   }
 
   function badge(text, tone, ic) {
@@ -438,7 +501,7 @@
     var open = !!o.open;
     var head = c.querySelector('.pcdn-card-head');
     var tgl = h('button', { type: 'button', className: 'pcdn-collapse-btn', 'aria-expanded': String(open), 'data-ro-ok': '1',
-      'aria-label': (open ? 'بستن ' : 'باز کردن ') + o.title }, icon('chevronDown'));
+      'aria-label': (open ? t('بستن ') : t('باز کردن ')) + o.title }, icon('chevronDown'));
     head.appendChild(tgl);
     function set(v) {
       open = v;
@@ -457,7 +520,7 @@
       text ? h('p', { text: text }) : null, action || null);
   }
   function skeleton(lines, cls) {
-    var out = h('div', { className: 'pcdn-skel-wrap' + (cls ? ' ' + cls : ''), 'aria-busy': 'true', 'aria-label': 'در حال بارگذاری' });
+    var out = h('div', { className: 'pcdn-skel-wrap' + (cls ? ' ' + cls : ''), 'aria-busy': 'true', 'aria-label': t('در حال بارگذاری') });
     for (var i = 0; i < (lines || 3); i++) out.appendChild(h('div', { className: 'pcdn-skel', style: 'width:' + (100 - (i % 3) * 18) + '%' }));
     return out;
   }
@@ -592,7 +655,7 @@
     o = o || {};
     var hint = h('span', { className: 'pcdn-dur-hint' });
     function upd() { hint.textContent = obj[key] === null || obj[key] === undefined ? (o.nullText || '') : (Number(obj[key]) === 0 && o.zeroText ? o.zeroText : '≈ ' + dur(obj[key])); }
-    var inp = input(obj, key, null, { type: 'number', min: o.min, max: o.max, nullable: o.nullable, aria: label, suffix: 'ثانیه', suffixRtl: true,
+    var inp = input(obj, key, null, { type: 'number', min: o.min, max: o.max, nullable: o.nullable, aria: label, suffix: t('ثانیه'), suffixRtl: true,
       oninput: function () { upd(); if (o.oninput) o.oninput(obj[key]); } });
     var chips = h('div', { className: 'pcdn-chips-row' }, (o.picks || []).map(function (p) {
       return h('button', { type: 'button', className: 'pcdn-chip-btn', text: p[1], 'data-write': '1', onclick: function () {
@@ -642,7 +705,7 @@
       Array.prototype.slice.call(wrap.querySelectorAll('.pcdn-tag')).forEach(function (x) { wrap.removeChild(x); });
       list.forEach(function (v, i) {
         wrap.insertBefore(h('span', { className: 'pcdn-tag' }, h('span', { text: v }),
-          h('button', { type: 'button', className: 'pcdn-tag-x', 'aria-label': 'حذف ' + v, 'data-write': '1', onclick: function () { list.splice(i, 1); draw(); fire(); } }, icon('x'))), inp);
+          h('button', { type: 'button', className: 'pcdn-tag-x', 'aria-label': t('حذف ') + v, 'data-write': '1', onclick: function () { list.splice(i, 1); draw(); fire(); } }, icon('x'))), inp);
       });
       inp.placeholder = list.length ? '' : (o.placeholder || '');
     }
@@ -650,7 +713,7 @@
     wrap.addEventListener('click', function (e) { if (e.target === wrap) inp.focus(); });
     draw();
     if (label === null) { reg(pathOf(obj, key), wrap); return wrap; }
-    return field(label, wrap, { help: o.help || 'با Enter یا کاما اضافه کنید.', path: pathOf(obj, key) });
+    return field(label, wrap, { help: o.help || t('با Enter یا کاما اضافه کنید.'), path: pathOf(obj, key) });
   }
 
   /** Radio cards: [[value, title, description, icon?, badge?]]. */
@@ -710,17 +773,324 @@
     }));
   }
 
+  // ------------------------------------------------------------------ theme: blend into the host page
+  //
+  // The app has no page background of its own. PCDN.theme reads the host page around #pcdn-app —
+  // background (colour or gradient), text colour, primary colour and font — decides light/dark and
+  // derives the neutral + brand tokens from it (set inline on the app root and the overlay layer),
+  // so our cards look like the host theme's own cards. Mode: data-theme="auto|light|dark" on
+  // #pcdn-app (templates/clientarea.tpl) or boot.theme; default "auto". It re-checks when the host
+  // toggles a class/style/data-theme on <html>/<body>, on prefers-color-scheme changes and on load.
+
+  var theme = (function () {
+    var WHITE = [255, 255, 255, 1], BLACK = [0, 0, 0, 1], INK = [11, 18, 32, 1];
+    var PERSIAN = /vazir|iran\s?sans|iransans|yekan|shabnam|sahel|samim|tanha|dana|peyda|estedad|kalameh|morabba|irancell|parastoo|nahid|gandom/i;
+    var targets = [], rootEl = null, mode = 'auto', applied = {}, attr = null, last = '', timer = null, cvs = null, watching = false;
+
+    function parse(str) {
+      str = String(str || '').trim();
+      if (!str || str === 'transparent' || str === 'none') return null;
+      var m = str.match(/^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i);
+      if (m) return [+m[1], +m[2], +m[3], m[4] === undefined ? 1 : m[4].slice(-1) === '%' ? parseFloat(m[4]) / 100 : +m[4]];
+      m = str.match(/^#([0-9a-f]{3,8})$/i);
+      if (m) {
+        var x = m[1];
+        if (x.length < 6) x = x.split('').map(function (c) { return c + c; }).join('');
+        return [parseInt(x.slice(0, 2), 16), parseInt(x.slice(2, 4), 16), parseInt(x.slice(4, 6), 16), x.length === 8 ? parseInt(x.slice(6, 8), 16) / 255 : 1];
+      }
+      try { // oklch(), color(srgb …), hsl(), names: let a canvas normalise it
+        cvs = cvs || document.createElement('canvas');
+        cvs.width = cvs.height = 1;
+        var cx = cvs.getContext('2d');
+        if (!cx) return null;
+        cx.fillStyle = '#010203'; cx.fillStyle = str;
+        if (cx.fillStyle === '#010203') return null;
+        cx.clearRect(0, 0, 1, 1); cx.fillRect(0, 0, 1, 1);
+        var d = cx.getImageData(0, 0, 1, 1).data;
+        return [d[0], d[1], d[2], d[3] / 255];
+      } catch (e) { return null; }
+    }
+    function lin(v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+    function lum(c) { return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]); }
+    function contrast(a, b) { var x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+    function mix(a, b, tx) { return [0, 1, 2].map(function (i) { return a[i] + (b[i] - a[i]) * tx; }).concat([1]); }
+    function over(top, bot) {
+      var a = top[3] + bot[3] * (1 - top[3]);
+      if (!a) return [0, 0, 0, 0];
+      return [0, 1, 2].map(function (i) { return (top[i] * top[3] + bot[i] * bot[3] * (1 - top[3])) / a; }).concat([a]);
+    }
+    function hex(c) { return '#' + c.slice(0, 3).map(function (v) { var s2 = Math.max(0, Math.min(255, Math.round(v))).toString(16); return s2.length < 2 ? '0' + s2 : s2; }).join(''); }
+    function rgba(c, a) { return 'rgba(' + c.slice(0, 3).map(Math.round).join(', ') + ', ' + a + ')'; }
+    function chroma(c) { return Math.max(c[0], c[1], c[2]) - Math.min(c[0], c[1], c[2]); }
+    /** Worst contrast of fg against a list of backgrounds. */
+    function worst(fg, bgs) { return Math.min.apply(null, bgs.map(function (b) { return contrast(fg, b); })); }
+    /** Move fg toward `to` until it reaches `ratio` against every bg. */
+    function ensure(fg, bgs, ratio, to) {
+      for (var i = 0; i < 25 && worst(fg, bgs) < ratio; i++) fg = mix(fg, to, 0.08);
+      return fg;
+    }
+
+    /** Average colour of a CSS gradient (computed background-image), or null. */
+    function gradient(img) {
+      if (!img || img === 'none' || img.indexOf('gradient') < 0) return null;
+      var list = img.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}\b|(?:color|oklch|oklab|lab|lch|hsla?)\([^)]*\)/gi) || [];
+      var acc = [0, 0, 0], w = 0, n = 0;
+      list.forEach(function (x) { var c = parse(x); if (c) { n++; if (c[3] > 0) { acc[0] += c[0] * c[3]; acc[1] += c[1] * c[3]; acc[2] += c[2] * c[3]; w += c[3]; } } });
+      return w ? [acc[0] / w, acc[1] / w, acc[2] / w, Math.min(1, w / n)] : null;
+    }
+    /** Painted background of one element (gradient over colour), or null. */
+    function paintOf(el) {
+      var cs = window.getComputedStyle(el), c = parse(cs.backgroundColor), g = gradient(cs.backgroundImage);
+      if (c && c[3] < 0.02) c = null;
+      return g && c ? over(g, c) : g || c;
+    }
+    /** First (composited) non-transparent background from `el` upwards. */
+    function hostBg(el) {
+      var layers = [];
+      for (; el && el.nodeType === 1; el = el.parentElement) {
+        var p = paintOf(el);
+        if (p) { layers.push(p); if (p[3] >= 0.98) break; }
+      }
+      if (!layers.length) return null;
+      var res = layers[layers.length - 1][3] >= 0.98 ? layers.pop() : WHITE;
+      while (layers.length) res = over(layers.pop(), res);
+      return res.slice(0, 3).concat([1]);
+    }
+    function inApp(el) { return !!(el.closest && el.closest('#pcdn-app, #pcdn-layer')); }
+    /** The host's primary colour: a real .btn-primary (what users see, incl. custom.css), the Bootstrap vars, or a hidden probe. */
+    function hostBrand(host) {
+      function ok(c) { return c && c[3] > 0.5 && chroma(c) >= 24 ? c.slice(0, 3).concat([1]) : null; }
+      var list = document.querySelectorAll('.btn-primary'), c = null, i;
+      for (i = 0; i < list.length && i < 20 && !c; i++) if (!inApp(list[i])) c = ok(paintOf(list[i]));
+      if (c) return c;
+      var st = [window.getComputedStyle(document.documentElement), document.body ? window.getComputedStyle(document.body) : null];
+      ['--bs-primary', '--primary'].forEach(function (v) { st.forEach(function (x) { if (!c && x) c = ok(parse(x.getPropertyValue(v))); }); });
+      if (c) return c;
+      try {
+        var probe = document.createElement('button');
+        probe.type = 'button'; probe.className = 'btn btn-primary'; probe.tabIndex = -1;
+        probe.setAttribute('aria-hidden', 'true');
+        probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;left:-9999px;top:0';
+        probe.textContent = 'x';
+        (host || document.body).appendChild(probe);
+        c = ok(paintOf(probe));
+        probe.parentNode.removeChild(probe);
+      } catch (e) { c = null; }
+      return c;
+    }
+    /** A host card colour (.card / .panel outside the app) when it clearly is one. */
+    function hostCard(bg, dark) {
+      var list = document.querySelectorAll('.card, .panel'), i, c;
+      for (i = 0; i < list.length && i < 30; i++) {
+        if (inApp(list[i]) || list[i].contains(rootEl)) continue;
+        c = paintOf(list[i]);
+        if (!c || c[3] < 0.98) continue;
+        var L = lum(c);
+        if (dark ? (L < 0.2 && L >= lum(bg) && contrast(c, bg) < 1.8) : (L > 0.75 && contrast(c, bg) < 1.35)) return c.slice(0, 3).concat([1]);
+        return null;
+      }
+      return null;
+    }
+
+    function derive(bg, fg, dark, brandC, card) {
+      var v = {}, surface, s2, text;
+      if (dark) {
+        surface = card && lum(card) > lum(bg) + 0.002 ? card : mix(bg, WHITE, 0.055);
+        text = fg && lum(fg) > 0.55 && contrast(fg, surface) >= 7 ? fg : [231, 235, 242, 1];
+        s2 = mix(surface, WHITE, 0.03);
+        v.elevated = mix(surface, WHITE, 0.03);
+        v.hover = mix(surface, text, 0.06);
+        v.fill = mix(surface, text, 0.07);
+        v['fill-2'] = mix(surface, text, 0.09);
+        v['row-hover'] = mix(surface, text, 0.03);
+        v['seg-bg'] = mix(surface, BLACK, 0.28);
+        v.border = mix(bg, text, 0.14);
+        v['border-strong'] = mix(bg, text, 0.24);
+        v['border-hover'] = mix(bg, text, 0.34);
+        v['input-bg'] = mix(surface, BLACK, 0.14);
+        v['switch-off'] = mix(surface, text, 0.3);
+        v.knob = mix(text, WHITE, 0.3);
+        v.track = mix(surface, text, 0.12);
+        v.handle = v['border-strong'];
+        v['skel-a'] = mix(surface, text, 0.07);
+        v['skel-b'] = mix(surface, text, 0.12);
+        v.grid = mix(surface, text, 0.09);
+        v.baseline = mix(surface, text, 0.2);
+        v.cross = mix(surface, text, 0.4);
+        v['tip-bg'] = mix(bg, WHITE, 0.13);
+        v['tip-border'] = v['border-strong'];
+        v['code-bg'] = mix(bg, BLACK, 0.35);
+        v['code-head'] = mix(v['code-bg'], WHITE, 0.05);
+        v['code-border'] = v.border;
+        v['code-line'] = mix(v['code-bg'], WHITE, 0.16);
+        v['inv-bg'] = mix(bg, WHITE, 0.13);
+        v['inv-bg-2'] = mix(bg, WHITE, 0.09);
+        v['inv-edge'] = v['border-strong'];
+      } else {
+        surface = card || (lum(bg) > 0.97 ? bg : mix(bg, WHITE, 0.65));
+        text = fg && lum(fg) < 0.2 && contrast(fg, surface) >= 7 ? fg : [15, 23, 42, 1];
+        var base = mix(surface, bg, 0.45);
+        s2 = mix(base, text, 0.018);
+        v.elevated = surface;
+        v.hover = mix(base, text, 0.04);
+        v.fill = mix(base, text, 0.045);
+        v['fill-2'] = mix(base, text, 0.06);
+        v['row-hover'] = mix(surface, text, 0.015);
+        v['seg-bg'] = mix(base, text, 0.09);
+        v.border = mix(base, text, 0.11);
+        v['border-strong'] = mix(surface, text, 0.2);
+        v['border-hover'] = mix(surface, text, 0.32);
+        v['input-bg'] = surface;
+        v['switch-off'] = mix(surface, text, 0.27);
+        v.track = mix(base, text, 0.08);
+        v.handle = mix(surface, text, 0.16);
+        v['skel-a'] = mix(surface, text, 0.07);
+        v['skel-b'] = mix(surface, text, 0.035);
+        v.grid = mix(surface, text, 0.07);
+        v.baseline = mix(surface, text, 0.18);
+        v.cross = mix(surface, text, 0.4);
+      }
+      v.surface = surface;
+      v['surface-2'] = s2;
+      v.text = ensure(text, [surface, s2, v.fill, v.hover], 7, dark ? WHITE : BLACK);
+      v['input-disabled'] = v.fill;
+      var backs = [surface, s2, v.fill, v['fill-2'], v.hover, v.elevated];
+      v['text-2'] = ensure(mix(v.text, surface, 0.16), backs, 7, dark ? WHITE : BLACK);
+      v.muted = ensure(mix(v.text, surface, 0.4), backs, 4.6, dark ? WHITE : BLACK);
+      v.faint = ensure(mix(v.text, surface, 0.52), [surface, v['input-bg']], 3.2, dark ? WHITE : BLACK);
+      v.axis = v.muted;
+      if (dark) {
+        v['tip-fg'] = v.text;
+        v['tip-label'] = ensure(v['text-2'], [v['tip-bg']], 7, WHITE);
+        v['tip-muted'] = ensure(v.muted, [v['tip-bg']], 4.6, WHITE);
+      }
+
+      // brand
+      var b = brandC || [29, 95, 214, 1];
+      if (dark && contrast(b, surface) < 2) b = ensure(b, [surface], 2, WHITE);
+      var on = WHITE;
+      if (contrast(WHITE, b) < 4.5) {
+        var d0 = b, k = 0;
+        while (contrast(WHITE, d0) < 4.5 && k < 4) { d0 = mix(d0, BLACK, 0.06); k++; }
+        if (contrast(WHITE, d0) >= 4.5) b = d0; else on = ensure(INK, [b], 4.5, BLACK);
+      }
+      v.brand = b;
+      v['on-brand'] = on;
+      v['brand-hover'] = on === WHITE ? mix(b, BLACK, 0.14) : mix(b, WHITE, 0.16);
+      v['brand-lite'] = mix(b, WHITE, 0.18);
+      v['brand-deep'] = mix(b, BLACK, 0.22);
+      v['brand-50'] = mix(surface, b, dark ? 0.16 : 0.08);
+      v['brand-100'] = mix(surface, b, dark ? 0.32 : 0.2);
+      var lb = [surface, s2, v['brand-50'], v.hover, v.elevated];
+      v.link = ensure(b, lb, 4.6, dark ? WHITE : BLACK);
+      v['brand-600'] = ensure(mix(v.link, dark ? WHITE : BLACK, 0.12), lb, 4.6, dark ? WHITE : BLACK);
+      v['info-strong'] = ensure(mix(b, dark ? WHITE : BLACK, 0.45), [v['brand-50'], surface], 6, dark ? WHITE : BLACK);
+      v['hero-end'] = mix(surface, b, dark ? 0.12 : 0.07);
+      v['guide-a'] = mix(surface, b, dark ? 0.04 : 0.015);
+      v['guide-b'] = mix(surface, b, dark ? 0.09 : 0.05);
+      v['upgrade-end'] = mix(surface, [139, 92, 246, 1], dark ? 0.12 : 0.05);
+      v.ring = '0 0 0 3px ' + rgba(dark ? v.link : b, dark ? 0.45 : 0.32);
+      v['brand-glow'] = dark ? 'rgba(0, 0, 0, .35)' : rgba(b, 0.28);
+      v.page = bg;
+      var out = {};
+      Object.keys(v).forEach(function (key) { out['--pc-' + key] = Array.isArray(v[key]) ? hex(v[key]) : v[key]; });
+      return out;
+    }
+
+    function detect() {
+      if (!rootEl) return;
+      var host = rootEl.parentElement || document.body;
+      var bg = hostBg(host), fgRaw = parse(window.getComputedStyle(host).color);
+      var fg = fgRaw && fgRaw[3] > 0.3 ? fgRaw.slice(0, 3).concat([1]) : null;
+      var brandC = hostBrand(host), dark, forced = mode === 'light' || mode === 'dark';
+      if (forced) {
+        dark = mode === 'dark';
+        bg = dark ? [17, 24, 39, 1] : [243, 245, 249, 1];
+        fg = null;
+      } else {
+        var fgL = fg ? lum(fg) : null, bgL = bg ? lum(bg) : null;
+        if (fgL !== null && fgL > 0.5) dark = true;          // light text: dark theme whatever the walk found
+        else if (fgL !== null && fgL < 0.1) dark = false;    // dark text: light theme
+        else dark = bgL !== null && bgL < 0.18;
+        if (dark && (bgL === null || bgL > 0.12)) {          // signals disagree / gradient we could not read: synthesise
+          var hue = brandC || [30, 41, 90, 1];
+          bg = mix([17, 24, 39, 1], hue, 0.12);
+        }
+        if (!dark && (bgL === null || bgL < 0.35)) bg = [248, 250, 252, 1];
+      }
+      var card = forced ? null : hostCard(bg, dark);
+      var vars = derive(bg, fg, dark, brandC, card);
+      var ff = window.getComputedStyle(host).fontFamily || '';
+      if (PERSIAN.test(ff)) vars['--pc-font'] = ff + ", 'PCDN Vazirmatn', Tahoma, sans-serif";
+      var key = JSON.stringify(vars) + dark + forced;
+      if (key === last) return;
+      last = key;
+      applied = vars;
+      attr = dark ? 'dark' : 'light';
+      targets.forEach(paint);
+      rootEl.classList.toggle('pcdn-framed', forced);
+    }
+    function paint(el) {
+      var old = el.getAttribute('data-pcdn-vars');
+      if (old) old.split(' ').forEach(function (k) { if (!(k in applied)) el.style.removeProperty(k); });
+      Object.keys(applied).forEach(function (k) { el.style.setProperty(k, applied[k]); });
+      el.setAttribute('data-pcdn-vars', Object.keys(applied).join(' '));
+      if (attr) el.setAttribute('data-pcdn-theme', attr);
+    }
+    function schedule() { clearTimeout(timer); timer = setTimeout(detect, 120); }
+    function hostSig() {
+      return [document.documentElement, document.body].map(function (el) {
+        return el ? ['class', 'style', 'data-theme', 'data-bs-theme', 'data-mode', 'data-color-scheme'].map(function (a) {
+          var x = el.getAttribute(a) || '';
+          return a === 'class' ? x.split(/\s+/).filter(function (c) { return c.indexOf('pcdn-') !== 0; }).join(' ') : x;
+        }).join('|') : '';
+      }).join('#');
+    }
+    function watch() {
+      if (watching) return;
+      watching = true;
+      var sig = hostSig();
+      if (window.MutationObserver) {
+        var mo = new window.MutationObserver(function () { var s2 = hostSig(); if (s2 !== sig) { sig = s2; schedule(); } });
+        var opts = { attributes: true, attributeFilter: ['class', 'style', 'data-theme', 'data-bs-theme', 'data-mode', 'data-color-scheme'] };
+        mo.observe(document.documentElement, opts);
+        if (document.body) mo.observe(document.body, opts);
+      }
+      if (window.matchMedia) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        if (mq.addEventListener) mq.addEventListener('change', schedule); else if (mq.addListener) mq.addListener(schedule);
+      }
+      if (document.readyState !== 'complete') window.addEventListener('load', schedule);
+    }
+    return {
+      /** Start theming `root`; `pref` = "auto" | "light" | "dark" (data-theme on the root wins). */
+      init: function (root, pref) {
+        rootEl = root;
+        var m = String(root.getAttribute('data-theme') || pref || 'auto').toLowerCase();
+        mode = m === 'light' || m === 'dark' ? m : 'auto';
+        if (targets.indexOf(root) < 0) targets.push(root);
+        try { detect(); } catch (e) { root.setAttribute('data-pcdn-theme', 'light'); }
+        watch();
+      },
+      /** Give another .pcdn element (the overlay layer) the same palette. */
+      attach: function (el) { if (targets.indexOf(el) < 0) { targets.push(el); if (attr) paint(el); } },
+      refresh: detect,
+      current: function () { return { theme: attr, mode: mode, vars: applied }; },
+      _util: { parse: parse, lum: lum, contrast: contrast, mix: mix, hex: hex }
+    };
+  })();
+
   // ------------------------------------------------------------------ export
 
   var K = {
     h: h, s: s, append: append, clear: clear, ltr: ltr, code: code, clone: clone, uid: uid, icon: icon, ICONS: ICONS,
     fa: fa, num: num, num1: num1, bytes: bytes, short: short, pct: pct, dur: dur, date: date, rel: rel, norm: norm, country: country,
-    store: store, CFG: CFG, api: api, parseErrors: parseErrors, errorText: errorText, errorBox: errorBox,
+    store: store, CFG: CFG, api: api, parseErrors: parseErrors, errorText: errorText, errorBox: errorBox, ctlText: ctlText,
     toast: toast, dialog: dialog, confirm: confirmDlg, btn: btn, iconBtn: iconBtn, busy: busy, copyText: copyText, copyBtn: copyBtn,
     copyable: copyable, badge: badge, alertBox: alertBox, card: card, collapsible: collapsible, empty: empty, skeleton: skeleton, meter: meter,
     beginForm: beginForm, endForm: endForm, pathOf: pathOf, reg: reg, placeErrors: placeErrors, clearErrors: clearErrors,
     field: field, toggle: toggle, switchInput: switchInput, select: select, input: input, duration: duration, tags: tags,
-    choice: choice, checks: checks, textarea: textarea, segmented: segmented, getLayer: getLayer
+    choice: choice, checks: checks, textarea: textarea, segmented: segmented, getLayer: getLayer, theme: theme
   };
   Object.keys(K).forEach(function (k) { P[k] = K[k]; });
 })();

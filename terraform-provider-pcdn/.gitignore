@@ -1,0 +1,6 @@
+/terraform-provider-pcdn
+/dist/
+*.test
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*

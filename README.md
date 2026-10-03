@@ -17,6 +17,7 @@ CDN اختصاصی **پاسارگاد میزبان** برای فروش خودک�
 - [۴. نصب ماژول WHMCS](#۴-نصب-ماژول-whmcs)
 - [روند کار مشتری](#روند-کار-مشتری)
 - [GeoDNS (ترافیک ایران از نودهای داخل)](#geodns-ترافیک-ایران-از-نودهای-داخل)
+- [حالت تونل (VPN از طریق CDN)](#حالت-تونل-vpn-از-طریق-cdn)
 - [مرجع API](#مرجع-api)
 - [ساختار پروژه](#ساختار-پروژه)
 - [تست‌ها](#تستها)
@@ -158,7 +159,8 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/p
 # روی سرور ns2 (پوشه‌های dns/ و deploy/ این مخزن را کپی کنید):
 cd /opt/pcdn/deploy && PDNS_API_KEY=<همان کلید کنترلر> docker compose -f ns2-compose.yml up -d
 # فایروال: پورت 8081 فقط برای IP کنترلر باز باشد
-ufw allow 53 && ufw allow from <CONTROLLER_IP> to any port 8081 proto tcp
+ufw allow 53
+sudo ./ns2-firewall.sh <CONTROLLER_IP>   # ufw روی پورت‌های Docker اثر ندارد
 ```
 
 سپس در `.env` کنترلر آدرس API سرور ns2 را اضافه کنید و `docker compose up -d` را دوباره اجرا کنید:
@@ -199,7 +201,7 @@ curl -X POST https://cdn-api.pasargadmizban.com/api/v1/edges \
 
 ```bash
 git clone <this-repo> /opt/pcdn && cd /opt/pcdn/edge
-sudo ./install.sh --controller https://cdn-api.pasargadmizban.com --token edge_xxxxxxxx
+sudo PCDN_EDGE_TOKEN=edge_xxxxxxxx ./install.sh --controller https://cdn-api.pasargadmizban.com
 # اگر سرور IPv6 ندارد:  --no-ipv6        اندازه کش هر سایت:  --cache-size 50g
 ```
 
@@ -223,11 +225,19 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 | `journalctl -u pcdn-agent -f` | لاگ agent |
 | `curl -H 'Host: health.pcdn' http://127.0.0.1/__pcdn/health` | سلامت نود |
 | `curl -X PATCH ".../api/v1/edges/ID?enabled=false" -H "Authorization: Bearer $KEY"` | خارج کردن موقت نود از سرویس (برای نگهداری) |
+| `curl -X PATCH .../api/v1/edges/ID -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{"capacity_mbps":1000}'` | ثبت ظرفیت نود (برای [خروج خودکار از DNS هنگام بار زیاد](#حالت-تونل-vpn-از-طریق-cdn)) |
 | `curl -X POST .../api/v1/edges/ID/rotate-token -H "Authorization: Bearer $KEY"` | تعویض توکن نود |
 
 ---
 
 ## ۴. نصب ماژول WHMCS
+
+> راهنمای کامل WHMCS، شامل پنل مدیریت CDN، ساخت خودکار پلن‌ها و قیمت‌ها و سناریوی سفارش مشتری، در [`docs/WHMCS.md`](docs/WHMCS.md) آمده است. خلاصه آن:
+> 1. پوشه‌های `whmcs/modules/servers/pasargadcdn` و `whmcs/modules/addons/pasargadcdn_admin` را آپلود کنید.
+> 2. افزونه «مدیریت CDN پاسارگاد» را در `System Settings → Addon Modules` فعال کنید و دسترسی نقش مدیران را به آن بدهید.
+> 3. سرور را تعریف کنید و از صفحه «پلن‌ها و قیمت‌گذاری» جادوی ساخت محصولات را اجرا کنید.
+>
+> مراحل دستی زیر برای مواقعی است که بخواهید محصولات را خودتان بسازید.
 
 1. پوشه `whmcs/modules/servers/pasargadcdn` را در مسیر `modules/servers/` نصب WHMCS در `my.pasargadmizban.com` کپی کنید:
    ```bash
@@ -295,16 +305,99 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 
 ## GeoDNS (ترافیک ایران از نودهای داخل)
 
-به‌طور پیش‌فرض، همه نودهای سالم به‌صورت تصادفی در پاسخ DNS قرار می‌گیرند. برای اینکه کاربران ایرانی به نودهای `home` و بقیه به نودهای `global` هدایت شوند، این مراحل را انجام دهید:
+به‌طور پیش‌فرض، همه نودهای سالم به‌صورت تصادفی در پاسخ DNS قرار می‌گیرند. با GeoDNS:
+- کاربران ایران فقط نودهای `home` را می‌گیرند و بقیه کاربران فقط نودهای `global` را.
+- اگر همه نودهای یک گروه از کار بیفتند، گروه دیگر خودکار جایگزین می‌شود.
 
-1. دیتابیس رایگان [GeoLite2-City](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) را دانلود کنید و در کانتینر PowerDNS در مسیر `/etc/powerdns/GeoLite2-City.mmdb` قرار دهید. برای این کار یک volume اضافه کنید.
-2. یک فایل `/etc/powerdns/geo-zones.yaml` با محتوای `domains: []` بسازید.
-3. سه خط `launch+=geoip`، `geoip-database-files` و `geoip-zones-file` را در `dns/pdns.conf` از حالت توضیح خارج کنید.
-4. در `.env` مقدار `GEOIP_ENABLED=true` را تنظیم کنید. در صورت تمایل `LUA_SELECTOR=pickclosest` را هم بگذارید.
+**چطور کار می‌کند:**
+- **هر دو نیم‌سرور همیشه یک جواب می‌دهند.** اینکه کدام گروه آنلاین است را کنترلر از گزارش نودها (هر ۲۰ ثانیه) تعیین می‌کند. این تصمیم به بررسی سلامتِ خود نیم‌سرورها سپرده نمی‌شود، چون مثلاً ns2 در خارج ممکن است به نودهای ایران دسترسی نداشته باشد و کاربران ایرانی را به خارج بفرستد. بررسی سلامت PowerDNS (`EDGE_PROBE`) فقط بین نودهای همان گروه انتخاب می‌کند.
+- **IPv6:** اگر نودهای ایران IPv6 نداشته باشند، کاربر ایرانی رکورد AAAA خالی می‌گیرد و با IPv4 به نود ایران وصل می‌شود؛ دیگر IPv6 نود خارج به او داده نمی‌شود.
+- **کشور کاربر:** اگر resolver زیرشبکه کاربر را بفرستد (EDNS Client Subnet، مثل Google 8.8.8.8 و resolverهای ISPهای ایران)، کشور از روی زیرشبکه کاربر تعیین می‌شود؛ وگرنه از روی IP خود resolver. Cloudflare (1.1.1.1) و Quad9 (9.9.9.9) زیرشبکه کاربر را نمی‌فرستند و سرورهایشان خارج از ایران است، پس کاربرانشان به گروه `GEO_NO_ECS_POOL` (پیش‌فرض `home`) فرستاده می‌شوند. بهای این انتخاب این است که کاربران خارجیِ همین دو سرویس هم نود ایران می‌گیرند. برای محدود کردن این قاعده، `GEO_NO_ECS_COUNTRIES` را روی کشورهایی بگذارید که ترافیک کاربران ایرانی به این resolverها در آن‌ها فرود می‌آید (مثلاً `DE,BG,TR`). این کشورها را با `GEO_LOG` و تست از نقاط ایران پیدا کنید. کاربران همین دو سرویس در بقیه کشورها (مثل آمریکا یا ژاپن) نود خارج را می‌گیرند.
+- **دیتابیس کشورها:** `deploy/geoip-update.sh` دیتابیس DB-IP Lite را با ثبت‌های رسمی RIPE NCC ترکیب می‌کند. DB-IP حدود ۵٪ از رنج‌های ثبت‌شده برای ایران را در کشورهای دیگر نشان می‌دهد (مثلاً IPهای ایرانی که در آلمان announce شده‌اند). با این ترکیب، این رنج‌ها هم ایران شناخته می‌شوند. برای اصلاح دستی یک رنج، فایل `dns/geo/overrides.txt` را بسازید (نمونه: `dns/geo/overrides.txt.example`).
 
-بعد از این تغییرات، پاسخ DNS برای کاربران ایران ابتدا نودهای `home` است. اگر همه نودهای `home` از دسترس خارج شوند، نودهای `global` جایگزین می‌شوند. برای بقیه کاربران برعکس است.
+**روی سرور کنترل‌پنل (ns1):**
 
----
+1. دیتابیس کشورها را بسازید (فقط python3 لازم است؛ حدود ۲۰ ثانیه و ۱۰۰ مگابایت رم):
+   ```bash
+   cd /opt/pcdn && sudo git pull && sudo deploy/geoip-update.sh --no-restart
+   ```
+2. به `.env` این دو خط را اضافه کنید:
+   ```
+   COMPOSE_FILE=docker-compose.yml:deploy/geoip.override.yml
+   GEOIP_ENABLED=true
+   ```
+3. سرویس‌ها را بالا بیاورید. کنترلر با تغییر تنظیمات GeoDNS همه زون‌ها را خودش دوباره می‌نویسد؛ `dns-sync` این کار را فوری انجام می‌دهد:
+   ```bash
+   sudo docker compose up -d --build
+   sudo docker compose exec controller python -m app.manage dns-sync
+   ```
+4. برای به‌روزرسانی هفتگی دیتابیس، کران اضافه کنید:
+   ```bash
+   echo '0 4 * * 1 root /opt/pcdn/deploy/geoip-update.sh >> /var/log/pcdn-geoip.log 2>&1' | sudo tee /etc/cron.d/pcdn-geoip
+   ```
+
+**روی ns2 (اگر جداست)** دقیقاً همین دیتابیس لازم است. اگر ns2 آن را نداشته باشد، همه کاربرانی که resolverشان از ns2 می‌پرسد اشتباه هدایت می‌شوند:
+```bash
+cd /opt/pcdn && sudo git pull && sudo deploy/geoip-update.sh --no-restart
+cd deploy && sudo PDNS_API_KEY=... docker compose -f ns2-compose.yml -f ns2-geoip.override.yml up -d
+echo '0 4 * * 1 root /opt/pcdn/deploy/geoip-update.sh >> /var/log/pcdn-geoip.log 2>&1' | sudo tee /etc/cron.d/pcdn-geoip
+```
+
+**بررسی (روی سرور کنترل‌پنل):**
+```bash
+sudo docker compose exec controller python -m app.manage geo-check
+# با IP یک کاربر مشخص (مثلاً IP گوشی‌تان از سایت‌هایی مثل ipinfo.io):
+sudo docker compose exec controller python -m app.manage geo-check --ip 5.120.10.1
+```
+این دستور از هر نیم‌سرور می‌پرسد که یک کاربر ایرانی و یک کاربر خارجی کدام گروه را می‌گیرند. اگر یکی از نیم‌سرورها دیتابیس کشورها را نداشته باشد یا جواب نیم‌سرورها با هم فرق کند، خطا می‌دهد. کنترلر همین آزمون را هر ۱۰ دقیقه خودکار اجرا می‌کند و در صورت خطا هشدار می‌فرستد. نتیجه در `/healthz/deep` هم دیده می‌شود.
+
+هر زون یک رکورد تشخیصی `_pcdn-geo` دارد که تصمیم GeoDNS را برای همان کسی که می‌پرسد نشان می‌دهد:
+```bash
+dig +short TXT _pcdn-geo.example.com                   # از سیستم خود کاربر
+dig +short TXT _pcdn-geo.example.com @NS2_IP +subnet=5.120.10.0/24
+# "ip=5.120.10.0 ecs=yes resolver=... country=ir pool=home"
+```
+
+**اگر کاربران یک شهر یا ISP خاص هنوز نود خارج می‌گیرند:** در `.env` کنترلر `GEO_LOG=true` بگذارید و `sudo docker compose up -d` بزنید. کنترلر زون‌ها را خودش دوباره می‌نویسد. بعد از آن، PowerDNS هر تصمیم را در لاگ ثبت می‌کند. از آن محل دوباره تست کنید و روی **هر دو** نیم‌سرور لاگ را ببینید:
+```bash
+sudo docker compose logs --since 10m pdns | grep pcdn-geo              # روی سرور پنل
+sudo docker logs --since 10m deploy-pdns-1 2>&1 | grep pcdn-geo         # روی ns2
+# pcdn-geo www.example.com. A resolver=185.x.x.x ecs=- country=de pool=global
+```
+- `resolver`: آدرس resolver آن کاربر.
+- `ecs`: زیرشبکه کاربر، اگر resolver آن را فرستاده باشد.
+- `country`: کشوری که دیتابیس برای این آدرس تشخیص داده است.
+
+اگر resolver یک سرویس عمومی بدون ECS باشد، رنجش را به `GEO_NO_ECS_RESOLVERS` اضافه کنید. آن متغیر را کامل بنویسید، چون جایگزین فهرست پیش‌فرض می‌شود. اگر آدرس ایرانی است ولی کشور اشتباه تشخیص داده شده، آن را در `dns/geo/overrides.txt` بنویسید و `deploy/geoip-update.sh` را روی هر دو سرور اجرا کنید. بعد از بررسی `GEO_LOG` را دوباره `false` کنید.
+
+> **هنگام تست دقت کنید:** اگر VPN یا پروکسی روشن باشد، کاربر از کشور سرور VPN دیده می‌شود و درست است که به نود خارج برود. resolverها جواب را تا `PROXIED_TTL` (پیش‌فرض ۶۰ ثانیه) کش می‌کنند.
+
+اگر `download.db-ip.com` یا `ftp.ripe.net` از سرور در دسترس نبود، `DBIP_URL_BASE` و `RIPE_URL` را به یک آینه (یا `file:///...`) بدهید. اگر فقط فایل RIPE در دسترس نباشد، اسکریپت با هشدار از DB-IP تنها استفاده می‌کند.
+
+## حالت تونل (VPN از طریق CDN)
+
+مشتری می‌تواند سرور Xray / V2Ray / sing-box خود را پشت CDN بگذارد (WebSocket، HTTPUpgrade، gRPC، XHTTP و HTTP/2 خام). کاربر به نود داخل ایران وصل می‌شود و نود، اتصال طولانی را بدون بافر، کش و فیلترهای امنیتی به سرور مشتری می‌رساند. قرارداد کامل در بخش ۷ [`docs/SPEC.md`](docs/SPEC.md) آمده است.
+
+**پلن:** در WHMCS یا با `PATCH /api/v1/sites/{domain}/plan` قابلیت‌های `tunnel`، `max_tunnel_paths`، `max_tunnel_connections` (اتصال همزمان هر سایت روی هر نود)، `tunnel_max_mbps` (سقف سرعت هر اتصال) و `edge_group` را تنظیم کنید. مشتری مسیرهای تونل را در بخش `tunnel` تعریف می‌کند. ترافیک تونل در هر دو جهت (دانلود و آپلود) در مصرف ماهانه حساب می‌شود.
+
+**گروه نودها:** هر نود `group` دارد: `general` (پیش‌فرض) یا `tunnel`. همه نودها کانفیگ همه سایت‌ها را می‌گیرند، ولی DNS هر سایت فقط نودهای آنلاینِ گروهِ `edge_group` پلن آن سایت را برمی‌گرداند. این‌طوری ترافیک سنگین VPN روی نودهای جدا می‌ماند و سایت‌های معمولی کند نمی‌شوند. اگر هیچ نودی از آن گروه آنلاین نباشد، همه نودهای آنلاین جواب می‌دهند. تقسیم `home`/`global` در GeoDNS داخل هر گروه مثل قبل انجام می‌شود.
+
+**ظرفیت و خروج خودکار از DNS:** برای هر نود `capacity_mbps` (پهنای باند واقعی پورت) را ثبت کنید. agent هر ۲۰ ثانیه مصرف (`rx_mbps`، `tx_mbps`، تعداد اتصال و load) را گزارش می‌دهد. وقتی مصرف یک نود به `EDGE_SHED_PERCENT` درصد ظرفیت (پیش‌فرض ۹۰) برسد، تا وقتی نود دیگری از همان گروه و منطقه در DNS باشد، این نود از پاسخ‌ها کنار می‌رود. وقتی مصرف به زیر `EDGE_SHED_PERCENT - 15` درصد برگردد، نود دوباره در DNS قرار می‌گیرد. اتصال‌های باز قطع نمی‌شوند؛ فقط کاربران جدید به نودهای دیگر می‌روند. اگر نود خارج شود یا در سه گزارش پشت سر هم بالای ۸۰٪ بماند، هشدار `edge_saturated` فرستاده می‌شود. با `capacity_mbps: 0` این رفتار خاموش است.
+
+```bash
+# نود مخصوص تونل با پورت ۱ گیگابیت
+curl -X POST https://cdn-api.pasargadmizban.com/api/v1/edges -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"ir-thr-t1","ipv4":"5.160.x.x","region":"home","group":"tunnel","capacity_mbps":1000}'
+# تغییر گروه / ظرفیت / منطقه یک نود موجود
+curl -X PATCH https://cdn-api.pasargadmizban.com/api/v1/edges/ID -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{"group":"tunnel","capacity_mbps":1000}'
+```
+مصرف لحظه‌ای هر نود در فیلد `metrics` و وضعیت خروج از DNS در فیلد `shed` خروجی `GET /api/v1/edges` دیده می‌شود.
+
+| متغیر `.env` | پیش‌فرض | کاربرد |
+|---|---|---|
+| `EDGE_SHED_PERCENT` | `90` | درصدی از `capacity_mbps` که نود از آن به بعد از DNS کنار می‌رود (بازگشت: ۱۵ درصد پایین‌تر) |
 
 ## مرجع API
 
@@ -316,7 +409,9 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 | POST | `/api/v1/sites` | ساخت سایت `{domain, external_id?, origin_ip?, plan{..., features{...}}}` |
 | GET | `/api/v1/sites` · `/api/v1/sites/{domain}` | فهرست / جزئیات سایت (شامل `config` همه بخش‌ها) |
 | PATCH | `/api/v1/sites/{domain}/plan` | تغییر پلن و قابلیت‌ها |
-| GET / PUT | `/api/v1/sites/{domain}/config/{section}` | بخش‌های `cache`، `ssl`، `waf`، `ddos`، `firewall`، `ratelimit`، `pagerules`، `pools`، `headers`، `hotlink`، `image` و `errorpages` |
+| GET / PUT | `/api/v1/sites/{domain}/config/{section}` | بخش‌های `cache`، `ssl`، `waf`، `ddos`، `firewall`، `ratelimit`، `pagerules`، `pools`، `headers`، `hotlink`، `image`، `errorpages` و `tunnel` |
+| GET | `/api/v1/sites/{domain}/tunnel/stats?hours=24` | آمار ساعتی تونل (نشست، مدت، آپلود و دانلود) |
+| POST | `/api/v1/sites/{domain}/tunnel/check` | بررسی دسترسی کنترلر به سرور مقصد هر مسیر تونل (TCP و TLS) |
 | PATCH | `/api/v1/sites/{domain}/settings` | تنظیمات v1 (برای سازگاری) |
 | POST | `/api/v1/sites/{domain}/suspend` · `/unsuspend` | تعلیق / رفع تعلیق |
 | DELETE | `/api/v1/sites/{domain}` | حذف سایت و زون |
@@ -332,7 +427,7 @@ curl -H "Authorization: Bearer $KEY" https://cdn-api.pasargadmizban.com/api/v1/e
 | GET | `/api/v1/sites/{domain}/events?limit=100` | رویدادهای امنیتی |
 | GET | `/api/v1/sites/{domain}/usage?days=30` | مصرف روزانه |
 | GET | `/api/v1/usage?month=YYYY-MM` | مصرف ماهانه همه سایت‌ها (برای WHMCS) |
-| GET/POST/PATCH/DELETE | `/api/v1/edges[/{id}]` | مدیریت نودها |
+| GET/POST/PATCH/DELETE | `/api/v1/edges[/{id}]` | مدیریت نودها (`group`، `capacity_mbps`؛ PATCH با بدنه JSON یا `?enabled=`) |
 
 مسیرهای `/edge/v1/*` مخصوص agent هستند و با توکن نود احراز هویت می‌شوند: `config` (با ETag)، `heartbeat`، `purges` و `usage` (که آمار و رویدادها را هم شامل می‌شود).
 
@@ -370,7 +465,7 @@ docs/EDGE.md           معماری نود
 ## تست‌ها
 
 ```bash
-cd controller && pip install -r requirements-dev.txt && python -m pytest -q       # ۲۵ تست
+cd controller && pip install -r requirements-dev.txt && python -m pytest -q       # ۹۱ تست (۱۲ تست PostgreSQL با PCDN_TEST_PG_URL)
 # تست‌های نود روی nginx واقعی با njs اجرا می‌شوند (Ubuntu 24.04 + ماژول‌های بالا، با دسترسی root)
 sudo python3 -m pytest -q edge/tests                                              # ۴۶ تست
 find whmcs -name '*.php' -exec php -l {} \;
@@ -379,6 +474,18 @@ find whmcs -name '*.php' -exec php -l {} \;
 این تست‌ها روی GitHub Actions هم اجرا می‌شوند (`.github/workflows/ci.yml`).
 
 ---
+
+## نگهداری و عملیات
+
+راهنمای کامل نگهداری در [`docs/OPERATIONS.md`](docs/OPERATIONS.md) آمده است و این موارد را پوشش می‌دهد:
+- **مهاجرت دیتابیس (Alembic):** در هر بار شروع خودکار اجرا می‌شود.
+- **هشدار تلگرام و ایمیل:** برای قطع شدن نودها، خطای DNS، مشکلات SSL و شکست پشتیبان‌گیری.
+- **پشتیبان‌گیری روزانه:** رمزنگاری‌شده، با امکان آپلود روی فضای S3 مثل فضای ابری آروان، و راهنمای بازیابی.
+- **High Availability:** چند نسخه کنترلر با انتخاب رهبر، و راهنمای راه‌اندازی دو سروره.
+- **رمزنگاری کلیدها و تعویض کلید.**
+- **پایش سلامت** از طریق `/healthz/deep`.
+
+دستورهای مدیریتی با `docker compose exec controller python -m app.manage <command>` اجرا می‌شوند.
 
 ## عیب‌یابی
 
@@ -403,7 +510,7 @@ find whmcs -name '*.php' -exec php -l {} \;
 - **اعتبارسنجی ورودی:** همه ورودی‌ها در کنترلر اعتبارسنجی می‌شوند. به‌عنوان نمونه، IP خصوصی یا loopback به‌عنوان Origin پذیرفته نمی‌شود. agent هم پیش از نوشتن کانفیگ nginx، نام‌ها و Originها را دوباره بررسی می‌کند.
 - **کلید خصوصی SSL:**
   - روی نودها در فایلی با دسترسی `600` ذخیره می‌شود.
-  - در دیتابیس کنترلر رمزنگاری نمی‌شود، پس دسترسی به دیتابیس را محدود کنید.
+  - در دیتابیس کنترلر با `DATA_ENCRYPTION_KEY` رمزنگاری می‌شود (همین‌طور کلید چالش‌های امنیتی هر سایت). اگر کلید تنظیم نشده باشد، در لاگ شروع و در `/healthz/deep` هشدار داده می‌شود. جزئیات در [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 - **رفتار امن‌تر از مشخصات:**
   - در کش تهاجمی و قانون «کش همه‌چیز»، پاسخ‌هایی که کوکی تنظیم می‌کنند هرگز کش نمی‌شوند تا نشست یک کاربر به کاربر دیگر نرسد.
   - اگر کشور یک IP مشخص نباشد، شرط کشور در فایروال برقرار نمی‌شود. به این ترتیب قانون «همه به‌جز ایران را مسدود کن» در نبود دیتابیس GeoIP همه را مسدود نمی‌کند.
@@ -412,3 +519,34 @@ find whmcs -name '*.php' -exec php -l {} \;
   - فقط روش تغییر NS پشتیبانی می‌شود، مشابه آروان. روش CNAME (partial setup) پیاده‌سازی نشده است.
   - گواهی wildcard فقط یک سطح زیردامنه را پوشش می‌دهد. `a.b.example.com` را پوشش نمی‌دهد.
 - **محافظت در برابر حمله:** Rate limit و مسدودسازی IP محافظت پایه‌ای هستند. در برابر حملات حجیم لایه ۳ و ۴، به ظرفیت و فیلترینگ دیتاسنتر نودها نیاز دارید.
+
+---
+
+## معماری در یک نگاه
+
+سامانه از چهار لایه تشکیل شده است. **WHMCS** فروشگاه و صورت‌حساب است و همهٔ کنش‌ها را با کلید ادمین
+به **کنترلر** (FastAPI) می‌فرستد. کنترلر مغز سامانه است: مدل داده در PostgreSQL، صدور خودکار SSL،
+نوشتن زون‌ها در **PowerDNS** (با GeoDNS و استخرهای home/global)، failover نودها، سهمیه، هشدار و
+پشتیبان‌گیری. **Caddy** جلوی کنترلر TLS را پایان می‌دهد و بار را بین نمونه‌های کنترلر پخش می‌کند.
+
+نودهای **Edge** (nginx + njs + `pcdn-agent`) ترافیک واقعی را سرو می‌کنند. عامل نود همه‌چیز را از
+کنترلر **pull** می‌کند — کانفیگ، گواهی، purge — و فقط heartbeat، آمار مصرف و لاگ‌های عملیاتی را
+برمی‌گرداند؛ هیچ push کد/دستوری از کنترلر به نود نیست، پس قطعی کنترلر سرو سایت‌ها را متوقف نمی‌کند.
+رکوردهای پروکسی به‌صورت رکورد LUA با health check فقط IP نودهای سالم را برمی‌گردانند، و برای نودهای
+چندآدرسه failover مبتنی بر سلامت با قاعدهٔ fail-open کار می‌کند.
+
+کنترلر بدون وضعیت است و برای دسترس‌پذیری بالا می‌توان چند نمونه را هم‌زمان اجرا کرد؛ تنها «رهبر»
+(انتخاب‌شده با advisory lock در PostgreSQL) کارهای زمان‌بند را اجرا می‌کند. اسرار در `.env` (و کلید
+خصوصی گواهی‌ها رمزنگاری‌شده در دیتابیس) زندگی می‌کنند و API PowerDNS و دیتابیس هرگز روی اینترنت باز
+نیستند.
+
+### راهنماها
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — معماری کامل: اجزا، گذر درخواست، پورت‌ها، مرزهای اعتماد، تونل و HA
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — عملیات: migration، هشدار، پشتیبان‌گیری، HA، رمزنگاری، مانیتورینگ
+- [`docs/DISASTER_RECOVERY.md`](docs/DISASTER_RECOVERY.md) — بازیابی از فاجعه: دیتابیس، کنترلر، نود، کلیدها، DNS
+- [`docs/SECURITY.md`](docs/SECURITY.md) — چک‌لیست سخت‌سازی امنیتی
+- [`docs/NODES.md`](docs/NODES.md) — عملیات نودها: نصب تک‌دستوری، به‌روزرسانی، آدرس‌های چندگانه، عیب‌یابی
+- [`docs/UPGRADE.md`](docs/UPGRADE.md) — به‌روزرسانی سامانه
+- [`docs/API.md`](docs/API.md) — مرجع API
+- [`docs/WHMCS.md`](docs/WHMCS.md) — راهنمای ماژول و پنل WHMCS

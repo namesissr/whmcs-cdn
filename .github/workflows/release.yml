@@ -1,0 +1,116 @@
+# Releases (SPEC §16.2). Push a tag and this workflow builds, signs and publishes a GitHub release:
+#   git tag cli/v0.1.0      && git push origin cli/v0.1.0       -> the `pcdn` CLI (cli/.goreleaser.yml)
+#   git tag provider/v0.1.0 && git push origin provider/v0.1.0  -> terraform-provider-pcdn
+#                                                                  (terraform-provider-pcdn/.goreleaser.yml)
+# Repository secrets (Settings -> Secrets and variables -> Actions; see docs/CLI.md):
+#   GPG_PRIVATE_KEY  ASCII-armored private signing key (gpg --armor --export-secret-keys FPR)
+#   PASSPHRASE       its passphrase
+# The key is only ever imported into the runner's keyring; nothing secret is committed.
+#
+# GoReleaser OSS cannot parse prefixed (monorepo) tags, so a local, never-pushed `vX.Y.Z` tag is made
+# on the same commit, GoReleaser builds/signs into dist/ with its own release step disabled, and the
+# files are uploaded here to the release of the real tag.
+name: Release
+
+on:
+  push:
+    tags:
+      - "cli/v*"
+      - "provider/v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve component and version from the tag
+        id: meta
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          case "$TAG" in
+            cli/v*)      component=cli;      dir=cli;                     version="${TAG#cli/v}" ;;
+            provider/v*) component=provider; dir=terraform-provider-pcdn; version="${TAG#provider/v}" ;;
+            *) echo "::error::unexpected tag $TAG"; exit 1 ;;
+          esac
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag $TAG is not <component>/vMAJOR.MINOR.PATCH[-pre]"; exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "component=$component"
+            echo "dir=$dir"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ steps.meta.outputs.dir }}/go.mod
+          cache-dependency-path: ${{ steps.meta.outputs.dir }}/go.mod
+
+      - name: Test before releasing
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Import the GPG signing key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: Local version tag for GoReleaser (never pushed)
+        run: git tag -f "v${{ steps.meta.outputs.version }}" "$GITHUB_SHA"
+
+      - name: Build, checksum and sign
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          workdir: ${{ steps.meta.outputs.dir }}
+          args: release --clean
+        env:
+          GORELEASER_CURRENT_TAG: v${{ steps.meta.outputs.version }}
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+
+      - name: Verify the checksum signature
+        working-directory: ${{ steps.meta.outputs.dir }}/dist
+        run: |
+          sums=$(ls ./*_SHA256SUMS)
+          gpg --batch --verify "$sums.sig" "$sums"
+          if [ "${{ steps.meta.outputs.component }}" = provider ]; then
+            # the registry manifest is listed in SHA256SUMS; ship it next to the zips
+            cp ../terraform-registry-manifest.json \
+              "terraform-provider-pcdn_${{ steps.meta.outputs.version }}_manifest.json"
+          fi
+          sha256sum --check --ignore-missing "$sums"
+
+      - name: Publish the GitHub release
+        working-directory: ${{ steps.meta.outputs.dir }}/dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          COMPONENT: ${{ steps.meta.outputs.component }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          shopt -s nullglob
+          files=(./*.tar.gz ./*.zip ./*_SHA256SUMS ./*_SHA256SUMS.sig ./*_manifest.json)
+          if [ "$COMPONENT" = cli ]; then title="pcdn CLI v$VERSION"; else title="terraform-provider-pcdn v$VERSION"; fi
+          flags=(--title "$title" --generate-notes --verify-tag)
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "${flags[@]}" "${files[@]}"

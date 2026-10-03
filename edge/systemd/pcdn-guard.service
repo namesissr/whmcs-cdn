@@ -1,0 +1,17 @@
+[Unit]
+Description=Pasargad CDN host network guard (nftables table inet pcdn_guard, SPEC §16.3)
+# loaded after the distribution firewall so a `flush ruleset` there cannot drop it; restarted with it
+After=network-pre.target nftables.service
+PartOf=nftables.service
+ConditionPathExists=/etc/pcdn/guard.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# the file replaces any previous version of the table atomically (table / delete / table)
+ExecStart=/usr/sbin/nft -f /etc/pcdn/guard.nft
+ExecReload=/usr/sbin/nft -f /etc/pcdn/guard.nft
+ExecStop=-/usr/sbin/nft delete table inet pcdn_guard
+
+[Install]
+WantedBy=multi-user.target

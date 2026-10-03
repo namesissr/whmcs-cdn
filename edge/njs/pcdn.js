@@ -7,8 +7,20 @@
 // Exports:
 //   verdict  js_set $pcdn_verdict  — "ok" | "<action>:<source>:<rule>"
 //   upstream js_set $pcdn_upstream — "host:port" chosen from a load-balancer pool
-//   imgW/imgH/imgQ js_set          — image resize parameters ("" = no resize)
+//   tunnelUpstream js_set $pcdn_tn_upstream — same for the pool of a tunnel path ($pcdn_tn_pool)
+//   tunnelFair js_set $pcdn_tn_fair — "1" refuses a NEW tunnel session while the node is hot (SPEC §15.2)
+//   fairSet                        — js_content of the localhost-only /__pcdn/fair (agent: hot / drain flags)
+//   tunnelDrain js_set $pcdn_tn_drain — "1" refuses the first request of a new connection while draining (SPEC §22.1)
+//   hcSet                          — js_content of the localhost-only /__pcdn/hc (agent TCP health, SPEC §22.4)
+//   speedDown / speedUp            — js_content of /__pcdn/speed/down|up (SPEC §15.6)
+//   imgW/imgH/imgQ js_set          — image resize / transform parameters ("" = none; SPEC §2, §16.6)
+//   videoNext js_set $pcdn_vnext   — next HLS/DASH segment to prefetch ("" = none; SPEC §16.5)
+//   bodyNeed js_set $pcdn_bodychk  — "1" when a WAF pack inspects this request's body (SPEC §14.2)
+//   bodyInspect                    — js_content for /__pcdn/body/*: inspects the body, then proxies
+//   tfHeaders js_header_filter     — conditional transform-rule response headers (SPEC §14.2)
 //   deny / verify / captcha        — js_content handlers for /__pcdn/*
+//   accessEmail js_set $pcdn_acc_email — signed-in email of an access app (SPEC §18.2)
+//   accessLogin/Send/Verify/Logout — js_content of /__pcdn/access/* (SPEC §18.2)
 //   health                         — js_periodic origin health checker
 //
 // njs 0.8.2 notes: no destructuring/spread/classes/optional chaining/BigInt,
@@ -61,6 +73,27 @@ function esc(s) {
 function reOrNull(src, flags) {
     if (src === null || src === undefined || src === '') return null;
     try { return new RegExp(src, flags); } catch (e) { return null; }
+}
+
+// Customer regexes (security review H2). pcdn-agent re-checks every one before it reaches sites.js
+// (regex_unsafe: length, nested quantifiers, overlapping repeated alternatives, polynomial chains)
+// and skips unsafe rules; this is the backstop for anything that slips past it: a length cap, no
+// back-references, no repeated single quantified atom such as (a+)+ / (.*)* / ([a-z]+)* (a subset of
+// what the agent rejects, so both agree), at most RE_INPUT_MAX characters of a value are tested,
+// and a PCRE2 match-limit error counts as "no match" instead of failing the whole verdict.
+const RE_SRC_MAX = 256, RE_INPUT_MAX = 1024;   // pcdn-agent REGEX_MAX_LEN / REGEX_INPUT_MAX_NJS
+const RE_NESTED = /\((?:\?:)?(?:\.|\\[dDwWsS]|\[(?:\\.|[^\]\\])*\]|[^()\\|*+?{}\[\]])[*+]\)(?:[*+]|\{(?:\d*,|0*[2-9]|0*[1-9]\d))/;
+
+function custRe(src) {
+    src = String(src === null || src === undefined ? '' : src);
+    if (!src || src.length > RE_SRC_MAX || /\\[1-9]/.test(src) || RE_NESTED.test(src)) return null;
+    return reOrNull(src, 'i');
+}
+
+function rxTest(re, v, cap) {
+    v = String(v);
+    if (cap && v.length > cap) v = v.substring(0, cap);
+    try { return re.test(v); } catch (e) { return false; }
 }
 
 // ------------------------------------------------------------------ IP / CIDR
@@ -179,7 +212,146 @@ const WAF_RULES = [
     { id: 913120, g: 'scanner', pl: 1, t: 'p', re: /\/\.(?:git|svn|hg|env)(?:\/|$)/ },
     { id: 913130, g: 'scanner', pl: 2, t: 'p', re: /\.(?:sql|bak|old|swp|orig)$|\/wp-config\.php./ },
     { id: 913110, g: 'scanner', pl: 3, t: 'u', re: /python-requests|go-http-client|libwww-perl|^curl\/|^wget\// },
+
+    // ---- managed rule packs (SPEC §14.2): enabled per site by waf.packs (k = pack), independent of
+    // waf.groups, honouring waf.mode / paranoia / exclusions like every other rule. Stable ids in a
+    // reserved range per pack (see WAF_PACK_VERSION). Targets as above plus a: the whole query string.
+    // Patterns are linear-time: no nested or overlapping quantifiers (checked by the unit tests).
+    // generic 990xxx
+    { id: 990100, k: 'generic', pl: 1, t: 'p', re: /\/(?:c99|c100|r57|wso\d{0,2}|b374k|alfa(?:shell)?|indoxploit|webshell|leafmailer|priv8)\.ph(?:p\d?|tml|ar)$/ },
+    { id: 990110, k: 'generic', pl: 1, t: 'p', re: /\/(?:backups?|bak|db|database|dump|sql|site|www|wwwroot|htdocs|public_html|web|html|archive|old)\.(?:zip|rar|7z|tar|tgz|tar\.gz|tar\.bz2|gz|bz2|sql|sql\.gz|bak)$/ },
+    { id: 990120, k: 'generic', pl: 1, t: 'p', re: /\/(?:\.ds_store|thumbs\.db|web\.config|\.user\.ini|php\.ini|\.npmrc|\.dockerenv|docker-compose\.ya?ml|dockerfile|id_[rd]sa|\.pgpass|\.my\.cnf|sftp-config\.json|\.ftpconfig|\.git-credentials|\.netrc)$/ },
+    { id: 990130, k: 'generic', pl: 1, t: 'p', re: /\/(?:phpinfo\.php|server-status|server-info)\/?$/ },
+    { id: 990140, k: 'generic', pl: 1, t: 'q', re: /169\.254\.169\.254|\bmetadata\.google\.internal\b|100\.100\.100\.200|fd00:ec2::254/ },
+    { id: 990150, k: 'generic', pl: 2, t: 'p', re: /\/(?:phpmyadmin\d{0,2}|pma|myadmin|mysqladmin|sqladmin|dbadmin)(?:\/|$)|\/adminer[^\/]{0,32}\.php$/ },
+    { id: 990160, k: 'generic', pl: 1, t: 'p', re: /\/eval-stdin\.php$/ },
+    { id: 990170, k: 'generic', pl: 1, t: 'p', re: /\/actuator\/(?:env|heapdump|jolokia|gateway|threaddump|configprops|mappings)(?:\/|$)|\/(?:jmx-console|web-console|invoker\/jmxinvokerservlet)(?:\/|$)/ },
+    { id: 990180, k: 'generic', pl: 1, t: 'p', re: /\/\.\.;/ },
+    { id: 990190, k: 'generic', pl: 2, t: 'p', re: /\/cgi-bin\/(?:[^\/]{1,64}\.(?:sh|pl|cgi)|php\d?|test-cgi|printenv)$/ },
+    // wordpress 991xxx (xmlrpc bodies: WAF_BODY_XMLRPC; 991105 / 991170 are WAF_PACK_FN checks)
+    { id: 991120, k: 'wordpress', pl: 1, t: 'p', re: /\/\.?wp-config(?:\.php)?[^\/]{0,64}$/ },
+    { id: 991130, k: 'wordpress', pl: 1, t: 'a', re: /(?:^|&)author=\d/ },
+    { id: 991150, k: 'wordpress', pl: 1, t: 'p', re: /^\/wp-content\/uploads\/.{0,1024}\.(?:ph(?:p\d?|tml|ar|ps))(?:\/|$)/ },
+    { id: 991160, k: 'wordpress', pl: 1, t: 'p', re: /^\/wp-content\/debug\.log$/ },
+    { id: 991165, k: 'wordpress', pl: 2, t: 'p', re: /^\/wp-admin\/(?:install|setup-config)\.php$/ },
+    { id: 991180, k: 'wordpress', pl: 3, t: 'p', re: /^\/(?:readme\.html|license\.txt|wp-includes\/version\.php)$/ },
+    // joomla 992xxx
+    { id: 992100, k: 'joomla', pl: 1, t: 'p', re: /\/configuration\.php(?:[~#]|\.\w{1,8}|-dist)?$/ },
+    { id: 992120, k: 'joomla', pl: 1, t: 'uq', re: /\}__[a-z0-9_]{1,64}\|o:\d{1,6}:"|jdatabasedrivermysqli/ },
+    { id: 992140, k: 'joomla', pl: 2, t: 'p', re: /^\/administrator\/(?:manifests\/files\/joomla\.xml|logs\/|cache\/)/ },
+    { id: 992150, k: 'joomla', pl: 2, t: 'p', re: /^\/installation\// },
+    // drupal 993xxx
+    { id: 993100, k: 'drupal', pl: 1, t: 'q', re: /\[#(?:post_render|pre_render|access_callback|lazy_builder|markup|submit|validate)\]|(?:^|\/)#(?:value|markup|post_render|pre_render|lazy_builder|access_callback)(?:$|\/|\[)/ },
+    { id: 993110, k: 'drupal', pl: 1, t: 'q', re: /^name\[[^\]]{0,64}[;'"(]/ },
+    { id: 993120, k: 'drupal', pl: 1, t: 'p', re: /^\/sites\/[^\/]{1,128}\/(?:settings(?:\.local)?\.php|services\.yml)(?:[~#]|\.\w{1,8})?$/ },
+    { id: 993130, k: 'drupal', pl: 2, t: 'p', re: /^\/(?:core\/)?install\.php$/ },
+    { id: 993135, k: 'drupal', pl: 3, t: 'p', re: /^\/(?:core\/)?(?:update|cron|authorize)\.php$/ },
+    { id: 993140, k: 'drupal', pl: 3, t: 'p', re: /^\/(?:core\/)?changelog\.txt$/ },
+    // laravel 994xxx
+    { id: 994100, k: 'laravel', pl: 1, t: 'p', re: /\/\.env(?:$|[.\-_~])/ },
+    { id: 994110, k: 'laravel', pl: 1, t: 'p', re: /^\/_ignition\/(?:execute-solution|share-report|update-config)(?:\/|$)/ },
+    { id: 994115, k: 'laravel', pl: 2, t: 'p', re: /^\/_ignition\// },
+    { id: 994120, k: 'laravel', pl: 1, t: 'p', re: /^\/(?:_debugbar|__clockwork|_clockwork)(?:\/|$)/ },
+    { id: 994125, k: 'laravel', pl: 2, t: 'p', re: /^\/(?:telescope|horizon)(?:\/|$)/ },
+    { id: 994130, k: 'laravel', pl: 1, t: 'p', re: /\/storage\/logs\/[^\/]{1,128}\.log$|\/storage\/framework\/sessions\// },
+    { id: 994140, k: 'laravel', pl: 2, t: 'p', re: /^\/(?:composer\.(?:json|lock)|artisan|server\.php|phpunit\.xml(?:\.dist)?)$/ },
+    { id: 994150, k: 'laravel', pl: 1, t: 'p', re: /^\/vendor\/.{1,1024}\.php$/ },
+    // api 995xxx (JSON bodies: inspectJson; header / size checks: WAF_PACK_FN)
+    { id: 995150, k: 'api', pl: 1, t: 'q', re: /__proto__|constructor\[prototype\]|constructor\.prototype/ },
+    { id: 995160, k: 'api', pl: 1, t: 'q', re: /\[\$(?:where|function|accumulator|expr)\]|^\$(?:where|function|accumulator)$/ },
+    { id: 995165, k: 'api', pl: 2, t: 'q', re: /\[\$(?:ne|eq|gt|gte|lt|lte|in|nin|regex|exists|or|and|not|nor|elemmatch|size|type|all)\]/ },
 ];
+
+// rule-pack versions (SPEC §14.2 "versioned rule sets"): bumped when a pack's rules change; ids are
+// never reused for a different check. Reserved id ranges: generic 990000-990999, wordpress
+// 991000-991999, joomla 992000-992999, drupal 993000-993999, laravel 994000-994999, api 995000-995999.
+const WAF_PACK_VERSION = { generic: 1, wordpress: 1, joomla: 1, drupal: 1, laravel: 1, api: 1 };
+
+// request bodies are inspected (wordpress xmlrpc.php, api JSON) only when their declared length is
+// at most BODY_CAP: the body is read into memory by bodyInspect before it is proxied
+const BODY_CAP = 131072;
+const JSON_CT = /^application\/(?:[a-z0-9.+-]{0,64}\+)?json\s*(?:;|$)/i;
+const CT_SYNTAX = /^[a-z0-9!#$&^_.+-]{1,64}\/[a-z0-9!#$&^_.+-]{1,64}(?:\s*;\s*[a-z0-9!#$&^_.+-]{1,64}=(?:[^;",\s]{0,256}|"[^"]{0,256}"))*\s*$/i;
+const CT_EXPECTED = /^(?:application\/(?:[a-z0-9.+-]{0,64}\+)?(?:json|xml)|application\/(?:x-www-form-urlencoded|octet-stream|graphql|x-ndjson)|multipart\/form-data|text\/(?:plain|xml))\s*(?:;|$)/i;
+const STD_METHODS = { GET: 1, HEAD: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, OPTIONS: 1 };
+
+function bodyLen(r) {
+    const v = String(r.headersIn['Content-Length'] || '');
+    return /^\d{1,12}$/.test(v) ? +v : -1;
+}
+function hasBody(c) {
+    return bodyLen(c.r) > 0 || /chunked/i.test(String(c.r.headersIn['Transfer-Encoding'] || ''));
+}
+function bodyMethod(c) { return c.method === 'POST' || c.method === 'PUT' || c.method === 'PATCH'; }
+function methodOverride(c) {
+    const h = c.r.headersIn;
+    return String(h['X-HTTP-Method-Override'] || h['X-HTTP-Method'] || h['X-Method-Override'] || '');
+}
+
+// pack checks that need more than one regex on one target
+const WAF_PACK_FN = [
+    // xmlrpc.php POST whose body cannot be inspected (no length / larger than BODY_CAP): padding a
+    // system.multicall past the inspection limit must not be a bypass
+    { id: 991105, k: 'wordpress', pl: 1, f: function (c) {
+        if (c.method !== 'POST' || c.pathL !== '/xmlrpc.php') return false;
+        const n = bodyLen(c.r);
+        return n > BODY_CAP || (n < 0 && hasBody(c));
+    } },
+    // plugin / theme endpoint used for path traversal or wp-config disclosure
+    { id: 991140, k: 'wordpress', pl: 1, f: function (c) {
+        return /^\/wp-content\/(?:plugins|themes)\//.test(c.pathL)
+            && /\.\.[\/\\]|wp-config|etc\/passwd/.test(c.query().toLowerCase() + ' ' + c.pathL);
+    } },
+    // REST / ?rest_route user enumeration by visitors who are not logged in
+    { id: 991170, k: 'wordpress', pl: 2, f: function (c) {
+        return (/^\/wp-json\/wp\/v2\/users/.test(c.pathL) || /(?:^|&)rest_route=\/wp\/v2\/users/.test(c.query().toLowerCase()))
+            && !/(?:^|;)\s*wordpress_logged_in_/.test(String(c.r.headersIn.Cookie || ''));
+    } },
+    // CVE-2023-23752: unauthenticated configuration / user disclosure through the Joomla API
+    { id: 992110, k: 'joomla', pl: 1, f: function (c) {
+        return /^\/api\/index\.php\/v1\/(?:config\/application|users)/.test(c.pathL) && /(?:^|&)public=(?:true|1)\b/i.test(c.args);
+    } },
+    // component parameter carrying a traversal
+    { id: 992130, k: 'joomla', pl: 1, f: function (c) {
+        const q = c.query().toLowerCase();
+        return /(?:^|&)option=com_/.test(q) && /\.\.[\/\\]/.test(q);
+    } },
+    // body-carrying request without a Content-Type
+    { id: 995100, k: 'api', pl: 2, f: function (c) {
+        return bodyMethod(c) && hasBody(c) && !c.r.headersIn['Content-Type'];
+    } },
+    // syntactically invalid Content-Type
+    { id: 995110, k: 'api', pl: 1, f: function (c) {
+        const ct = c.r.headersIn['Content-Type'];
+        return ct !== undefined && !CT_SYNTAX.test(String(ct));
+    } },
+    // body of an unexpected media type
+    { id: 995120, k: 'api', pl: 2, f: function (c) {
+        const ct = c.r.headersIn['Content-Type'];
+        return bodyMethod(c) && hasBody(c) && ct !== undefined && !CT_EXPECTED.test(String(ct));
+    } },
+    // overlong request target
+    { id: 995130, k: 'api', pl: 2, f: function (c) { return c.rawUri.length > 4096; } },
+    // JSON body too large (or of unknown length) to be inspected
+    { id: 995140, k: 'api', pl: 3, f: function (c) {
+        if (!bodyMethod(c) || !JSON_CT.test(String(c.r.headersIn['Content-Type'] || ''))) return false;
+        const n = bodyLen(c.r);
+        return n > BODY_CAP || (n < 0 && hasBody(c));
+    } },
+    // method override to a non-standard method; any override at paranoia 3
+    { id: 995170, k: 'api', pl: 1, f: function (c) { const m = methodOverride(c); return m !== '' && !STD_METHODS[m.toUpperCase()]; } },
+    { id: 995175, k: 'api', pl: 3, f: function (c) { return methodOverride(c) !== ''; } },
+];
+
+// xmlrpc.php request bodies (lower-cased)
+const WAF_BODY_XMLRPC = [
+    { id: 991100, pl: 1, re: /<methodname>\s*system\.multicall\s*<\/methodname>/ },
+    { id: 991110, pl: 2, re: /<methodname>\s*pingback\.(?:ping|extensions\.getpingbacks)\s*<\/methodname>/ },
+];
+// JSON body limits (api pack)
+const JSON_MAX_DEPTH = 32, JSON_MAX_NODES = 10000, JSON_MAX_STRINGS = 2000;
+const MONGO_EXEC = /^\$(?:where|function|accumulator|expr)$/;   // a regex: an object lookup would hit '__proto__'
+const MONGO_OPS = /^\$(?:ne|eq|gt|gte|lt|lte|in|nin|regex|exists|or|and|not|nor|elemmatch|size|type|all|text|jsonschema|mod)$/i;
 
 const ALLOWED_METHODS = { GET: 1, HEAD: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, OPTIONS: 1 };
 const RESTRICTED_EXT = /\.(?:asa|asax|backup|bat|cdx|cer|cfg|cmd|com|config|conf|cs|csproj|csr|dat|db|dbf|dll|dos|htr|htw|ida|idc|idq|inc|ini|key|licx|lnk|log|mdb|pass|pdb|pol|printer|pwd|rdb|resources|resx|sys|vb|vbs|vbproj|vsdisco|webinfo|xsd|xsx)$/;
@@ -229,8 +401,9 @@ function compileCond(c) {
     } else {
         let one;
         if (op === 'regex') {
-            const res = vals.map(function (v) { return reOrNull(v, 'i'); }).filter(Boolean);
-            one = function (v) { return res.some(function (re) { return re.test(v); }); };
+            const res = vals.map(custRe);
+            if (res.some(function (re) { return !re; })) return null;   // unsafe / invalid: rule skipped
+            one = function (v) { return res.some(function (re) { return rxTest(re, v, RE_INPUT_MAX); }); };
         } else if (STRING_OPS[op]) {
             const fn = STRING_OPS[op], lv = vals.map(function (v) { return v.toLowerCase(); });
             one = function (v) { v = v.toLowerCase(); return lv.some(function (x) { return fn(v, x); }); };
@@ -258,13 +431,16 @@ function fieldValue(ctx, field, name) {
 function prepSite(id, s) {
     const P = { id: id, domain: s.domain, secret: String(s.secret || ''), hosts: (s.hosts || []).map(wildHost) };
     P.blocked = (s.blocked_ips || []).map(cidr).filter(Boolean);
+    // tunnel path prefixes (nginx "location ^~" on the same normalised $uri)
+    P.tunnel = (s.tunnel_paths || []).map(String).filter(function (p) { return p.charAt(0) === '/' && p.length > 1; });
+    P.fair = s.tunnel_fair !== false;   // SPEC §15.2, default on (only tunnel sites carry the key)
     P.minTls13 = s.min_tls === '1.3';
 
     const fw = s.firewall || {};
     P.fwDefault = fw.default_action === 'block' ? 'block' : 'allow';
     P.fwRules = (fw.rules || []).filter(function (r) { return r.enabled !== false; }).map(function (r) {
         return { id: clean(r.id), action: r.action, conds: (r.conditions || []).map(compileCond) };
-    });
+    }).filter(function (r) { return r.conds.every(Boolean); });
 
     const hl = s.hotlink || {};
     P.hotlink = hl.enabled ? {
@@ -283,31 +459,59 @@ function prepSite(id, s) {
     P.ddos = { mode: dd.mode || 'off', threshold: Math.max(1, +dd.threshold_rps || 200), ttl: Math.max(60, +dd.clearance_ttl || 3600) };
 
     const w = s.waf || {};
-    const groups = {};
+    const groups = {}, packs = {};
     (w.groups || []).forEach(function (g) { groups[g] = 1; });
+    (w.packs || []).forEach(function (k) { if (WAF_PACK_VERSION[k]) packs[k] = 1; });
     const pl = Math.min(3, Math.max(1, +w.paranoia || 1));
     P.waf = {
         mode: w.mode || 'off',
-        rules: WAF_RULES.filter(function (r) { return groups[r.g] && r.pl <= pl; }),
+        pl: pl,
+        rules: WAF_RULES.filter(function (r) { return (r.k ? packs[r.k] : groups[r.g]) && r.pl <= pl; }),
         proto: groups.protocol ? WAF_PROTOCOL.filter(function (r) { return r.pl <= pl; }) : [],
+        fn: WAF_PACK_FN.filter(function (r) { return packs[r.k] && r.pl <= pl; }),
+        // request bodies read by bodyInspect: xmlrpc.php (wordpress), JSON (api)
+        body: packs.wordpress || packs.api ? { xmlrpc: !!packs.wordpress, json: !!packs.api } : null,
         excl: (w.exclusions || []).map(function (e) { return { id: +e.rule_id || 0, re: reOrNull(e.path_re, '') }; }),
         off: (w.off_paths || []).map(function (p) { return reOrNull(p, ''); }).filter(Boolean),
+        // SPEC §17.1 learning mode: until this epoch second the WAF runs log-only (see wafMode)
+        learnUntil: Math.max(0, +w.learn_until || 0),
     };
+    // JSON body string values are checked with the site's query-string signatures
+    P.waf.jsonRules = P.waf.rules.filter(function (r) { return r.t.indexOf('q') >= 0; });
+
+    // bot management (SPEC §14.2); absent / mode off -> no bot checks
+    const b = s.bots;
+    P.bots = b && (b.mode === 'log' || b.mode === 'challenge' || b.mode === 'block')
+        ? { mode: b.mode, allowVerified: b.allow_verified !== false, blockEmpty: b.block_empty_ua !== false } : null;
+
+    // conditional transform-rule response headers, applied in order by tfHeaders (SPEC §14.2):
+    // {f: flag variable ("" = always), op: set|del, n: header name, v: value}
+    P.tfResp = Array.isArray(s.tf_resp) && s.tf_resp.length ? s.tf_resp.filter(function (o) {
+        return o && typeof o.n === 'string' && (o.op === 'del' || (o.op === 'set' && typeof o.v === 'string'));
+    }) : null;
 
     P.pools = {};
     Object.keys(s.pools || {}).forEach(function (name) {
         const p = s.pools[name], h = p.health || {};
         P.pools[name] = {
             name: name, method: p.method === 'ip_hash' ? 'ip_hash' : 'weighted', protocol: p.protocol === 'https' ? 'https' : 'http',
-            origins: (p.origins || []).map(function (o) { return { hp: o.hp, weight: Math.max(1, +o.weight || 1), backup: !!o.backup }; }),
-            health: { enabled: !!h.enabled, path: h.path || '/', interval: Math.max(1, +h.interval || 10),
+            origins: (p.origins || []).map(function (o) { return { hp: o.hp, weight: Math.max(1, +o.weight || 1), backup: !!o.backup, up: o.up || null }; }),
+            // type "tcp" (SPEC §22.4): checked by the agent, results arrive through hcSet
+            health: { enabled: !!h.enabled, tcp: h.type === 'tcp', path: h.path || '/', interval: Math.max(1, +h.interval || 10),
                 timeout: Math.min(10, Math.max(1, +h.timeout || 3)), expect: String(h.expect || '2xx,3xx').toLowerCase().split(','),
                 host: h.host || s.domain },
         };
     });
 
     const im = s.image || {};
-    P.image = im.enabled ? { quality: Math.min(100, Math.max(1, +im.quality || 85)), max: Math.max(16, +im.max_width || 2000) } : null;
+    P.image = im.enabled ? { quality: Math.min(100, Math.max(1, +im.quality || 85)), max: Math.max(16, +im.max_width || 2000),
+        // images v2 (SPEC §16.6): only present in sites.js when the site uses them
+        avif: im.avif === true, smart: im.smart === true,
+        secret: typeof im.secret === 'string' && im.secret.length >= 16 ? im.secret : '' } : null;
+    // video delivery (SPEC §16.5): next-segment prefetch flag
+    P.video = s.video && s.video.prefetch === true ? { prefetch: true } : null;
+    P.wr = prepWaitingRoom(s.waiting_room);    // SPEC §18.1
+    P.access = prepAccess(s.access);            // SPEC §18.2
     return P;
 }
 
@@ -317,6 +521,11 @@ Object.keys(SITES).forEach(function (id) {
 });
 
 function siteOf(r) { const id = r.variables.pcdn_site; return id ? S[id] || null : null; }
+
+function inTunnel(site, uri) {
+    for (let i = 0; i < site.tunnel.length; i++) if (String(uri).indexOf(site.tunnel[i]) === 0) return true;
+    return false;
+}
 
 // ------------------------------------------------------------------ request context
 
@@ -373,8 +582,29 @@ function verdict(r) {
     return v;
 }
 
+// The verdict: the security checks, then (when they pass) the visitor gates of SPEC §18 - access apps
+// and the waiting room (gates). A gate that lets the request through may add "ok:wr:..." (read by
+// the usage pass); a "log:..." security verdict is kept as it is.
 function evaluate(r) {
-    if (String(r.uri).indexOf('/__pcdn/') === 0) return 'ok';
+    const v = security(r);
+    if (v !== 'ok' && v.indexOf('log:') !== 0) return v;
+    const site = siteOf(r);
+    if (!site || (!site.access && !site.wr)) return v;
+    const uri = String(r.uri);
+    if (uri.indexOf('/__pcdn/') === 0 || (site.tunnel.length && inTunnel(site, uri))) return v;
+    const g = gates(mkctx(r, site), site);
+    if (!g) return v;
+    if (g.indexOf('ok:') === 0) return v === 'ok' ? g : v;
+    return g;
+}
+
+function security(r) {
+    const uri = String(r.uri);
+    // speed test (SPEC §15.6): like a tunnel path - firewall block rules, blocked_ips and min_tls apply,
+    // challenges / WAF / rate-limit rules / DDoS do not (the measurement must not hit an HTML challenge).
+    // The access sign-in endpoints (SPEC §18.2) are treated the same way.
+    const speed = uri.indexOf('/__pcdn/speed/') === 0 || uri.indexOf('/__pcdn/access/') === 0;
+    if (!speed && uri.indexOf('/__pcdn/') === 0) return 'ok';
     const site = siteOf(r);
     if (!site) return 'ok';
     const ctx = mkctx(r, site);
@@ -382,6 +612,7 @@ function evaluate(r) {
 
     if (site.minTls13 && r.variables.ssl_protocol && r.variables.ssl_protocol !== 'TLSv1.3') return 'block:firewall:min_tls';
     for (let i = 0; i < site.blocked.length; i++) if (inCidr(ctx.ip, site.blocked[i])) return 'block:firewall:blocked_ips';
+    if (speed || (site.tunnel.length && inTunnel(site, ctx.path))) return tunnelVerdict(ctx, site);
 
     // firewall: first matching rule wins; allow short-circuits everything; log continues
     let matched = false;
@@ -390,7 +621,11 @@ function evaluate(r) {
         if (!rule.conds.every(function (c) { return c(ctx); })) continue;
         if (rule.action === 'log') { if (!logged) logged = 'log:firewall:' + rule.id; continue; }
         matched = true;
-        if (rule.action === 'allow') return logged || 'ok';
+        if (rule.action === 'allow') {
+            // the request-body inspection (bodyNeed) is part of the WAF that `allow` skips
+            if (site.waf.body) { try { r.variables.pcdn_wafskip = '1'; } catch (e) { /* no js_var */ } }
+            return logged || 'ok';
+        }
         if (rule.action === 'block') return 'block:firewall:' + rule.id;
         if (rule.action === 'challenge' || rule.action === 'captcha') {
             v = challengeOr(ctx, rule.action, 'firewall', rule.id);
@@ -401,16 +636,146 @@ function evaluate(r) {
 
     if (site.hotlink && site.hotlink.ext && site.hotlink.ext.test(ctx.path) && !hotlinkOk(ctx, site)) return 'block:hotlink:referer';
 
-    v = rateLimit(ctx, site);
-    if (v) return v;
-    v = ddos(ctx, site);
-    if (v) return v;
-    v = waf(ctx, site);
+    v = bots(ctx, site);
     if (v) {
         if (v.indexOf('log:') !== 0) return v;
         if (!logged) logged = v;
     }
+
+    v = rateLimit(ctx, site);
+    if (v) return v;
+    // a verified search-engine crawler (allow_verified) is never sent a DDoS challenge it cannot solve
+    if (!(ctx.verifiedBot && site.bots && site.bots.allowVerified)) {
+        v = ddos(ctx, site);
+        if (v) return v;
+    }
+    v = waf(ctx, site);
+    if (v) {
+        if (v.indexOf('log:') !== 0) return v;
+        // a learning site records the WAF rule id even after a firewall / bot "log" (SPEC §17.1)
+        if (!logged) logged = v;
+        else if (wafLearning(site.waf)) logged = withAttack(v);
+    }
     return logged || 'ok';
+}
+
+// Tunnel paths (VPN streams): firewall allow/block/log rules and the default action only.
+// Challenge / captcha rules, hotlink, rate limits, DDoS and WAF are skipped: a VPN client
+// cannot solve a challenge and binary stream payloads only produce WAF false positives.
+function tunnelVerdict(ctx, site) {
+    let logged = null;
+    for (let i = 0; i < site.fwRules.length; i++) {
+        const rule = site.fwRules[i];
+        if (rule.action === 'challenge' || rule.action === 'captcha') continue;
+        if (!rule.conds.every(function (c) { return c(ctx); })) continue;
+        if (rule.action === 'log') { if (!logged) logged = 'log:firewall:' + rule.id; continue; }
+        if (rule.action === 'allow') return logged || 'ok';
+        return 'block:firewall:' + rule.id;
+    }
+    if (site.fwDefault === 'block') return 'block:firewall:default';
+    return logged || 'ok';
+}
+
+// ------------------------------------------------------------------ tunnel fair share (SPEC §15.2)
+// nginx 1.24 cannot rate-limit tunnel streams (limit_rate is reset for unbuffered proxying and never
+// applies to upgraded connections), so fair share works on ADMISSION: while the node is hot (the agent
+// sets pcdn_fair "hot" = fair_share_pct when tx >= 85 % of the node capacity) a site whose share of the
+// node's new tunnel sessions over the last 1-2 minutes exceeds fair_share_pct AND exceeds all other
+// sites together (so at most one site - the dominant one - is ever refused, and two busy sites can
+// never starve each other) gets its NEW sessions refused (429) until it is back under that line.
+// Established sessions are never touched, xhttp packet POSTs (which belong to a session) are never
+// refused, refused attempts are not counted (so the share converges to the cap instead of locking the
+// site out), and nothing is refused while the site has fewer than FAIR_MIN_SITE opens in the window
+// or the other sites together fewer than FAIR_MIN_OTHERS (with nobody to protect, refusing only
+// hurts). Any error fails open.
+const FAIR_BUCKET = 60;        // seconds; a decision looks at the current and the previous bucket
+const FAIR_MIN_SITE = 30;
+const FAIR_MIN_OTHERS = 10;
+
+function tunnelFair(r) {
+    try {
+        const v = r.variables;
+        if (v.pcdn_tn === 'xhttp' && r.method !== 'GET') return '';   // same session rule as limit_conn (F13)
+        const id = v.pcdn_site, site = id ? S[id] : null;
+        const d = ngx.shared.pcdn_fair;
+        if (!site || !d) return '';
+        const b = Math.floor(Date.now() / 1000 / FAIR_BUCKET);
+        const pct = d.get('hot') || 0;
+        if (site.fair && pct > 0) {
+            const mine = (d.get('o:' + id + ':' + b) || 0) + (d.get('o:' + id + ':' + (b - 1)) || 0);
+            const all = (d.get('o:*:' + b) || 0) + (d.get('o:*:' + (b - 1)) || 0);
+            const others = all - mine;
+            if (mine >= FAIR_MIN_SITE && others >= FAIR_MIN_OTHERS && mine * 100 > pct * all && mine > others) return '1';
+        }
+        d.incr('o:' + id + ':' + b, 1, 0);
+        d.incr('o:*:' + b, 1, 0);
+    } catch (e) { /* fail open */ }
+    return '';
+}
+
+// /__pcdn/fair?hot=<pct>&drain=0|1 (localhost only, default server): hot 1..100 = hot with that
+// fair_share_pct, 0 = not; drain=1 sets the node drain flag (SPEC §22.1), 0 clears it. A parameter that
+// is absent leaves its flag as it is. Both flags expire with the zone timeout (agent gone: fail open).
+function fairSet(r) {
+    const d = ngx.shared.pcdn_fair;
+    if (r.args.hot !== undefined) {
+        const pct = Math.floor(+r.args.hot || 0);
+        if (pct >= 1 && pct <= 100) d.set('hot', pct); else d.delete('hot');
+    }
+    if (r.args.drain !== undefined) {
+        if (r.args.drain === '1') d.set('drain', 1); else d.delete('drain');
+    }
+    if (r.args.wr === '1') {   // the agent's heartbeat: per-site waiting-room state (SPEC §18.1)
+        let out = {};
+        try { out = wrStats(); } catch (e) { r.error('pcdn wr stats: ' + e); }
+        r.headersOut['Content-Type'] = 'application/json';
+        return r.return(200, JSON.stringify(out));
+    }
+    r.return(204);
+}
+
+// ------------------------------------------------------------------ node drain (SPEC §22.1)
+// While the node drains (after the DNS grace) a tunnel request that OPENS a client connection
+// ($connection_requests = 1) is refused with 503 so the client reconnects to another node. Requests on
+// an existing connection (upgraded sessions are never re-checked, new h2 streams) and xhttp POSTs
+// (packets of a session that already exists) always pass. Any error fails open.
+function tunnelDrain(r) {
+    try {
+        const d = ngx.shared.pcdn_fair;
+        if (!d || d.get('drain') !== 1) return '';
+        const v = r.variables;
+        if (v.pcdn_tn === 'xhttp' && r.method !== 'GET') return '';
+        if (String(v.connection_requests) !== '1') return '';
+        return '1';
+    } catch (e) { return ''; }
+}
+
+// ------------------------------------------------------------------ speed test (SPEC §15.6)
+// down?bytes=N (1..10 MB, default 1 MB): N >= 64 is an internal redirect to the static random file
+// the agent writes (SPEED_FILE_SIZE bytes of os.urandom) through the flv module: "?start=S" serves
+// a 13-byte FLV header + file[S:], so S = SPEED_FILE_SIZE + 13 - N gives exactly N bytes with
+// sendfile and no memory held per request or per worker. Smaller N come from a tiny buffer.
+// up: nginx reads (and drops) the body before the handler runs (client_max_body_size 10m on the
+// location), so the 204 marks the end of the upload.
+const SPEED_MAX = 10 * 1024 * 1024;
+const SPEED_FILE_SIZE = SPEED_MAX + 64;
+const SPEED_SMALL = Buffer.from('7f3a9c21e05bd84612f7aa0394ce5b17d26e08f1c4b9357a2d6e91f0b84c23a5'
+    + 'e1093d7b5fa2c86410ed37b9f25a68c40c9d71e2b356f8a4097c1de25b38fa61', 'hex');
+
+function speedDown(r) {
+    const raw = String(r.args.bytes === undefined ? '1048576' : r.args.bytes);
+    if (!/^[0-9]{1,9}$/.test(raw) || +raw < 1 || +raw > SPEED_MAX) { r.return(400); return; }
+    const n = +raw;
+    if (n < SPEED_SMALL.length) {
+        r.headersOut['Content-Type'] = 'application/octet-stream';
+        r.return(200, SPEED_SMALL.subarray(0, n));
+        return;
+    }
+    r.internalRedirect('/__pcdn/speed/file?start=' + (SPEED_FILE_SIZE + 13 - n));
+}
+
+function speedUp(r) {
+    r.return(r.method === 'POST' ? 204 : 405);
 }
 
 function hotlinkOk(ctx, site) {
@@ -422,13 +787,54 @@ function hotlinkOk(ctx, site) {
     return h === ctx.host || site.hosts.some(ok) || site.hotlink.allowed.some(ok);
 }
 
+// ------------------------------------------------------------------ bot management (SPEC §14.2)
+// Verified crawler = the client IP is in that engine's published ranges ($pcdn_vbot, a geo rendered
+// from the node-wide bots.verified block: "<engine><known>" where engine is 1 google / 2 bing /
+// 0 neither and <known> lists the engines whose ranges this node has, e.g. "1gb") AND the
+// User-Agent claims that engine. A crawler User-Agent from outside the engine's ranges is
+// "spoofed" — but only when this node has ranges for that engine: with none ($pcdn_vbot "" or the
+// engine missing from <known>) crawler UAs fail open and are never treated as spoofed.
+const BOT_GOOGLE = /googlebot|storebot-google|google-inspectiontool|googleother/i;   // googlebot.json crawlers
+const BOT_BING = /bingbot/i;
+const BOT_HEADLESS = /headlesschrome|phantomjs|slimerjs|puppeteer|playwright|selenium|webdriver|htmlunit|nightmare/i;
+const BOT_LIBRARY = /^(?:curl|wget|libcurl|python-requests|python-urllib|python-httpx|python\/|aiohttp|httpx|go-http-client|okhttp|java\/|apache-httpclient|libwww-perl|lwp-|php\/|guzzlehttp|node-fetch|axios\/|undici|got |ruby|faraday|mechanize|scrapy|httpie|powershell|pycurl|http_request2|colly|winhttp|reqwest|hackney|zgrab|masscan)|\b(?:scrapy|httrack|python-requests|go-http-client|libwww-perl|curl\/)/i;
+
+// -> {verified, rule} where rule is null or empty_ua | spoofed | headless | library
+function botClass(ua, vbot, blockEmpty) {
+    vbot = String(vbot || '');
+    const engine = vbot.charAt(0), known = vbot.substring(1);
+    const g = BOT_GOOGLE.test(ua), b = BOT_BING.test(ua);
+    if ((g && engine === '1') || (b && engine === '2')) return { verified: true, rule: null };
+    let rule = null;
+    if (!ua) rule = blockEmpty ? 'empty_ua' : null;
+    else if ((g && known.indexOf('g') >= 0) || (b && known.indexOf('b') >= 0)) rule = 'spoofed';
+    else if (BOT_HEADLESS.test(ua)) rule = 'headless';
+    else if (BOT_LIBRARY.test(ua)) rule = 'library';
+    return { verified: false, rule: rule };
+}
+
+function bots(ctx, site) {
+    const b = site.bots;
+    if (!b) return null;
+    const c = botClass(ctx.ua, ctx.r.variables.pcdn_vbot, b.blockEmpty);
+    ctx.verifiedBot = c.verified;
+    if (!c.rule) return null;
+    if (b.mode === 'log') return 'log:bots:' + c.rule;
+    if (b.mode === 'challenge') return challengeOr(ctx, 'challenge', 'bots', c.rule);
+    return 'block:bots:' + c.rule;
+}
+
 function rateLimit(ctx, site) {
     if (!site.rl.length) return null;
     const cnt = ngx.shared.pcdn_cnt, blk = ngx.shared.pcdn_blk, t = now();
+    // a verified crawler (bots.allow_verified) is never sent a challenge / captcha it cannot solve;
+    // rate-limit blocks (429, which crawlers honour) still apply to it
+    const crawler = ctx.verifiedBot && site.bots && site.bots.allowVerified;
     for (let i = 0; i < site.rl.length; i++) {
         const rule = site.rl[i];
-        if (!rule.re || !rule.re.test(ctx.path)) continue;
+        if (!rule.re || !rxTest(rule.re, ctx.path)) continue;
         if (rule.methods.length && rule.methods.indexOf(ctx.method) < 0) continue;
+        if (crawler && rule.action !== 'block') continue;
         const bkey = 'b:' + site.id + ':' + rule.id + ':' + ctx.ipStr;
         if (rule.action === 'block' && (blk.get(bkey) || 0) > t) return 'block:ratelimit:' + rule.id;
         const n = cnt.incr('r:' + site.id + ':' + rule.id + ':' + ctx.ipStr + ':' + Math.floor(t / rule.period), 1, 0);
@@ -464,7 +870,8 @@ function normalize(s) {
 }
 
 function wafTargets(ctx) {
-    const t = { p: [normalize(ctx.path)], q: [], c: [], u: [normalize(ctx.ua)], r: [] };
+    const t = { p: [normalize(ctx.path)], q: [], c: [], u: [normalize(ctx.ua)], r: [],
+        a: ctx.args ? [normalize(ctx.args.replace(/\+/g, ' '))] : [] };
     if (ctx.args) {
         ctx.args.split('&').forEach(function (kv) {
             if (!kv) return;
@@ -486,31 +893,186 @@ function wafTargets(ctx) {
 }
 
 function wafExcluded(w, id, path) {
-    return w.excl.some(function (e) { return (e.id === 0 || e.id === id) && (!e.re || e.re.test(path)); });
+    return w.excl.some(function (e) { return (e.id === 0 || e.id === id) && (!e.re || rxTest(e.re, path)); });
 }
 
-function waf(ctx, site) {
-    const w = site.waf;
-    if (w.mode !== 'block' && w.mode !== 'detect') return null;
-    if (w.off.some(function (re) { return re.test(ctx.path); })) return null;
-    let hit = 0;
-    for (let i = 0; i < w.proto.length && !hit; i++) {
+// SPEC §17.1: the effective WAF mode. While the site is learning (waf.learn_until in the future)
+// the WAF, its packs and the body inspection run exactly as in detect ("log") mode whatever the
+// configured mode is - never a block from a WAF verdict. Firewall / rate limits / DDoS are untouched.
+function wafLearning(w) { return w.learnUntil > 0 && now() < w.learnUntil; }
+function wafMode(w) { return wafLearning(w) ? 'detect' : w.mode; }
+
+// group of a WAF rule: its group, its pack, or "protocol"
+function wafGroup(rule) { return rule.g || rule.k || 'protocol'; }
+
+// first matching WAF rule (null = none), skipping the rules of group `skip` ('' = none)
+function wafScan(ctx, w, skip) {
+    for (let i = 0; i < w.proto.length; i++) {
         const pr = w.proto[i];
-        if (!wafExcluded(w, pr.id, ctx.path) && pr.f(ctx)) hit = pr.id;
+        if (skip !== 'protocol' && !wafExcluded(w, pr.id, ctx.path) && pr.f(ctx)) return pr;
     }
-    if (!hit && w.rules.length) {
-        const T = wafTargets(ctx);
-        for (let i = 0; i < w.rules.length && !hit; i++) {
+    for (let i = 0; i < w.fn.length; i++) {
+        const fr = w.fn[i];
+        if (fr.k !== skip && !wafExcluded(w, fr.id, ctx.path) && fr.f(ctx)) return fr;
+    }
+    if (w.rules.length) {
+        if (!ctx._wt) ctx._wt = wafTargets(ctx);
+        const T = ctx._wt;
+        for (let i = 0; i < w.rules.length; i++) {
             const rule = w.rules[i];
-            if (wafExcluded(w, rule.id, ctx.path)) continue;
-            for (let j = 0; j < rule.t.length && !hit; j++) {
+            if (wafGroup(rule) === skip || wafExcluded(w, rule.id, ctx.path)) continue;
+            for (let j = 0; j < rule.t.length; j++) {
                 const vals = T[rule.t.charAt(j)];
-                for (let k = 0; k < vals.length; k++) if (rule.re.test(vals[k])) { hit = rule.id; break; }
+                for (let k = 0; k < vals.length; k++) if (rule.re.test(vals[k])) return rule;
             }
         }
     }
+    return null;
+}
+
+// SPEC §17.1: a learning site's WAF verdict ends in ":a" ("log:waf:<id>:a") when the request also
+// carried another attack signal (a rule of another WAF group / pack, an earlier firewall / bot
+// verdict), so the controller does not propose an exclusion for it. The usage reader strips it.
+function waf(ctx, site) {
+    const w = site.waf, mode = wafMode(w);
+    if (mode !== 'block' && mode !== 'detect') return null;
+    if (w.off.some(function (re) { return rxTest(re, ctx.path); })) return null;
+    const hit = wafScan(ctx, w, '');
     if (!hit) return null;
-    return (w.mode === 'block' ? 'block' : 'log') + ':waf:' + hit;
+    const v = (mode === 'block' ? 'block' : 'log') + ':waf:' + hit.id;
+    return wafLearning(w) && wafScan(ctx, w, wafGroup(hit)) ? v + ':a' : v;
+}
+
+function withAttack(v) { return v.substring(v.length - 2) === ':a' ? v : v + ':a'; }
+
+// ------------------------------------------------------------------ request-body inspection (WAF packs)
+// js_set $pcdn_bodychk: evaluated at server level right after the verdict, so only requests the
+// verdict let through get here. "1" routes the request to the internal /__pcdn/body/ location
+// (bodyInspect), which reads the (size-capped) body, checks it and then proxies it unchanged
+// through the named location @pcdn_body.
+function bodyNeed(r) {
+    try {
+        const site = siteOf(r);
+        if (!site || !site.waf.body) return '';
+        const w = site.waf, m = r.method, mode = wafMode(w);
+        if ((mode !== 'block' && mode !== 'detect') || r.variables.pcdn_wafskip) return '';
+        if (m !== 'POST' && m !== 'PUT' && m !== 'PATCH') return '';
+        const uri = String(r.uri);
+        if (uri.indexOf('/__pcdn/') === 0 || inTunnel(site, uri) || w.off.some(function (re) { return rxTest(re, uri); })) return '';
+        const n = bodyLen(r);
+        if (n < 1 || n > BODY_CAP) return '';
+        if (w.body.xmlrpc && m === 'POST' && uri === '/xmlrpc.php') return '1';
+        if (w.body.json && JSON_CT.test(String(r.headersIn['Content-Type'] || ''))) return '1';
+    } catch (e) { r.error('pcdn bodyNeed: ' + e); }
+    return '';
+}
+
+// nesting depth of a JSON text, scanned linearly (before JSON.parse, so a deeply nested document
+// never reaches the parser)
+function jsonDepth(s) {
+    let depth = 0, max = 0, str = false;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s.charCodeAt(i);
+        if (str) {
+            if (ch === 92) i++;                 // backslash: skip the escaped character
+            else if (ch === 34) str = false;
+        } else if (ch === 34) str = true;
+        else if (ch === 123 || ch === 91) { if (++depth > max) max = depth; }
+        else if (ch === 125 || ch === 93) depth--;
+    }
+    return max;
+}
+
+// -> rule id (0 = clean). Keys and string values are collected iteratively (no recursion).
+function inspectJson(w, text, path) {
+    const ok = function (id, pl) { return pl <= w.pl && !wafExcluded(w, id, path); };
+    if (jsonDepth(text) > JSON_MAX_DEPTH) return ok(995210, 1) ? 995210 : 0;
+    let doc;
+    try { doc = JSON.parse(text); } catch (e) { return ok(995200, 2) ? 995200 : 0; }
+    const stack = [doc], strs = [];
+    let nodes = 0, proto = false, exec = false, ops = false;
+    while (stack.length) {
+        const x = stack.pop();
+        if (++nodes > JSON_MAX_NODES) return ok(995210, 1) ? 995210 : 0;
+        if (typeof x === 'string') { if (strs.length < JSON_MAX_STRINGS) strs.push(x); continue; }
+        if (x === null || typeof x !== 'object') continue;
+        if (Array.isArray(x)) { for (let i = 0; i < x.length; i++) stack.push(x[i]); continue; }
+        const keys = Object.keys(x);
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            if (k === '__proto__' || (k === 'constructor' && x[k] && typeof x[k] === 'object' && 'prototype' in x[k])) proto = true;
+            if (MONGO_EXEC.test(k)) exec = true; else if (MONGO_OPS.test(k)) ops = true;
+            if (strs.length < JSON_MAX_STRINGS) strs.push(k);
+            stack.push(x[k]);
+        }
+    }
+    if (proto && ok(995220, 1)) return 995220;
+    if (exec && ok(995230, 1)) return 995230;
+    if (ops && ok(995235, 2)) return 995235;
+    // injection signatures of the site's enabled groups / packs, as for query-string values
+    for (let i = 0; i < w.jsonRules.length; i++) {
+        const rule = w.jsonRules[i];
+        if (wafExcluded(w, rule.id, path)) continue;
+        for (let j = 0; j < strs.length; j++) if (rule.re.test(normalize(strs[j]))) return rule.id;
+    }
+    return 0;
+}
+
+function inspectBody(r, site, path) {
+    const w = site.waf;
+    const text = r.requestText;
+    if (typeof text !== 'string' || !text) return 0;
+    if (w.body.xmlrpc && path === '/xmlrpc.php') {
+        const lb = text.toLowerCase();
+        for (let i = 0; i < WAF_BODY_XMLRPC.length; i++) {
+            const rule = WAF_BODY_XMLRPC[i];
+            if (rule.pl <= w.pl && !wafExcluded(w, rule.id, path) && rule.re.test(lb)) return rule.id;
+        }
+    }
+    if (w.body.json && JSON_CT.test(String(r.headersIn['Content-Type'] || ''))) return inspectJson(w, text, path);
+    return 0;
+}
+
+function bodyInspect(r) {
+    const site = siteOf(r);
+    const path = String(r.uri).replace(/^\/__pcdn\/body(?=\/)/, '');
+    let hit = 0;
+    try { if (site) hit = inspectBody(r, site, path); } catch (e) { r.error('pcdn body: ' + e); hit = 0; }
+    if (hit) {
+        let v = (wafMode(site.waf) === 'block' ? 'block' : 'log') + ':waf:' + hit;
+        const cur = String(r.variables.pcdn_vmemo || 'ok');
+        // "ok:wr:..." (a waiting-room note, SPEC §18.1) counts as "ok"
+        let set = v.indexOf('block:') === 0 || cur === 'ok' || cur.indexOf('ok:') === 0;
+        if (!set && wafLearning(site.waf) && cur.indexOf('log:') === 0) {
+            // learning (SPEC §17.1): the request already carried a signal - keep a WAF id, mark ":a"
+            const same = cur === v || cur === v + ':a';   // the same rule matched the URI already
+            v = same ? cur : withAttack(cur.indexOf('log:waf:') === 0 ? cur : v);
+            set = v !== cur;
+        }
+        if (set) {
+            // the access log reports this verdict ($pcdn_verdict was cached as "ok" before the body
+            // was read, so it is overwritten as well as the memo)
+            try { r.variables.pcdn_vmemo = v; r.variables.pcdn_verdict = v; } catch (e) { r.error('pcdn body verdict: ' + e); }
+        }
+        if (v.indexOf('block:') === 0) return blockPage(r, v);
+    }
+    r.internalRedirect('@pcdn_body');
+}
+
+// ------------------------------------------------------------------ transform rules (SPEC §14.2)
+// js_header_filter of sites whose response-header transform rules have conditions: each op runs
+// when its flag variable (a per-rule nginx map over method / country / path) is "1", in rule order,
+// so a later matching rule wins; a removal deletes every value of a multi-value header (Set-Cookie).
+function tfHeaders(r) {
+    const site = siteOf(r);
+    if (!site || !site.tfResp) return;
+    const ops = site.tfResp;
+    for (let i = 0; i < ops.length; i++) {
+        const o = ops[i];
+        if (o.f && r.variables[o.f] !== '1') continue;
+        if (o.op === 'del') delete r.headersOut[o.n];
+        else r.headersOut[o.n] = o.v;
+    }
 }
 
 // ------------------------------------------------------------------ load balancing
@@ -524,25 +1086,58 @@ function fnv(s) {
 function hcKey(site, pool, o) { return site.id + '|' + pool.name + '|' + o.hp; }
 
 function isUp(site, pool, o) {
+    // a missing entry (never checked, or aged out after the agent stopped) counts as up: fail open
     if (!pool.health.enabled) return true;
     return (ngx.shared.pcdn_hc.get(hcKey(site, pool, o)) || 0) < HC_FALL;
 }
 
-function upstream(r) {
-    const site = siteOf(r), pool = site ? site.pools[r.variables.pcdn_pool] : null;
+// web load balancer: host:port, ip_hash/weighted-random across the pool (unchanged behaviour).
+function upstream(r) { return pick(r, r.variables.pcdn_pool, null, false, false); }
+
+// tunnel pool picker. For xhttp/h2 every request of a session must reach the SAME origin, so a
+// session key is parsed out of the path (after the tunnel prefix) and used for a weighted
+// rendezvous (HRW) hash: a health change only moves the sessions on the origin that failed. ws/grpc
+// keep the existing ip_hash/random behaviour (key = null). When a picked IP-literal member has a
+// keepalive upstream (F11), its upstream name is returned instead of host:port.
+function tunnelUpstream(r) {
+    const tn = r.variables.pcdn_tn;
+    const h2 = tn === 'grpc' || tn === 'h2';
+    const ka = tn === 'xhttp' || tn === 'grpc' || tn === 'h2';   // upgraded (ws) conns are never reused
+    let key = null;
+    if (tn === 'xhttp' || tn === 'h2') {
+        const prefix = String(r.variables.pcdn_tn_prefix || '');
+        const m = String(r.uri).substring(prefix.length).match(/^\/+([^\/?]+)/);
+        key = m ? m[1] : String(r.variables.remote_addr);
+    }
+    return pick(r, r.variables.pcdn_tn_pool, key, ka, h2);
+}
+
+function pick(r, poolName, key, keepalive, h2) {
+    const site = siteOf(r), pool = site ? site.pools[poolName] : null;
     if (!pool || !pool.origins.length) return '127.0.0.1:9';   // discard port -> 502, never an open proxy
     let cand = pool.origins.filter(function (o) { return !o.backup && isUp(site, pool, o); });
     if (!cand.length) cand = pool.origins.filter(function (o) { return o.backup && isUp(site, pool, o); });
     if (!cand.length) cand = pool.origins.filter(function (o) { return !o.backup; });   // fail open
     if (!cand.length) cand = pool.origins;
-    let total = 0;
-    cand.forEach(function (o) { total += o.weight; });
-    let x = pool.method === 'ip_hash' ? fnv(String(r.variables.remote_addr)) % total : Math.random() * total;
-    for (let i = 0; i < cand.length; i++) {
-        x -= cand[i].weight;
-        if (x < 0) return cand[i].hp;
+    let chosen;
+    // key != null (loose) is false for both null (ws/grpc) and undefined (never passed): only a real
+    // string session key takes the rendezvous branch, so non-tunnel balancing is untouched.
+    if (key != null) {
+        let best = -1;
+        for (let i = 0; i < cand.length; i++) {
+            const o = cand[i];
+            const score = o.weight / -Math.log((fnv(key + '|' + o.hp) + 1) / 4294967297);
+            if (score > best) { best = score; chosen = o; }
+        }
+    } else {
+        let total = 0;
+        cand.forEach(function (o) { total += o.weight; });
+        let x = pool.method === 'ip_hash' ? fnv(String(r.variables.remote_addr)) % total : Math.random() * total;
+        for (let i = 0; i < cand.length; i++) { x -= cand[i].weight; if (x < 0) { chosen = cand[i]; break; } }
+        if (!chosen) chosen = cand[cand.length - 1];
     }
-    return cand[cand.length - 1].hp;
+    if (keepalive && chosen.up) { const n = h2 ? chosen.up.h2 : chosen.up.h1; if (n) return n; }
+    return chosen.hp;
 }
 
 function expectOk(expect, status) {
@@ -582,7 +1177,7 @@ async function health() {
         if (!site) return;
         Object.keys(site.pools).forEach(function (name) {
             const pool = site.pools[name];
-            if (!pool.health.enabled) return;
+            if (!pool.health.enabled || pool.health.tcp) return;   // tcp: the agent checks (hcSet)
             pool.origins.forEach(function (o) {
                 const nk = 'n|' + hcKey(site, pool, o);
                 if ((hc.get(nk) || 0) > t) return;
@@ -594,37 +1189,268 @@ async function health() {
     await Promise.all(jobs);
 }
 
-// ------------------------------------------------------------------ image resize parameters
+// /__pcdn/hc (localhost only, POST): {"<site>|<pool>|<host:port>": <consecutive failures>, ...} from the
+// agent's TCP health checker (SPEC §22.4), at most HC_SET_MAX keys per call; counts like checkOrigin's.
+const HC_SET_MAX = 4096;
+const HC_KEY = /^[0-9]{1,12}\|[a-z0-9._-]{1,40}\|[a-z0-9.:\[\]-]{1,300}$/;
+
+function hcSet(r) {
+    if (r.method !== 'POST') return r.return(405);
+    let body;
+    try { body = JSON.parse(r.requestText || '{}'); } catch (e) { return r.return(400); }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return r.return(400);
+    const hc = ngx.shared.pcdn_hc, keys = Object.keys(body);
+    if (keys.length > HC_SET_MAX) return r.return(413);
+    let n = 0;
+    keys.forEach(function (k) {
+        const v = Math.floor(+body[k]);
+        if (!HC_KEY.test(k) || !(v >= 0)) return;
+        hc.set(k, Math.min(v, 1000));
+        n++;
+    });
+    r.return(200, String(n));
+}
+
+// ------------------------------------------------------------------ image resize / transform parameters
+//
+// Legacy (SPEC §2): ?width=N&height=N -> $pcdn_img_w / $pcdn_img_h are "N" or "-" (capped at
+// max_width), $pcdn_img_q the site quality.
+// Images v2 (SPEC §16.6): ?w=&h=&fit=cover|contain&q=&fmt=webp|avif|jpeg. $pcdn_img_w stays "N" or "-"
+// (w,h <= min(4096, max_width)); $pcdn_img_h carries the whole transform spec
+// "<h|->:<fit>:<fmt|keep>:<q>:<smart 0|1>" (the loopback resizer routes on the ":"), so the cache key
+// "w=$pcdn_img_w&h=$pcdn_img_h" covers every output-relevant parameter. With image.avif, a request
+// without parameters from a client that accepts AVIF is converted when this node can encode AVIF
+// ($pcdn_avif_ok). With image.transform_secret every request carrying transform parameters must be
+// signed: sig = hex HMAC-SHA256(secret, "<raw path>?<k=v&...>" over w,h,fit,q,fmt,width,height in
+// that order, the ones present, raw values); a missing / wrong signature gives "!" (403).
+
+const IMG_SRC = /\.(?:jpe?g|png|gif|webp)$/i;
+const IMG_V2_KEYS = ['w', 'h', 'fit', 'q', 'fmt'];
+const IMG_SIG_KEYS = ['w', 'h', 'fit', 'q', 'fmt', 'width', 'height'];
+const IMG_MAX_DIM = 4096;
+const IMG_FMT = { webp: 1, avif: 1, jpeg: 1 };
+
+function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+
+// raw (still percent-encoded) query arguments, first occurrence wins
+function rawArgs(q) {
+    const o = {};
+    String(q || '').split('&').forEach(function (p) {
+        if (!p) return;
+        const i = p.indexOf('=');
+        const k = i < 0 ? p : p.substring(0, i);
+        if (!own(o, k)) o[k] = i < 0 ? '' : p.substring(i + 1);
+    });
+    return o;
+}
+
+function imgSigBase(path, a) {
+    const parts = [];
+    IMG_SIG_KEYS.forEach(function (k) { if (own(a, k)) parts.push(k + '=' + a[k]); });
+    return path + '?' + parts.join('&');
+}
+
+function avifOk(r) { return String(r.variables.pcdn_avif_ok || '') === '1'; }
 
 function imgParams(r) {
     const site = siteOf(r);
-    if (!site || !site.image || !/\.(?:jpe?g|png|gif|webp)$/i.test(r.uri)) return null;
-    const dim = function (v) {
-        if (!/^\d{1,5}$/.test(String(v || ''))) return '-';
-        return String(Math.min(site.image.max, Math.max(1, +v)));
+    if (!site || !site.image || !IMG_SRC.test(r.uri) || inTunnel(site, r.uri)) return null;
+    const im = site.image;
+    const a = rawArgs(r.variables.args);
+    const v2 = IMG_V2_KEYS.some(function (k) { return own(a, k); });
+    const legacy = own(a, 'width') || own(a, 'height');
+    const quality = String(im.quality);
+    if (!v2 && !legacy) {
+        // image.avif: plain image URL, client accepts AVIF, node can encode it -> convert
+        if (im.avif && avifOk(r) && !/\.gif$/i.test(r.uri) && /image\/avif/i.test(String(r.headersIn.Accept || ''))) {
+            return { w: '-', h: '-:contain:avif:' + quality + ':0', q: quality };
+        }
+        return null;
+    }
+    if (im.secret) {
+        const raw = String(r.variables.request_uri || '');
+        const qi = raw.indexOf('?');
+        const sig = own(a, 'sig') ? String(a.sig).toLowerCase() : '';
+        if (!safeEq(sig, hmac(im.secret, imgSigBase(qi < 0 ? raw : raw.substring(0, qi), a)))) {
+            return { w: '!', h: '!', q: '' };
+        }
+    }
+    if (!v2) {
+        const dim = function (v) {
+            if (!/^\d{1,5}$/.test(String(v || ''))) return '-';
+            return String(Math.min(im.max, Math.max(1, +v)));
+        };
+        const w = dim(r.args.width), h = dim(r.args.height);
+        if (w === '-' && h === '-') return null;
+        return { w: w, h: h, q: quality };
+    }
+    const cap = Math.min(IMG_MAX_DIM, im.max);
+    const dim2 = function (k) {
+        const v = own(a, k) ? a[k] : '';
+        if (!/^\d{1,5}$/.test(v) || +v < 1) return '-';
+        return String(Math.min(cap, +v));
     };
-    const w = dim(r.args.width), h = dim(r.args.height);
-    if (w === '-' && h === '-') return null;
-    return { w: w, h: h, q: String(site.image.quality) };
+    const w = dim2('w'), h = dim2('h');
+    const fit = a.fit === 'cover' ? 'cover' : 'contain';
+    const qGiven = own(a, 'q') && /^\d{1,3}$/.test(a.q) && +a.q >= 1 && +a.q <= 100;
+    const q = qGiven ? String(+a.q) : quality;
+    let fmt = own(a, 'fmt') && own(IMG_FMT, a.fmt) ? a.fmt : '';
+    if (fmt === 'avif' && !avifOk(r)) fmt = 'keep';   // unsupported here: the source format is kept
+    if (!fmt) {
+        fmt = im.avif && avifOk(r) && !/\.gif$/i.test(r.uri) && /image\/avif/i.test(String(r.headersIn.Accept || ''))
+            ? 'avif' : 'keep';
+    }
+    if (w === '-' && h === '-' && fmt === 'keep' && !qGiven) return null;   // nothing to do
+    const smart = im.smart && fit === 'cover' ? '1' : '0';
+    return { w: w, h: [h, fit, fmt, q, smart].join(':'), q: q };
 }
 function imgW(r) { const p = imgParams(r); return p ? p.w : ''; }
 function imgH(r) { const p = imgParams(r); return p ? p.h : ''; }
 function imgQ(r) { const p = imgParams(r); return p ? p.q : ''; }
 
+// ------------------------------------------------------------------ video next-segment prefetch (SPEC §16.5)
+//
+// js_set $pcdn_vnext, evaluated in the mirror subrequest (/__pcdn/vpf) of a segment request: the raw
+// path of the NEXT segment ("seg_0042.ts" -> "seg_0043.ts", zero padding kept) when the name ends in
+// a number, the site enables prefetch_next, this next segment was not prefetched in the last
+// pcdn_vpf zone timeout (once) and fewer than VPF_RATE prefetches were started this second on this
+// node (bounded); "" otherwise (the mirror location then answers 204 without any upstream request).
+
+const VPF_RATE = 100;
+const VPF_RE = /^(.*?)(\d{1,9})(\.(?:ts|m4s|aac))$/i;
+
+function videoNext(r) {
+    const site = siteOf(r);
+    const dict = ngx.shared.pcdn_vpf;
+    if (!site || !site.video || !dict) return '';
+    const raw = String(r.variables.request_uri || '');
+    const qi = raw.indexOf('?');
+    const m = VPF_RE.exec(qi < 0 ? raw : raw.substring(0, qi));
+    if (!m) return '';
+    let n = String(+m[2] + 1);
+    while (n.length < m[2].length) n = '0' + n;
+    const next = m[1] + n + m[3];
+    try {
+        if (!dict.add('s|' + site.id + '|' + r.variables.host + '|' + next, 1)) return '';
+        if (dict.incr('r|' + now(), 1, 0) > VPF_RATE) return '';
+    } catch (e) {
+        return '';   // dictionary full / unavailable: no prefetch (it is only an optimisation)
+    }
+    return next;
+}
+
 // ------------------------------------------------------------------ pages
+//
+// One design system for every visitor-facing page (the static edge/pages/suspended.html and
+// over_quota.html carry a copy of CSS, kept identical by tests/test_pages.py). Self-contained: no
+// external fonts, styles, images or scripts, so the pages stay tiny and work during an attack.
+// Accent per page type: body class red (block), amber (rate limit / quota / failed check),
+// blue (default: checks, queue), violet (protected access), slate (suspended).
 
-const CSS = 'body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Tahoma,Vazirmatn,sans-serif;background:#f5f7fb;color:#1f2937}'
-    + '.box{max-width:460px;padding:32px;background:#fff;border-radius:16px;box-shadow:0 10px 30px #0001;text-align:center}'
-    + 'h1{font-size:20px;margin:0 0 12px}p{line-height:1.9;color:#4b5563;margin:0}.en{margin-top:16px;font-size:13px}'
-    + '.meta{margin-top:18px;font-size:12px;color:#9ca3af;direction:ltr}input,button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid #d1d5db}'
-    + 'button{background:#2563eb;color:#fff;border:0;cursor:pointer}.err{color:#b91c1c}svg{background:#f3f4f6;border-radius:8px;margin:12px 0}';
+const CSS = ':root{color-scheme:light dark;--bg:#f3f5fa;--bg2:#e8ecf5;--dot:#d3d9e6;--card:#fff;--tx:#0f172a;--mu:#3f4b5e;'
+    + '--fa:#5b6779;--bd:#e2e7f0;--sf:#f7f9fc;--on:#fff;--a:#2563eb;--at:#1d4ed8;--as:#dbe7fe}'
+    + '.red{--a:#dc2626;--at:#b91c1c;--as:#fde2e2}.amber{--a:#c2610c;--at:#92400e;--as:#fdefc8}'
+    + '.violet{--a:#7c3aed;--at:#6d28d9;--as:#ece7fe}.slate{--a:#52627a;--at:#3f4b5e;--as:#e3e8f0}'
+    + '@media(prefers-color-scheme:dark){:root{--bg:#0a0f1c;--bg2:#0f1626;--dot:#1b2436;--card:#121a2b;--tx:#f1f5f9;--mu:#cdd5e1;'
+    + '--fa:#9aa6b8;--bd:#222d42;--sf:#0d1424;--on:#0a0f1c;--a:#6ea8fe;--at:#93c0ff;--as:#16264a}'
+    + '.red{--a:#f87171;--at:#fca5a5;--as:#3d1418}.amber{--a:#fbbf24;--at:#fcd34d;--as:#3a2508}'
+    + '.violet{--a:#a78bfa;--at:#c4b5fd;--as:#2a1a52}.slate{--a:#a9b6c9;--at:#cdd5e1;--as:#1d2638}}'
+    + '*{box-sizing:border-box}html{min-height:100%;background:radial-gradient(1000px 460px at 50% -160px,var(--as),transparent 70%),'
+    + 'radial-gradient(var(--dot) 1px,transparent 1.4px) 0 0/22px 22px,linear-gradient(var(--bg),var(--bg2)) var(--bg2)}'
+    + 'body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;'
+    + 'padding:32px 16px;font:15px/1.9 Vazirmatn,"Segoe UI",Tahoma,system-ui,-apple-system,Roboto,"Noto Sans Arabic",sans-serif;color:var(--tx)}'
+    + 'main{position:relative;overflow:hidden;width:100%;max-width:540px;padding:40px 36px 30px;text-align:center;background:var(--card);'
+    + 'border:1px solid var(--bd);border-radius:22px;box-shadow:0 1px 2px #0f172a0f,0 24px 48px -24px #0f172a3d}'
+    + 'main:before{content:"";position:absolute;inset:0 0 auto;height:4px;background:var(--a)}'
+    + '.ic{position:relative;width:76px;height:76px;margin:0 auto 18px;display:grid;place-items:center;border-radius:50%;'
+    + 'color:var(--a);background:var(--as);box-shadow:0 0 0 8px var(--card),0 0 0 9px var(--as)}'
+    + '.ic svg{width:40px;height:40px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}'
+    + '.sp:after{content:"";position:absolute;inset:-9px;border-radius:50%;border:2px solid transparent;border-top-color:var(--a);'
+    + 'animation:rt 1s linear infinite}@keyframes rt{to{transform:rotate(1turn)}}'
+    + '.pill{display:inline-block;margin:0 0 10px;padding:4px 12px;border-radius:99px;direction:ltr;color:var(--at);background:var(--as);'
+    + 'font:600 12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.03em}'
+    + 'h1{margin:0 0 10px;font-size:23px;line-height:1.55}h2{margin:0 0 4px;font-size:15px;line-height:1.6}'
+    + 'p{margin:0 0 10px;color:var(--mu)}.hint{font-size:13.5px;color:var(--fa)}a{color:var(--at)}'
+    + '.hl{margin:14px 0;padding:10px 14px;border-radius:12px;color:var(--tx);background:var(--as);font-weight:600}'
+    + '.en,.alt{margin-top:16px;padding-top:14px;border-top:1px dashed var(--bd);font-size:13.5px}.en,.alt p{color:var(--fa)}'
+    + '.tech{margin-top:20px;padding:12px 16px;border:1px solid var(--bd);border-radius:14px;background:var(--sf);text-align:start}'
+    + '.tech h2{font-size:12.5px;color:var(--fa);margin-bottom:6px}.tech h2 span{margin:0 8px;font-weight:400}'
+    + '.tech dl{display:grid;grid-template-columns:auto 1fr;align-items:baseline;gap:2px 16px;margin:0;direction:ltr;text-align:left;font-size:12.5px}'
+    + '.tech dt{color:var(--fa)}.tech dd{margin:0;color:var(--tx);overflow-wrap:anywhere;'
+    + 'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}'
+    + 'form{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin:18px 0 6px}'
+    + 'input{flex:1 1 200px;min-width:0;padding:10px 14px;font:inherit;color:var(--tx);background:var(--sf);border:1px solid var(--bd);border-radius:12px}'
+    + 'input:focus{outline:2px solid var(--a);outline-offset:1px}'
+    + 'button,.btn{display:inline-block;padding:10px 22px;font:inherit;font-weight:600;color:var(--on);background:var(--a);'
+    + 'border:0;border-radius:12px;cursor:pointer;text-decoration:none}button:hover,.btn:hover{filter:brightness(1.08)}'
+    + '.err{padding:8px 12px;border-radius:12px;color:#991b1b;background:#fde2e2}'
+    + '.cap{display:inline-block;max-width:100%;margin:6px 0;padding:4px;background:#fff;border:1px solid var(--bd);border-radius:14px}'
+    + '.cap svg{display:block;max-width:100%;height:auto}'
+    + '.bar{height:6px;margin:18px 0 8px;overflow:hidden;direction:ltr;border-radius:99px;background:var(--as)}'
+    + '.bar i{display:block;width:35%;height:100%;border-radius:99px;background:var(--a);animation:ld 1.5s ease-in-out infinite}'
+    + '@keyframes ld{from{transform:translateX(-100%)}to{transform:translateX(290%)}}'
+    + 'footer{text-align:center;font-size:12.5px;line-height:1.9;color:var(--fa)}footer a{color:var(--mu);font-weight:600;text-decoration:none}'
+    + 'footer a:hover{color:var(--at);text-decoration:underline}'
+    + '@media(prefers-color-scheme:dark){.err{color:#fecaca;background:#3d1418}}'
+    + '@media(max-width:480px){main{padding:32px 20px 24px;border-radius:18px}h1{font-size:20px}}'
+    + '@media(prefers-reduced-motion:reduce){*{animation:none!important}}';
 
-function page(title, bodyFa, en, extra, meta) {
-    return '<!doctype html>\n<html lang="fa" dir="rtl">\n<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        + '<meta name="robots" content="noindex"><title>' + esc(title) + '</title><style>' + CSS + '</style></head>\n'
-        + '<body><div class="box"><h1>' + esc(title) + '</h1><p>' + bodyFa + '</p>' + (extra || '')
-        + '<p dir="ltr" class="en">' + esc(en) + '</p>'
-        + (meta ? '<div class="meta">' + esc(meta) + '</div>' : '') + '</div></body></html>\n';
+// inline icons (24x24, stroked with the accent colour)
+const ICONS = {
+    block: '<path d="M12 2.8l7.6 3v5.6c0 4.7-3.2 8.5-7.6 9.8-4.4-1.3-7.6-5.1-7.6-9.8V5.8z"/><path d="M9.6 9.6l4.8 4.8m0-4.8l-4.8 4.8"/>',
+    speed: '<path d="M4.2 17.5a9 9 0 1 1 15.6 0"/><path d="M12 13l4.2-4.4"/><circle cx="12" cy="13" r="1.4"/>'
+        + '<path d="M12 4v1.6M5.6 6.6l1.1 1.1M18.4 6.6l-1.1 1.1M3 13h1.6M21 13h-1.6"/>',
+    check: '<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9h18M6 6.8h.01M8.5 6.8h.01"/><path d="M8.7 14.3l2.3 2.3 4.6-4.6"/>',
+    fail: '<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9h18M6 6.8h.01M8.5 6.8h.01"/><path d="M10 12l4 4m0-4l-4 4"/>',
+    captcha: '<path d="M12 2.8l7.6 3v5.6c0 4.7-3.2 8.5-7.6 9.8-4.4-1.3-7.6-5.1-7.6-9.8V5.8z"/><path d="M8.9 12.1l2.2 2.2 4.2-4.3"/>',
+    queue: '<path d="M6.5 3h11M6.5 21h11"/><path d="M8 3v3a4 4 0 0 0 1.6 3.2L12 12l2.4-2.8A4 4 0 0 0 16 6V3M8 21v-3a4 4 0 0 1 1.6-3.2L12 12'
+        + 'l2.4 2.8A4 4 0 0 1 16 18v3"/><path d="M10.2 18.6h3.6"/>',
+    lock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3M12 14.6v2.4"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.6 6.6l8.4 6.4 8.4-6.4"/>',
+    pause: '<circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/>',
+    gauge: '<path d="M5.6 18.4a9 9 0 1 1 12.8 0"/><path d="M12 12l4.6 3.2"/><circle cx="12" cy="12" r="1.4"/><path d="M9 20.5h6"/>',
+};
+
+const FOOTER = '<footer><a href="https://pasargadmizban.com" rel="noopener" target="_blank">پاسارگاد میزبان'
+    + ' · <span dir="ltr">pasargadmizban.com</span></a><br>قدرت گرفته از پاسارگاد سی‌دی‌ان'
+    + ' · <span lang="en" dir="ltr">Powered by Pasargad CDN</span></footer>';
+
+const SUPPORT_FA = 'اگر فکر می‌کنید اشتباهی رخ داده، کد پیگیری زیر را برای مدیر وب‌سایت بفرستید.';
+const SUPPORT_EN = 'If you believe this is a mistake, send the reference below to the website owner.';
+
+// the whole document: kind = accent class, body = the card's inner HTML (already escaped),
+// head = extra <head> markup, nonce = style nonce under a strict CSP
+function shell(lang, title, kind, body, head, nonce) {
+    return '<!doctype html>\n<html lang="' + lang + '" dir="' + (lang === 'fa' ? 'rtl' : 'ltr') + '">\n<head><meta charset="utf-8">'
+        + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+        + '<meta name="color-scheme" content="light dark">' + (head || '') + '<title>' + esc(title) + '</title>'
+        + '<style' + (nonce ? ' nonce="' + nonce + '"' : '') + '>' + CSS + '</style></head>\n'
+        + '<body class="' + kind + '"><main>' + body + '</main>' + FOOTER + '</body></html>\n';
+}
+
+function cardHead(icon, pill, title, spin) {
+    return '<div class="ic' + (spin ? ' sp' : '') + '"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' + ICONS[icon]
+        + '</svg></div>' + (pill ? '<p class="pill">' + esc(pill) + '</p>' : '') + '<h1>' + esc(title) + '</h1>';
+}
+
+function utcNow() { return new Date().toISOString().substring(0, 19).replace('T', ' ') + ' UTC'; }
+
+// «جزئیات فنی»: [label, value] rows (values escaped, empty ones left out), LTR monospace
+function techBox(rows) {
+    return '<section class="tech"><h2>جزئیات فنی<span lang="en" dir="ltr">Technical details</span></h2><dl>'
+        + rows.filter(function (x) { return x[1]; }).map(function (x) { return '<dt>' + x[0] + '</dt><dd>' + esc(x[1]) + '</dd>'; }).join('')
+        + '</dl></section>';
+}
+
+function techRows(r, v, more) {
+    return [['Reference', v || ''], ['Your IP', String(r.variables.remote_addr || '')], ['Time', utcNow()]].concat(more || []);
+}
+
+// a Persian page with an English line: o = { kind, icon, spin, pill, title, fa (HTML), hint, en, extra (HTML), rows }
+function page(o) {
+    return shell('fa', o.title, o.kind || 'blue', cardHead(o.icon, o.pill, o.title, o.spin) + '<p>' + o.fa + '</p>'
+        + (o.hint ? '<p class="hint">' + esc(o.hint) + '</p>' : '') + (o.extra || '')
+        + '<p class="en" lang="en" dir="ltr">' + esc(o.en) + '</p>' + (o.rows ? techBox(o.rows) : ''));
 }
 
 function send(r, code, html, headers) {
@@ -640,14 +1466,12 @@ function safeReturn(u) {
     return u;
 }
 
-function metaLine(r, v) {
-    return 'ref ' + v + ' · ip ' + r.variables.remote_addr + ' · ' + new Date().toISOString().substring(0, 19) + 'Z';
-}
-
 function deny(r) {
     const v = String(r.variables.pcdn_verdict || 'block:firewall:x');
     const p = v.split(':'), action = p[0], source = p[1] || '', rule = p[2] || '';
     const site = siteOf(r);
+    if (action === 'wr') return wrPage(r, site, Math.max(1, +p[2] || 1));        // SPEC §18.1
+    if (action === 'acc') return accessDenied(r, site, source, rule);              // SPEC §18.2
     if (site && action === 'challenge') return challengePage(r, site, v);
     if (site && action === 'captcha') return captchaPage(r, site, safeReturn(r.variables.request_uri), '', v);
     if (source === 'ratelimit') {
@@ -656,11 +1480,18 @@ function deny(r) {
             const until = ngx.shared.pcdn_blk.get('b:' + site.id + ':' + rule + ':' + r.variables.remote_addr) || 0;
             retry = Math.max(1, until - now());
         }
-        return send(r, 429, page('درخواست‌های بیش از حد', 'تعداد درخواست‌های شما از حد مجاز بیشتر شده است. لطفاً کمی بعد دوباره تلاش کنید.',
-            'Too many requests. Please try again later.', '', metaLine(r, v)), { 'Retry-After': String(retry) });
+        return send(r, 429, page({ kind: 'amber', icon: 'speed', pill: '429 Too Many Requests', title: 'درخواست‌های بیش از حد',
+            fa: 'تعداد درخواست‌های شما از حد مجاز بیشتر شده است. لطفاً کمی بعد دوباره تلاش کنید.', hint: SUPPORT_FA,
+            en: 'Too many requests. Please try again later. ' + SUPPORT_EN, rows: techRows(r, v, [['Retry after', retry + ' s']]) }),
+            { 'Retry-After': String(retry) });
     }
-    return send(r, 403, page('دسترسی مسدود شد', 'درخواست شما توسط سامانه امنیتی CDN مسدود شد. اگر فکر می‌کنید اشتباهی رخ داده، با مدیر وب‌سایت تماس بگیرید.',
-        'Access denied by the website\'s security settings.', '', metaLine(r, v)));
+    return blockPage(r, v);
+}
+
+function blockPage(r, v) {
+    return send(r, 403, page({ kind: 'red', icon: 'block', pill: '403 Forbidden', title: 'دسترسی مسدود شد',
+        fa: 'درخواست شما توسط سامانه امنیتی این وب‌سایت مسدود شد.', hint: SUPPORT_FA,
+        en: 'Access denied by the website\'s security settings. ' + SUPPORT_EN, rows: techRows(r, v) }));
 }
 
 // ---- JS proof-of-work challenge
@@ -685,8 +1516,11 @@ function challengePage(r, site, v) {
         + ';(function(){var c=JSON.parse(document.getElementById("pcdn-challenge").textContent),z=new Array(c.d+1).join("0"),n=0;'
         + 'function step(){for(var k=0;k<5000;k++,n++){if(S(c.n+":"+n).slice(0,c.d)===z){location.replace("/__pcdn/verify?t="+encodeURIComponent(c.t)+"&n="+n+"&r="+encodeURIComponent(c.r));return}}setTimeout(step,0)}step()})()</script>'
         + '<noscript><p class="err">برای ادامه باید جاوااسکریپت مرورگر فعال باشد.</p></noscript>';
-    send(r, 403, page('در حال بررسی مرورگر شما…', 'این بررسی خودکار چند ثانیه طول می‌کشد و از وب‌سایت در برابر حملات محافظت می‌کند.',
-        'Checking your browser before accessing the website…', script, metaLine(r, v)));
+    send(r, 403, page({ icon: 'check', spin: true, pill: 'Security check', title: 'در حال بررسی مرورگر شما…',
+        fa: 'این بررسی خودکار چند ثانیه طول می‌کشد و از وب‌سایت در برابر حملات محافظت می‌کند.',
+        hint: 'لطفاً صبر کنید؛ پس از پایان بررسی به‌طور خودکار به وب‌سایت منتقل می‌شوید.',
+        extra: '<div class="bar" role="progressbar" aria-label="Checking"><i></i></div>' + script,
+        en: 'Checking your browser before accessing the website…', rows: techRows(r, v) }));
 }
 
 function verify(r) {
@@ -701,8 +1535,10 @@ function verify(r) {
         && sha256(p[1] + ':' + n).substring(0, +p[2]) === new Array(+p[2] + 1).join('0');
     ok = ok && useOnce('pv:' + p[1], +p[0]);
     if (!ok) {
-        return send(r, 403, page('بررسی ناموفق بود', 'تأیید مرورگر انجام نشد. <a href="' + esc(back) + '">دوباره تلاش کنید</a>.',
-            'Browser verification failed. Please try again.', '', ''));
+        return send(r, 403, page({ kind: 'amber', icon: 'fail', pill: 'Verification failed', title: 'بررسی ناموفق بود',
+            fa: 'تأیید مرورگر انجام نشد. ممکن است زمان بررسی تمام شده باشد یا مرورگر شما تغییر کرده باشد.',
+            extra: '<p><a class="btn" href="' + esc(back) + '">دوباره تلاش کنید</a></p>',
+            en: 'Browser verification failed. Please try again.', rows: techRows(r, '') }));
     }
     grant(r, site, 'js', back);
 }
@@ -775,14 +1611,15 @@ function captchaSvg(text) {
 function captchaPage(r, site, back, err, v) {
     const exp = now() + TOKEN_TTL, nonce = randHex(16), ip = r.variables.remote_addr, ua = String(r.headersIn['User-Agent'] || '');
     const token = exp + '.' + nonce + '.' + capSig(site, ip, ua, exp, nonce);
-    const form = '<div>' + captchaSvg(captchaAnswer(site, nonce)) + '</div>'
-        + (err ? '<p class="err">' + err + '</p>' : '')
+    const form = '<div class="cap">' + captchaSvg(captchaAnswer(site, nonce)) + '</div>'
+        + (err ? '<p class="err" role="alert">' + err + '</p>' : '')
         + '<form method="post" action="/__pcdn/captcha"><input type="hidden" name="t" value="' + esc(token) + '">'
         + '<input type="hidden" name="r" value="' + esc(back) + '">'
         + '<input name="a" autocomplete="off" autofocus required maxlength="12" dir="ltr" placeholder="کد تصویر"> '
         + '<button type="submit">تأیید</button></form>';
-    send(r, 403, page('لطفاً کد امنیتی را وارد کنید', 'برای ادامه، حروف و اعداد تصویر زیر را وارد کنید.',
-        'Please type the characters shown in the image to continue.', form, v ? metaLine(r, v) : ''));
+    send(r, 403, page({ icon: 'captcha', pill: 'Security check', title: 'لطفاً کد امنیتی را وارد کنید',
+        fa: 'برای ادامه، حروف و اعداد تصویر زیر را وارد کنید.', extra: form,
+        en: 'Please type the characters shown in the image to continue.', rows: techRows(r, v || '') }));
 }
 
 function parseForm(body) {
@@ -808,4 +1645,612 @@ function captcha(r) {
     grant(r, site, 'cap', back);
 }
 
-export default { verdict, upstream, imgW, imgH, imgQ, deny, verify, captcha, health };
+// ------------------------------------------------------------------ visitor gates (SPEC §18.1 / §18.2)
+//
+// Both run after the security checks, never on /__pcdn/ paths or tunnel paths, and fail open when
+// their shared dictionary is missing (an older http.conf).
+
+const WR_COOKIE = '__pcdn_wr';
+const WR_TICKET_TTL = 3600;        // s: a queue ticket older than this is void (the visitor starts again)
+const WR_SKIP_AFTER = 45;          // s that slots stay free while tickets wait without anyone claiming
+                                   // them: the tickets ahead of the free slots are taken as abandoned
+const WR_IP_NEW = 30;              // sessions admitted per client IP per minute (more wait in the queue)
+const WR_REFRESH_MIN = 15;         // queue page refresh / Retry-After: 15..30 s with jitter
+const WR_REFRESH_SPAN = 16;
+const WR_STATS_MAX = 1000;         // sites reported to the agent (heartbeat, keyed by site domain)
+const WR_COOKIE_RE = /^([0-9a-f]{16})\.(\d{1,15})\.(\d{1,12})\.(\d{1,12})\.([aq])\.([0-9a-f]{64})$/;
+
+const ACC_COOKIE = '__pcdn_access_';
+// one-time codes (pcdn-agent validation/gates.py OTP_*, the controller computes the same):
+// d = HMAC-SHA256(bytes(access secret), "otp|<app>|<email>|<window>"), RFC 4226 dynamic truncation
+// (offset = d[31] & 15, 31 bits from there) mod 10^6, window = floor(unix / 300)
+const OTP_PREFIX = 'otp';
+const OTP_WINDOW = 300;
+const OTP_DIGITS = 6;
+const OTP_WINDOWS = 2;             // the current and the previous window
+const ACC_SEND_PER_MIN = 5;        // code requests per client IP per site and minute
+const ACC_FAIL_MAX = 10;           // failed codes per client IP per site ...
+const ACC_FAIL_WINDOW = 600;       // ... in this window lock the IP out ...
+const ACC_LOCK_S = 600;            // ... for this long
+const ACC_EMAIL_RE = /^[a-z0-9._%+'-]{1,64}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+function lowerList(v) {
+    return (Array.isArray(v) ? v : []).map(function (x) { return String(x).toLowerCase(); }).filter(function (x) { return x.charAt(0) === '/'; });
+}
+
+function underAny(list, pathL) {
+    for (let i = 0; i < list.length; i++) if (pathL.indexOf(list[i]) === 0) return true;
+    return false;
+}
+
+function prepWaitingRoom(w) {
+    if (!w || typeof w !== 'object' || !(+w.max >= 1) || typeof w.secret !== 'string'
+        || !/^(?:[0-9a-f]{2}){16,64}$/.test(w.secret)) return null;
+    const b = w.bypass || {};
+    return { paths: lowerList(w.paths), max: Math.floor(+w.max), secret: Buffer.from(w.secret, 'hex'),
+        sessMin: Math.min(120, Math.max(1, Math.ceil((+w.session_s || 600) / 60))),
+        page: w.page || {}, bots: b.bots !== false, bpaths: lowerList(b.paths),
+        bips: (Array.isArray(b.ips) ? b.ips : []).map(cidr).filter(Boolean) };
+}
+
+function prepAccess(a) {
+    if (!a || typeof a !== 'object' || !Array.isArray(a.apps) || !a.apps.length) return null;
+    const key = typeof a.secret === 'string' && /^(?:[0-9a-f]{2}){16,64}$/.test(a.secret) ? Buffer.from(a.secret, 'hex') : null;
+    const A = { key: key, apps: [], byId: {} };
+    a.apps.forEach(function (x) {
+        if (!x || typeof x.id !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(x.id) || A.byId[x.id]) return;
+        const app = { id: x.id, name: String(x.name || x.id), paths: lowerList(x.paths),
+            methods: ['otp', 'ip', 'otp_or_ip'].indexOf(x.methods) >= 0 ? x.methods : 'none',
+            emails: (Array.isArray(x.emails) ? x.emails : []).map(function (e) { return String(e).toLowerCase(); }),
+            ips: (Array.isArray(x.ips) ? x.ips : []).map(cidr).filter(Boolean),
+            sessionS: Math.min(720 * 3600, Math.max(3600, Math.floor(+x.session_s || 86400))) };
+        if (!app.paths.length) return;
+        if (!key) { app.methods = 'none'; app.ips = []; }   // enabled without a secret: fail closed
+        app.otp = !!key && (app.methods === 'otp' || app.methods === 'otp_or_ip');
+        A.apps.push(app);
+        A.byId[app.id] = app;
+    });
+    return A.apps.length ? A : null;
+}
+
+function gates(ctx, site) {
+    if (site.access) {
+        const v = accessGate(ctx, site);
+        if (v) return v;
+    }
+    return site.wr ? wrGate(ctx, site) : null;
+}
+
+function cookieGet(r, name) {
+    const h = r.headersIn.Cookie;
+    if (!h) return '';
+    const parts = String(h).split(';');
+    for (let i = 0; i < parts.length; i++) {
+        const kv = parts[i], j = kv.indexOf('=');
+        if (j > 0 && kv.substring(0, j).trim() === name) return kv.substring(j + 1).trim();
+    }
+    return '';
+}
+
+function cookieAttrs(r, maxAge) {
+    return '; Path=/' + (maxAge === null ? '' : '; Max-Age=' + maxAge) + '; HttpOnly; SameSite=Lax'
+        + (r.variables.scheme === 'https' ? '; Secure' : '');
+}
+
+// the verdict reported in the access log for a /__pcdn/access/ request (usage `access`):
+// "ok:acc:<kind>:..." - it starts with "ok", so the OTP subrequest (which shares the variables of
+// this request) still passes the server-level verdict check
+function noteVerdict(r, v) {
+    try { r.variables.pcdn_verdict = 'ok:' + v; } catch (e) { r.error('pcdn note verdict: ' + e); }
+}
+
+function wantsHtml(r) {
+    return (r.method === 'GET' || r.method === 'HEAD') && /text\/html/i.test(String(r.headersIn.Accept || ''))
+        && !/xmlhttprequest/i.test(String(r.headersIn['X-Requested-With'] || ''));
+}
+
+// primary language of the visitor: "fa" unless English comes first in Accept-Language
+function pickLang(r) {
+    const h = String(r.headersIn['Accept-Language'] || '').toLowerCase();
+    const fa = h.search(/(?:^|[\s,])fa\b/), en = h.search(/(?:^|[\s,])en\b/);
+    return en >= 0 && (fa < 0 || en < fa) ? 'en' : 'fa';
+}
+
+// a gate page: the visitor's language first, the other one below; no script; inline style with a
+// per-response nonce under a strict CSP. T = { fa: {title, lines}, en: {...}, kind, icon, pill,
+// refresh (meta refresh s), hl (index of the line to highlight), wait (progress bar caption per lang), rows }
+function gatePage(r, code, lang, T, form, headers) {
+    const nonce = randHex(16);
+    const other = lang === 'fa' ? 'en' : 'fa';
+    const lines = function (l, main) {
+        return T[l].lines.map(function (x, i) { return '<p' + (main && i === T.hl ? ' class="hl"' : '') + '>' + esc(x) + '</p>'; }).join('');
+    };
+    const body = cardHead(T.icon || 'lock', T.pill || '', T[lang].title, false) + lines(lang, true)
+        + (T.wait ? '<div class="bar" role="progressbar" aria-label="' + esc(T.wait.en) + '"><i></i></div><p class="hint">'
+            + esc(T.wait[lang]) + '</p>' : '')
+        + (form || '')
+        + '<div class="alt" dir="' + (other === 'fa' ? 'rtl' : 'ltr') + '" lang="' + other + '"><h2>' + esc(T[other].title) + '</h2>'
+        + lines(other, false) + '</div>' + techBox(techRows(r, '', T.rows));
+    const html = shell(lang, T[lang].title, T.kind || 'violet', body,
+        T.refresh ? '<meta http-equiv="refresh" content="' + T.refresh + '">' : '', nonce);
+    const h = { 'Content-Security-Policy': "default-src 'none'; style-src 'nonce-" + nonce + "'; form-action 'self'; "
+        + "frame-ancestors 'none'; base-uri 'none'", 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff' };
+    Object.keys(headers || {}).forEach(function (k) { h[k] = headers[k]; });
+    send(r, code, html, h);
+}
+
+function sendJson(r, code, obj, headers) {
+    r.headersOut['Content-Type'] = 'application/json';
+    r.headersOut['Cache-Control'] = 'no-store';
+    Object.keys(headers || {}).forEach(function (k) { r.headersOut[k] = headers[k]; });
+    r.return(code, JSON.stringify(obj));
+}
+
+// ---- waiting room (SPEC §18.1)
+//
+// Per site in js_shared_dict pcdn_wr (number values, zone timeout + evict bound the memory):
+//   s:<site>:<rid>   minute of the session's last request (a session = an admitted visitor)
+//   m:<site>:<min>   sessions whose last request fell in that minute; active = the sum over the last
+//                    session_minutes minutes, so idle sessions drop out without any sweep
+//   c:<site> / cs:<site>  that sum, cached for the current second (cs) and bumped by admissions
+//   t:<site>         last queue ticket issued (monotonic per node), l:<site> last admitted ticket,
+//   lf:<site>        since when slots are free while tickets wait (abandoned tickets: WR_SKIP_AFTER)
+// The cookie __pcdn_wr = rid.ticket.issued.last.state(a|q).hmac (key: the raw bytes of
+// waiting_room.secret); a session is valid
+// while its s: entry exists and is younger than session_minutes.
+
+function wrSig(site, rid, ticket, issued, last, state) {
+    return hmac(site.wr.secret, 'wr|' + site.domain + '|' + rid + '|' + ticket + '|' + issued + '|' + last + '|' + state);
+}
+
+function wrCookie(ctx, site) {
+    const m = WR_COOKIE_RE.exec(cookieGet(ctx.r, WR_COOKIE));
+    if (!m || !safeEq(m[6], wrSig(site, m[1], m[2], m[3], m[4], m[5]))) return null;
+    return { rid: m[1], ticket: +m[2], issued: +m[3], last: +m[4], state: m[5] };
+}
+
+function wrSetCookie(ctx, site, rid, ticket, issued, state) {
+    const t = now();
+    const val = rid + '.' + ticket + '.' + issued + '.' + t + '.' + state + '.' + wrSig(site, rid, ticket, issued, t, state);
+    try { ctx.r.variables.pcdn_wrc = WR_COOKIE + '=' + val + cookieAttrs(ctx.r, 86400); } catch (e) { ctx.r.error('pcdn wr cookie: ' + e); }
+}
+
+function wrBypass(ctx, w) {
+    if (underAny(w.bpaths, ctx.pathL)) return true;
+    for (let i = 0; i < w.bips.length; i++) if (inCidr(ctx.ip, w.bips[i])) return true;
+    return w.bots && botClass(ctx.ua, ctx.r.variables.pcdn_vbot, false).verified;
+}
+
+function wrActive(d, site, t) {
+    const id = site.id;
+    if (d.get('cs:' + id) === t) return Math.max(0, d.get('c:' + id) || 0);
+    const min = Math.floor(t / 60);
+    let n = 0;
+    for (let k = 0; k < site.wr.sessMin; k++) n += d.get('m:' + id + ':' + (min - k)) || 0;
+    n = Math.max(0, n);
+    d.set('c:' + id, n);
+    d.set('cs:' + id, t);
+    return n;
+}
+
+function wrAdmit(ctx, d, site, t, active, ticket, waited) {
+    const id = site.id, min = Math.floor(t / 60), rid = randHex(8);
+    d.set('s:' + id + ':' + rid, min);
+    d.incr('m:' + id + ':' + min, 1, 0);
+    d.incr('c:' + id, 1, 0);
+    try { ngx.shared.pcdn_cnt.incr('wi:' + id + ':' + ctx.ipStr + ':' + min, 1, 0); } catch (e) { /* best effort */ }
+    wrSetCookie(ctx, site, rid, ticket, t, 'a');
+    return 'ok:wr:a:' + (active + 1) + ':' + Math.max(0, waited);
+}
+
+// -> null (not covered / bypassed / an active session in the same minute), "ok:wr:..." (admitted or
+// an active session's first request of a minute) or "wr:q:<position>:<active>" / "wr:qn:..." (queued;
+// qn = a new ticket)
+function wrGate(ctx, site) {
+    const w = site.wr, d = ngx.shared.pcdn_wr;
+    if (!d || !underAny(w.paths, ctx.pathL) || wrBypass(ctx, w)) return null;
+    const id = site.id, t = now(), min = Math.floor(t / 60);
+    const c = wrCookie(ctx, site);
+    if (c && c.state === 'a') {
+        const sk = 's:' + id + ':' + c.rid, last = d.get(sk);
+        if (last !== undefined && min - last < w.sessMin && min >= last) {
+            if (last === min) return null;
+            d.set(sk, min);
+            d.incr('m:' + id + ':' + min, 1, 0);
+            d.incr('m:' + id + ':' + last, -1, 0);
+            return 'ok:wr:t:' + wrActive(d, site, t);
+        }
+        // expired / unknown here (another node, restart): a new visitor
+    }
+    const active = wrActive(d, site, t), free = w.max - active;
+    const tq = d.get('t:' + id) || 0;
+    let la = d.get('l:' + id) || 0;
+    if (free > 0 && la < tq) {
+        // free slots nobody in the queue claimed for WR_SKIP_AFTER: the tickets ahead were abandoned
+        const lf = d.get('lf:' + id);
+        if (!lf) d.set('lf:' + id, t);
+        else if (t - lf > WR_SKIP_AFTER) {
+            la = Math.min(tq, la + free);
+            d.set('l:' + id, la);
+            d.delete('lf:' + id);
+        }
+    }
+    if (c && c.state === 'q' && c.ticket >= 1 && c.ticket <= tq && t - c.issued < WR_TICKET_TTL) {
+        if (free > 0 && c.ticket - la <= free) {   // FIFO: the first `free` tickets after the last admitted one
+            if (c.ticket > la) d.set('l:' + id, c.ticket);
+            d.delete('lf:' + id);
+            return wrAdmit(ctx, d, site, t, active, c.ticket, t - c.issued);
+        }
+        return 'wr:q:' + Math.max(1, c.ticket - la) + ':' + active;
+    }
+    let ipOk = true;
+    try { ipOk = (ngx.shared.pcdn_cnt.get('wi:' + id + ':' + ctx.ipStr + ':' + min) || 0) < WR_IP_NEW; } catch (e) { /* open */ }
+    if (free > 0 && la >= tq && ipOk) return wrAdmit(ctx, d, site, t, active, 0, 0);
+    const ticket = d.incr('t:' + id, 1, 0);
+    wrSetCookie(ctx, site, randHex(8), ticket, t, 'q');
+    return 'wr:qn:' + Math.max(1, ticket - la) + ':' + active;
+}
+
+function wrStats() {
+    const d = ngx.shared.pcdn_wr, out = {}, t = now();
+    if (!d) return out;
+    let n = 0;
+    Object.keys(S).forEach(function (id) {
+        const site = S[id];
+        if (!site || !site.wr || n >= WR_STATS_MAX) return;
+        n++;
+        out[site.domain] = { active: wrActive(d, site, t), queued: Math.max(0, (d.get('t:' + id) || 0) - (d.get('l:' + id) || 0)) };
+    });
+    return out;
+}
+
+const WR_TEXT = {
+    fa: { title: 'در صف ورود به وب‌سایت هستید', message: 'به دلیل ترافیک زیاد، ورود به وب‌سایت به ترتیب انجام می‌شود. این صفحه خودکار به‌روز می‌شود؛ لطفاً آن را نبندید.',
+        pos: 'جایگاه تقریبی شما در صف: ' },
+    en: { title: 'You are in the queue', message: 'Due to high traffic, visitors enter the website in order. This page refreshes automatically; please keep it open.',
+        pos: 'Your estimated position in the queue: ' },
+};
+
+function wrPage(r, site, pos) {
+    const retry = WR_REFRESH_MIN + Math.floor(Math.random() * WR_REFRESH_SPAN);
+    const h = { 'Retry-After': String(retry) };
+    const ck = r.variables.pcdn_wrc;
+    if (ck) h['Set-Cookie'] = String(ck);
+    if (!wantsHtml(r)) return sendJson(r, 503, { error: 'waiting_room', position: pos, retry_after: retry }, h);
+    const p = (site && site.wr && site.wr.page) || {};
+    const T = { refresh: retry, kind: 'blue', icon: 'queue', pill: 'Waiting room', hl: 1,
+        wait: { fa: 'به‌روزرسانی خودکار تا ' + retry + ' ثانیه دیگر', en: 'Refreshing automatically in ' + retry + ' seconds' } };
+    ['fa', 'en'].forEach(function (l) {
+        T[l] = { title: p['title_' + l] || WR_TEXT[l].title,
+            lines: [p['message_' + l] || WR_TEXT[l].message, WR_TEXT[l].pos + pos] };
+    });
+    gatePage(r, 200, pickLang(r), T, '', h);
+}
+
+// ---- access apps (SPEC §18.2)
+
+function accessApp(A, pathL) {
+    for (let i = 0; i < A.apps.length; i++) if (underAny(A.apps[i].paths, pathL)) return A.apps[i];
+    return null;
+}
+
+function emailAllowed(app, email) {
+    const dom = email.substring(email.lastIndexOf('@'));
+    for (let i = 0; i < app.emails.length; i++) {
+        const e = app.emails[i];
+        if (e.charAt(0) === '@' ? dom === e : email === e) return true;
+    }
+    return false;
+}
+
+// access_events email_hash: HMAC-SHA256(access secret, "email|" + email), first 16 hex
+function emailHash(A, email) { return A.key ? hmac(A.key, 'email|' + email).substring(0, 16) : '-'; }
+
+function otpCode(key, app, email, win) {
+    const h = hmac(key, OTP_PREFIX + '|' + app + '|' + email + '|' + win);
+    const b = function (i) { return parseInt(h.substring(i * 2, i * 2 + 2), 16); };
+    const off = b(31) & 15;
+    const bin = (b(off) & 0x7f) * 16777216 + b(off + 1) * 65536 + b(off + 2) * 256 + b(off + 3);
+    let c = String(bin % Math.pow(10, OTP_DIGITS));
+    while (c.length < OTP_DIGITS) c = '0' + c;
+    return c;
+}
+
+// session cookie __pcdn_access_<app> = base64url(app|email|exp) "." hex HMAC(access_secret, "sess|" + b64)
+function accSig(A, b64) { return hmac(A.key, 'sess|' + b64); }
+
+function accessSession(r, site, app) {
+    const A = site.access;
+    if (!A.key) return '';
+    const v = cookieGet(r, ACC_COOKIE + app.id), i = v.lastIndexOf('.');
+    if (i < 1 || !/^[A-Za-z0-9_-]{1,1024}$/.test(v.substring(0, i)) || !safeEq(v.substring(i + 1), accSig(A, v.substring(0, i)))) return '';
+    let p;
+    try { p = Buffer.from(v.substring(0, i), 'base64url').toString().split('|'); } catch (e) { return ''; }
+    if (p.length !== 3 || p[0] !== app.id || !(+p[2] > now()) || !ACC_EMAIL_RE.test(p[1]) || !emailAllowed(app, p[1])) return '';
+    return p[1];
+}
+
+function accessGate(ctx, site) {
+    const app = accessApp(site.access, ctx.pathL);
+    if (!app) return null;
+    if (app.methods !== 'otp') {
+        for (let i = 0; i < app.ips.length; i++) if (inCidr(ctx.ip, app.ips[i])) return null;
+    }
+    if (app.otp) return accessSession(ctx.r, site, app) ? null : 'acc:login:' + app.id;
+    return 'acc:deny:' + app.id;
+}
+
+// js_set $pcdn_acc_email -> X-PCDN-Access-Email: the signed-in email on a path of an access app
+// ("" = the header is not sent; a visitor's own copy never reaches the origin)
+function accessEmail(r) {
+    try {
+        const site = siteOf(r);
+        if (!site || !site.access) return '';
+        const path = String(r.uri).replace(/^\/__pcdn\/(?:img|body)(?=\/)/, '').toLowerCase();
+        if (path.indexOf('/__pcdn/') === 0) return '';
+        const app = accessApp(site.access, path);
+        return app && app.otp ? accessSession(r, site, app) : '';
+    } catch (e) { r.error('pcdn accessEmail: ' + e); }
+    return '';
+}
+
+// a same-site relative path only: no scheme, no "//" or "/\" (protocol-relative), no backslash,
+// no control / space / non-ASCII characters, never the sign-in endpoints themselves
+function safeNext(u) {
+    u = String(u === undefined || u === null ? '' : u);
+    if (u.length > 2048 || !/^\/(?![\/\\])[\x21-\x7e]*$/.test(u) || u.indexOf('\\') >= 0 || /^\/__pcdn\/access\//i.test(u)) return '/';
+    return u;
+}
+
+function queryArgs(r) {
+    const o = {};
+    String(r.variables.args || '').split('&').forEach(function (kv) {
+        const i = kv.indexOf('=');
+        if (i > 0) {
+            const k = pctDecode(kv.substring(0, i).replace(/\+/g, ' '));
+            if (!own(o, k)) o[k] = pctDecode(kv.substring(i + 1).replace(/\+/g, ' '));
+        }
+    });
+    return o;
+}
+
+function jsonReq(r) { return /^application\/json\b/i.test(String(r.headersIn['Content-Type'] || '')); }
+
+function gateBody(r) {
+    const text = String(r.requestText || '');
+    if (jsonReq(r)) {
+        try {
+            const o = JSON.parse(text);
+            return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+        } catch (e) { return {}; }
+    }
+    return parseForm(text);
+}
+
+function str(v, max) { return typeof v === 'string' || typeof v === 'number' ? String(v).substring(0, max) : ''; }
+
+// cross-site form posts are refused (an Origin header naming another host)
+function sameOrigin(r) {
+    const o = r.headersIn.Origin;
+    if (o === undefined) return true;
+    const m = /^https?:\/\/([^\/:]+)(?::\d+)?\/?$/i.exec(String(o));
+    return !!m && m[1].toLowerCase() === String(r.variables.host || '').toLowerCase();
+}
+
+const ACC_TEXT = {
+    fa: { title: 'ورود به بخش محافظت‌شده', email: 'برای دسترسی به «%s» نشانی ایمیل خود را وارد کنید تا کد ورود برایتان ارسال شود.',
+        sent: 'اگر این نشانی مجاز باشد، یک کد ۶ رقمی به آن ارسال شد. کد را وارد کنید.', bad: 'کد وارد شده درست نیست یا منقضی شده است.',
+        locked: 'تلاش‌های ناموفق زیاد بود. لطفاً چند دقیقه دیگر دوباره تلاش کنید.', many: 'درخواست‌های زیاد. لطفاً یک دقیقه دیگر تلاش کنید.',
+        deny: 'دسترسی به این بخش از وب‌سایت محدود است.', denyTitle: 'دسترسی محدود', send: 'ارسال کد', verify: 'ورود', ph: 'ایمیل',
+        code: 'کد ۶ رقمی' },
+    en: { title: 'Sign in to a protected area', email: 'To access "%s", enter your email address and we will send you a sign-in code.',
+        sent: 'If this address is allowed, a 6-digit code has been sent to it. Enter the code.', bad: 'The code is wrong or has expired.',
+        locked: 'Too many failed attempts. Please try again in a few minutes.', many: 'Too many requests. Please try again in a minute.',
+        deny: 'Access to this part of the website is restricted.', denyTitle: 'Restricted', send: 'Send code', verify: 'Sign in', ph: 'Email',
+        code: '6-digit code' },
+};
+
+// gate page text for an access page; extra = { icon, pill, rows, title (ACC_TEXT key) }
+function accT(key, name, extra) {
+    const tk = (extra && extra.title) || 'title';
+    const nm = name ? '\u2068' + name + '\u2069' : '';   // bidi-isolated app name
+    const T = { fa: { title: ACC_TEXT.fa[tk], lines: [ACC_TEXT.fa[key].replace('%s', nm)] },
+        en: { title: ACC_TEXT.en[tk], lines: [ACC_TEXT.en[key].replace('%s', nm)] }, kind: 'violet', icon: 'lock',
+        pill: 'Protected area' };
+    Object.keys(extra || {}).forEach(function (k) { if (k !== 'title') T[k] = extra[k]; });
+    return T;
+}
+
+function hidden(n, v) { return '<input type="hidden" name="' + n + '" value="' + esc(v) + '">'; }
+
+function emailForm(lang, app, next) {
+    const L = ACC_TEXT[lang];
+    return '<form method="post" action="/__pcdn/access/send">' + hidden('app', app.id) + hidden('next', next)
+        + '<input type="email" name="email" required maxlength="254" autocomplete="email" dir="ltr" placeholder="' + esc(L.ph) + '"> '
+        + '<button type="submit">' + esc(L.send) + '</button></form>';
+}
+
+function codeForm(lang, app, email, next) {
+    const L = ACC_TEXT[lang];
+    return '<form method="post" action="/__pcdn/access/verify">' + hidden('app', app.id) + hidden('email', email) + hidden('next', next)
+        + '<input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" dir="ltr" placeholder="'
+        + esc(L.code) + '"> <button type="submit">' + esc(L.verify) + '</button></form>';
+}
+
+// deny() for "acc:login:<app>" / "acc:deny:<app>"
+function accessDenied(r, site, kind, appId) {
+    const app = site && site.access ? site.access.byId[appId] : null;
+    if (kind === 'login' && app) {
+        const url = '/__pcdn/access/login?app=' + encodeURIComponent(app.id) + '&next=' + encodeURIComponent(safeNext(r.variables.request_uri));
+        if (wantsHtml(r)) {
+            r.headersOut['Cache-Control'] = 'no-store';
+            return r.return(302, url);
+        }
+        return sendJson(r, 401, { error: 'access_required', app: app.id, login: url });
+    }
+    if (!wantsHtml(r)) return sendJson(r, 403, { error: 'access_denied' });
+    gatePage(r, 403, pickLang(r), accT('deny', '', { title: 'denyTitle', pill: '403 Forbidden' }), '', {});
+}
+
+function accessLogin(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    const q = queryArgs(r), app = A.byId[str(q.app, 64)] || null, next = safeNext(q.next), lang = pickLang(r);
+    if (!app || !app.otp) return r.return(404);
+    if (accessSession(r, site, app)) {
+        r.headersOut['Cache-Control'] = 'no-store';
+        return r.return(302, next);
+    }
+    gatePage(r, 200, lang, accT('email', app.name), emailForm(lang, app, next), {});
+}
+
+function accessSend(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    if (r.method !== 'POST') return r.return(405);
+    if (!sameOrigin(r)) return r.return(403);
+    const f = gateBody(r), ip = r.variables.remote_addr, lang = pickLang(r), json = jsonReq(r);
+    const app = A.byId[str(f.app, 64)] || null;
+    const email = str(f.email, 254).trim().toLowerCase(), next = safeNext(str(f.next, 2048));
+    const n = ngx.shared.pcdn_cnt.incr('as:' + site.id + ':' + ip + ':' + Math.floor(now() / 60), 1, 0);
+    if (n > ACC_SEND_PER_MIN) {
+        noteVerdict(r, 'acc:limited:' + (app ? app.id : '-'));
+        if (json) return sendJson(r, 429, { error: 'rate_limited' }, { 'Retry-After': '60' });
+        const T = accT('many', '', { pill: '429 Too Many Requests', rows: [['Retry after', '60 s']] });
+        return gatePage(r, 429, lang, T, '', { 'Retry-After': '60' });
+    }
+    if (app && app.otp && ACC_EMAIL_RE.test(email) && emailAllowed(app, email)) {
+        try {
+            // detached: the visitor's answer never waits for the controller (no timing difference)
+            r.subrequest('/__pcdn/access/otp', { method: 'POST', detached: true,
+                body: JSON.stringify({ domain: site.domain, app: app.id, email: email }) });
+            noteVerdict(r, 'acc:otp:' + app.id + ':' + emailHash(A, email));
+        } catch (e) { r.error('pcdn access send: ' + e); }
+    }
+    // the same answer whether or not the address is allowed (no enumeration)
+    if (json || !app || !app.otp) return sendJson(r, 200, { ok: true, message: ACC_TEXT.en.sent });
+    gatePage(r, 200, lang, accT('sent', '', { icon: 'mail' }), codeForm(lang, app, email, next), {});
+}
+
+function accessVerify(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    if (r.method !== 'POST') return r.return(405);
+    if (!sameOrigin(r)) return r.return(403);
+    const f = gateBody(r), ip = r.variables.remote_addr, lang = pickLang(r), json = jsonReq(r), t = now();
+    const app = A.byId[str(f.app, 64)] || null;
+    const email = str(f.email, 254).trim().toLowerCase(), next = safeNext(str(f.next, 2048));
+    const code = str(f.code, 32).replace(/\s/g, '');
+    const okEmail = ACC_EMAIL_RE.test(email);
+    const tag = (app ? app.id : '-') + ':' + (okEmail ? emailHash(A, email) : '-');
+    const blk = ngx.shared.pcdn_blk, lockKey = 'al:' + site.id + ':' + ip;
+    const lockedUntil = blk.get(lockKey) || 0;
+    if (lockedUntil > t) {
+        noteVerdict(r, 'acc:locked:' + tag);
+        const wait = String(lockedUntil - t);
+        if (json) return sendJson(r, 429, { error: 'locked', retry_after: +wait }, { 'Retry-After': wait });
+        const T = accT('locked', '', { pill: '429 Too Many Requests', rows: [['Retry after', wait + ' s']] });
+        return gatePage(r, 429, lang, T, '', { 'Retry-After': wait });
+    }
+    let ok = false;
+    if (app && app.otp && okEmail && emailAllowed(app, email) && new RegExp('^\\d{' + OTP_DIGITS + '}$').test(code)) {
+        const w = Math.floor(t / OTP_WINDOW);
+        let hit = false;
+        for (let i = 0; i < OTP_WINDOWS; i++) hit = safeEq(code, otpCode(A.key, app.id, email, w - i)) || hit;
+        // a code signs in once
+        ok = hit && useOnce('ao:' + site.id + ':' + sha256(app.id + '|' + email + '|' + code).substring(0, 32), t + OTP_WINDOW * (OTP_WINDOWS + 1));
+    }
+    if (!ok) {
+        const n = ngx.shared.pcdn_cnt.incr('af:' + site.id + ':' + ip + ':' + Math.floor(t / ACC_FAIL_WINDOW), 1, 0);
+        if (n >= ACC_FAIL_MAX) blk.set(lockKey, t + ACC_LOCK_S);
+        noteVerdict(r, 'acc:fail:' + tag);
+        if (json || !app) return sendJson(r, 401, { ok: false, error: 'invalid_code' });
+        const T = accT('bad', '', { pill: '401 Unauthorized' });
+        return gatePage(r, 401, lang, T, app.otp ? codeForm(lang, app, email, next) : '', {});
+    }
+    const exp = t + app.sessionS;
+    const b64 = Buffer.from(app.id + '|' + email + '|' + exp).toString('base64url');
+    r.headersOut['Set-Cookie'] = ACC_COOKIE + app.id + '=' + b64 + '.' + accSig(A, b64) + cookieAttrs(r, app.sessionS);
+    noteVerdict(r, 'acc:ok:' + tag);
+    if (json) return sendJson(r, 200, { ok: true, next: next });
+    r.headersOut['Cache-Control'] = 'no-store';
+    r.return(302, next);
+}
+
+function accessLogout(r) {
+    const site = siteOf(r), A = site && site.access;
+    if (!A) return r.return(404);
+    const q = queryArgs(r), one = A.byId[str(q.app, 64)];
+    const apps = one ? [one] : A.apps;
+    r.headersOut['Set-Cookie'] = apps.map(function (a) { return ACC_COOKIE + a.id + '=' + cookieAttrs(r, 0); });
+    r.headersOut['Cache-Control'] = 'no-store';
+    r.return(302, safeNext(q.next));
+}
+
+// ------------------------------------------------------------------ RUM ingestion (SPEC §23.7)
+//
+// POST /__pcdn/rum (sendBeacon / fetch keepalive from /__pcdn/rum.js). Only a POST with a text/plain or
+// application/json body whose Origin (else Referer) host is the request's own host is kept; everything
+// else gets the same 204 and is dropped. The kept beacon becomes ONE sanitized JSON line in
+// $pcdn_rum_line (the pcdn_rum log): minute, host, country, ASN, region, the validated dimensions and
+// the clamped metrics. The client address is read by nginx only for the ASN / region lookup; it is never
+// part of the line (the log format has no other field).
+
+const RUM_MS = ['ttfb', 'fcp', 'lcp', 'inp', 'dns', 'tcp', 'tls', 'dom', 'load'];
+const RUM_MS_MAX = 60000, RUM_CLS_MAX = 10;
+const RUM_NT = { navigate: 1, reload: 1, back_forward: 1, prerender: 1, soft: 1 };
+const RUM_CS = { HIT: 1, MISS: 1, BYPASS: 1, EXPIRED: 1, STALE: 1 };
+const RUM_DEV = { m: 1, t: 1, d: 1 };
+const RUM_PATH = /^\/[^\s?#]{0,199}$/;
+const RUM_CT = /^(?:text\/plain|application\/json)\s*(?:;|$)/i;
+const RUM_HOST = /^[a-z0-9.-]{1,253}$/;
+
+function rumUrlHost(v) {
+    const m = /^[a-z][a-z0-9+.-]*:\/\/([^\/?#\s]+)/i.exec(String(v || ''));
+    return m ? m[1].replace(/^.*@/, '').replace(/:\d+$/, '').toLowerCase() : null;
+}
+
+function rumNum(v, hi, ms) {
+    if (typeof v !== 'number' || !isFinite(v)) return null;
+    const n = Math.min(hi, Math.max(0, v));
+    return ms ? Math.round(n) : Math.round(n * 10000) / 10000;
+}
+
+function rumLine(r) {
+    if (r.method !== 'POST' || !RUM_CT.test(String(r.headersIn['Content-Type'] || ''))) return '';
+    const host = String(r.variables.host || '').toLowerCase();
+    if (!RUM_HOST.test(host)) return '';
+    const origin = r.headersIn['Origin'];
+    const from = origin !== undefined ? rumUrlHost(origin) : rumUrlHost(r.headersIn['Referer']);
+    if (from !== host) return '';
+    let b;
+    try { b = JSON.parse(r.requestText || ''); } catch (e) { return ''; }
+    if (!b || typeof b !== 'object' || Array.isArray(b) || b.v !== 1) return '';
+    const cc = String(r.variables.pcdn_country || '').toUpperCase();
+    const asn = parseInt(r.variables.pcdn_asn || '0', 10);
+    const o = { t: new Date().toISOString().slice(0, 16) + ':00Z', h: host, cc: /^[A-Z]{2}$/.test(cc) ? cc : '',
+        asn: asn >= 0 && asn <= 4294967295 ? asn : 0, rg: String(r.variables.pcdn_region || '').substring(0, 64),
+        p: typeof b.p === 'string' && RUM_PATH.test(b.p) ? b.p : '/' };
+    if (typeof b.nt === 'string' && RUM_NT[b.nt] === 1) o.nt = b.nt;
+    if (typeof b.dev === 'string' && RUM_DEV[b.dev] === 1) o.dev = b.dev;
+    o.cs = typeof b.cs === 'string' && RUM_CS[b.cs] === 1 ? b.cs : '';
+    RUM_MS.forEach(function (k) {
+        const v = rumNum(b[k], RUM_MS_MAX, true);
+        if (v !== null) o[k] = v;
+    });
+    const cls = rumNum(b.cls, RUM_CLS_MAX, false);
+    if (cls !== null) o.cls = cls;
+    return JSON.stringify(o);
+}
+
+function rumIngest(r) {
+    let line = '';
+    try { line = rumLine(r); } catch (e) { line = ''; }
+    if (line) r.variables.pcdn_rum_line = line;
+    r.return(204);
+}
+
+export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
+    bodyNeed, bodyInspect, tfHeaders, tunnelFair, tunnelDrain, fairSet, hcSet, speedDown, speedUp, videoNext,
+    accessEmail, accessLogin, accessSend, accessVerify, accessLogout, rumIngest };

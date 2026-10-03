@@ -1,0 +1,39 @@
+#cloud-config
+# Pasargad CDN — unattended edge install on first boot (SPEC §11.1).
+#
+# Paste this into your provider's "user data" / cloud-init field when creating a VM
+# (Ubuntu 24.04). Replace the two placeholders below with your controller URL and the
+# node's one-time edge token (from the WHMCS admin Edges page: "افزودن نود" / batch add).
+#
+# The one-command bootstrap downloads the edge bundle from the controller and runs the
+# installer with the flags you choose. It holds no secrets other than the token you paste.
+#
+# SPEC §23.9: a one-time JOIN token (jt_..., from a provisioning proposal or the admin's
+# "join token" action) works instead of the edge token: pass it as PCDN_JOIN_TOKEN="$TOKEN"
+# (install.sh exchanges it for the edge token). Add --version vX.Y.Z to install a pinned release.
+
+write_files:
+  - path: /root/pcdn-install.sh
+    permissions: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # ---- edit these two lines ----
+      CONTROLLER="https://cdn-api.example.com"     # your controller URL (no trailing slash)
+      TOKEN="edge_REPLACE_WITH_ONE_TIME_TOKEN"     # this node's one-time edge token
+      # ---- optional flags ----
+      REGION="global"        # home | global
+      ROLE="general"         # general | tunnel
+      CACHE_SIZE="10g"
+      # the token goes through the environment, not the command line (`ps` shows argv)
+      curl -fsSL --proto '=https' "$CONTROLLER/edge/bootstrap.sh" | PCDN_EDGE_TOKEN="$TOKEN" bash -s -- \
+        --controller "$CONTROLLER" \
+        --region "$REGION" --role "$ROLE" --cache-size "$CACHE_SIZE"
+
+runcmd:
+  - [ bash, /root/pcdn-install.sh ]
+
+# After boot, verify on the node:
+#   systemctl status pcdn-agent
+#   journalctl -u pcdn-agent -f
+#   curl -H 'Host: health.pcdn' http://127.0.0.1/__pcdn/health

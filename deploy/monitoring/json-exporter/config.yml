@@ -1,0 +1,128 @@
+# json-exporter modules for the OPTIONAL admin-API bridge (compose profile api-bridge).
+#
+# The controller's /metrics exposes platform aggregates only. Per-edge load, capacity, uptime and
+# 24h traffic / cache / security totals live in the admin API; this maps a FIXED set of their
+# fields to pcdn_api_* gauges. Anything not listed here (customer domains in top_sites/sites,
+# edge IPs, errors) is never exported. Edge names/groups become labels: keep Prometheus private.
+#
+# Auth: Bearer ADMIN_API_KEY from the Compose secret /run/secrets/admin_api_key.
+modules:
+  # GET /api/v1/overview (scraped every 2m)
+  overview:
+    http_client_config:
+      authorization:
+        type: Bearer
+        credentials_file: /run/secrets/admin_api_key
+    metrics:
+      - name: pcdn_api_edge
+        type: object
+        help: Per-edge state from /api/v1/overview (edges.list).
+        path: '{.edges.list[*]}'
+        labels:
+          edge: '{.name}'
+          edge_id: '{.id}'
+          group: '{.group}'
+        values:
+          enabled: '{.enabled}'
+          online: '{.online}'
+          shed: '{.shed}'
+          capacity_mbps: '{.capacity_mbps}'
+      # heartbeat load metrics and availability. Fields that are null (an edge that never reported
+      # metrics, unknown capacity, no uptime yet) are skipped: json-exporter logs "Failed to
+      # extract/convert value" for them on each scrape, which is expected.
+      - name: pcdn_api_edge
+        type: object
+        help: Latest heartbeat load metrics and availability per edge (SPEC §7.4, §8.1).
+        path: '{.edges.list[*]}'
+        labels:
+          edge: '{.name}'
+          edge_id: '{.id}'
+          group: '{.group}'
+        values:
+          rx_mbps: '{.metrics.rx_mbps}'
+          tx_mbps: '{.metrics.tx_mbps}'
+          connections: '{.metrics.connections}'
+          load1: '{.metrics.load1}'
+          cpus: '{.metrics.cpus}'
+          uptime_24h_percent: '{.uptime.h24}'
+          uptime_30d_percent: '{.uptime.d30}'
+      - name: pcdn_api_edges
+        type: object
+        help: Edge counters from /api/v1/overview.
+        path: '{.edges}'
+        values:
+          total: '{.total}'
+          enabled: '{.enabled}'
+          online: '{.online}'
+          with_errors: '{.with_errors}'
+          shed: '{.shed}'
+      # SPEC §15.5: per edge group, 3-day p95 of hourly tx vs summed capacity
+      - name: pcdn_api_group
+        type: object
+        help: Per edge group 3-day p95 throughput vs capacity (SPEC §15.5).
+        path: '{.capacity[*]}'
+        labels:
+          group: '{.group}'
+        values:
+          p95_mbps: '{.p95_mbps}'
+          capacity_mbps: '{.capacity_mbps}'
+          capacity_used_percent: '{.pct}'
+      - name: pcdn_api_month
+        type: object
+        help: Platform totals for the current calendar month.
+        path: '{.month}'
+        values:
+          bytes: '{.bytes}'
+          requests: '{.requests}'
+
+  # GET /api/v1/analytics?period=24h (scraped every 5m): rolling 24h platform totals
+  analytics:
+    http_client_config:
+      authorization:
+        type: Bearer
+        credentials_file: /run/secrets/admin_api_key
+    metrics:
+      - name: pcdn_api_24h
+        type: object
+        help: Platform traffic over the last 24 hours (rolling).
+        path: '{.totals}'
+        values:
+          requests: '{.requests}'
+          bytes: '{.bytes}'
+          cache_hits: '{.cache_hits}'
+      - name: pcdn_api_24h_status_requests
+        type: object
+        help: Requests over the last 24 hours by status class.
+        path: '{.totals}'
+        values:
+          2xx: '{.status.2xx}'
+          3xx: '{.status.3xx}'
+          4xx: '{.status.4xx}'
+          5xx: '{.status.5xx}'
+      - name: pcdn_api_24h_security_events
+        type: object
+        help: Security events over the last 24 hours by source (SPEC §4).
+        path: '{.totals.security}'
+        values:
+          waf: '{.waf}'
+          firewall: '{.firewall}'
+          ratelimit: '{.ratelimit}'
+          challenge: '{.challenge}'
+          ddos: '{.ddos}'
+          hotlink: '{.hotlink}'
+          bots: '{.bots}'
+      # the last COMPLETED hour of the hourly series (the final element is the running hour)
+      - name: pcdn_api_last_hour
+        type: object
+        help: Platform traffic in the last completed hour.
+        path: '{.series[-2:-1]}'
+        values:
+          requests: '{.requests}'
+          bytes: '{.bytes}'
+          cache_hits: '{.cache_hits}'
+      - name: pcdn_api_last_hour_security_events
+        type: object
+        help: Security events in the last completed hour.
+        path: '{.security_series[-2:-1]}'
+        values:
+          total: '{.events}'

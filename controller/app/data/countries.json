@@ -1,0 +1,230 @@
+{
+"IR": {
+"fa": "ایران",
+"en": "Iran"
+},
+"US": {
+"fa": "آمریکا",
+"en": "United States"
+},
+"DE": {
+"fa": "آلمان",
+"en": "Germany"
+},
+"GB": {
+"fa": "بریتانیا",
+"en": "United Kingdom"
+},
+"FR": {
+"fa": "فرانسه",
+"en": "France"
+},
+"NL": {
+"fa": "هلند",
+"en": "Netherlands"
+},
+"TR": {
+"fa": "ترکیه",
+"en": "Turkey"
+},
+"AE": {
+"fa": "امارات",
+"en": "United Arab Emirates"
+},
+"IQ": {
+"fa": "عراق",
+"en": "Iraq"
+},
+"AF": {
+"fa": "افغانستان",
+"en": "Afghanistan"
+},
+"AM": {
+"fa": "ارمنستان",
+"en": "Armenia"
+},
+"AZ": {
+"fa": "آذربایجان",
+"en": "Azerbaijan"
+},
+"CA": {
+"fa": "کانادا",
+"en": "Canada"
+},
+"SE": {
+"fa": "سوئد",
+"en": "Sweden"
+},
+"NO": {
+"fa": "نروژ",
+"en": "Norway"
+},
+"FI": {
+"fa": "فنلاند",
+"en": "Finland"
+},
+"DK": {
+"fa": "دانمارک",
+"en": "Denmark"
+},
+"IT": {
+"fa": "ایتالیا",
+"en": "Italy"
+},
+"ES": {
+"fa": "اسپانیا",
+"en": "Spain"
+},
+"AT": {
+"fa": "اتریش",
+"en": "Austria"
+},
+"CH": {
+"fa": "سوئیس",
+"en": "Switzerland"
+},
+"BE": {
+"fa": "بلژیک",
+"en": "Belgium"
+},
+"RU": {
+"fa": "روسیه",
+"en": "Russia"
+},
+"UA": {
+"fa": "اوکراین",
+"en": "Ukraine"
+},
+"CN": {
+"fa": "چین",
+"en": "China"
+},
+"IN": {
+"fa": "هند",
+"en": "India"
+},
+"JP": {
+"fa": "ژاپن",
+"en": "Japan"
+},
+"AU": {
+"fa": "استرالیا",
+"en": "Australia"
+},
+"QA": {
+"fa": "قطر",
+"en": "Qatar"
+},
+"OM": {
+"fa": "عمان",
+"en": "Oman"
+},
+"KW": {
+"fa": "کویت",
+"en": "Kuwait"
+},
+"SA": {
+"fa": "عربستان",
+"en": "Saudi Arabia"
+},
+"BH": {
+"fa": "بحرین",
+"en": "Bahrain"
+},
+"GE": {
+"fa": "گرجستان",
+"en": "Georgia"
+},
+"TM": {
+"fa": "ترکمنستان",
+"en": "Turkmenistan"
+},
+"PK": {
+"fa": "پاکستان",
+"en": "Pakistan"
+},
+"MY": {
+"fa": "مالزی",
+"en": "Malaysia"
+},
+"SG": {
+"fa": "سنگاپور",
+"en": "Singapore"
+},
+"BG": {
+"fa": "بلغارستان",
+"en": "Bulgaria"
+},
+"PL": {
+"fa": "لهستان",
+"en": "Poland"
+},
+"RO": {
+"fa": "رومانی",
+"en": "Romania"
+},
+"GR": {
+"fa": "یونان",
+"en": "Greece"
+},
+"CY": {
+"fa": "قبرس",
+"en": "Cyprus"
+},
+"IE": {
+"fa": "ایرلند",
+"en": "Ireland"
+},
+"PT": {
+"fa": "پرتغال",
+"en": "Portugal"
+},
+"CZ": {
+"fa": "چک",
+"en": "Czechia"
+},
+"HU": {
+"fa": "مجارستان",
+"en": "Hungary"
+},
+"BR": {
+"fa": "برزیل",
+"en": "Brazil"
+},
+"KR": {
+"fa": "کره جنوبی",
+"en": "South Korea"
+},
+"LB": {
+"fa": "لبنان",
+"en": "Lebanon"
+},
+"SY": {
+"fa": "سوریه",
+"en": "Syria"
+},
+"TJ": {
+"fa": "تاجیکستان",
+"en": "Tajikistan"
+},
+"UZ": {
+"fa": "ازبکستان",
+"en": "Uzbekistan"
+},
+"KZ": {
+"fa": "قزاقستان",
+"en": "Kazakhstan"
+},
+"NZ": {
+"fa": "نیوزیلند",
+"en": "New Zealand"
+},
+"LU": {
+"fa": "لوکزامبورگ",
+"en": "Luxembourg"
+},
+"EG": {
+"fa": "مصر",
+"en": "Egypt"
+}
+}

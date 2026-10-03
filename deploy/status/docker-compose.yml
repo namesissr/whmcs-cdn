@@ -1,0 +1,55 @@
+# Pasargad CDN — public status page, deployed on a SEPARATE host and domain so it stays up while
+# the control plane is down (a status page on the broken stack is useless).
+#
+#   cd deploy/status
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+#
+# caddy  : serves the page + mirrored JSON over HTTPS (automatic Let's Encrypt for STATUS_DOMAIN)
+# mirror : polls <controller>/status.json, keeps the LAST KNOWN copy when the controller is down
+# Guide (Persian): docs/MONITORING.md — «صفحهٔ وضعیت جداگانه»
+name: pcdn-status
+
+services:
+  mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile.mirror
+    image: pcdn-status-mirror:local
+    restart: unless-stopped
+    environment:
+      STATUS_UPSTREAMS: ${STATUS_UPSTREAMS:?set STATUS_UPSTREAMS in .env (e.g. https://cdn-api.example.com)}
+      MIRROR_INTERVAL: ${MIRROR_INTERVAL:-20}
+      MIRROR_TIMEOUT: ${MIRROR_TIMEOUT:-10}
+    volumes:
+      - ../../status:/src/status:ro       # the page itself, unchanged (repo status/)
+      - www:/srv/www
+      - data:/srv/data                    # last known status.json survives restarts
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      STATUS_DOMAIN: ${STATUS_DOMAIN:?set STATUS_DOMAIN in .env (e.g. status.example.net)}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - www:/srv/www:ro
+      - data:/srv/data:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - mirror
+
+volumes:
+  www:
+  data:
+  caddy-data:
+  caddy-config:

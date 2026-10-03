@@ -3,20 +3,43 @@ name: CI
 on:
   push:
   pull_request:
+  # release-platform.yml runs every job of this workflow before it builds a platform release (SPEC §23.1)
+  workflow_call:
 
 jobs:
   controller:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: controller
+    # migrations, leader election and pg_dump/pg_restore are also tested against a real PostgreSQL
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pcdn
+          POSTGRES_PASSWORD: pcdn
+          POSTGRES_DB: pcdn
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pcdn" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PCDN_TEST_PG_URL: postgresql+psycopg://pcdn:pcdn@127.0.0.1:5432/pcdn
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: PostgreSQL 16 client (pg_dump / pg_restore for the backup tests)
+        run: |
+          if ! pg_dump --version | grep -q " 16\."; then
+            sudo apt-get update -q && sudo apt-get install -y -q postgresql-client-16
+          fi
+          pg_dump --version
       - run: pip install -r requirements-dev.txt
-      - run: python -m pytest -q
+      - run: python -m pyflakes app tests migrations
+      - run: python -m pytest -q -rs
 
   edge:
     runs-on: ubuntu-24.04
@@ -26,15 +49,208 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nginx libnginx-mod-http-js libnginx-mod-http-geoip2 \
-            libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter python3-pytest
+            libnginx-mod-http-image-filter libnginx-mod-http-brotli-filter libnginx-mod-stream \
+            python3-pil nftables quickjs python3-pytest
           sudo systemctl stop nginx
           sudo pip install --break-system-packages -q mmdb-writer netaddr
       # nginx -t binds the listen ports, so the tests run as root
       - run: sudo python3 -m pytest -q -p no:cacheprovider edge/tests
-      - run: bash -n edge/install.sh && bash -n edge/pcdn-geoip-update.sh
+      - run: sudo python3 -m pytest -q -p no:cacheprovider tools/loadtest/tests
+      - run: bash -n edge/install.sh && bash -n edge/bootstrap.sh && bash -n edge/pcdn-geoip-update.sh
 
   whmcs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: find whmcs -name '*.php' -print0 | xargs -0 -n1 php -l
+
+  terraform:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: terraform-provider-pcdn
+    env:
+      # the plan/apply tests (terraform-plugin-testing against an in-process httptest fake controller,
+      # no network) are skipped without a Terraform CLI; in CI a missing CLI is a failure instead
+      PCDN_REQUIRE_TERRAFORM: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: terraform-provider-pcdn/go.mod
+          cache-dependency-path: terraform-provider-pcdn/go.sum
+      # the wrapper script breaks terraform-plugin-testing (it rewrites stdout), so it stays off
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...
+
+  cli:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          # the CLI has no third-party dependencies (no go.sum)
+          cache-dependency-path: cli/go.mod
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: cross-compile (release targets)
+        run: |
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -o /dev/null ./cmd/pcdn
+            done
+          done
+      # validates both release configs (cli/ and terraform-provider-pcdn/) without building or signing
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          workdir: cli
+          args: check
+      - name: goreleaser check (provider)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          workdir: terraform-provider-pcdn
+          args: check
+
+  # end-to-end: the full staging stack (deploy/staging, docs/STAGING.md) — controller + PostgreSQL +
+  # PowerDNS + two edges installed through the controller's one-command installer + a sample origin —
+  # and tests/integration run inside the stack's runner container
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      STAGING_WAIT_TIMEOUT: "600"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the staging compose file
+        run: deploy/staging/staging.sh config
+      - name: Start the staging stack (build + wait until healthy)
+        run: deploy/staging/staging.sh up
+      - name: Integration tests
+        run: deploy/staging/staging.sh test
+      - name: Dump logs
+        if: failure()
+        run: |
+          deploy/staging/staging.sh logs
+          deploy/staging/staging.sh logs staging-logs
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-logs
+          path: staging-logs/
+          if-no-files-found: ignore
+      - name: Tear down
+        if: always()
+        run: deploy/staging/staging.sh down
+
+  ops-tooling:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install promtool + amtool
+        run: |
+          curl -fsSL https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin prometheus-3.5.0.linux-amd64/promtool
+          curl -fsSL https://github.com/prometheus/alertmanager/releases/download/v0.28.1/alertmanager-0.28.1.linux-amd64.tar.gz | sudo tar xz --strip-components=1 -C /usr/local/bin alertmanager-0.28.1.linux-amd64/amtool
+      - run: python3 deploy/monitoring/tools/check_monitoring.py
+      - name: Preflight tool tests (SPEC §18.6)
+        run: |
+          pip install pytest pyflakes
+          python3 -m pyflakes tools/preflight
+          python3 -m pytest -q tools/preflight/tests
+      - name: Alertmanager config renders and validates
+        run: |
+          mkdir -p /tmp/sec && printf x > /tmp/sec/telegram_bot_token
+          RENDER_ONLY=1 RENDER_DIR=/tmp/am SECRETS_DIR=/tmp/sec TELEGRAM_CHAT_ID=-1 ALERT_EMAIL_TO=a@b.c SMTP_SMARTHOST=s:587 SMTP_FROM=a@b.c sh deploy/monitoring/render-config.sh alertmanager
+          sed -i "s#/etc/alertmanager/templates#$PWD/deploy/monitoring/alertmanager/templates#" /tmp/am/alertmanager.yml
+          amtool check-config /tmp/am/alertmanager.yml
+      - run: sh -n deploy/monitoring/render-config.sh && sh -n deploy/status/mirror.sh
+      - run: docker compose -f deploy/monitoring/docker-compose.yml --env-file deploy/monitoring/.env.example config -q
+      - run: docker compose -f deploy/status/docker-compose.yml --env-file deploy/status/.env.example config -q
+      - run: pip install -r docs-site/requirements.txt && mkdocs build --strict
+
+  # release metadata (SPEC §23.1): VERSION is SemVer, CHANGELOG has [Unreleased], the edge release bundle
+  # is deterministic, tools/release/*.sh pass bash -n + shellcheck; release tooling tests (prepare /
+  # changelog section / bundle / fetch / staging gate against a fake controller / security-check scanners)
+  release-meta:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: shellcheck available
+        run: shellcheck --version || (sudo apt-get update -q && sudo apt-get install -y -q shellcheck)
+      - run: tools/release/check-meta.sh
+      - name: Release tooling tests
+        run: |
+          pip install pytest pyflakes
+          python3 -m pyflakes tools/release tools/provision
+          git config --global user.email ci@example.invalid && git config --global user.name ci
+          python3 -m pytest -q tools/release/tests
+
+  # node provisioning (SPEC §23.9): terraform/ fmt + validate (fake + hcloud example, no cloud credentials)
+  # and pcdn-provision against a fake controller with the real Terraform CLI and the fake provider module
+  provisioning:
+    runs-on: ubuntu-24.04
+    env:
+      PCDN_REQUIRE_TERRAFORM: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff terraform
+      - name: terraform validate
+        run: |
+          for d in terraform/modules/pcdn-edge-node terraform/providers/fake terraform/providers/hcloud; do
+            echo "== $d"
+            terraform -chdir="$d" init -backend=false -input=false -no-color
+            terraform -chdir="$d" validate -no-color
+          done
+      - name: Provisioner tests
+        run: |
+          pip install pytest pyflakes
+          python3 -m pyflakes tools/provision
+          python3 -m pytest -q tools/provision/tests
+
+  # public status page: abuse form PoW solver / helpers (SPEC §23.10) under node
+  status-page:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --check status/status.js && node --check status/abuse.js
+      - run: node --test status/tests/*.test.js

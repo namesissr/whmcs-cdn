@@ -1,0 +1,10 @@
+# provisioner / local runs: never commit state, plans, provider caches or secret tfvars
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+plan.bin
+secrets.auto.tfvars.json
+terraform.tfvars.json
+out/

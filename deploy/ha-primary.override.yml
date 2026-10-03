@@ -1,0 +1,24 @@
+# Server A (primary) in the two-server HA setup — docs/OPERATIONS.md, section "HA".
+#   docker compose -f docker-compose.yml -f deploy/ha-primary.override.yml up -d
+# Publishes PostgreSQL (replication + B's controller) and the PowerDNS API (B's controller
+# writes zones to ns1 too) on A's PRIVATE address only. Firewall 5432 and 8081 so that
+# only server B can reach them.
+services:
+  pdns:
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP}:8081:8081"
+  db:
+    ports:
+      - "${PRIVATE_IP:?set PRIVATE_IP to this server's private address in .env}:5432:5432"
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - hot_standby=on
+      - -c
+      - wal_keep_size=1GB

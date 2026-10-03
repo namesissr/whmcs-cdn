@@ -23,7 +23,10 @@ def test_sections_defaults_and_roundtrip(client):
     s = site(client)
     assert s["plan"]["features"]["max_page_rules"] == 10
     assert set(s["config"]) == {"cache", "ssl", "waf", "ddos", "firewall", "ratelimit", "pagerules", "pools",
-                                "headers", "hotlink", "image", "errorpages"}
+                                "headers", "hotlink", "image", "errorpages", "tunnel",
+                                "transform", "redirects", "bots", "logs", "webhooks",
+                                "l4", "video", "dns_secondary", "functions", "waiting_room", "access",
+                                "rum"}
     assert s["config"]["cache"]["level"] == "standard"
 
     fw = {"default_action": "allow", "rules": [
@@ -269,3 +272,60 @@ def test_analytics_and_events(client):
         prune_events(db, keep=0)
         db.commit()
     assert client.get(f"{S}/events").json() == []
+
+
+def test_platform_analytics(client):
+    site(client)
+    client.post("/api/v1/sites", json={"domain": "other.org"})
+    token = add_edge(client)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    client.post("/edge/v1/usage", headers={"Authorization": f"Bearer {token}"}, json={
+        "items": [
+            {"host": "example.com", "hour": now.isoformat(), "bytes": 1000, "requests": 10, "cache_hits": 6,
+             "status": {"2xx": 8, "4xx": 2}, "countries": {"IR": 9, "DE": 1}, "security": {"waf": 2}},
+            {"host": "other.org", "hour": now.isoformat(), "bytes": 500, "requests": 5, "cache_hits": 1,
+             "countries": {"IR": 5}, "security": {"firewall": 3, "ratelimit": 1}},
+        ]})
+    a = client.get("/api/v1/analytics?period=24h").json()
+    assert a["period"] == "24h"
+    assert a["totals"]["requests"] == 15 and a["totals"]["bytes"] == 1500 and a["totals"]["cache_hits"] == 7
+    assert a["totals"]["status"]["2xx"] == 8 and a["totals"]["status"]["4xx"] == 2
+    assert a["totals"]["security"] == {"waf": 2, "firewall": 3, "ratelimit": 1, "challenge": 0, "ddos": 0,
+                                       "hotlink": 0, "bots": 0}
+    assert a["countries"][0] == {"code": "IR", "requests": 14}
+    assert a["sites"][0] == {"domain": "example.com", "requests": 10, "bytes": 1000}
+    assert {s["domain"] for s in a["sites"]} == {"example.com", "other.org"}
+    assert len(a["series"]) == 24 and a["series"][-1]["requests"] == 15
+    assert len(a["security_series"]) == 24 and a["security_series"][-1]["events"] == 6
+    assert sum(b["events"] for b in a["security_series"]) == 6
+    assert len(client.get("/api/v1/analytics?period=7d").json()["security_series"]) in (7, 8)
+    assert client.get("/api/v1/analytics?period=1y").status_code == 422
+    assert client.get("/api/v1/analytics", headers={"Authorization": "Bearer x"}).status_code == 401
+
+
+def test_platform_overview_and_events(client):
+    site(client)
+    client.post("/api/v1/sites", json={"domain": "other.org"})
+    token = add_edge(client)
+    add_edge(client, "de-1", "88.99.1.10", "global")
+    edge_get(client, token, "/edge/v1/config")  # first edge checks in -> online
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    client.post("/edge/v1/usage", headers={"Authorization": f"Bearer {token}"}, json={
+        "items": [{"host": "example.com", "hour": now.isoformat(), "bytes": 5000, "requests": 50,
+                   "security": {"waf": 3}},
+                  {"host": "other.org", "hour": now.isoformat(), "bytes": 100, "requests": 1}],
+        "events": [{"t": now.isoformat(), "host": "example.com", "ip": "1.1.1.1", "action": "block",
+                    "source": "waf", "rule": "942100"},
+                   {"t": now.isoformat(), "host": "other.org", "ip": "2.2.2.2", "action": "block",
+                    "source": "firewall", "rule": "r1"}]})
+    o = client.get("/api/v1/overview").json()
+    assert o["sites"] == {"total": 2, "by_status": {"pending_ns": 2}, "by_owner": {"client": 2}}
+    assert {k: o["edges"][k] for k in ("total", "enabled", "online", "with_errors", "shed")} == \
+        {"total": 2, "enabled": 2, "online": 1, "with_errors": 0, "shed": 0}
+    assert len(o["edges"]["list"]) == 2 and all("uptime" in e for e in o["edges"]["list"])
+    assert o["month"]["bytes"] == 5100 and o["month"]["security"] == {"waf": 3}
+    assert o["top_sites"][0] == {"domain": "example.com", "bytes": 5000, "requests": 50}
+    ev = client.get("/api/v1/events").json()
+    assert {e["domain"] for e in ev} == {"example.com", "other.org"}
+    assert [e["domain"] for e in client.get("/api/v1/events?source=firewall").json()] == ["other.org"]
+    assert client.get("/api/v1/overview", headers={"Authorization": "Bearer x"}).status_code == 401

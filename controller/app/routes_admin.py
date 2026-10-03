@@ -3,25 +3,34 @@
 import ipaddress
 import json
 from datetime import datetime, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import nscheck, pdns, sections
-from .auth import hash_token, new_token, require_admin
+from . import bundle, dnsbuild, edge_state, l4, nscheck, origin_guard, pdns, sections, tenancy, transfer, webhooks
+from .audit import record_audit, with_actor
+from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
 from .db import get_db
-from .models import Edge, Record, Site, UsageHourly, utcnow
+from .models import ApiKey, AuditLog, Edge, EdgeAddress, Record, Site, UsageHourly, utcnow
 from .services import (
+    billed_usage,
+    delete_platform_data,
+    lock_site,
+    refresh_quota,
     month_start,
     queue_purge,
     record_to_dict,
+    edge_capabilities,
+    edge_metrics,
+    online_edges,
     site_to_dict,
     sync_all_dns,
     sync_site_dns,
-    usage_totals,
+    update_shed,
 )
 from .validation import (
     ValidationError,
@@ -36,6 +45,18 @@ router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_admin)])
 
 def bad(e: Exception):
     raise HTTPException(422, str(e))
+
+
+def _client_ip(request: Request | None) -> str | None:
+    return request.client.host if request is not None and request.client else None
+
+
+def _audit(db: Session, request: Request | None, action: str, target: str | None = None,
+           detail: dict | None = None) -> None:
+    """Record an admin mutation (SPEC §13.2). The admin surface has a single key, so the actor
+    label is simply "admin"; secrets are stripped by record_audit."""
+    record_audit(db, actor="admin", actor_kind="admin", action=action, target=target,
+                 detail=with_actor(detail, request), ip=_client_ip(request))
 
 
 def get_site(db: Session, domain: str) -> Site:
@@ -61,6 +82,38 @@ class FeaturesIn(BaseModel):
     max_firewall_rules: int | None = Field(default=None, ge=0, le=1000)
     max_ratelimit_rules: int | None = Field(default=None, ge=0, le=1000)
     max_pools: int | None = Field(default=None, ge=0, le=100)
+    tunnel: bool | None = None
+    max_tunnel_paths: int | None = Field(default=None, ge=0, le=50)
+    # SPEC §22.4: origins per tunnel path (1 = a single origin only)
+    max_tunnel_origins: int | None = Field(default=None, ge=1, le=10)
+    max_tunnel_connections: int | None = Field(default=None, ge=0, le=1000000)
+    tunnel_max_mbps: int | None = Field(default=None, ge=0, le=100000)
+    edge_group: Literal["general", "tunnel"] | None = None
+    max_transform_rules: int | None = Field(default=None, ge=0, le=1000)
+    max_redirects: int | None = Field(default=None, ge=0, le=10000)
+    # analytics & platform (SPEC §14.3)
+    log_export: bool | None = None
+    max_webhooks: int | None = Field(default=None, ge=0, le=sections.WEBHOOKS_MAX)
+    sla_target: float | None = Field(default=None, ge=0, le=100)
+    # TCP/UDP proxy (SPEC §16.4)
+    l4_proxy: bool | None = None
+    max_l4_apps: int | None = Field(default=None, ge=0, le=sections.L4_APPS_MAX)
+    # object storage (SPEC §16.8): GB of storage, 0 = none
+    storage_gb: int | None = Field(default=None, ge=0, le=1000000)
+    # edge functions (SPEC §16.9): section `functions` and how many items it may hold
+    edge_functions: bool | None = None
+    max_functions: int | None = Field(default=None, ge=0, le=sections.FUNCTIONS_MAX)
+    # security review H1: section `dns_secondary` (our nameservers transfer the zone from the
+    # customer's primary) is a plan feature, off by default
+    dns_secondary: bool | None = None
+    # wave 10 (SPEC §18.1 / §18.2): sections `waiting_room` and `access`
+    waiting_room: bool | None = None
+    access: bool | None = None
+    # wave 14 (SPEC §23.15): RUM section, customer alert channels
+    rum: bool | None = None
+    alert_sms: bool | None = None
+    alert_messengers: bool | None = None
+    max_alert_subscriptions: int | None = Field(default=None, ge=0, le=100)
 
 
 class Plan(BaseModel):
@@ -76,6 +129,79 @@ class SiteCreate(BaseModel):
     external_id: str | None = None
     origin_ip: str | None = None  # optional: creates proxied @ and www records
     plan: Plan = Plan()
+    # reseller sub-site tag (SPEC §10.5), set by WHMCS
+    reseller_client_id: int | None = Field(default=None, ge=1)
+    reseller_label: str | None = None
+    # owning WHMCS client (userid) of a normal service; decides the parent/child zone rule (tenancy.py)
+    client_id: int | None = Field(default=None, ge=1)
+    # SPEC §19.1: an operator (admin-owned) site — no client / reseller / external_id
+    operator: bool = False
+    operator_note: str | None = Field(default=None, max_length=200)
+
+
+class DomainCheckIn(BaseModel):
+    """Would POST /sites accept this domain for this owner? (WHMCS cart / reseller pre-check)"""
+    model_config = ConfigDict(extra="forbid")
+    domain: str
+    client_id: int | None = Field(default=None, ge=1)
+    reseller_client_id: int | None = Field(default=None, ge=1)
+    operator: bool = False  # SPEC §19.1: check for the operator's own sites
+
+
+class OperatorNoteIn(BaseModel):
+    """Edit the admin-only note of an operator site (SPEC §19.1); null / "" clears it."""
+    model_config = ConfigDict(extra="forbid")
+    operator_note: str | None = Field(default=None, max_length=200)
+
+
+class TransferTo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["client", "operator"]
+    client_id: int | None = Field(default=None, ge=1)
+    # the WHMCS service id of the new owner's service; omitted on a client target = keep the current
+    # one (client -> client moves the WHMCS service itself)
+    external_id: str | None = Field(default=None, max_length=64)
+    operator_note: str | None = Field(default=None, max_length=200)
+
+
+class TransferIn(BaseModel):
+    """Domain transfer (SPEC §19.2)."""
+    model_config = ConfigDict(extra="forbid")
+    to: TransferTo
+    reset_billing_anchor: bool = False
+    revoke_credentials: bool = True
+    pause_integrations: bool = True
+    include_related: bool = False
+    dry_run: bool = False
+
+
+class OwnerIn(BaseModel):
+    """Set or clear the owning WHMCS client of a site (tenancy.py); null clears it."""
+    model_config = ConfigDict(extra="forbid")
+    client_id: int | None = Field(default=None, ge=1)
+
+
+class ResellerIn(BaseModel):
+    """Set or clear the reseller tag on a site; pass null to clear a field."""
+    model_config = ConfigDict(extra="forbid")
+    reseller_client_id: int | None = Field(default=None, ge=1)
+    reseller_label: str | None = None
+
+
+def _clean_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+    label = label.strip()[:120]
+    return label or None
+
+
+OPERATOR_FIELDS_MSG = ("سایت اپراتور نباید client_id، external_id یا فیلدهای نماینده (reseller_client_id / "
+                       "reseller_label) داشته باشد")
+
+
+def _clean_addr_label(label: str | None) -> str:
+    """Edge-address label: stored as "" when absent (SPEC §12.1, String(64))."""
+    return (label or "").strip()[:64]
 
 
 class SiteSettings(BaseModel):
@@ -91,7 +217,8 @@ class SiteSettings(BaseModel):
 class RecordIn(BaseModel):
     name: str = "@"
     type: str
-    content: str
+    # may be empty only with `storage` (then a CNAME to the storage endpoint host is stored)
+    content: str = ""
     ttl: int = Field(default=300, ge=60, le=86400)
     priority: int | None = None
     proxied: bool = False
@@ -99,10 +226,19 @@ class RecordIn(BaseModel):
     origin_port: int | None = Field(default=None, ge=1, le=65535)
     health_check: bool = False
     health_port: int | None = Field(default=None, ge=1, le=65535)
+    # SPEC §16.7: weighted / failover sets of non-proxied A/AAAA/CNAME records and the controller's
+    # probe protocol (null = tcp; on an unweighted A/AAAA set null keeps the PowerDNS port check)
+    weight: int | None = Field(default=None, ge=0, le=100)
+    health_protocol: Literal["tcp", "http", "https"] | None = None
+    health_path: str | None = Field(default=None, max_length=512, pattern=r"^/[^\s\"'<>\\]*$")
+    # SPEC §16.8 origin shortcut: serve this proxied record from the site's storage bucket <name>
+    storage: str | None = Field(default=None, max_length=63, pattern=r"^[a-z0-9-]{1,63}$")
 
 
 class PurgeIn(BaseModel):
     urls: list[str] = []
+    prefixes: list[str] = []
+    everything: bool = False
 
 
 class EdgeIn(BaseModel):
@@ -110,6 +246,63 @@ class EdgeIn(BaseModel):
     ipv4: str
     ipv6: str | None = None
     region: str = Field(default="global", pattern="^(home|global)$")
+    group: Literal["general", "tunnel"] = "general"
+    capacity_mbps: int = Field(default=0, ge=0, le=10_000_000)  # 0 = unknown (never shed)
+    shield: bool = False  # origin shield / tiered cache node (SPEC §14.1)
+
+
+class EdgePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None = None
+    group: Literal["general", "tunnel"] | None = None
+    capacity_mbps: int | None = Field(default=None, ge=0, le=10_000_000)
+    region: str | None = Field(default=None, pattern="^(home|global)$")
+    shield: bool | None = None  # origin shield / tiered cache node (SPEC §14.1)
+    http3_enabled: bool | None = None  # SPEC §22.9: QUIC on this node (where its nginx can)
+    # SPEC §23.12: customer-visible city label (letters, spaces, ZWNJ; "" clears it)
+    display_city: str | None = Field(default=None, max_length=32)
+    display_city_en: str | None = Field(default=None, max_length=32)
+
+    @field_validator("display_city", "display_city_en")
+    @classmethod
+    def _city(cls, v):
+        from . import edge_labels
+
+        return edge_labels.clean_city(v)
+
+
+class EdgeDrainIn(BaseModel):
+    """POST /edges/{id}/drain (SPEC §22.1)."""
+    model_config = ConfigDict(extra="forbid")
+    minutes: int | None = Field(default=None, ge=1, le=120)
+    reason: str | None = Field(default=None, pattern=r"^[\x20-\x7e]{1,64}$")
+    force: bool = False
+
+
+class EdgeAddressIn(BaseModel):
+    """Add an additional address to an edge (SPEC §12.4)."""
+    model_config = ConfigDict(extra="forbid")
+    family: Literal[4, 6]
+    ip: str
+    label: str | None = None
+
+
+class EdgeAddressPatch(BaseModel):
+    """Edit / enable / disable an additional address (SPEC §12.4). The family is fixed."""
+    model_config = ConfigDict(extra="forbid")
+    ip: str | None = None
+    label: str | None = None
+    enabled: bool | None = None
+
+
+class EdgeBatchIn(BaseModel):
+    """Batch-create N edges in one call (SPEC §11.1)."""
+    model_config = ConfigDict(extra="forbid")
+    count: int = Field(ge=1, le=50)
+    region: str = Field(default="global", pattern="^(home|global)$")
+    group: Literal["general", "tunnel"] = "general"
+    name_prefix: str = Field(default="edge", pattern=r"^[a-zA-Z0-9_.-]{1,48}$")
+    capacity_mbps: int = Field(default=0, ge=0, le=10_000_000)
 
 
 def apply_plan(site: Site, plan: Plan):
@@ -124,6 +317,7 @@ def apply_plan(site: Site, plan: Plan):
         site.ssl_source = None
     if not site.ssl_allowed and site.ssl_status != "none":
         site.ssl_status, site.ssl_cert, site.ssl_key, site.ssl_expires_at = "none", None, None, None
+        site.ssl_cert_rsa = site.ssl_key_rsa_stored = None  # SPEC §22.8
     elif site.ssl_allowed and site.ssl_status == "none" and site.ns_verified_at:
         site.ssl_status = "pending"
 
@@ -143,15 +337,30 @@ def ping(db: Session = Depends(get_db)):
 # ------------------------------------------------------------------ sites
 
 @router.post("/sites", status_code=201)
-def create_site(body: SiteCreate, db: Session = Depends(get_db)):
+def create_site(body: SiteCreate, request: Request, db: Session = Depends(get_db)):
     try:
         domain = normalize_domain(body.domain)
         origin = validate_ip(body.origin_ip, 4) if body.origin_ip else None
     except ValidationError as e:
         bad(e)
-    if db.scalar(select(Site).where(Site.domain == domain)):
-        raise HTTPException(409, "این دامنه قبلاً ثبت شده است")
-    site = Site(domain=domain, external_id=body.external_id)
+    if body.operator:
+        if body.client_id or body.reseller_client_id or body.reseller_label or body.external_id:
+            raise HTTPException(422, OPERATOR_FIELDS_MSG)
+    elif body.operator_note:
+        raise HTTPException(422, "operator_note فقط برای سایت اپراتور (operator: true) است")
+    # C1: no public suffix, no parent/child of another owner's site (409 only for "already exists":
+    # WHMCS treats a 409 as a re-run of Create on its own site)
+    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id,
+                                                                  body.operator))
+    if problem is not None:
+        raise HTTPException(409 if problem[0] == "exists" else 422, problem[1])
+    if body.operator:
+        site = Site(domain=domain, owner_kind="operator", operator_note=transfer.clean_note(body.operator_note))
+    else:
+        site = Site(domain=domain, external_id=body.external_id,
+                    reseller_client_id=body.reseller_client_id, client_id=body.client_id,
+                    reseller_label=_clean_label(body.reseller_label),
+                    owner_kind="reseller" if body.reseller_client_id else "client")
     apply_plan(site, body.plan)
     if origin:
         site.records = [
@@ -160,15 +369,52 @@ def create_site(body: SiteCreate, db: Session = Depends(get_db)):
         ]
     db.add(site)
     db.commit()
+    _audit(db, request, "site.create", site.domain,
+           {"external_id": body.external_id, "reseller_client_id": body.reseller_client_id,
+            "client_id": body.client_id, "owner_kind": site.owner_kind})
     err = sync_site_dns(db, site)
     return {**site_to_dict(db, site), "dns_error": err}
 
 
+@router.post("/domain-check")
+def domain_check(body: DomainCheckIn, db: Session = Depends(get_db)):
+    """The checks of POST /sites without creating anything: {"ok", "code", "error", "domain"}.
+    code: invalid | public_suffix | exists | nested (tenancy.py)."""
+    try:
+        domain = normalize_domain(body.domain)
+    except ValidationError as e:
+        return {"ok": False, "code": "invalid", "error": str(e), "domain": None}
+    if body.operator and (body.client_id or body.reseller_client_id):
+        raise HTTPException(422, OPERATOR_FIELDS_MSG)
+    problem = tenancy.domain_problem(db, domain, tenancy.owner_of(body.client_id, body.reseller_client_id,
+                                                                  body.operator))
+    if problem is not None:
+        return {"ok": False, "code": problem[0], "error": problem[1], "domain": domain}
+    return {"ok": True, "code": None, "error": None, "domain": domain}
+
+
 @router.get("/sites")
-def list_sites(db: Session = Depends(get_db)):
+def list_sites(reseller: int | None = None, owner: Literal["operator", "client", "reseller"] | None = None,
+               db: Session = Depends(get_db)):
+    stmt = select(Site).order_by(Site.id)
+    if owner is not None:  # SPEC §19.1
+        stmt = stmt.where(Site.owner_kind == owner)
+    if reseller is not None:
+        # rolled-up report for one reseller (SPEC §10.5): only its sub-sites
+        stmt = stmt.where(Site.reseller_client_id == reseller)
+        return [
+            {"domain": s.domain, "reseller_label": s.reseller_label, "status": s.effective_status,
+             "bandwidth_limit_gb": s.bandwidth_limit_gb, "over_quota": s.over_quota,
+             "suspended": s.suspended}
+            for s in db.scalars(stmt)
+        ]
     return [
-        {"domain": s.domain, "status": s.effective_status, "external_id": s.external_id}
-        for s in db.scalars(select(Site).order_by(Site.id))
+        {"domain": s.domain, "status": s.effective_status, "external_id": s.external_id,
+         "client_id": s.client_id,
+         "reseller_client_id": s.reseller_client_id, "reseller_label": s.reseller_label,
+         "owner_kind": s.owner_kind, "operator_note": s.operator_note,
+         "billing_since": s.billing_since.isoformat() + "Z" if s.billing_since else None}
+        for s in db.scalars(stmt)
     ]
 
 
@@ -178,17 +424,131 @@ def read_site(domain: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/sites/{domain}/plan")
-def update_plan(domain: str, plan: Plan, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def update_plan(domain: str, plan: Plan, request: Request, db: Session = Depends(get_db)):
+    site = lock_site(db, get_site(db, domain))  # read-modify-write of site.features
+    before = sections.features_of(site)
+    group = before["edge_group"]
     apply_plan(site, plan)
+    after = sections.features_of(site)
+    moved = []
+    if after["edge_group"] != group:
+        # SPEC §16.4: the site's TCP/UDP edge ports move to the new group (re-allocated on conflict)
+        try:
+            moved = l4.rehome(db, site)
+        except l4.PortConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
+    # a raised/lowered bandwidth limit takes effect now, not on the next scheduler tick
+    refresh_quota(db, site)
     db.commit()
+    _audit(db, request, "site.plan", site.domain, plan.model_dump(exclude_none=True))
+    if before["storage_gb"] != after["storage_gb"]:
+        # SPEC §16.8: the buckets' MinIO quotas follow the new storage_gb now (best effort; the
+        # hourly storage job re-applies them)
+        from . import storage
+
+        if storage.available():
+            try:
+                storage.sync_site_quotas(db, site)
+                db.commit()
+            except storage.StorageError:
+                db.rollback()
+    if after["edge_group"] != group or (before["l4_proxy"], before["max_l4_apps"]) != (
+            after["l4_proxy"], after["max_l4_apps"]):
+        sync_site_dns(db, site)  # other edges answer / the l4-<id> names appear or go
+    out = site_to_dict(db, site)
+    if moved:
+        out["l4_reallocated"] = moved
+    return out
+
+
+@router.patch("/sites/{domain}/reseller")
+def update_reseller(domain: str, body: ResellerIn, request: Request, db: Session = Depends(get_db)):
+    """Set or clear the reseller tag on a site (SPEC §10.5). Only provided fields change;
+    pass an explicit null to clear one."""
+    site = get_site(db, domain)
+    _not_operator(site)
+    fields = body.model_fields_set
+    if "reseller_client_id" in fields:
+        _check_owner_change(db, site, tenancy.owner_of(site.client_id, body.reseller_client_id))
+        site.reseller_client_id = body.reseller_client_id
+        site.owner_kind = "reseller" if body.reseller_client_id else "client"
+    if "reseller_label" in fields:
+        site.reseller_label = _clean_label(body.reseller_label)
+    db.commit()
+    _audit(db, request, "reseller.flag", site.domain,
+           {"reseller_client_id": site.reseller_client_id, "reseller_label": site.reseller_label})
     return site_to_dict(db, site)
+
+
+def _not_operator(site: Site) -> None:
+    if site.owner_kind == "operator":
+        raise HTTPException(422, "این سایت متعلق به اپراتور است؛ برای واگذاری آن به مشتری از انتقال دامنه "
+                                 "(POST /api/v1/sites/{domain}/transfer) استفاده کنید")
+
+
+def _check_owner_change(db: Session, site: Site, owner: tenancy.Owner) -> None:
+    """422 when the new owner would turn a same-owner parent/child pair into a pair of different
+    owners (C1). Pairs that already had different owners (legacy data) are left as they are."""
+    before = tenancy.site_owner(site)
+    for other in tenancy.related_sites(db, site.domain, exclude_id=site.id):
+        if tenancy.same_owner(before, other) and not tenancy.same_owner(owner, other):
+            raise HTTPException(422, f"سایت مرتبط {other.domain} متعلق به مالک دیگری است؛ مالک این سایت را "
+                                     "نمی‌توان به این مقدار تغییر داد")
+
+
+@router.patch("/sites/{domain}/owner")
+def update_owner(domain: str, body: OwnerIn, request: Request, db: Session = Depends(get_db)):
+    """Set the owning WHMCS client (C1, tenancy.py). Refused (422) when the change would put the
+    site in a parent/child relation with a site of a different owner."""
+    site = get_site(db, domain)
+    _not_operator(site)
+    _check_owner_change(db, site, tenancy.owner_of(body.client_id, site.reseller_client_id))
+    site.client_id = body.client_id
+    db.commit()
+    _audit(db, request, "site.owner", site.domain, {"client_id": site.client_id})
+    return site_to_dict(db, site)
+
+
+@router.patch("/sites/{domain}/operator")
+def update_operator_note(domain: str, body: OperatorNoteIn, request: Request, db: Session = Depends(get_db)):
+    """Edit the admin-only note of an operator site (SPEC §19.1); 422 on any other site."""
+    site = get_site(db, domain)
+    if site.owner_kind != "operator":
+        raise HTTPException(422, "یادداشت اپراتور فقط برای سایت‌های اپراتور است")
+    site.operator_note = transfer.clean_note(body.operator_note)
+    db.commit()
+    _audit(db, request, "site.operator_note", site.domain, {"operator_note": site.operator_note})
+    return site_to_dict(db, site)
+
+
+@router.post("/sites/{domain}/transfer")
+def transfer_site(domain: str, body: TransferIn, request: Request, db: Session = Depends(get_db)):
+    """Domain transfer to another owner (SPEC §19.2, transfer.py): one transaction; `dry_run`
+    returns the same answer without changing anything. 422 (Persian `detail`) when refused."""
+    from . import config_history
+
+    site = get_site(db, domain)
+    with config_history.source("transfer"):  # SPEC §23.4: the integration pause is a "transfer" version
+        try:
+            result, post = transfer.transfer(db, site, body)
+        except transfer.TransferError as e:
+            db.rollback()
+            raise HTTPException(422, str(e))
+        if body.dry_run:
+            db.rollback()
+            return result
+        db.commit()
+    transfer.after_commit(db, result, post)  # TSIG push to PowerDNS, storage keys on MinIO
+    _audit(db, request, "site.transfer", result["domain"],
+           {k: result[k] for k in ("from", "to", "related", "revoked_keys", "paused", "billing_since", "rotated")})
+    return result
 
 
 @router.patch("/sites/{domain}/settings")
 def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_db)):
     """v1 settings endpoint; values are written into the cache/ssl sections."""
-    site = get_site(db, domain)
+    site = lock_site(db, get_site(db, domain))  # read-modify-write of site.config
     data = body.model_dump(exclude_none=True)
     if "blocked_ips" in data:
         ips = []
@@ -218,7 +578,9 @@ def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_d
 
 @router.post("/sites/{domain}/suspend")
 def suspend(domain: str, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+    site = lock_site(db, get_site(db, domain))  # one webhook per transition, also when concurrent
+    if not site.suspended and not site.abuse_suspended:  # webhook on the transition only (SPEC §14.3.3)
+        webhooks.emit(db, site, "site.suspended", {"status": "suspended", "reason": "billing"})
     site.suspended = True
     db.commit()
     return {"ok": True}
@@ -226,18 +588,28 @@ def suspend(domain: str, db: Session = Depends(get_db)):
 
 @router.post("/sites/{domain}/unsuspend")
 def unsuspend(domain: str, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
-    site.suspended = False
+    site = lock_site(db, get_site(db, domain))
+    if site.suspended:
+        site.suspended = False
+        # SPEC §23.10: a billing unsuspend never clears an abuse suspension (the site stays suspended)
+        if not site.abuse_suspended:
+            webhooks.emit(db, site, "site.unsuspended", {"status": site.effective_status, "reason": "billing"})
     db.commit()
     return {"ok": True}
 
 
 @router.delete("/sites/{domain}")
-def delete_site(domain: str, db: Session = Depends(get_db)):
+def delete_site(domain: str, request: Request, db: Session = Depends(get_db)):
     site = get_site(db, domain)
     name = site.domain
+    # SPEC §16.8: revoke the storage access keys, remove empty buckets (others are kept + alerted)
+    from . import storage
+
+    storage.on_site_delete(db, site)
+    delete_platform_data(db, site.id)
     db.delete(site)
     db.commit()
+    _audit(db, request, "site.delete", name)
     if settings.pdns_enabled:
         try:
             pdns.client().delete_zone(name)
@@ -249,9 +621,11 @@ def delete_site(domain: str, db: Session = Depends(get_db)):
 @router.post("/sites/{domain}/ns-check")
 def ns_check(domain: str, db: Session = Depends(get_db)):
     site = get_site(db, domain)
-    ok, found = nscheck.check_and_update(site)
+    ok, found, reason = nscheck.check_and_update_reason(site)
     db.commit()
-    return {"ok": ok, "found": found, "expected": settings.nameservers, "status": site.effective_status}
+    # reason (when not ok): nameservers | parent_delegation | parent_site:<domain> (C1)
+    return {"ok": ok, "found": found, "expected": settings.nameservers, "status": site.effective_status,
+            "reason": reason}
 
 
 @router.post("/sites/{domain}/ssl")
@@ -269,18 +643,35 @@ def request_ssl(domain: str, db: Session = Depends(get_db)):
     return {"ok": True, "status": site.ssl_status}
 
 
-@router.post("/sites/{domain}/purge")
-def purge(domain: str, body: PurgeIn, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def purge_site(db: Session, site: Site, body: PurgeIn) -> dict:
+    """Shared purge validation + queueing (SPEC §9.2), used by the admin and customer APIs."""
     urls = [u.strip() for u in body.urls if u.strip()]
-    if len(urls) > 100:
-        bad(ValidationError("حداکثر ۱۰۰ آدرس در هر درخواست"))
+    prefixes = [p.strip() for p in body.prefixes if p.strip()]
+    if len(urls) + len(prefixes) > 100:
+        bad(ValidationError("حداکثر ۱۰۰ مورد در هر درخواست"))
+    if len(prefixes) > 20:
+        bad(ValidationError("حداکثر ۲۰ پیشوند در هر درخواست"))
     for u in urls:
         if not u.startswith(("http://", "https://")):
             bad(ValidationError(f"آدرس باید کامل باشد: {u}"))
-    queue_purge(db, site, urls)
+    for p in prefixes:
+        if len(p) > 200:
+            bad(ValidationError(f"پیشوند باید حداکثر ۲۰۰ نویسه باشد: {p}"))
+        # a prefix is a path ("/blog/") or a full address ("https://ex.com/img/")
+        if not (p.startswith("/") or p.startswith(("http://", "https://"))):
+            bad(ValidationError(f"پیشوند باید با / یا آدرس کامل شروع شود: {p}"))
+    queue_purge(db, site, urls, prefixes, body.everything)
     db.commit()
-    return {"ok": True, "queued": len(urls) or "all"}
+    return {"ok": True, "queued": (len(urls) + len(prefixes)) or "all"}
+
+
+@router.post("/sites/{domain}/purge")
+def purge(domain: str, body: PurgeIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = purge_site(db, site, body)
+    _audit(db, request, "purge", site.domain,
+           {"everything": body.everything, "urls": len(body.urls), "prefixes": len(body.prefixes)})
+    return result
 
 
 @router.get("/sites/{domain}/usage")
@@ -295,7 +686,8 @@ def site_usage(domain: str, days: int = 30, db: Session = Depends(get_db)):
         .group_by(func.date(UsageHourly.hour)).order_by(func.date(UsageHourly.hour))
     ).all()
     return {
-        "month": usage_totals(db, site.id, month_start()),
+        # billed month (from max(month start, billing_since), SPEC §19.2); "daily" is the full history
+        "month": billed_usage(db, site, month_start()),
         "daily": [{"date": str(d), "bytes": int(b or 0), "requests": int(r or 0), "cache_hits": int(h or 0)}
                   for d, b, r, h in rows],
     }
@@ -314,19 +706,89 @@ def all_usage(month: str | None = None, db: Session = Depends(get_db)):
     end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
     out = []
     for s in db.scalars(select(Site).order_by(Site.id)):
-        u = usage_totals(db, s.id, start, end)
+        # SPEC §19.2: the current owner's share of the month, from max(month start, billing_since)
+        u = billed_usage(db, s, start, end)
         out.append({"domain": s.domain, "external_id": s.external_id, "bandwidth_limit_gb": s.bandwidth_limit_gb,
-                    "status": s.effective_status, **u})
+                    "status": s.effective_status, "owner_kind": s.owner_kind,
+                    "billing_since": s.billing_since.isoformat() + "Z" if s.billing_since else None, **u})
     return {"month": start.strftime("%Y-%m"), "sites": out}
+
+
+# ------------------------------------------------------------------ customer API keys (SPEC §10.1)
+
+# security review M3: `dns` = records (+ secondary DNS); `config` = configuration sections;
+# `functions` = edge function code (routes_capi.section_scope)
+CAPI_SCOPES = ("purge", "stats", "dns", "config", "functions")
+MAX_API_KEYS = 5
+
+
+class ApiKeyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(min_length=1)
+
+
+def api_key_dict(k: ApiKey) -> dict:
+    """Public view of an ApiKey — never includes the key itself."""
+    return {
+        "id": k.id, "name": k.name, "scopes": k.scope_list,
+        "last_used_at": k.last_used_at.isoformat() + "Z" if k.last_used_at else None,
+        "created_at": k.created_at.isoformat() + "Z" if k.created_at else None,
+        "revoked": k.revoked,
+    }
+
+
+@router.get("/sites/{domain}/apikeys")
+def list_api_keys(domain: str, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    keys = db.scalars(select(ApiKey).where(ApiKey.site_id == site.id).order_by(ApiKey.id))
+    return [api_key_dict(k) for k in keys]
+
+
+@router.post("/sites/{domain}/apikeys", status_code=201)
+def create_api_key(domain: str, body: ApiKeyIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    scopes = []
+    for s in body.scopes:
+        if s not in CAPI_SCOPES:
+            bad(ValidationError(f"دسترسی نامعتبر: {s} (مجاز: {'، '.join(CAPI_SCOPES)})"))
+        if s not in scopes:
+            scopes.append(s)
+    active = db.scalar(select(func.count(ApiKey.id)).where(
+        ApiKey.site_id == site.id, ApiKey.revoked.is_(False)))
+    if active >= MAX_API_KEYS:
+        raise HTTPException(403, f"حداکثر {MAX_API_KEYS} کلید فعال برای هر سرویس مجاز است")
+    plaintext = new_capi_key()
+    key = ApiKey(site_id=site.id, key_hash=hash_token(plaintext), name=body.name.strip(),
+                 scopes=json.dumps(scopes))
+    db.add(key)
+    db.commit()
+    # the plaintext key is returned ONCE and never stored or shown again
+    return {**api_key_dict(key), "key": plaintext}
+
+
+@router.delete("/sites/{domain}/apikeys/{key_id}")
+def revoke_api_key(domain: str, key_id: int, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    key = db.scalar(select(ApiKey).where(ApiKey.id == key_id, ApiKey.site_id == site.id))
+    if key is None:
+        raise HTTPException(404, "کلید یافت نشد")
+    key.revoked = True
+    db.commit()
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ records
 
-def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None):
+def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None, weighted: bool = False):
     others = [r for r in site.records if r.name == name and r.id != exclude_id]
-    if rtype == "CNAME" and others:
-        raise ValidationError("رکورد CNAME نمی‌تواند با رکورد دیگری هم‌نام باشد")
-    if any(r.type == "CNAME" for r in others):
+    # SPEC §16.7: several weighted non-proxied CNAMEs may share a name (one is answered per query)
+    cname_set = weighted and rtype == "CNAME" and all(
+        r.type == "CNAME" and not r.proxied and r.weight is not None for r in others)
+    if rtype == "CNAME" and others and not cname_set:
+        raise ValidationError("رکورد CNAME نمی‌تواند با رکورد دیگری هم‌نام باشد (چند CNAME هم‌نام فقط وقتی همه "
+                              "وزن‌دار و بدون پروکسی باشند مجاز است)")
+    if any(r.type == "CNAME" for r in others) and not cname_set:
         raise ValidationError("برای این نام یک رکورد CNAME وجود دارد")
     # ALIAS answers A/AAAA itself, so it cannot share a name with address records
     address = {"A", "AAAA", "ALIAS"}
@@ -334,27 +796,88 @@ def _conflicts(site: Site, name: str, rtype: str, exclude_id: int | None = None)
         raise ValidationError("رکورد ALIAS نمی‌تواند با رکورد A/AAAA هم‌نام باشد")
 
 
+def _storage_origin(site: Site, body: RecordIn) -> tuple[str, str]:
+    """SPEC §16.8: validate a record's `storage` origin -> (type, content) to store. The bucket must be
+    one of this site's own buckets; an empty content becomes a CNAME to the storage endpoint host
+    (only informative: a proxied name answers with the edges)."""
+    from . import storage
+
+    if not body.proxied:
+        raise ValidationError("مبدأ فضای ذخیره‌سازی (storage) فقط برای رکورد پروکسی‌شده (CDN) مجاز است")
+    if body.pool:
+        raise ValidationError("برای هر رکورد فقط یکی از pool یا storage را تعیین کنید")
+    if sections.features_of(site)["storage_gb"] <= 0:
+        raise PermissionError("فضای ذخیره‌سازی در پلن شما فعال نیست")
+    from sqlalchemy.orm import object_session
+
+    from .models import StorageBucket
+
+    db = object_session(site)
+    if db is None or db.scalar(select(StorageBucket.id).where(
+            StorageBucket.site_id == site.id, StorageBucket.name == body.storage)) is None:
+        raise ValidationError(f"باکت {body.storage} برای این سرویس وجود ندارد")
+    if body.content.strip():
+        return body.type, body.content
+    host = _url_host(storage.public_endpoint())
+    if not host:
+        raise ValidationError("فضای ذخیره‌سازی روی این کنترلر پیکربندی نشده است")
+    return "CNAME", host
+
+
+def _url_host(url: str) -> str:
+    import httpx
+
+    try:
+        return httpx.URL(url).host if url else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> dict:
     name = normalize_name(body.name, site.domain)
-    rtype, content, prio, proxied = validate_record(body.type, body.content, body.priority, body.proxied)
+    rtype_in, content_in = body.type, body.content
+    if body.storage:
+        rtype_in, content_in = _storage_origin(site, body)
+    rtype, content, prio, proxied = validate_record(rtype_in, content_in, body.priority, body.proxied)
+    if body.storage and not proxied:
+        raise ValidationError("مبدأ فضای ذخیره‌سازی (storage) فقط برای رکوردهای A، AAAA و CNAME پروکسی‌شده مجاز است")
     if rtype == "CNAME" and name == "@" and not proxied:
         raise ValidationError("CNAME روی ریشه دامنه فقط در حالت پروکسی (CDN) مجاز است؛ از ALIAS استفاده کنید")
+    if proxied and rtype == "CNAME" and not body.storage and not (
+            content == site.domain or content.endswith("." + site.domain)):
+        # the edges connect to this host: it must be public (origin_guard.py); in-zone targets are
+        # followed inside the zone's own (validated) records
+        problem = origin_guard.host_problem(content)
+        if problem:
+            raise ValidationError(problem)
     if rtype == "NS" and name == "@":
         raise ValidationError("نیم‌سرورهای ریشه به‌صورت خودکار مدیریت می‌شوند")
-    _conflicts(site, name, rtype, exclude_id)
+    weighted = body.weight is not None
+    if weighted and (proxied or rtype not in ("A", "AAAA", "CNAME")):
+        raise ValidationError("وزن (weight) فقط برای رکوردهای A، AAAA و CNAME بدون پروکسی مجاز است")
+    _conflicts(site, name, rtype, exclude_id, weighted)
+    if name.startswith("l4-") and name[3:] in {a["id"] for a in sections.get_section(site, "l4")["apps"]}:
+        raise ValidationError(f"نام {name} برای برنامه TCP/UDP همین سرویس رزرو شده است")
     pool = body.pool if proxied else None
     if pool:
         if not sections.features_of(site)["load_balancer"]:
             raise PermissionError("توزیع بار در پلن شما فعال نیست")
         if pool not in {p["name"] for p in sections.get_section(site, "pools")["pools"]}:
             raise ValidationError(f"استخر {pool} تعریف نشده است")
-    health = body.health_check and not proxied and rtype in ("A", "AAAA")
+    health = body.health_check and not proxied and rtype in ("A", "AAAA", "CNAME")
+    if rtype == "CNAME" and health and not weighted:
+        health = False  # a lone CNAME has nothing to fail over to
+    protocol = body.health_protocol if health else None
     return {
         "name": name, "type": rtype, "content": content, "priority": prio, "proxied": proxied, "ttl": body.ttl,
         "pool": pool,
-        "origin_port": body.origin_port if proxied and not pool else None,
+        "storage_bucket": body.storage if proxied else None,
+        "origin_port": body.origin_port if proxied and not pool and not body.storage else None,
         "health_check": health,
         "health_port": body.health_port if health else None,
+        "weight": body.weight,
+        "health_protocol": protocol,
+        "health_path": (body.health_path or "/") if protocol in ("http", "https") else None,
     }
 
 
@@ -367,14 +890,13 @@ def _record_or_error(site: Site, body: RecordIn, exclude_id: int | None = None) 
         raise HTTPException(403, str(e))
 
 
-@router.get("/sites/{domain}/records")
-def list_records(domain: str, db: Session = Depends(get_db)):
-    return [record_to_dict(r) for r in get_site(db, domain).records]
+# record handlers factored so the admin and customer APIs share identical validation/logic
+
+def list_records_of(site: Site) -> list[dict]:
+    return [record_to_dict(r) for r in site.records]
 
 
-@router.post("/sites/{domain}/records", status_code=201)
-def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def add_record_of(db: Session, site: Site, body: RecordIn) -> dict:
     if len(site.records) >= site.max_records:
         raise HTTPException(403, f"سقف تعداد رکوردها ({site.max_records}) پر شده است")
     rec = Record(**_record_or_error(site, body))
@@ -383,9 +905,7 @@ def add_record(domain: str, body: RecordIn, db: Session = Depends(get_db)):
     return {**record_to_dict(rec), "dns_error": sync_site_dns(db, site)}
 
 
-@router.put("/sites/{domain}/records/{record_id}")
-def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def update_record_of(db: Session, site: Site, record_id: int, body: RecordIn) -> dict:
     rec = next((r for r in site.records if r.id == record_id), None)
     if rec is None:
         raise HTTPException(404, "record not found")
@@ -395,15 +915,42 @@ def update_record(domain: str, record_id: int, body: RecordIn, db: Session = Dep
     return {**record_to_dict(rec), "dns_error": sync_site_dns(db, site)}
 
 
-@router.delete("/sites/{domain}/records/{record_id}")
-def delete_record(domain: str, record_id: int, db: Session = Depends(get_db)):
-    site = get_site(db, domain)
+def delete_record_of(db: Session, site: Site, record_id: int) -> dict:
     rec = next((r for r in site.records if r.id == record_id), None)
     if rec is None:
         raise HTTPException(404, "record not found")
     site.records.remove(rec)
     db.commit()
     return {"ok": True, "dns_error": sync_site_dns(db, site)}
+
+
+@router.get("/sites/{domain}/records")
+def list_records(domain: str, db: Session = Depends(get_db)):
+    return list_records_of(get_site(db, domain))
+
+
+@router.post("/sites/{domain}/records", status_code=201)
+def add_record(domain: str, body: RecordIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = add_record_of(db, site, body)
+    _audit(db, request, "record.create", site.domain, {"type": body.type, "name": body.name})
+    return result
+
+
+@router.put("/sites/{domain}/records/{record_id}")
+def update_record(domain: str, record_id: int, body: RecordIn, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = update_record_of(db, site, record_id, body)
+    _audit(db, request, "record.update", site.domain, {"record_id": record_id, "type": body.type, "name": body.name})
+    return result
+
+
+@router.delete("/sites/{domain}/records/{record_id}")
+def delete_record(domain: str, record_id: int, request: Request, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    result = delete_record_of(db, site, record_id)
+    _audit(db, request, "record.delete", site.domain, {"record_id": record_id})
+    return result
 
 
 @router.post("/sites/{domain}/dns-sync")
@@ -415,62 +962,461 @@ def dns_sync(domain: str, db: Session = Depends(get_db)):
 
 # ------------------------------------------------------------------ edges
 
-def edge_to_dict(e: Edge) -> dict:
+def _probe_dict(ok, ms, at, error) -> dict:
+    return {"ok": ok, "ms": ms, "at": at.isoformat() + "Z" if at else None, "error": error}
+
+
+def address_to_dict(a: EdgeAddress) -> dict:
+    """One additional address with its per-address health and current DNS-advertise state (§12)."""
+    return {
+        "id": a.id, "family": a.family, "ip": a.ip, "label": a.label, "enabled": a.enabled,
+        "primary": False,
+        "advertised": dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail),
+        "probe": _probe_dict(a.probe_ok, a.probe_ms, a.probe_at, a.probe_error),
+    }
+
+
+def _advertised_counts(e: Edge) -> dict:
+    """How many addresses of each family are currently advertised in DNS (primary + additional).
+
+    Per-address health only; the DNS fail-open (dnsbuild.edge_pools) can still advertise a
+    withdrawn address when a pool would otherwise be empty.
+    """
+    counts = {"4": 0, "6": 0}
+    # F32: each primary family advertises on its own probe state
+    if e.ipv4 and dnsbuild.address_advertised(True, e.probe_ok4, e.probe_fail4):
+        counts["4"] += 1
+    if e.ipv6 and dnsbuild.address_advertised(True, e.probe_ok6, e.probe_fail6):
+        counts["6"] += 1
+    for a in e.addresses:
+        if dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail):
+            counts["6" if a.family == 6 else "4"] += 1
+    return counts
+
+
+def edge_to_dict(e: Edge, uptime: dict | None = None, q: int | None = None) -> dict:
     return {
         "id": e.id, "name": e.name, "ipv4": e.ipv4, "ipv6": e.ipv6, "region": e.region,
         "enabled": e.enabled, "last_seen_at": e.last_seen_at.isoformat() + "Z" if e.last_seen_at else None,
         "applied_version": e.applied_version, "last_error": e.last_error,
+        "group": e.group, "capacity_mbps": e.capacity_mbps, "metrics": edge_metrics(e), "shed": e.shed,
+        "uptime": uptime if uptime is not None else {"h24": None, "d30": None},
+        "probe": {"ok": e.probe_ok, "ms": e.probe_ms,
+                  "at": e.probe_at.isoformat() + "Z" if e.probe_at else None, "error": e.probe_error},
+        # additional addresses + per-family advertised counts (multi-address failover, SPEC §12)
+        "addresses": [address_to_dict(a) for a in e.addresses],
+        "advertised": _advertised_counts(e),
+        # centralized logs hint (SPEC §11.2): the full lines come from GET /edges/{id}/logs
+        "logs_at": e.logs_at.isoformat() + "Z" if e.logs_at else None,
+        "has_logs": bool(e.logs and e.logs not in ("[]", "null")),
+        # running bundle version (SPEC §11.1); the panel compares it to GET /edge/version
+        "bundle_version": e.bundle_version,
+        # origin shield flag + heartbeat-reported node capabilities (SPEC §14.1); capabilities is
+        # {"http3", "early_hints", "webp_convert", "modules"} or null when never reported
+        "shield": e.shield,
+        "capabilities": edge_capabilities(e),
+        # SPEC §18.4: agent errors in the last hour from the latest heartbeat (null = never reported)
+        "errors_last_hour": e.errors_last_hour,
+        # wave 13 (SPEC §22): drain state, reload counters, tunnel probe / degraded state, kernel tuning
+        # report, the per-node HTTP/3 switch and the DNS weight (q null while DNS_WEIGHTS=off). Never a
+        # TLS ticket key.
+        "drain": edge_state.drain_dict(e),
+        "reloads": edge_state.public(edge_state.loads(e.reload_stats)),
+        "tunnel_probe": edge_state.tunnel_probe_dict(e),
+        "tuning": edge_state.public(edge_state.loads(e.tuning)),
+        "http3_enabled": True if e.http3_enabled is None else bool(e.http3_enabled),
+        "dns_weight": edge_state.dns_weight_dict(e, q),
+        **_wave14_edge(e),
+    }
+
+
+def _wave14_edge(e: Edge) -> dict:
+    """SPEC §23.1 / §23.2 / §23.12 admin fields: release + effective pin of the group, the latest
+    self-upgrade report, the customer-visible label and the public tag."""
+    from sqlalchemy.orm import object_session
+
+    from . import edge_labels, rollout
+
+    db = object_session(e)
+    pin = bundle.group_pin(db, dnsbuild.edge_group(e)) if db is not None else None
+    label = edge_labels.label_of(db, e.id) if db is not None and e.id is not None else \
+        edge_labels.label_for(*edge_labels.city_of(e), None)
+    up = rollout.upgrade_report(e)
+    return {
+        "release": e.release,
+        "pinned_release": pin,
+        "release_ok": (e.release == pin) if pin else None,
+        "upgrade": up or None,
+        "display_city": e.display_city,
+        "display_city_en": e.display_city_en,
+        "display_label": label["fa"],
+        "display_label_en": label["en"],
+        "public_tag": edge_labels.public_tag(e.id, db) if e.id is not None else None,
     }
 
 
 @router.get("/edges")
-def list_edges(db: Session = Depends(get_db)):
-    return [edge_to_dict(e) for e in db.scalars(select(Edge).order_by(Edge.id))]
+def list_edges(tag: str | None = None, db: Session = Depends(get_db)):
+    """?tag=<8 hex> (SPEC §23.12.2): the edge whose public tag a customer reported (X-Served-By)."""
+    from . import edge_labels
+    from . import uptime as up
+
+    edges = list(db.scalars(select(Edge).order_by(Edge.id)))
+    if tag is not None:
+        tag = tag.strip().lower()
+        if not edge_labels.TAG_RE.match(tag):
+            bad(ValidationError("tag باید ۸ نویسهٔ هگز باشد"))
+        tags = edge_labels.tags(db)
+        edges = [e for e in edges if tags.get(e.id) == tag]
+    ups = up.summaries(db)
+    qs = _dns_qs(db)
+    return [edge_to_dict(e, ups.get(e.id), qs.get(e.id)) for e in edges]
+
+
+def _dns_qs(db: Session) -> dict[int, int]:
+    """{edge id: q} of the online edges while DNS_WEIGHTS=capacity (SPEC §22.10), else {}."""
+    if not dnsbuild.weights_enabled():
+        return {}
+    online = online_edges(db)
+    q4, q6 = dnsbuild.edge_q(online, 4), dnsbuild.edge_q(online, 6)
+    return {e.id: q4.get(id(e)) or q6.get(id(e)) for e in online if q4.get(id(e)) or q6.get(id(e))}
+
+
+def _edge_dict(db: Session, e: Edge) -> dict:
+    return edge_to_dict(e, q=_dns_qs(db).get(e.id))
+
+
+@router.get("/edges/{edge_id}/uptime")
+def edge_uptime(edge_id: int, days: int = 30, db: Session = Depends(get_db)):
+    from . import uptime as up
+
+    if db.get(Edge, edge_id) is None:
+        raise HTTPException(404, "edge not found")
+    return up.daily(db, edge_id, days)
+
+
+def _edge_install(edge: Edge, token: str) -> str:
+    """The one-command install one-liner for this node (SPEC §11.1); role == edge group; SPEC §23.1:
+    + --version <pin> when the edge's group has an effective pinned release."""
+    from sqlalchemy.orm import object_session
+
+    db = object_session(edge)
+    pin = bundle.group_pin(db, edge.group) if db is not None else None
+    return bundle.install_command(token, region=edge.region, role=edge.group, version=pin)
 
 
 @router.post("/edges", status_code=201)
-def create_edge(body: EdgeIn, db: Session = Depends(get_db)):
+def create_edge(body: EdgeIn, request: Request, db: Session = Depends(get_db)):
     try:
-        ipv4 = validate_ip(body.ipv4, 4)
-        ipv6 = validate_ip(body.ipv6, 6) if body.ipv6 else None
+        ipv4 = validate_ip(body.ipv4, 4, strict=False)
+        ipv6 = validate_ip(body.ipv6, 6, strict=False) if body.ipv6 else None
     except ValidationError as e:
         bad(e)
     if db.scalar(select(Edge).where(Edge.name == body.name)):
         raise HTTPException(409, "edge name exists")
     token = new_token()
-    edge = Edge(name=body.name, ipv4=ipv4, ipv6=ipv6, region=body.region, token_hash=hash_token(token))
+    edge = Edge(name=body.name, ipv4=ipv4, ipv6=ipv6, region=body.region, token_hash=hash_token(token),
+                group=body.group, capacity_mbps=body.capacity_mbps, shield=body.shield)
     db.add(edge)
     db.commit()
+    _audit(db, request, "edge.add", edge.name,
+           {"region": edge.region, "group": edge.group, "capacity_mbps": edge.capacity_mbps,
+            "shield": edge.shield})
     # DNS changes once the edge sends its first heartbeat
-    return {**edge_to_dict(edge), "token": token}
+    return {**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)}
+
+
+@router.post("/edges/batch", status_code=201)
+def batch_create_edges(body: EdgeBatchIn, request: Request, db: Session = Depends(get_db)):
+    """Create N edges in one call (SPEC §11.1). IPs are unknown at batch time (the node reports
+    itself on first heartbeat); each edge gets a unique name and its one-time token + install
+    one-liner. Names are name_prefix + index, skipping names already taken."""
+    taken = {n for (n,) in db.execute(select(Edge.name)).all()}
+    out = []
+    idx = 1
+    for _ in range(body.count):
+        while f"{body.name_prefix}-{idx}" in taken:
+            idx += 1
+        name = f"{body.name_prefix}-{idx}"
+        taken.add(name)
+        idx += 1
+        token = new_token()
+        # ipv4 is filled in once the node heartbeats; 0.0.0.0 is a harmless placeholder (kept out of
+        # DNS because it is not online). The operator can also set it from the panel.
+        edge = Edge(name=name, ipv4="0.0.0.0", region=body.region, token_hash=hash_token(token),
+                    group=body.group, capacity_mbps=body.capacity_mbps)
+        db.add(edge)
+        db.flush()
+        out.append({**edge_to_dict(edge), "token": token, "install": _edge_install(edge, token)})
+    db.commit()
+    _audit(db, request, "edge.add", body.name_prefix,
+           {"count": body.count, "region": body.region, "group": body.group})
+    return {"edges": out}
+
+
+@router.get("/edges/install")
+def edge_install_oneliner(token: str, region: str = "global", role: str = "general"):
+    """Ready copy-paste one-liner for a specific node/token (SPEC §11.1)."""
+    region = region if region in ("home", "global") else "global"
+    role = role if role in ("general", "tunnel") else "general"
+    return {"command": bundle.install_command(token, region=region, role=role)}
 
 
 @router.post("/edges/{edge_id}/rotate-token")
-def rotate_edge_token(edge_id: int, db: Session = Depends(get_db)):
+def rotate_edge_token(edge_id: int, request: Request, db: Session = Depends(get_db)):
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")
     token = new_token()
     edge.token_hash = hash_token(token)
     db.commit()
+    # the new token is NEVER written to the audit log
+    _audit(db, request, "edge.rotate", edge.name)
     return {"token": token}
 
 
 @router.patch("/edges/{edge_id}")
-def toggle_edge(edge_id: int, enabled: bool, db: Session = Depends(get_db)):
+def update_edge(edge_id: int, request: Request, enabled: bool | None = None,
+                body: EdgePatch | None = Body(default=None), db: Session = Depends(get_db)):
+    """JSON body {enabled?, group?, capacity_mbps?, region?, shield?}; v1 clients send ?enabled=true|false.
+    A shield change reaches the edges through their next config poll (SPEC §14.1)."""
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")
-    edge.enabled = enabled
+    changes = body.model_dump(exclude_none=True) if body else {}
+    if enabled is not None:
+        changes.setdefault("enabled", enabled)
+    if not changes:
+        bad(ValidationError("هیچ تغییری ارسال نشده است"))
+    for k, v in changes.items():
+        setattr(edge, k, (v or None) if k in ("display_city", "display_city_en") else v)
+    update_shed(edge)
     db.commit()
-    return {"ok": True, "dns_failed": sync_all_dns(db)}
+    _audit(db, request, "edge.patch", edge.name, {"fields": sorted(changes), **changes})
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": _edge_dict(db, edge)}
+
+
+@router.post("/edges/{edge_id}/drain")
+def drain_edge(edge_id: int, request: Request, body: EdgeDrainIn | None = Body(default=None),
+               db: Session = Depends(get_db)):
+    """Drain a node before an upgrade/restart (SPEC §22.1): it leaves DNS answers at once and, after
+    PROXIED_TTL + 30 s, refuses NEW tunnel connections. 409 last_edge (pass force: true to drain the
+    last active edge of its group+region anyway); 409 already_draining (a re-POST with different
+    minutes only moves drain_until)."""
+    body = body or EdgeDrainIn()
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    minutes = body.minutes or settings.drain_default_minutes
+    reason = body.reason or "admin"
+    now = utcnow()
+    if edge_state.is_draining(edge):
+        if edge.drain_started_at is not None and edge.drain_until == edge.drain_started_at + timedelta(minutes=minutes):
+            raise HTTPException(409, "already_draining")
+    elif not body.force and edge_state.is_last_edge(db, edge, now):
+        raise HTTPException(409, "last_edge")
+    edge_state.start_drain(db, edge, minutes, reason, "admin", now)
+    db.commit()
+    _audit(db, request, "edge.drain", edge.name, {"minutes": minutes, "reason": reason, "force": body.force})
+    from . import alerts
+
+    alerts.resolve_alert(f"edge_drain_stuck:{edge.id}", notify=False)
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": _edge_dict(db, edge)}
+
+
+@router.delete("/edges/{edge_id}/drain")
+def undrain_edge(edge_id: int, request: Request, db: Session = Depends(get_db)):
+    """End a drain (idempotent, SPEC §22.1): the node is back in DNS answers at once."""
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    changed = edge_state.stop_drain(db, edge, "admin")
+    db.commit()
+    if changed:
+        _audit(db, request, "edge.undrain", edge.name, {})
+    from . import alerts
+
+    alerts.resolve_alert(f"edge_drain_stuck:{edge.id}", notify=False)
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": _edge_dict(db, edge)}
 
 
 @router.delete("/edges/{edge_id}")
-def delete_edge(edge_id: int, db: Session = Depends(get_db)):
+def delete_edge(edge_id: int, request: Request, db: Session = Depends(get_db)):
     edge = db.get(Edge, edge_id)
     if edge is None:
         raise HTTPException(404, "edge not found")
+    name = edge.name
+    from sqlalchemy import delete as sql_delete
+
+    from .models import EdgeEvent
+
+    # SQLite enforces no foreign keys: a later edge reusing the id must not inherit these (SPEC §22.13)
+    db.execute(sql_delete(EdgeEvent).where(EdgeEvent.edge_id == edge.id))
     db.delete(edge)
     db.commit()
+    _audit(db, request, "edge.delete", name)
     return {"ok": True, "dns_failed": sync_all_dns(db)}
+
+
+@router.get("/edges/{edge_id}/logs")
+def edge_logs(edge_id: int, db: Session = Depends(get_db)):
+    """Centralized node logs (SPEC §11.2). `lines` are stored newest-last (as the ring keeps
+    them); the UI shows them newest-first. Empty list when the node has reported none."""
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    try:
+        lines = json.loads(edge.logs) if edge.logs else []
+        if not isinstance(lines, list):
+            lines = []
+    except (ValueError, TypeError):
+        lines = []
+    return {"name": edge.name, "logs_at": edge.logs_at.isoformat() + "Z" if edge.logs_at else None,
+            "lines": lines}
+
+
+# ------------------------------------------------------------------ edge addresses (SPEC §12)
+
+def _get_edge(db: Session, edge_id: int) -> Edge:
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    return edge
+
+
+def _address_in_use(db: Session, ip: str, exclude_id: int | None = None) -> bool:
+    """True when `ip` already belongs to ANY edge — a primary (ipv4/ipv6) or an additional
+    address (SPEC §12.4: reject duplicates of any edge's address)."""
+    if db.scalar(select(Edge.id).where(or_(Edge.ipv4 == ip, Edge.ipv6 == ip))) is not None:
+        return True
+    q = select(EdgeAddress.id).where(EdgeAddress.ip == ip)
+    if exclude_id is not None:
+        q = q.where(EdgeAddress.id != exclude_id)
+    return db.scalar(q) is not None
+
+
+def _primary_entry(e: Edge, family: int) -> dict | None:
+    """The primary address of a family as an address entry (health = the edge-level probe)."""
+    ip = e.ipv4 if family == 4 else e.ipv6
+    if not ip:
+        return None
+    return {
+        "id": None, "family": family, "ip": ip, "label": "primary", "enabled": True, "primary": True,
+        "advertised": dnsbuild.address_advertised(True, e.probe_ok, e.probe_fail),
+        "probe": _probe_dict(e.probe_ok, e.probe_ms, e.probe_at, e.probe_error),
+    }
+
+
+@router.get("/edges/{edge_id}/addresses")
+def list_edge_addresses(edge_id: int, db: Session = Depends(get_db)):
+    """Primary + additional addresses with per-address health (SPEC §12.4). The primary is the
+    node's identity address (edges.ipv4/ipv6) and cannot be deleted; correct it via PATCH
+    /api/v1/edges/{id}."""
+    edge = _get_edge(db, edge_id)
+    return {
+        "edge_id": edge.id, "name": edge.name,
+        "primary": [p for p in (_primary_entry(edge, 4), _primary_entry(edge, 6)) if p],
+        "additional": [address_to_dict(a) for a in edge.addresses],
+        "advertised": _advertised_counts(edge),
+    }
+
+
+@router.post("/edges/{edge_id}/addresses", status_code=201)
+def add_edge_address(edge_id: int, body: EdgeAddressIn, request: Request, db: Session = Depends(get_db)):
+    """Add an additional address to a node (SPEC §12.4). Validated, family-matched, and rejected
+    when the address already belongs to any edge."""
+    edge = _get_edge(db, edge_id)
+    try:
+        ip = validate_ip(body.ip, body.family, strict=False)
+    except ValidationError as e:
+        bad(e)
+    if _address_in_use(db, ip):
+        raise HTTPException(409, "این آدرس قبلاً برای یکی از نودها ثبت شده است")
+    a = EdgeAddress(edge_id=edge.id, family=body.family, ip=ip, label=_clean_addr_label(body.label))
+    db.add(a)
+    db.commit()
+    _audit(db, request, "edge.address.add", edge.name, {"family": a.family, "ip": a.ip, "address_id": a.id})
+    db.refresh(edge)
+    return {"address": address_to_dict(a), "edge": edge_to_dict(edge), "dns_failed": sync_all_dns(db)}
+
+
+@router.patch("/edges/{edge_id}/addresses/{address_id}")
+def update_edge_address(edge_id: int, address_id: int, body: EdgeAddressPatch, request: Request,
+                        db: Session = Depends(get_db)):
+    """Edit / rename / enable / disable an additional address (SPEC §12.4). The family is fixed;
+    a changed IP starts its health over. `enabled=false` withdraws it from DNS immediately."""
+    edge = _get_edge(db, edge_id)
+    a = db.get(EdgeAddress, address_id)
+    if a is None or a.edge_id != edge.id:
+        raise HTTPException(404, "address not found")
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        bad(ValidationError("هیچ تغییری ارسال نشده است"))
+    if changes.get("ip") is not None:
+        try:
+            ip = validate_ip(changes["ip"], a.family, strict=False)  # family cannot change on edit
+        except ValidationError as e:
+            bad(e)
+        if _address_in_use(db, ip, exclude_id=a.id):
+            raise HTTPException(409, "این آدرس قبلاً برای یکی از نودها ثبت شده است")
+        if ip != a.ip:  # a new address is unprobed again -> advertised until it fails
+            a.ip = ip
+            a.probe_ok = a.probe_ms = a.probe_at = a.probe_error = None
+            a.probe_fail = 0
+    if "label" in changes:
+        a.label = _clean_addr_label(changes["label"])
+    if changes.get("enabled") is not None:
+        a.enabled = changes["enabled"]
+    db.commit()
+    _audit(db, request, "edge.address.patch", edge.name,
+           {"address_id": a.id, "family": a.family, "ip": a.ip, "fields": sorted(changes)})
+    db.refresh(edge)
+    return {"address": address_to_dict(a), "edge": edge_to_dict(edge), "dns_failed": sync_all_dns(db)}
+
+
+@router.delete("/edges/{edge_id}/addresses/{address_id}")
+def delete_edge_address(edge_id: int, address_id: int, request: Request, db: Session = Depends(get_db)):
+    """Remove an additional address (SPEC §12.4). The primary cannot be deleted."""
+    edge = _get_edge(db, edge_id)
+    a = db.get(EdgeAddress, address_id)
+    if a is None or a.edge_id != edge.id:
+        raise HTTPException(404, "address not found")
+    ip, family = a.ip, a.family
+    db.delete(a)
+    db.commit()
+    _audit(db, request, "edge.address.del", edge.name, {"address_id": address_id, "family": family, "ip": ip})
+    return {"ok": True, "dns_failed": sync_all_dns(db)}
+
+
+# ------------------------------------------------------------------ audit log (SPEC §13.2)
+
+AUDIT_MAX_LIMIT = 500
+
+
+def audit_to_dict(e: AuditLog) -> dict:
+    try:
+        detail = json.loads(e.detail or "{}")
+    except ValueError:
+        detail = {}
+    return {"id": e.id, "at": e.at.isoformat() + "Z" if e.at else None, "actor": e.actor,
+            "actor_kind": e.actor_kind, "action": e.action, "target": e.target,
+            "detail": detail, "ip": e.ip}
+
+
+@router.get("/audit")
+def list_audit(limit: int = 100, since: str | None = None, action: str | None = None,
+               actor: str | None = None, db: Session = Depends(get_db)):
+    """Recent audit entries, newest first (SPEC §13.2). `since` is an ISO-8601 timestamp."""
+    limit = max(1, min(limit, AUDIT_MAX_LIMIT))
+    q = select(AuditLog).order_by(AuditLog.id.desc())
+    if action:
+        q = q.where(AuditLog.action == action)
+    if actor:
+        q = q.where(AuditLog.actor == actor)
+    if since:
+        try:
+            dt = datetime.fromisoformat(since.replace("Z", "").strip())
+        except ValueError:
+            bad(ValidationError("since باید یک زمان ISO-8601 باشد"))
+        q = q.where(AuditLog.at >= dt)
+    return [audit_to_dict(e) for e in db.scalars(q.limit(limit))]

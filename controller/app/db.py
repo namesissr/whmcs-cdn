@@ -28,6 +28,7 @@ def get_db():
 
 
 def init_db():
-    from . import models  # noqa: F401
+    """Create / upgrade the schema with Alembic (see app/migrate.py and docs/OPERATIONS.md)."""
+    from . import migrate
 
-    Base.metadata.create_all(engine)
+    migrate.upgrade(engine)
