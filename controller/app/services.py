@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import (access, botranges, crypto, dnsbuild, images, l4, logexport, origin_guard, origin_pull, pdns, sections,
-               storage, waf_learning, waiting_room, webhooks)
+from . import (access, botranges, crypto, dnsbuild, edge_state, images, l4, logexport, origin_guard, origin_pull,
+               pdns, sections, storage, tls_tickets, waf_learning, waiting_room, webhooks)
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -42,7 +42,10 @@ def edge_metrics(e: Edge) -> dict | None:
         m = json.loads(e.metrics)
     except ValueError:
         return None
-    return {**m, "at": e.metrics_at.isoformat() + "Z"}
+    if not isinstance(m, dict):
+        return None
+    # "_"-prefixed keys are the controller's own hysteresis counters (edge_state.py), never shown
+    return {**{k: v for k, v in m.items() if not k.startswith("_")}, "at": e.metrics_at.isoformat() + "Z"}
 
 
 def metrics_fresh(e, now: datetime | None = None) -> bool:
@@ -103,13 +106,25 @@ def cpu_ratio(m: dict) -> float | None:
 
 def record_metrics(e: Edge, metrics: dict, now: datetime | None = None):
     """Store heartbeat metrics and update the shed flag and the high-load counters. Caller commits."""
+    from . import edge_state
+
     now = now or utcnow()
+    try:
+        prev = json.loads(e.metrics or "{}")
+        prev = prev if isinstance(prev, dict) else {}
+    except ValueError:
+        prev = {}
     # drop keys the agent didn't send (disk_pct/mem_pct are optional) so they don't show as 0
-    clean = {k: v for k, v in metrics.items() if v is not None}
+    clean = {k: v for k, v in metrics.items() if v is not None and not str(k).startswith("_")}
     e.metrics = json.dumps(clean)
     e.metrics_at = now
     update_shed(e, now)
     pct = edge_load_percent(e, now)
+    # SPEC §22.2 draining-generation pile-up and §22.10 DNS weight level hysteresis (internal counters)
+    level, up, down = edge_state.weight_level(int(e.dns_weight_level or 0), pct, prev)
+    e.dns_weight_level = level
+    e.metrics = json.dumps({**clean, "_pileup_n": edge_state.pileup_counter(prev, clean),
+                            "_wl_up": up, "_wl_down": down})
     e.load_high = (e.load_high or 0) + 1 if pct is not None and pct > LOAD_ALERT_PERCENT else 0
     ratio = cpu_ratio(clean)
     e.cpu_high = (e.cpu_high or 0) + 1 if ratio is not None and ratio > settings.edge_cpu_alert else 0
@@ -327,6 +342,10 @@ def site_to_dict(db: Session, site: Site) -> dict:
         },
         # authenticated origin pulls (SPEC §14.2): setting, effective mode, uploaded cert facts (no key)
         "origin_client": origin_pull.site_info(site, ssl_opts["origin_client_auth"]),
+        # SPEC §22.8: key type of the served certificate and whether an RSA certificate is served too
+        "ssl_key_type": _key_type(site),
+        "ssl_dual_rsa": bool(settings.acme_dual_rsa and site.ssl_status == "active"
+                             and site.ssl_source == "letsencrypt" and site.ssl_cert_rsa),
         "dnssec": site.dnssec_enabled,
         # customers whitelist these at their origin and use them for real-IP config
         "edge_ips": edge_ips(db),
@@ -334,6 +353,14 @@ def site_to_dict(db: Session, site: Site) -> dict:
         "records": [record_to_dict(r) for r in site.records],
         "created_at": site.created_at.isoformat() + "Z",
     }
+
+
+def _key_type(site: Site) -> str | None:
+    if site.ssl_status != "active" or not site.ssl_cert:
+        return None
+    from . import ssl as sslmod
+
+    return sslmod.cert_key_type(site.ssl_cert)
 
 
 def edge_ips(db: Session) -> list[str]:
@@ -431,6 +458,8 @@ def shield_peers(db: Session, edge: Edge | None) -> list[str]:
     for e in online_edges(db):  # enabled and heartbeating, ordered by id
         if not e.shield or e.id == edge.id or dnsbuild.edge_group(e) != group:
             continue
+        if dnsbuild.is_draining(e):  # SPEC §22.1: a draining shield gets no new hops either
+            continue
         addr = _edge_addr(e)
         if addr and addr not in out:
             out.append(addr)
@@ -505,7 +534,7 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
         ssl = None
         if (site.ssl_cert and site.ssl_key and site.ssl_status in ("active", "pending")
                 and (site.ssl_expires_at is None or site.ssl_expires_at > utcnow())):
-            ssl = {"cert": site.ssl_cert, "key": site.ssl_key}
+            ssl = ssl_block(site)
 
         cache = dict(cfg["cache"])
         if cache["dev_mode"]:
@@ -631,6 +660,14 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "name": edge.name if edge is not None else "",
             "capacity_mbps": int(edge.capacity_mbps or 0) if edge is not None else 0,
             "fair_share_pct": settings.fair_share_pct,
+            # SPEC §22: drain (§22.1), probe origin (§22.3) and dns_weight (§22.10) are agent-side only
+            # (never rendered: a change of only these keys never reloads nginx); http3 = this node's
+            # admin switch (§22.9); tls_tickets = the fleet's session ticket keys or null (§22.8)
+            "drain": edge_state.drain_block(edge),
+            "probe": edge_state.probe_block(),
+            "http3": edge is None or edge.http3_enabled is not False,
+            "tls_tickets": tls_tickets.edge_block(db),
+            "dns_weight": _node_dns_weight(db, edge),
         },
         # SPEC §16.4: the TCP/UDP proxy apps this node listens for — apps of the node's own edge
         # group, of active sites whose plan has l4_proxy, enabled apps only (l4.edge_block)
@@ -639,6 +676,43 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
     # content hash: an unchanged body keeps its version/ETag, so the edge sees a 304 and no reload
     version = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     return {"version": version, **body}
+
+
+def _node_dns_weight(db: Session, edge: Edge | None) -> dict | None:
+    """Edge config `node.dns_weight` (informational): {level, q} while DNS_WEIGHTS=capacity, else null."""
+    if edge is None or not dnsbuild.weights_enabled():
+        return None
+    return edge_state.dns_weight_dict(edge, edge_dns_q(db, edge))
+
+
+def edge_dns_q(db: Session, edge: Edge, online: list | None = None) -> int | None:
+    """The DNS weight q (1..4) of `edge` in its pool (SPEC §22.10); None when DNS_WEIGHTS=off or the
+    edge is not online."""
+    if not dnsbuild.weights_enabled():
+        return None
+    online = online if online is not None else online_edges(db)
+    me = next((e for e in online if e.id == edge.id), None)
+    if me is None:
+        return None
+    return dnsbuild.edge_q(online, 4).get(id(me)) or dnsbuild.edge_q(online, 6).get(id(me))
+
+
+def ssl_block(site: Site) -> dict:
+    """The `ssl` block of a site with a usable certificate (SPEC §22.8): the ECDSA pair, the optional
+    RSA pair (ACME_DUAL_RSA, Let's Encrypt sites, while unexpired) and whether to staple OCSP (only
+    when the leaf names an OCSP responder and the chain includes its issuer)."""
+    from . import ssl as sslmod
+
+    out = {"cert": site.ssl_cert, "key": site.ssl_key, "ocsp": sslmod.ocsp_capable(site.ssl_cert)}
+    if settings.acme_dual_rsa and site.ssl_source == "letsencrypt" and site.ssl_cert_rsa \
+            and site.ssl_key_rsa_stored and sslmod.cert_valid(site.ssl_cert_rsa):
+        try:
+            key = site.ssl_key_rsa
+        except crypto.CryptoError:  # unreadable key (key lost): ECDSA only
+            key = None
+        if key:
+            out["cert_rsa"], out["key_rsa"] = site.ssl_cert_rsa, key
+    return out
 
 
 def functions_for_edge(site: Site, fn: dict, feats: dict) -> dict:
@@ -656,15 +730,54 @@ def functions_for_edge(site: Site, fn: dict, feats: dict) -> dict:
     return {"enabled": bool(items), "on_error": fn["on_error"], "items": items}
 
 
+ORIGIN_COMPAT_KEYS = ("address", "port", "tls", "sni", "verify")
+
+
+def _edge_tunnel_path(p: dict, max_origins: int, blocked_hosts: dict | None) -> dict | None:
+    """One tunnel path as the edges get it (SPEC §22.4): `origins` members on the origin guard's
+    block list are dropped (a path left without members is dropped), the list is cut to the plan's
+    max_tunnel_origins (one member left -> a plain `origin` path), `failover` without explicit backups
+    sends every member after the first as backup, and `origin` carries the first non-backup member for
+    agents that predate `origins` (they serve the primary only, no failover)."""
+    p = dict(p)
+    for k in ("origins", "balance", "health", "idle_timeout"):
+        p.setdefault(k, None)
+    members = p.get("origins")
+    if not members:
+        p["origins"] = p["balance"] = p["health"] = None
+        return p
+    members = [dict(o) for o in members
+               if not (blocked_hosts and origin_guard.is_blocked(blocked_hosts, o["address"]))]
+    if not members:
+        return None
+    if all(o["backup"] for o in members):  # every primary was blocked: the first backup takes over
+        members[0]["backup"] = False
+    cut = members[: max(1, max_origins)]
+    if all(o["backup"] for o in cut):
+        cut[-1] = next(o for o in members if not o["backup"])
+    if len(cut) == 1:
+        p["origin"] = {k: cut[0][k] for k in ORIGIN_COMPAT_KEYS}
+        p["origins"] = p["balance"] = p["health"] = None
+        return p
+    if p["balance"] == "failover" and not any(o["backup"] for o in cut):
+        cut = [cut[0]] + [dict(o, backup=True) for o in cut[1:]]
+    p["origins"] = cut
+    primary = next(o for o in cut if not o["backup"])
+    p["origin"] = {k: primary[k] for k in ORIGIN_COMPAT_KEYS}
+    return p
+
+
 def tunnel_for_edge(site: Site, tunnel: dict, feats: dict, pool_names: set[str],
                     blocked_hosts: dict | None = None) -> dict:
     """Tunnel section as the edges get it (SPEC §7.3): plan limits folded in."""
     t = dict(tunnel)
     # a path whose pool is gone (or load balancing is off) is dropped, like hosts above; so is a
     # path whose own origin host is on the origin guard's block list
-    t["paths"] = [p for p in t["paths"] if (not p["pool"] or p["pool"] in pool_names) and not (
-        blocked_hosts and p.get("origin") and origin_guard.is_blocked(blocked_hosts, p["origin"]["address"]))
-    ][: feats["max_tunnel_paths"]]
+    max_origins = int(feats.get("max_tunnel_origins") or 1)
+    paths = [p for p in t["paths"] if (not p["pool"] or p["pool"] in pool_names) and not (
+        blocked_hosts and p.get("origin") and origin_guard.is_blocked(blocked_hosts, p["origin"]["address"]))]
+    paths = [x for x in (_edge_tunnel_path(p, max_origins, blocked_hosts) for p in paths) if x is not None]
+    t["paths"] = paths[: feats["max_tunnel_paths"]]
     cap = feats["tunnel_max_mbps"]
     if cap > 0 and (t["per_connection_mbps"] == 0 or t["per_connection_mbps"] > cap):
         t["per_connection_mbps"] = cap

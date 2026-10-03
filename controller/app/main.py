@@ -61,6 +61,9 @@ async def lifespan(app: FastAPI):
     errortrack.init_sentry()  # SPEC §18.4: only with SENTRY_DSN (sentry-sdk imported lazily)
     init_db()
     secrets_at_rest()
+    from . import tls_tickets
+
+    tls_tickets.startup_check()  # SPEC §22.8: TLS_TICKETS=on is refused without DATA_ENCRYPTION_KEY
     from . import pdns
 
     pdns.check_transport()  # M5: plain-HTTP PowerDNS API over a public network

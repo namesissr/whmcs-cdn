@@ -90,7 +90,10 @@ def targets(site: Site) -> list[tuple[str, list[dict] | str]]:
     cfg = sections.all_config(site)
     out = []
     for p in cfg["tunnel"]["paths"]:
-        if p["origin"]:
+        if p.get("origins"):  # SPEC §22.4: every member (ok when any answers, like a pool)
+            out.append((p["id"], [{k: o[k] for k in ("address", "port", "tls", "verify")}
+                                  | {"sni": o["sni"] or site.domain} for o in p["origins"]]))
+        elif p["origin"]:
             o = p["origin"]
             out.append((p["id"], [{**o, "sni": o["sni"] or site.domain}]))
         elif p["pool"]:
@@ -193,3 +196,91 @@ def check(paths: list[tuple[str, list[dict] | str]]) -> list[dict]:
             errors = list(dict.fromkeys(r["error"] for r in rs))
             out.append({"id": path_id, "ok": False, "ms": None, "error": "؛ ".join(errors)[:500] or None})
     return out
+
+
+# ------------------------------------------------------------------ client profile (SPEC §22.5 / §22.9 / §22.11)
+
+# The edge's tunnel timers — ONE documented contract with the edge render (edge/pcdn_agent/render/
+# site.py keeps the same values and has a matching golden test): keepalive_timeout of tunnel hosts,
+# keepalive_time, http2_max_concurrent_streams, the listeners' so_keepalive and the upstream connect
+# timeout (TUNNEL_CONNECT_TIMEOUT on the edge).
+EDGE_TUNNEL_TIMERS = {
+    "client_idle_s": 600,
+    "max_connection_age_s": 21600,
+    "h2_max_streams": 512,
+    "tcp_keepalive": {"idle_s": 120, "interval_s": 30, "count": 4},
+    "connect_timeout_s": 10,
+}
+SEND_TIMEOUT_MAX = 300  # edge: send_timeout = min(idle, 300)
+GRPC_HEALTH_CHECK_TIMEOUT_S = 20
+XMUX = {"max_concurrency": "16-32", "c_max_reuse_times": 0, "h_max_request_times": "600-900",
+        "h_max_reusable_secs": "1800-3000"}
+
+
+def keepalive_s(path_idle: int) -> int:
+    """Recommended client keepalive / ping interval: max(10, min(60, floor(min(idle, client_idle) / 3)))."""
+    return max(10, min(60, min(int(path_idle), EDGE_TUNNEL_TIMERS["client_idle_s"]) // 3))
+
+
+def recommended(protocol: str, k: int) -> dict:
+    """Stability settings only (keepalive, mux, protocol transport options) — never fragment / noise /
+    padding / SNI or address options."""
+    return {
+        "keepalive_s": k,
+        "mux": "off" if protocol in ("grpc", "xhttp", "h2") else "low",
+        "xmux": {**XMUX, "h_keepalive_period_s": k} if protocol == "xhttp" else None,
+        "grpc": ({"idle_timeout_s": k, "health_check_timeout_s": GRPC_HEALTH_CHECK_TIMEOUT_S,
+                  "permit_without_stream": False} if protocol == "grpc" else None),
+        "ws_heartbeat_s": k if protocol == "ws" else None,
+    }
+
+
+def http3_status(db: Session, site: Site) -> dict:
+    """{site, nodes, nodes_h3, available} (SPEC §22.9): HTTP/3 is offered to a client only when the
+    site serves it and EVERY online node serving the site speaks it. Counts only, never a node."""
+    from . import dnsbuild
+    from .services import edge_capabilities, online_edges
+
+    ssl_ok = bool(site.ssl_cert and site.ssl_key_stored and site.ssl_status in ("active", "pending")
+                  and (site.ssl_expires_at is None or site.ssl_expires_at > utcnow()))
+    site_h3 = bool(sections.get_section(site, "ssl").get("http3")) and ssl_ok
+    serving = dnsbuild.dns_edges(site, online_edges(db))
+    h3 = sum(1 for e in serving
+             if (edge_capabilities(e) or {}).get("http3") and (e.http3_enabled is None or e.http3_enabled))
+    return {"site": site_h3, "nodes": len(serving), "nodes_h3": h3,
+            "available": bool(site_h3 and serving and h3 == len(serving))}
+
+
+def _origin_count(cfg: dict, p: dict, max_origins: int) -> int:
+    if p.get("origins"):
+        return min(len(p["origins"]), max(1, max_origins))
+    if p.get("pool"):
+        pool = next((x for x in cfg["pools"]["pools"] if x["name"] == p["pool"]), None)
+        return len(pool["origins"]) if pool else 0
+    return 1
+
+
+def profile(db: Session, site: Site) -> dict | None:
+    """GET …/tunnel/profile (SPEC §22.11): edge timers, HTTP/3 availability and per path the
+    effective timeouts with the recommended client values. None when the plan has no tunnel."""
+    feats = sections.features_of(site)
+    if not feats.get("tunnel"):
+        return None
+    cfg = sections.all_config(site)
+    tn = cfg["tunnel"]
+    h3 = http3_status(db, site)
+    max_origins = int(feats.get("max_tunnel_origins") or 1)
+    paths = []
+    for p in tn["paths"][: feats["max_tunnel_paths"]]:
+        idle = int(p.get("idle_timeout") or tn["idle_timeout"])
+        k = keepalive_s(idle)
+        paths.append({
+            "id": p["id"], "path": p["path"], "protocol": p["protocol"],
+            "idle_timeout_s": idle, "read_timeout_s": idle, "send_timeout_s": min(idle, SEND_TIMEOUT_MAX),
+            "origins": _origin_count(cfg, p, max_origins),
+            "balance": p.get("balance") if p.get("origins") and max_origins > 1 else None,
+            "http3": bool(h3["available"] and p["protocol"] == "xhttp"),
+            "recommended": recommended(p["protocol"], k),
+        })
+    return {"edge": {**EDGE_TUNNEL_TIMERS, "tcp_keepalive": dict(EDGE_TUNNEL_TIMERS["tcp_keepalive"])},
+            "http3": h3, "paths": paths}

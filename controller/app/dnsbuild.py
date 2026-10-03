@@ -3,8 +3,10 @@
 import ipaddress
 import json
 import logging
+import math
+import statistics
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from .config import settings
 from .models import Edge, Site, utcnow
@@ -96,12 +98,25 @@ def _site_selector(site) -> str:
     return _tunnel_selector() if is_tunnel_site(site) else _selector()
 
 
-def _pick(ips: list[str], selector: str | None = None) -> str:
-    """LUA expression choosing among the edges of one pool."""
+def _pick(ips: list[str], selector: str | None = None, weights: dict[str, int] | None = None) -> str:
+    """LUA expression choosing among the edges of one pool.
+
+    `weights` (SPEC §22.10, DNS_WEIGHTS=capacity): {ip: q 1..4}. Only `random` and `hashed` use them
+    (pickwrandom / pickwhashed; with EDGE_PROBE the ifurlup candidate list repeats each address q
+    times); `all` / `first` / `pickclosest` ignore them, so tunnel sites (selector all) keep returning
+    every up address. Equal weights render exactly what the unweighted pool renders."""
     if not ips:
         return "{}"  # e.g. AAAA when the pool has no IPv6 edge: the visitor uses IPv4
-    lst = _lua_list(ips)
     sel = selector if selector in SELECTORS else _selector()
+    if weights and sel in ("random", "hashed"):
+        qs = [int(weights.get(ip, 1)) for ip in ips]
+        if len(set(qs)) > 1:
+            if settings.edge_probe:
+                rep = _lua_list([ip for ip, q in zip(ips, qs) for _ in range(q)])
+                return f"ifurlup('{settings.health_url}', {{{rep}}}, {{selector='{sel}', backupSelector='all'}})"
+            pairs = "{" + ",".join(f"{{{q},'{ip}'}}" for ip, q in zip(ips, qs)) + "}"
+            return f"pickwrandom({pairs})" if sel == "random" else f"pickwhashed({pairs})"
+    lst = _lua_list(ips)
     if settings.edge_probe:
         # PowerDNS probes the pool's edges itself; if none looks healthy from this
         # nameserver it still answers with the whole pool (never with the other pool)
@@ -125,7 +140,7 @@ def _log(rtype: str, pool: str) -> str:
 
 def lua_expression(home: list[str], global_: list[str],
                    home_alive: bool | None = None, global_alive: bool | None = None, rtype: str = "A",
-                   selector: str | None = None) -> str:
+                   selector: str | None = None, weights: dict[str, int] | None = None) -> str:
     """Build the LUA snippet that answers with the visitor's pool of online edges.
 
     home/global_: the online edges of one address family. *_alive: whether the pool has
@@ -137,12 +152,12 @@ def lua_expression(home: list[str], global_: list[str],
     global_alive = bool(global_) if global_alive is None else global_alive
     if geo_split(home_alive, global_alive):
         logline = _log(rtype, "(home and 'home' or 'global')")
-        return (f";{home_test()}{logline} if home then return {_pick(home, selector)} "
-                f"else return {_pick(global_, selector)} end")
+        return (f";{home_test()}{logline} if home then return {_pick(home, selector, weights)} "
+                f"else return {_pick(global_, selector, weights)} end")
     if settings.geo_log:
         pool = "'all'" if not settings.geoip_enabled else ("'home-only'" if home_alive else "'global-only'")
-        return f";{_log(rtype, pool).strip()} return {_pick(home + global_, selector)}"
-    return f";return {_pick(home + global_, selector)}"
+        return f";{_log(rtype, pool).strip()} return {_pick(home + global_, selector, weights)}"
+    return f";return {_pick(home + global_, selector, weights)}"
 
 
 def diag_expression(home_alive: bool, global_alive: bool) -> str:
@@ -255,6 +270,87 @@ def edge_group(e) -> str:
     return getattr(e, "group", None) or "general"
 
 
+def region_of(e) -> str:
+    return "home" if getattr(e, "region", None) == "home" else "global"
+
+
+def is_draining(e) -> bool:
+    """SPEC §22.1: draining / drained edges leave DNS answers (never emptying a pool)."""
+    return (getattr(e, "drain_state", None) or "") in ("draining", "drained")
+
+
+def is_degraded(e) -> bool:
+    """SPEC §22.3: the node's own tunnel proxy path fails its loopback probe."""
+    return bool(getattr(e, "tunnel_degraded", False))
+
+
+def _pools(edges: list) -> dict[tuple[str, str], list]:
+    pools: dict[tuple[str, str], list] = defaultdict(list)
+    for e in edges:
+        pools[(edge_group(e), region_of(e))].append(e)
+    return pools
+
+
+def _drop_draining(edges: list) -> list:
+    """Leave draining edges out, except where that would empty a group+region pool (fail-open)."""
+    keep = set()
+    for members in _pools(edges).values():
+        rest = [e for e in members if not is_draining(e)]
+        keep.update(id(e) for e in (rest or members))
+    return [e for e in edges if id(e) in keep]
+
+
+def _drop_degraded(edges: list) -> list:
+    """Tunnel sites only: withdraw tunnel-degraded edges, at most floor(n x
+    TUNNEL_DEGRADED_MAX_FRACTION) per group+region pool (the longest-degraded first; the most
+    recently degraded stay in), never emptying the pool."""
+    drop = set()
+    for members in _pools(edges).values():
+        degraded = sorted((e for e in members if is_degraded(e)),
+                          key=lambda e: getattr(e, "tunnel_degraded_since", None) or datetime.min)
+        budget = int(len(members) * settings.tunnel_degraded_max_fraction)  # floor
+        out = degraded[:budget]
+        if out and len(out) < len(members):
+            drop.update(id(e) for e in out)
+    return [e for e in edges if id(e) not in drop]
+
+
+def weights_enabled() -> bool:
+    return settings.dns_weights == "capacity"
+
+
+def edge_q(edges: list, family: int) -> dict[int, int]:
+    """SPEC §22.10: {id(edge): q} for the edges with a `family` address, per pool (group + region +
+    family). Base = capacity_mbps (the pool's median known capacity when 0, 100 when none is known)
+    x the load level factor (1, 0.5, 0.25); q = max(1, round(4 x w / max w)) in 1..4."""
+    from .edge_state import LEVEL_FACTOR
+
+    out: dict[int, int] = {}
+    for members in _pools([e for e in edges if _edge_family_addresses(e, family)]).values():
+        caps = [int(getattr(e, "capacity_mbps", 0) or 0) for e in members]
+        known = [c for c in caps if c > 0]
+        median = statistics.median(known) if known else 100
+        ws = {id(e): (c if c > 0 else median) * LEVEL_FACTOR.get(int(getattr(e, "dns_weight_level", 0) or 0), 1.0)
+              for e, c in zip(members, caps)}
+        top = max(ws.values())
+        for k, w in ws.items():
+            out[k] = max(1, int(math.floor(4 * w / top + 0.5))) if top > 0 else 1
+    return out
+
+
+def ip_weights(edges: list, family: int) -> dict[str, int]:
+    """{address: q} of every address of the edges (additional addresses share their edge's q)."""
+    qs = edge_q(edges, family)
+    out: dict[str, int] = {}
+    for e in edges:
+        q = qs.get(id(e))
+        if q is None:
+            continue
+        for ip, _, _ in _edge_family_addresses(e, family):
+            out[ip] = q
+    return out
+
+
 def is_shed(e, now=None) -> bool:
     """Shed by load (services.update_shed) and the metrics behind that are still fresh."""
     at = getattr(e, "metrics_at", None)
@@ -273,7 +369,12 @@ def dns_edges(site, edges: list) -> list:
     chosen = [e for e in edges if edge_group(e) == group] or list(edges)
     now = utcnow()
     keep_region = {e.region for e in chosen if not is_shed(e, now)}
-    return [e for e in chosen if not is_shed(e, now) or e.region not in keep_region]
+    out = [e for e in chosen if not is_shed(e, now) or e.region not in keep_region]
+    # SPEC §22.1: maintenance drain; §22.3: a broken node tunnel path matters for tunnel sites only
+    out = _drop_draining(out)
+    if is_tunnel_site(site):
+        out = _drop_degraded(out)
+    return out
 
 
 def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
@@ -282,6 +383,10 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
     edges: every online edge; the site's group and load shedding are applied here.
     """
     domain = site.domain
+    # SPEC §22.10: weights come from each edge's own full pool (before this site's filtering), so an
+    # edge's q is the same in every zone; None (DNS_WEIGHTS=off) renders today's equal answers
+    w4 = ip_weights(edges, 4) if weights_enabled() else None
+    w6 = ip_weights(edges, 6) if weights_enabled() else None
     edges = dns_edges(site, edges)
     grouped: dict[tuple[str, str], dict] = {}
 
@@ -371,11 +476,12 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
     for name in proxied_names:
         # The customer sees their record; resolvers see our edges.
         add(name, "LUA", settings.proxied_ttl,
-            "A \"" + lua_expression(v4_home, v4_global, home_alive, global_alive, selector=selector) + "\"")
+            "A \"" + lua_expression(v4_home, v4_global, home_alive, global_alive, selector=selector,
+                                    weights=w4) + "\"")
         if have_v6:
             add(name, "LUA", settings.proxied_ttl,
                 "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive, "AAAA",
-                                           selector=selector) + "\"")
+                                           selector=selector, weights=w6) + "\"")
     if proxied_names:
         add(f"{DIAG_LABEL}.{domain}", "LUA", 5, "TXT \"" + diag_expression(home_alive, global_alive) + "\"")
 

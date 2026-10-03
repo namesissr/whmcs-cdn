@@ -336,7 +336,7 @@ def check_all(db, edges: bool = True) -> None:
     edges=False skips the edge checks right after a controller outage (see scheduler).
     """
     for fn in ((check_edges, check_edge_load, check_edge_health, check_edge_probe,
-                check_edge_address_probe) if edges else ()) \
+                check_edge_address_probe, check_edge_tunnel) if edges else ()) \
             + (check_certs, check_pdns):
         try:
             fn(db)
@@ -549,6 +549,82 @@ def check_edge_address_probe(db) -> None:
         return f"آدرس {ip} روی نود {name} دوباره سالم شد."
 
     sync("edge_address_down:", active, normal)
+
+
+def check_edge_tunnel(db) -> None:
+    """Wave 13 node conditions (SPEC §22.2 / §22.3 / §22.6), for enabled edges that still heartbeat:
+
+    * edge_tunnel_degraded:{id} — the node's own tunnel proxy path keeps failing its loopback probe;
+      opens on degradation, resolves on recovery (tunnel sites' DNS already routes around it).
+    * edge_reload_storm:{id} — more than 12 reloads in the last hour for 3 heartbeats (resolves <= 6).
+    * edge_draining_pileup:{id} — more draining worker generations than 4 x CPUs for 5 heartbeats.
+    * edge_tuning:{id} (info) — the kernel tuning check failed for >= 3 heartbeats.
+    """
+    from . import edge_state
+    from .models import Edge
+    from .services import edge_metrics
+
+    now = utcnow()
+    cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
+    degraded, storm, pileup, tuning, names = {}, {}, {}, {}, {}
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
+        for p in ("edge_tunnel_degraded", "edge_reload_storm", "edge_draining_pileup", "edge_tuning"):
+            names[f"{p}:{e.id}"] = e.name
+        if e.last_seen_at is None or e.last_seen_at < cutoff:
+            continue  # no heartbeat: covered by edge_offline
+        if e.tunnel_degraded:
+            since = e.tunnel_degraded_since or now
+            last = (edge_state.loads(e.tunnel_probe) or {})
+            errs = [f"{k}: {(last.get(k) or {}).get('error')}" for k in ("ws", "grpc")
+                    if isinstance(last.get(k), dict) and (last.get(k) or {}).get("error")]
+            degraded[f"edge_tunnel_degraded:{e.id}"] = (
+                f"مسیر تونل نود {e.name} خراب است (پروب داخلی)",
+                f"پروب داخلی تونل روی نود {e.name} از {human_duration(now - since)} پیش پیاپی ناموفق است "
+                f"(nginx، TLS یا مسیر پروکسی تونل خود نود). نود فقط از پاسخ‌های DNS سایت‌های تونل و در "
+                f"محدوده‌ی بودجه کنار گذاشته شده است؛ سایت‌های وب عادی آن را نگه می‌دارند."
+                + (("\n" + "\n".join(errs)[:400]) if errs else ""),
+                "warning",
+            )
+        if edge_state.reload_storm(e):
+            r = edge_state.loads(e.reload_stats)
+            storm[f"edge_reload_storm:{e.id}"] = (
+                f"بارگذاری مجدد پیاپی nginx روی نود {e.name}",
+                f"نود {e.name} در یک ساعت گذشته {r.get('count_1h')} بار nginx را بارگذاری مجدد کرده است؛ هر "
+                f"بارگذاری نسل تازه‌ای از کارگرها می‌سازد و اتصال‌های طولانی تونل را در نهایت قطع می‌کند. "
+                f"تغییرات پیاپی تنظیمات (API مشتری / پنل) را بررسی کنید.",
+                "warning",
+            )
+        m = edge_metrics(e) or {}
+        try:
+            raw = json.loads(e.metrics or "{}")
+        except ValueError:
+            raw = {}
+        if int((raw if isinstance(raw, dict) else {}).get("_pileup_n") or 0) >= edge_state.PILEUP_CHECKS:
+            pileup[f"edge_draining_pileup:{e.id}"] = (
+                f"انباشت نسل‌های در حال تخلیه روی نود {e.name}",
+                f"روی نود {e.name} {m.get('draining_workers')} نسل کارگر nginx هنوز در حال خاموش شدن است "
+                f"(بیش از {edge_state.PILEUP_PER_CPU} برابر {m.get('cpus')} هسته)؛ حافظه‌ی نود در خطر است.",
+                "warning",
+            )
+        if edge_state.tuning_bad(e):
+            t = edge_state.loads(e.tuning)
+            mism = [f"{x.get('key')}: {x.get('have')} (انتظار {x.get('want')})"
+                    for x in (t.get("mismatches") or []) if isinstance(x, dict)][:10]
+            tuning[f"edge_tuning:{e.id}"] = (
+                f"تنظیمات هسته‌ی نود {e.name} با پروفایل یکسان نیست",
+                f"بررسی تنظیمات هسته (sysctl / qdisc / nofile) روی نود {e.name} ناموفق است:\n- "
+                + ("\n- ".join(mism) or "—"),
+                "info",
+            )
+
+    def normal(cond):
+        name = names.get(cond["key"])
+        return f"وضعیت نود {name} به حالت عادی برگشت." if name else "نود غیرفعال یا حذف شد؛ هشدار بسته شد."
+
+    sync("edge_tunnel_degraded:", degraded, normal)
+    sync("edge_reload_storm:", storm, normal)
+    sync("edge_draining_pileup:", pileup, normal)
+    sync("edge_tuning:", tuning, normal)
 
 
 def check_certs(db) -> None:

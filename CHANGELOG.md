@@ -11,6 +11,46 @@ process is described in [docs/ROLLOUT.md](docs/ROLLOUT.md).
 
 ## [Unreleased]
 
+### Added — wave 13: tunnel speed and stability (SPEC §22), controller
+
+Migration `0022` (edges drain / probe / reload / tuning / `http3_enabled` / `dns_weight_level` columns,
+`sites.ssl_cert_rsa` + encrypted `ssl_key_rsa`, table `edge_events`). Every new switch defaults to the
+previous behaviour. Node selection stays health / load / capacity driven; DNS answers of tunnel sites are
+never truncated or sampled.
+
+- **Node drain** (§22.1): `POST|DELETE /api/v1/edges/{id}/drain` (409 `last_edge` unless `force`,
+  409 `already_draining`), edge self-drain `POST /edge/v1/drain` (rate limited), `node.drain` in the edge
+  config, heartbeat `drain` (`drained`), automatic `drained` at `drain_until` and auto-undrain after
+  `DRAIN_MAX_HOLD_MINUTES` (alert `edge_drain_stuck`). Draining edges leave DNS answers and shield peers
+  without ever emptying a group+region pool. Env: `DRAIN_DEFAULT_MINUTES`, `DRAIN_MAX_HOLD_MINUTES`.
+- **Reload metrics** (§22.2): heartbeat `metrics.draining_workers` / `sock_tcp` / `sock_tw` are stored
+  (they were dropped before), heartbeat `reloads` stored and shown; `/metrics` gains
+  `pcdn_edge_reloads_1h{edge}`, `pcdn_edge_draining_workers{edge}`, `pcdn_edges_draining`,
+  `pcdn_edges_tunnel_degraded`; alerts `edge_reload_storm`, `edge_draining_pileup`.
+- **Synthetic tunnel probe** (§22.3): heartbeat `tunnel_probe` with fail/ok hysteresis
+  (`TUNNEL_PROBE_FAIL_CHECKS`, `TUNNEL_PROBE_OK_CHECKS`, ≥ 10 min), tunnel-degraded edges leave tunnel
+  sites' answers within `TUNNEL_DEGRADED_MAX_FRACTION` per pool (fail-open), alert
+  `edge_tunnel_degraded`, `overview.tunnel_degraded`, optional `TUNNEL_PROBE_ORIGIN` (`node.probe`).
+- **Multiple origins per tunnel path** (§22.4): `origins` (2..10) with `balance` failover / round_robin /
+  sticky_ip and `health` tcp / http; plan feature `max_tunnel_origins` (default 1); downgrade truncation and
+  the compatibility `origin` for older agents; pools `health.type`.
+- **Timeouts and client guide** (§22.5 / §22.11): per-path `idle_timeout`; `GET …/tunnel/profile` (admin
+  and `/capi/v1`, scope stats) with the edge timer contract and recommended keepalive / mux / xmux / gRPC
+  values.
+- **Kernel tuning report** (§22.6): heartbeat `tuning` stored; info alert `edge_tuning`.
+- **Upstream reuse** (§22.7): usage `reused_n`; `/tunnel/quality` paths gain `reuse_pct`.
+- **Faster TLS** (§22.8): shared TLS session ticket keys (`TLS_TICKETS`, `TLS_TICKET_ROTATE_HOURS`;
+  encrypted at rest, leader rotation, never logged or returned), optional RSA-2048 certificate
+  (`ACME_DUAL_RSA`), `ssl.ocsp` only for certificates with an OCSP responder; site `ssl_key_type`,
+  `ssl_dual_rsa`.
+- **HTTP/3 per node** (§22.9): `PATCH /api/v1/edges/{id}` `http3_enabled`, `node.http3`, HTTP/3
+  availability in the tunnel profile.
+- **Capacity-weighted DNS** (§22.10): `DNS_WEIGHTS=capacity` (default `off` = byte-identical zones),
+  quantised weights with a load-level hysteresis, `pickwrandom` / `pickwhashed`.
+- **"Why did my connection drop?"** (§22.12): usage `ends` per path, `GET …/tunnel/drops` (admin and
+  `/capi/v1`) with reasons, rejected attempts, hourly series and node maintenance times without node
+  identity.
+
 ## [2.0.0] - Unreleased
 
 First production release of the v2 platform: everything built in waves 1–10 on top of the original

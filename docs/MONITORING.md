@@ -125,6 +125,9 @@ docker compose -f docker-compose.yml -f same-host.override.yml up -d
 | `pcdn_audit_log_entries` | تعداد ردیف‌های لاگ حسابرسی |
 | `pcdn_webhook_deliveries{status}` | تحویل‌های وب‌هوک `pending`/`failed` (۷ روز اخیر) |
 | `pcdn_log_export_pending_records` | رکوردهای لاگ در صف آپلود به باکت مشتری |
+| `pcdn_edges_draining`، `pcdn_edges_tunnel_degraded` | موج ۱۳: نودهای در حال تخلیه (بیرون از DNS) / نودهایی که پروب داخلی تونلشان پیاپی رد می‌شود |
+| `pcdn_edge_reloads_1h{edge}` | موج ۱۳: بارگذاری مجدد nginx در ساعت گذشته‌ی هر نود آنلاین (برچسب فقط **نام** نود، هرگز آدرس) |
+| `pcdn_edge_draining_workers{edge}` | موج ۱۳: نسل‌های کارگر nginx که هنوز در حال خاموش شدن‌اند (برای هر نود آنلاینی که گزارش می‌دهد) |
 
 ### ۴.۲ پروب‌های blackbox (همیشه)
 
@@ -202,6 +205,17 @@ json-exporter برای فیلدهای `null` (نودی که هنوز متریک 
 | `PcdnEdgeUptimeLow` (پل) | uptime ۲۴ ساعتهٔ نود < ۹۵٪ | info |
 | `PcdnErrorRatioHigh` (پل) | نسبت 5xx ِ ۲۴ ساعت غلتان > ۵٪ (با حداقل ۱۰۰۰ درخواست) | warning |
 | `PcdnApiBridgeFailing` (پل) | json-exporter داده نمی‌گیرد | warning |
+
+**هشدارهای داخلی کنترلر در موج ۱۳ (SPEC §22)** — مثل بقیه‌ی هشدارهای کنترلر از تلگرام/ایمیل خود کنترلر
+فرستاده می‌شوند و در `pcdn_active_alerts` شمرده می‌شوند:
+
+| کلید | شرط | شدت |
+|---|---|---|
+| `edge_tunnel_degraded:<id>` | «مسیر تونل نود X خراب است (پروب داخلی)»: `TUNNEL_PROBE_FAIL_CHECKS` گزارش ناموفق پیاپی پروب داخلی؛ با بازگشت (`TUNNEL_PROBE_OK_CHECKS` گزارش موفق و ≥ ۱۰ دقیقه) بسته می‌شود | warning |
+| `edge_reload_storm:<id>` | بیش از ۱۲ بارگذاری مجدد در ساعت در ۳ heartbeat پیاپی؛ با ≤ ۶ بسته می‌شود | warning |
+| `edge_draining_pileup:<id>` | `draining_workers` بیش از ۴ × تعداد هسته در ۵ heartbeat پیاپی | warning |
+| `edge_tuning:<id>` | بررسی تنظیمات هسته‌ی نود (sysctl/qdisc/nofile) در ≥ ۳ heartbeat ناموفق | info |
+| `edge_drain_stuck:<id>` | تخلیه‌ای که `DRAIN_MAX_HOLD_MINUTES` بعد از پایانش هنوز باز بود خودکار لغو شد؛ با تخلیه/لغو بعدی همان نود بسته می‌شود | warning |
 
 **مسیرها (Alertmanager):** همه به گیرندهٔ `pcdn` (تلگرام + ایمیل)؛ `critical` با `repeat_interval` یک
 ساعته؛ `info` فقط به تلگرام (یا ایمیل اگر تلگرام نیست) و روزی یک‌بار. قواعد inhibit: وقتی کنترلر در

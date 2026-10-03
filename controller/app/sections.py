@@ -36,6 +36,8 @@ DEFAULT_FEATURES = {
     "max_tunnel_paths": 10,
     "max_tunnel_connections": 0,  # per site per edge, 0 = unlimited
     "tunnel_max_mbps": 0,         # cap for tunnel.per_connection_mbps, 0 = no cap
+    # SPEC §22.4: origins per tunnel path (`origins` list with failover); 1 = a single origin only
+    "max_tunnel_origins": 1,
     "edge_group": "general",      # which edges DNS answers with: general | tunnel
     # rules & security (SPEC §14.2)
     "max_transform_rules": 10,
@@ -95,6 +97,7 @@ class Features(Strict):
     max_tunnel_paths: int = Field(10, ge=0, le=50)
     max_tunnel_connections: int = Field(0, ge=0, le=1000000)
     tunnel_max_mbps: int = Field(0, ge=0, le=100000)
+    max_tunnel_origins: int = Field(1, ge=1, le=10)
     edge_group: Literal["general", "tunnel"] = "general"
     max_transform_rules: int = Field(10, ge=0, le=1000)
     max_redirects: int = Field(100, ge=0, le=10000)
@@ -425,6 +428,8 @@ class PoolOrigin(Strict):
 
 class Health(Strict):
     enabled: bool = True
+    # SPEC §22.4: tcp = a plain TCP connect by the edge agent (VPN origins rarely answer HTTP)
+    type: Literal["http", "tcp"] = "http"
     path: str = Field("/", max_length=512, pattern=r"^/[^\s\"'<>\\]*$")
     interval: int = Field(10, ge=5, le=300)
     timeout: int = Field(3, ge=1, le=30)
@@ -485,12 +490,44 @@ class TunnelOrigin(Strict):
         return self
 
 
+TUNNEL_ORIGINS_MAX = 10
+TUNNEL_BALANCES = ("failover", "round_robin", "sticky_ip")
+
+
+class TunnelPathOrigin(TunnelOrigin):
+    """One member of a tunnel path's `origins` list (SPEC §22.4)."""
+    weight: int = Field(1, ge=1, le=100)
+    backup: bool = False
+
+
+class TunnelHealth(Strict):
+    """Health check of a path's `origins` (SPEC §22.4): tcp (default) or the HTTP check of pools."""
+    type: Literal["tcp", "http"] = "tcp"
+    interval: int = Field(10, ge=5, le=300)
+    timeout: int = Field(3, ge=1, le=30)
+    path: str = Field("/", max_length=512, pattern=r"^/[^\s\"'<>\\]*$")
+    expect: str = Field("2xx,3xx,4xx", pattern=r"^([1-5]xx|[1-5]\d\d)(,([1-5]xx|[1-5]\d\d))*$")
+
+    @model_validator(mode="after")
+    def _timeout(self):
+        if self.timeout >= self.interval:
+            raise ValueError("مهلت بررسی سلامت باید کمتر از فاصله‌ی بررسی باشد")
+        return self
+
+
 class TunnelPath(Strict):
     id: str = Field(pattern=ID_RE)
     path: str
     protocol: Literal["ws", "httpupgrade", "grpc", "xhttp", "h2"]
     origin: TunnelOrigin | None = None
     pool: str | None = Field(None, pattern=ID_RE)
+    # SPEC §22.4: 2..10 origins with failover / balancing (plan max_tunnel_origins); balance and
+    # health apply to `origins` only (null otherwise)
+    origins: list[TunnelPathOrigin] | None = None
+    balance: Literal["failover", "round_robin", "sticky_ip"] | None = None
+    health: TunnelHealth | None = None
+    # SPEC §22.5: per-path idle timeout (null = the section's idle_timeout)
+    idle_timeout: int | None = Field(None, ge=60, le=86400)
 
     @field_validator("path")
     @classmethod
@@ -505,8 +542,27 @@ class TunnelPath(Strict):
 
     @model_validator(mode="after")
     def _target(self):
-        if self.origin is not None and self.pool is not None:
-            raise ValueError("برای هر مسیر تونل فقط یکی از origin یا pool را تعیین کنید")
+        if sum(x is not None for x in (self.origin, self.pool, self.origins)) > 1:
+            raise ValueError("برای هر مسیر تونل فقط یکی از origin، origins یا pool را تعیین کنید")
+        if self.origins is None:
+            self.balance = None
+            self.health = None
+            return self
+        o = self.origins
+        if not 2 <= len(o) <= TUNNEL_ORIGINS_MAX:
+            raise ValueError("فهرست origins باید ۲ تا ۱۰ مبدأ داشته باشد")
+        if len({(x.tls, x.verify) for x in o}) > 1:
+            raise ValueError("همه‌ی مبدأهای یک مسیر باید تنظیم TLS یکسان داشته باشند")
+        if len({x.sni for x in o}) > 1:
+            raise ValueError("sni همه‌ی مبدأهای یک مسیر باید خالی یا یکسان باشد")
+        if all(x.backup for x in o):
+            raise ValueError("دست‌کم یکی از مبدأهای مسیر باید اصلی (غیر پشتیبان) باشد")
+        if len({(x.address, x.port) for x in o}) != len(o):
+            raise ValueError("مبدأهای تکراری (آدرس و پورت یکسان) در یک مسیر مجاز نیست")
+        if self.balance is None:
+            self.balance = "failover"
+        if self.health is None:
+            self.health = TunnelHealth()
         return self
 
 
@@ -2157,6 +2213,8 @@ def origin_hosts(name: str, value: dict, include_ips: bool = False) -> list[tupl
         for p in value.get("paths") or []:
             if p.get("origin"):
                 add(p["origin"].get("address"), f"مسیر تونل {p.get('id')}")
+            for o in p.get("origins") or []:  # SPEC §22.4
+                add(o.get("address"), f"مسیر تونل {p.get('id')}")
     elif name == "l4":
         for a in value.get("apps") or []:
             add((a.get("origin") or {}).get("address"), f"برنامه {a.get('id')}")
@@ -2232,6 +2290,11 @@ def section_warnings(site, name: str, value: dict) -> list[str]:
                            f"مبدأ (origin) تعریف شده است؛ هر درخواست ممکن است به مبدأ دیگری برود و "
                            f"نشست کاربر بشکند. برای این پروتکل‌ها از استخر تک‌مبدأ یا یک origin مشخص "
                            f"استفاده کنید.")
+        # SPEC §22.4: most gRPC servers do not answer a plain HTTP request with 2xx
+        for p in value.get("paths", []):
+            if p["protocol"] == "grpc" and (p.get("health") or {}).get("type") == "http":
+                out.append(f"مسیر تونل «{p['id']}»: بیشتر سرورهای gRPC به درخواست HTTP معمولی پاسخ ۲xx "
+                           f"نمی‌دهند؛ نوع بررسی را tcp بگذارید")
         # F34: force_https + tunnel paths — a ws/httpupgrade/xhttp client on port 80 gets a 301 and
         # can never connect. Warn when the site has force_https on and any tunnel path exists.
         if value.get("paths") and _force_https_on(site):
@@ -2290,6 +2353,11 @@ def _check_tunnel(site, value: dict, feats: dict):
     """Plan limits and references of the tunnel section (the shape is checked by Tunnel)."""
     if len(value["paths"]) > feats["max_tunnel_paths"]:
         raise PermissionError(f"حداکثر {feats['max_tunnel_paths']} مسیر تونل در پلن شما مجاز است")
+    # SPEC §22.4: origins per path (the default plan value 1 allows no `origins` list at all)
+    max_origins = int(feats.get("max_tunnel_origins") or 1)
+    for p in value["paths"]:
+        if p.get("origins") and len(p["origins"]) > max_origins:
+            raise PermissionError(f"حداکثر {max_origins} مبدأ برای هر مسیر تونل در پلن شما مجاز است")
     cap = feats["tunnel_max_mbps"]
     # 0 (unlimited) is accepted: the edge config then applies the plan's cap (see tunnel_for_edge)
     if cap > 0 and value["per_connection_mbps"] > cap:

@@ -73,18 +73,27 @@ def dns_signature() -> str:
                      settings.geo_no_ecs_pool, ",".join(settings.geo_no_ecs_resolvers),
                      ",".join(settings.geo_no_ecs_countries), settings.geo_unknown_pool,
                      settings.lua_selector, settings.tunnel_lua_selector, str(settings.edge_probe),
-                     settings.health_url, str(settings.geo_log)])
+                     settings.health_url, str(settings.geo_log)]
+                    # SPEC §22: changing these rewrites every zone once (defaults keep the old signature)
+                    + ([settings.dns_weights] if settings.dns_weights != "off" else [])
+                    + ([f"tdf{settings.tunnel_degraded_max_fraction:g}"]
+                       if settings.tunnel_degraded_max_fraction != 0.5 else []))
 
 
-def edge_dns_state(e) -> str:
+def edge_dns_state(e, q: str | None = None) -> str:
     """Per-edge fingerprint of everything that changes a zone's edge answers: identity, region,
     group, load shedding, and — for multi-address failover (SPEC §12) — the advertised state of
-    the primary and of every additional address (health, enable/disable, add/remove)."""
+    the primary and of every additional address (health, enable/disable, add/remove). Wave 13
+    (SPEC §22): the drain flag (d1/d0), the tunnel-degraded flag (t1/t0) and, with
+    DNS_WEIGHTS=capacity, the edge's quantised weights `q` ("w<q4>-<q6>")."""
     flags = [f"{e.id}:{e.ipv4}:{e.ipv6 or ''}:{e.region}:{e.group}:{int(dnsbuild.is_shed(e))}",
              # F32: the primary's IPv4 and IPv6 advertise independently, so a per-family change
              # (one family withdrawn/restored) still triggers a zone rewrite
              f"p4{int(dnsbuild.address_advertised(True, e.probe_ok4, e.probe_fail4))}",
-             f"p6{int(dnsbuild.address_advertised(True, e.probe_ok6, e.probe_fail6))}"]
+             f"p6{int(dnsbuild.address_advertised(True, e.probe_ok6, e.probe_fail6))}",
+             f"d{int(dnsbuild.is_draining(e))}", f"t{int(dnsbuild.is_degraded(e))}"]
+    if q is not None:
+        flags.append(f"w{q}")
     for a in sorted(e.addresses, key=lambda a: a.id):
         flags.append(f"a{a.id}:{a.family}:{a.ip}:{int(a.enabled)}:"
                      f"{int(dnsbuild.address_advertised(a.enabled, a.probe_ok, a.probe_fail))}")
@@ -146,7 +155,11 @@ def job_edges(db):
     # GEO_* or upgrading the controller rewrites every zone on the next tick
     # group and load shedding decide which edges answer (dnsbuild.dns_edges): part of the state too
     # per-address advertisement (probe health / enable / add-remove) is part of the state too (§12)
-    current = ",".join(edge_dns_state(e) for e in edges) + "|" + dns_signature()
+    qs = None
+    if dnsbuild.weights_enabled():  # SPEC §22.10: quantised weights only, so heartbeats don't churn zones
+        q4, q6 = dnsbuild.edge_q(edges, 4), dnsbuild.edge_q(edges, 6)
+        qs = {id(e): f"{q4.get(id(e), 0)}-{q6.get(id(e), 0)}" for e in edges}
+    current = ",".join(edge_dns_state(e, qs.get(id(e)) if qs else None) for e in edges) + "|" + dns_signature()
     dirty = db.get(State, DNS_DIRTY_KEY) is not None
     if current == _state(db, "online_edges") and not dirty:
         # DNS already matches the live edge set: record the freshness for the /metrics age
@@ -293,9 +306,11 @@ def job_cleanup(db):
     # SPEC §15.4: tunnel origin-down / origin-up site events are kept SITE_EVENTS_RETENTION_DAYS
     tunnel_quality.prune_events(db)
     # SPEC §16.8: storage billing samples are kept like the bandwidth usage (400 days)
-    from . import storage
+    from . import edge_state, storage
 
     storage.prune(db)
+    # SPEC §22.13: edge_events are kept 90 days
+    edge_state.prune_events(db)
     db.commit()
 
 
@@ -542,6 +557,22 @@ def job_storage_rotation(db, now: datetime | None = None, force: bool = False):
     return {"done": done, "pending": pending}
 
 
+def job_drain(db, now: datetime | None = None):
+    """Every tick (leader only, SPEC §22.1): draining -> drained at drain_until; a drain held
+    DRAIN_MAX_HOLD_MINUTES past drain_until is cleared (alert + audit)."""
+    from . import edge_state
+
+    return edge_state.job_drain(db, now)
+
+
+def job_tls_tickets(db, now: datetime | None = None, force: bool = False):
+    """Every tick (leader only, SPEC §22.8): create / rotate the shared TLS session ticket keys
+    (TLS_TICKETS=on with DATA_ENCRYPTION_KEY); deletes them when tickets are off."""
+    from . import tls_tickets
+
+    return tls_tickets.rotate(db, now, force=force)
+
+
 def job_capacity(db, now: datetime | None = None, force: bool = False):
     """Daily: edge-group capacity alert from the 3-day p95 of the hourly tx (SPEC §15.5, leader
     only)."""
@@ -553,8 +584,8 @@ def job_capacity(db, now: datetime | None = None, force: bool = False):
 JOBRUN_PREFIX = "jobrun:"
 
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
-JOBS = [job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota, job_tunnel_origin,
-        job_capacity, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
+JOBS = [job_drain, job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota,
+        job_tunnel_origin, job_capacity, job_tls_tickets, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
         job_log_export, job_storage, job_storage_rotation, job_security_audit, job_waf_learning, job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
 FAST_JOBS = [job_webhooks]

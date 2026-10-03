@@ -320,6 +320,7 @@ def upload_cert(domain: str, body: CustomCert, request: Request, db: Session = D
     except ssl.SslError as e:
         bad(e)
     site.ssl_cert, site.ssl_key = body.cert.strip() + "\n", body.key.strip() + "\n"
+    site.ssl_cert_rsa = site.ssl_key_rsa_stored = None  # SPEC §22.8: an RSA pair belongs to Let's Encrypt
     site.ssl_expires_at = info["expires_at"]
     site.ssl_status, site.ssl_source, site.ssl_error = "active", "custom", None
     db.commit()
@@ -738,9 +739,16 @@ def overview(db: Session = Depends(get_db)):
     start = month_start()
     by_status = Counter()
     by_owner = Counter()  # SPEC §19.1: operator sites are counted separately on the dashboard
+    multi_origin = 0  # SPEC §22.4: sites with an `origins` tunnel path (nodes need tunnel_multi_origin)
     for s in db.scalars(select(Site)):
         by_status[s.effective_status] += 1
         by_owner[s.owner_kind or "client"] += 1
+        try:
+            paths = (json.loads(s.config or "{}").get("tunnel") or {}).get("paths") or []
+        except (ValueError, AttributeError):
+            paths = []
+        if any(isinstance(p, dict) and p.get("origins") for p in paths):
+            multi_origin += 1
     usage = Counter()
     requests = Counter()
     security = Counter()
@@ -772,6 +780,9 @@ def overview(db: Session = Depends(get_db)):
         "nameservers": settings.nameservers,
         # SPEC §15.5: per edge group, 3-day p95 of the hourly tx vs the group's summed capacity
         "capacity": tunnel_quality.capacity(db),
+        # SPEC §22.3: names of the enabled edges whose own tunnel path fails the loopback probe
+        "tunnel_degraded": [e.name for e in edges if e.enabled and e.tunnel_degraded],
+        "tunnel_multi_origin_sites": multi_origin,
     }
 
 

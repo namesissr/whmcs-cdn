@@ -14,6 +14,20 @@ def _list(name: str, default: str) -> list[str]:
     return [x.strip().lower().rstrip(".") for x in os.getenv(name, default).split(",") if x.strip()]
 
 
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name) or default)
+    except ValueError:
+        return default
+
+
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name) or default)
+    except ValueError:
+        return default
+
+
 def _raw_list(name: str) -> list[str]:
     return [x.strip() for x in os.getenv(name, "").split(",") if x.strip()]
 
@@ -324,6 +338,37 @@ class Settings:
     sentry_environment: str = field(default_factory=lambda: (os.getenv("SENTRY_ENVIRONMENT") or "production").strip())
     sentry_traces_sample_rate: float = field(
         default_factory=lambda: min(1.0, max(0.0, float(os.getenv("SENTRY_TRACES_SAMPLE_RATE") or 0))))
+
+    # ---- wave 13 (SPEC §22): tunnel speed and stability. Every switch defaults to today's behaviour.
+    # §22.1 node drain: default drain length of POST /api/v1/edges/{id}/drain (1..120 minutes) and how
+    # long after drain_until a forgotten drain is cleared automatically (10..1440 minutes)
+    drain_default_minutes: int = field(
+        default_factory=lambda: min(120, max(1, _int("DRAIN_DEFAULT_MINUTES", 15))))
+    drain_max_hold_minutes: int = field(
+        default_factory=lambda: min(1440, max(10, _int("DRAIN_MAX_HOLD_MINUTES", 120))))
+    # §22.3 synthetic tunnel probe of the node's own tunnel path: failing / ok reports before an edge
+    # is marked tunnel-degraded / recovered, and the share of a group+region pool that may be withdrawn
+    # from tunnel sites' answers for degradation (never the whole pool)
+    tunnel_probe_fail_checks: int = field(
+        default_factory=lambda: min(20, max(1, _int("TUNNEL_PROBE_FAIL_CHECKS", 3))))
+    tunnel_probe_ok_checks: int = field(
+        default_factory=lambda: min(20, max(1, _int("TUNNEL_PROBE_OK_CHECKS", 5))))
+    tunnel_degraded_max_fraction: float = field(
+        default_factory=lambda: min(1.0, max(0.0, _float("TUNNEL_DEGRADED_MAX_FRACTION", 0.5))))
+    # optional operator-run echo origin for the WS probe ("host:port[:tls]", empty = the node's local
+    # loopback echo origin). Never a customer origin.
+    tunnel_probe_origin: str = field(default_factory=lambda: os.getenv("TUNNEL_PROBE_ORIGIN", "").strip())
+    # §22.8 TLS session tickets shared across nodes (off = nginx keeps ssl_session_tickets off) and
+    # their rotation period (6..168 h). Needs DATA_ENCRYPTION_KEY (the keys are stored encrypted).
+    tls_tickets: bool = field(default_factory=lambda: _bool("TLS_TICKETS", False))
+    tls_ticket_rotate_hours: int = field(
+        default_factory=lambda: min(168, max(6, _int("TLS_TICKET_ROTATE_HOURS", 24))))
+    # §22.8 an RSA-2048 certificate next to the ECDSA one for old clients (Let's Encrypt sites)
+    acme_dual_rsa: bool = field(default_factory=lambda: _bool("ACME_DUAL_RSA", False))
+    # §22.10 DNS answer weights: off (equal weights, today's zones) | capacity
+    dns_weights: str = field(
+        default_factory=lambda: "capacity" if (os.getenv("DNS_WEIGHTS") or "off").strip().lower() == "capacity"
+        else "off")
 
 
 settings = Settings()

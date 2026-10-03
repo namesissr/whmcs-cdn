@@ -122,10 +122,14 @@ def rotate(value: str | None) -> str | None:
 # encrypted columns of the sites table (ORM attribute names). sites.integration_secrets is a JSON
 # document whose values are each encrypted (log-export S3 secret key, webhook signing secrets,
 # SPEC §14.3); site_secrets.map_values / values / drop_unreadable handle it below.
-SITE_SECRETS = ("ssl_key_stored", "secret_stored", "origin_client_key_stored")
+SITE_SECRETS = ("ssl_key_stored", "secret_stored", "origin_client_key_stored",
+                # SPEC §22.8: the optional RSA certificate's key (ACME_DUAL_RSA)
+                "ssl_key_rsa_stored")
 # `state` rows holding a JSON document whose listed fields are encrypted secrets (the platform
 # origin-pull CA + client certificate keys, SPEC §14.2; see origin_pull.py)
-STATE_SECRETS = {"origin_pull:platform": ("ca_key", "client_key")}
+STATE_SECRETS = {"origin_pull:platform": ("ca_key", "client_key"),
+                 # SPEC §22.8: the fleet's TLS session ticket keys (one encrypted JSON document)
+                 "tls_tickets": ("keys",)}
 # encrypted columns of storage_buckets (SPEC §16.8): the customer's MinIO secret key (shown once,
 # kept for the record) and the bucket's edge origin token
 STORAGE_SECRETS = ("secret_key_stored", "origin_token_stored")
@@ -294,6 +298,9 @@ def drop_unreadable(db) -> list[str]:
                 site.ssl_status, site.ssl_source = "none", None
             else:
                 site.ssl_status = "pending"
+            touched = True
+        if not _readable(site.ssl_key_rsa_stored):  # SPEC §22.8: re-issued with the next renewal
+            site.ssl_key_rsa_stored = site.ssl_cert_rsa = None
             touched = True
         if not _readable(site.origin_client_key_stored):
             site.origin_client_key_stored = site.origin_client_cert = site.origin_client_expires_at = None

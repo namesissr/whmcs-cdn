@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import bundle, dnsbuild, l4, nscheck, origin_guard, pdns, sections, tenancy, transfer, webhooks
+from . import bundle, dnsbuild, edge_state, l4, nscheck, origin_guard, pdns, sections, tenancy, transfer, webhooks
 from .audit import record_audit, with_actor
 from .auth import hash_token, new_capi_key, new_token, require_admin
 from .config import settings
@@ -26,6 +26,7 @@ from .services import (
     record_to_dict,
     edge_capabilities,
     edge_metrics,
+    online_edges,
     site_to_dict,
     sync_all_dns,
     sync_site_dns,
@@ -83,6 +84,8 @@ class FeaturesIn(BaseModel):
     max_pools: int | None = Field(default=None, ge=0, le=100)
     tunnel: bool | None = None
     max_tunnel_paths: int | None = Field(default=None, ge=0, le=50)
+    # SPEC §22.4: origins per tunnel path (1 = a single origin only)
+    max_tunnel_origins: int | None = Field(default=None, ge=1, le=10)
     max_tunnel_connections: int | None = Field(default=None, ge=0, le=1000000)
     tunnel_max_mbps: int | None = Field(default=None, ge=0, le=100000)
     edge_group: Literal["general", "tunnel"] | None = None
@@ -250,6 +253,15 @@ class EdgePatch(BaseModel):
     capacity_mbps: int | None = Field(default=None, ge=0, le=10_000_000)
     region: str | None = Field(default=None, pattern="^(home|global)$")
     shield: bool | None = None  # origin shield / tiered cache node (SPEC §14.1)
+    http3_enabled: bool | None = None  # SPEC §22.9: QUIC on this node (where its nginx can)
+
+
+class EdgeDrainIn(BaseModel):
+    """POST /edges/{id}/drain (SPEC §22.1)."""
+    model_config = ConfigDict(extra="forbid")
+    minutes: int | None = Field(default=None, ge=1, le=120)
+    reason: str | None = Field(default=None, pattern=r"^[\x20-\x7e]{1,64}$")
+    force: bool = False
 
 
 class EdgeAddressIn(BaseModel):
@@ -290,6 +302,7 @@ def apply_plan(site: Site, plan: Plan):
         site.ssl_source = None
     if not site.ssl_allowed and site.ssl_status != "none":
         site.ssl_status, site.ssl_cert, site.ssl_key, site.ssl_expires_at = "none", None, None, None
+        site.ssl_cert_rsa = site.ssl_key_rsa_stored = None  # SPEC §22.8
     elif site.ssl_allowed and site.ssl_status == "none" and site.ns_verified_at:
         site.ssl_status = "pending"
 
@@ -961,7 +974,7 @@ def _advertised_counts(e: Edge) -> dict:
     return counts
 
 
-def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
+def edge_to_dict(e: Edge, uptime: dict | None = None, q: int | None = None) -> dict:
     return {
         "id": e.id, "name": e.name, "ipv4": e.ipv4, "ipv6": e.ipv6, "region": e.region,
         "enabled": e.enabled, "last_seen_at": e.last_seen_at.isoformat() + "Z" if e.last_seen_at else None,
@@ -984,6 +997,15 @@ def edge_to_dict(e: Edge, uptime: dict | None = None) -> dict:
         "capabilities": edge_capabilities(e),
         # SPEC §18.4: agent errors in the last hour from the latest heartbeat (null = never reported)
         "errors_last_hour": e.errors_last_hour,
+        # wave 13 (SPEC §22): drain state, reload counters, tunnel probe / degraded state, kernel tuning
+        # report, the per-node HTTP/3 switch and the DNS weight (q null while DNS_WEIGHTS=off). Never a
+        # TLS ticket key.
+        "drain": edge_state.drain_dict(e),
+        "reloads": edge_state.public(edge_state.loads(e.reload_stats)),
+        "tunnel_probe": edge_state.tunnel_probe_dict(e),
+        "tuning": edge_state.public(edge_state.loads(e.tuning)),
+        "http3_enabled": True if e.http3_enabled is None else bool(e.http3_enabled),
+        "dns_weight": edge_state.dns_weight_dict(e, q),
     }
 
 
@@ -992,7 +1014,21 @@ def list_edges(db: Session = Depends(get_db)):
     from . import uptime as up
 
     ups = up.summaries(db)
-    return [edge_to_dict(e, ups.get(e.id)) for e in db.scalars(select(Edge).order_by(Edge.id))]
+    qs = _dns_qs(db)
+    return [edge_to_dict(e, ups.get(e.id), qs.get(e.id)) for e in db.scalars(select(Edge).order_by(Edge.id))]
+
+
+def _dns_qs(db: Session) -> dict[int, int]:
+    """{edge id: q} of the online edges while DNS_WEIGHTS=capacity (SPEC §22.10), else {}."""
+    if not dnsbuild.weights_enabled():
+        return {}
+    online = online_edges(db)
+    q4, q6 = dnsbuild.edge_q(online, 4), dnsbuild.edge_q(online, 6)
+    return {e.id: q4.get(id(e)) or q6.get(id(e)) for e in online if q4.get(id(e)) or q6.get(id(e))}
+
+
+def _edge_dict(db: Session, e: Edge) -> dict:
+    return edge_to_dict(e, q=_dns_qs(db).get(e.id))
 
 
 @router.get("/edges/{edge_id}/uptime")
@@ -1097,7 +1133,51 @@ def update_edge(edge_id: int, request: Request, enabled: bool | None = None,
     update_shed(edge)
     db.commit()
     _audit(db, request, "edge.patch", edge.name, {"fields": sorted(changes), **changes})
-    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": edge_to_dict(edge)}
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": _edge_dict(db, edge)}
+
+
+@router.post("/edges/{edge_id}/drain")
+def drain_edge(edge_id: int, request: Request, body: EdgeDrainIn | None = Body(default=None),
+               db: Session = Depends(get_db)):
+    """Drain a node before an upgrade/restart (SPEC §22.1): it leaves DNS answers at once and, after
+    PROXIED_TTL + 30 s, refuses NEW tunnel connections. 409 last_edge (pass force: true to drain the
+    last active edge of its group+region anyway); 409 already_draining (a re-POST with different
+    minutes only moves drain_until)."""
+    body = body or EdgeDrainIn()
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    minutes = body.minutes or settings.drain_default_minutes
+    reason = body.reason or "admin"
+    now = utcnow()
+    if edge_state.is_draining(edge):
+        if edge.drain_started_at is not None and edge.drain_until == edge.drain_started_at + timedelta(minutes=minutes):
+            raise HTTPException(409, "already_draining")
+    elif not body.force and edge_state.is_last_edge(db, edge, now):
+        raise HTTPException(409, "last_edge")
+    edge_state.start_drain(db, edge, minutes, reason, "admin", now)
+    db.commit()
+    _audit(db, request, "edge.drain", edge.name, {"minutes": minutes, "reason": reason, "force": body.force})
+    from . import alerts
+
+    alerts.resolve_alert(f"edge_drain_stuck:{edge.id}", notify=False)
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": _edge_dict(db, edge)}
+
+
+@router.delete("/edges/{edge_id}/drain")
+def undrain_edge(edge_id: int, request: Request, db: Session = Depends(get_db)):
+    """End a drain (idempotent, SPEC §22.1): the node is back in DNS answers at once."""
+    edge = db.get(Edge, edge_id)
+    if edge is None:
+        raise HTTPException(404, "edge not found")
+    changed = edge_state.stop_drain(db, edge, "admin")
+    db.commit()
+    if changed:
+        _audit(db, request, "edge.undrain", edge.name, {})
+    from . import alerts
+
+    alerts.resolve_alert(f"edge_drain_stuck:{edge.id}", notify=False)
+    return {"ok": True, "dns_failed": sync_all_dns(db), "edge": _edge_dict(db, edge)}
 
 
 @router.delete("/edges/{edge_id}")
@@ -1106,6 +1186,12 @@ def delete_edge(edge_id: int, request: Request, db: Session = Depends(get_db)):
     if edge is None:
         raise HTTPException(404, "edge not found")
     name = edge.name
+    from sqlalchemy import delete as sql_delete
+
+    from .models import EdgeEvent
+
+    # SQLite enforces no foreign keys: a later edge reusing the id must not inherit these (SPEC §22.13)
+    db.execute(sql_delete(EdgeEvent).where(EdgeEvent.edge_id == edge.id))
     db.delete(edge)
     db.commit()
     _audit(db, request, "edge.delete", name)

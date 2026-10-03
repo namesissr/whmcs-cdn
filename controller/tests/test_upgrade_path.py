@@ -140,6 +140,11 @@ def check_rows(engine, exp: dict):
             assert edges[name].token_hash == S.sha256(token)
             assert edges[name].probe_fail == 0 and edges[name].probe_fail4 == 0 and edges[name].shed_high == 0
         assert edges["ir-tun-1"].group == "tunnel" and edges["ir-thr-1"].group == "general"
+        # 0022: no drain, never tunnel-degraded, HTTP/3 allowed, weight level 0 on every existing edge
+        assert c.execute(text("SELECT count(*) FROM edges WHERE drain_state <> '' OR tunnel_degraded "
+                              "OR NOT http3_enabled OR dns_weight_level <> 0 OR tunnel_probe_fail <> 0"
+                              )).scalar_one() == 0
+        assert c.execute(text("SELECT count(*) FROM edge_events")).scalar_one() == 0
         # 0013: nobody is a shield after the upgrade unless the seed (>= 0013) said so
         assert bool(edges["de-fsn-1"].shield) is S.at_least(rev, "0013")
         assert not edges["ir-thr-1"].shield

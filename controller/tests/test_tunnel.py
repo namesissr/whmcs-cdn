@@ -71,7 +71,8 @@ def test_tunnel_section_roundtrip_and_normalisation(client):
     t = r.json()
     assert t["allowed_countries"] == ["IR", "DE"]
     assert t["paths"][0] == {"id": "grpc1", "path": "/my-secret-service", "protocol": "grpc", "origin": None,
-                             "pool": None}
+                             "pool": None, "origins": None, "balance": None, "health": None,
+                             "idle_timeout": None}  # SPEC §22.4 / §22.5
     assert t["paths"][1]["origin"] == {"address": "vpn.example.net", "port": 443, "tls": True,
                                        "sni": "vpn.example.net", "verify": False}
     assert t["paths"][3]["origin"]["address"] == "[2a01:4f8::1]" and t["paths"][3]["origin"]["port"] == 8443

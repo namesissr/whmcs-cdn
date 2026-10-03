@@ -25,8 +25,8 @@ from sqlalchemy.orm import Session
 
 from . import alerts, kv, sections, webhooks
 from .config import settings
-from .models import AnalyticsMinute, Edge, Site, SiteEvent, State, UsageHourly, utcnow
-from .routes_edge import TUNNEL_ERROR_KEYS, TUNNEL_PROTOCOLS
+from .models import AnalyticsMinute, Edge, EdgeEvent, Site, SiteEvent, State, UsageHourly, utcnow
+from .routes_edge import TUNNEL_END_KEYS, TUNNEL_ERROR_KEYS, TUNNEL_PROTOCOLS
 from .services import billed_usage, month_start
 from .validation import num
 
@@ -50,7 +50,8 @@ ADVICE = {
 }
 assert set(ADVICE) == set(TUNNEL_ERROR_KEYS)
 
-PATH_COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down", "abnormal", "connect_ms_sum", "connect_n")
+PATH_COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down", "abnormal", "connect_ms_sum", "connect_n",
+                 "reused_n")
 
 
 def _loads(s: str | None) -> dict:
@@ -106,6 +107,9 @@ def path_metrics(c: dict) -> dict:
         "avg_session_s": round(c["seconds"] / sessions, 1) if sessions else None,
         "abnormal_pct": _pct(c["abnormal"], sessions),
         "connect_ms_avg": round(c["connect_ms_sum"] / c["connect_n"], 1) if c["connect_n"] else None,
+        # SPEC §22.7: share of tunnel requests on a reused upstream connection (approximation: connect
+        # time exactly 0.000); null without data
+        "reuse_pct": _pct(min(c.get("reused_n", 0), c["connect_n"]), c["connect_n"]),
         "errors": dict(c["errors"]),
         "error_total": error_total,
         "success_pct": _pct(sessions, sessions + error_total),
@@ -166,6 +170,85 @@ def quality(db: Session, site: Site, hours: int, now: datetime | None = None) ->
         series.append({"t": _hour_iso(t), **h})
         t += timedelta(hours=1)
     return {"hours": hours, "paths": out_paths, "edges": out_edges, "series": series}
+
+
+# ------------------------------------------------------------------ "why did my connection drop?" (SPEC §22.12)
+
+DROPS_TOP_PCT = 5  # `top` = the largest non-normal reason when it is at least this share of all ends
+REJECTED_KEYS = ("limit", "origin_refused", "origin_timeout")
+
+
+def _zero_ends() -> dict:
+    return {k: 0 for k in TUNNEL_END_KEYS}
+
+
+def top_reason(reasons: dict, total: int) -> str | None:
+    """The largest non-normal reason (ties: SPEC order) when it is >= 5 % of all ends, else None."""
+    cands = [k for k in TUNNEL_END_KEYS if k != "normal"]
+    best = max(cands, key=lambda k: (reasons.get(k, 0), -cands.index(k)))
+    n = reasons.get(best, 0)
+    return best if total > 0 and n > 0 and n * 100 >= DROPS_TOP_PCT * total else None
+
+
+def drops(db: Session, site: Site, hours: int, now: datetime | None = None) -> dict:
+    """`{hours, total, reasons, rejected, paths, series, maintenance, plan, top, has_data}`; callers
+    validate 1 <= hours <= 744. `maintenance` lists drain / upgrade events of the edges that served the
+    site in the window — times and kinds only, never a node name or address."""
+    end = (now or utcnow()).replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=hours - 1)
+    reasons, rejected = _zero_ends(), {k: 0 for k in REJECTED_KEYS}
+    per_path: dict[str, dict] = {}
+    per_hour: dict[datetime, dict] = {}
+    edge_ids: set[int] = set()
+    has_data = False
+    rows = db.execute(select(UsageHourly.edge_id, UsageHourly.hour, UsageHourly.details).where(
+        UsageHourly.site_id == site.id, UsageHourly.hour >= start, UsageHourly.hour <= end))
+    for edge_id, hour, details in rows:
+        paths = _tunnel_paths(_loads(details))
+        if not paths:
+            continue
+        edge_ids.add(edge_id)
+        for pid, c in paths.items():
+            if not isinstance(c, dict):
+                continue
+            errs = c.get("errors") if isinstance(c.get("errors"), dict) else {}
+            for k in REJECTED_KEYS:
+                rejected[k] += max(num(errs.get(k)), 0)
+            ends = c.get("ends")
+            if not isinstance(ends, dict):
+                continue
+            has_data = True
+            p = per_path.setdefault(str(pid), _zero_ends())
+            h = per_hour.setdefault(hour, _zero_ends())
+            for k in TUNNEL_END_KEYS:
+                n = max(num(ends.get(k)), 0)
+                reasons[k] += n
+                p[k] += n
+                h[k] += n
+    total = sum(reasons.values())
+    configured = sections.get_section(site, "tunnel")["paths"]
+    ids = [p["id"] for p in configured] + sorted(set(per_path) - {p["id"] for p in configured})
+    out_paths = []
+    for pid in ids:
+        r = per_path.get(pid) or _zero_ends()
+        t = sum(r.values())
+        out_paths.append({"id": pid, "total": t, "reasons": r, "top": top_reason(r, t)})
+    series, t = [], start
+    while t <= end:
+        series.append({"t": _hour_iso(t), **(per_hour.get(t) or _zero_ends())})
+        t += timedelta(hours=1)
+    maintenance = []
+    if edge_ids:
+        for ev in db.scalars(select(EdgeEvent).where(
+                EdgeEvent.edge_id.in_(sorted(edge_ids)), EdgeEvent.kind.in_(("drain_start", "upgrade")),
+                EdgeEvent.at >= start, EdgeEvent.at < end + timedelta(hours=1)).order_by(EdgeEvent.at)):
+            kind = "upgrade" if ev.kind == "upgrade" or _loads(ev.data).get("reason") == "upgrade" else "drain"
+            maintenance.append({"t": _iso(ev.at), "kind": kind})
+    over_since = site.quota_warned_at if site.over_quota else None
+    return {"hours": hours, "total": total, "reasons": reasons, "rejected": rejected, "paths": out_paths,
+            "series": series, "maintenance": maintenance,
+            "plan": {"over_quota_since": _iso(over_since), "suspended": bool(site.suspended)},
+            "top": top_reason(reasons, total), "has_data": has_data}
 
 
 # ------------------------------------------------------------------ usage + forecast (SPEC §15.3)

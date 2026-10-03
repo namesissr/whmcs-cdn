@@ -47,7 +47,7 @@ from .routes_admin import (
 )
 from .routes_platform import live_of
 from .routes_reports import access_log_of, access_rotate_of, site_audit_of, statement_of, waiting_room_of
-from .routes_tunnel import quality_of, usage_of
+from .routes_tunnel import drops_of, profile_of, quality_of, usage_of
 from .routes_v2 import (
     LearningApplyIn,
     config_audit,
@@ -244,6 +244,18 @@ def tunnel_usage(days: int = 30, key: ApiKey = Depends(require_scope("stats")), 
 def tunnel_health(key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
     """Origin health of the site's tunnel paths as seen by the edges: up | down | unknown."""
     return tunnel_quality.health(db, _site(key))
+
+
+@router.get("/tunnel/profile")
+def tunnel_profile(key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Edge timers, HTTP/3 availability and recommended client settings per path (404 without tunnel)."""
+    return profile_of(db, _site(key))
+
+
+@router.get("/tunnel/drops")
+def tunnel_drops(hours: int = 24, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    """Why tunnel sessions ended in the last `hours` (1..744) hours, by reason / path / hour."""
+    return drops_of(db, _site(key), hours)
 
 
 # ------------------------------------------------------------------ edge functions (scope: stats, SPEC §16.9)

@@ -270,7 +270,9 @@ def test_edge_patch_shield_and_audit(client):
 # SPEC §16 (wave 8) capability defaults of an agent that does not report them
 WAVE8_CAPS = {"l4": False, "l4_port_range": None, "slice": False, "video": False, "avif": False,
               "image_transform": False, "net_guard": False,
-              "edge_functions": False}  # SPEC §16.9
+              "edge_functions": False,  # SPEC §16.9
+              # SPEC §22 (wave 13)
+              "drain": False, "tunnel_probe": False, "tunnel_multi_origin": False, "upstream_resolve": False}
 
 
 def test_heartbeat_capabilities_stored_and_sanitised(client):

@@ -1,7 +1,8 @@
 """GET /metrics — Prometheus text exposition (SPEC §13.1).
 
 Platform aggregates ONLY. The endpoint NEVER exposes a domain, IP, token, key or any other
-per-customer identifier — just counts and ages. It is cheap (a handful of aggregate queries)
+per-customer identifier — just counts and ages (the wave-13 per-edge gauges are labelled with the
+operator's edge NAME only, SPEC §22.2). It is cheap (a handful of aggregate queries)
 and wrapped so a scrape never 500s: whatever cannot be computed is simply left out.
 
 Mounted WITHOUT the admin-auth dependency. If METRICS_TOKEN is set it must be presented as
@@ -16,10 +17,11 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import func, select
 
-from . import alerts
+from . import alerts, dnsbuild, edge_state
 from .config import settings
 from .db import SessionLocal
 from .models import AuditLog, Edge, LogSpool, Site, State, WebhookDelivery, utcnow
+from .services import edge_metrics
 
 log = logging.getLogger("pcdn.metrics")
 
@@ -105,6 +107,23 @@ def _collect(out: _Out) -> None:
             out.metric("pcdn_edges_shed", shed, "Enabled edge nodes currently shed from DNS (load shedding).")
             out.metric("pcdn_edges_probe_failing", probe_failing,
                        "Enabled edges that heartbeat but fail the synthetic health probe.")
+            # SPEC §22: per-edge node health by edge NAME only (never an address)
+            out.metric("pcdn_edges_draining", sum(1 for e in edges if dnsbuild.is_draining(e)),
+                       "Enabled edges drained for maintenance (left out of DNS).")
+            out.metric("pcdn_edges_tunnel_degraded", sum(1 for e in edges if e.tunnel_degraded),
+                       "Enabled edges whose own tunnel path fails the loopback probe.")
+            live = [e for e in sorted(edges, key=lambda x: x.name)
+                    if e.last_seen_at is not None and e.last_seen_at >= cutoff]
+            for e in live:  # one metric family at a time (exposition format)
+                rl = edge_state.loads(e.reload_stats)
+                if "count_1h" in rl:
+                    out.metric("pcdn_edge_reloads_1h", int(rl.get("count_1h") or 0),
+                               "nginx reloads of the edge in the last hour (heartbeat).", labels={"edge": e.name})
+            for e in live:
+                m = edge_metrics(e) or {}
+                if m.get("draining_workers") is not None:
+                    out.metric("pcdn_edge_draining_workers", int(m["draining_workers"]),
+                               "nginx worker generations still shutting down on the edge.", labels={"edge": e.name})
         except Exception:  # noqa: BLE001
             log.exception("metrics: edges block failed")
             db.rollback()

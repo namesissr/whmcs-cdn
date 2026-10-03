@@ -154,12 +154,12 @@ def test_quality_math_edges_series_removed_and_advice(client):
     assert q["hours"] == 24 and len(q["series"]) == 24
     grpc, ws, old = q["paths"]
     assert grpc == {"id": "grpc1", "path": "/x", "protocol": "grpc", "sessions": 12, "avg_session_s": 450.0,
-                    "abnormal_pct": 8.333, "connect_ms_avg": 70.0, "errors": {**ERR0, "origin_timeout": 1},
+                    "abnormal_pct": 8.333, "connect_ms_avg": 70.0, "reuse_pct": 0.0, "errors": {**ERR0, "origin_timeout": 1},
                     "error_total": 1, "success_pct": 92.308, "top_issue": "origin_timeout",
                     "advice": tunnel_quality.ADVICE["origin_timeout"], "removed": False}
     # a configured path without data: nulls, no advice
     assert ws == {"id": "ws1", "path": "/ws", "protocol": "ws", "sessions": 0, "avg_session_s": None,
-                  "abnormal_pct": None, "connect_ms_avg": None, "errors": ERR0, "error_total": 0,
+                  "abnormal_pct": None, "connect_ms_avg": None, "reuse_pct": None, "errors": ERR0, "error_total": 0,
                   "success_pct": None, "top_issue": None, "advice": None, "removed": False}
     # a path id that is no longer configured
     assert old["id"] == "old9" and old["removed"] is True and old["path"] is None and old["protocol"] is None

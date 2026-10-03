@@ -6,19 +6,21 @@ import json
 import logging
 import math
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import access as access_mod
-from . import alerts, dnsbuild, live, logexport, sections, waf_learning, webhooks
+from . import alerts, dnsbuild, edge_state, live, logexport, sections, waf_learning, webhooks
 from . import waiting_room as wr_mod
 from .auth import require_edge
 from .config import settings
@@ -61,6 +63,11 @@ class Metrics(BaseModel):
     # optional; older agents omit them and no disk/memory alert is raised for that edge
     disk_pct: float | None = Field(default=None, ge=0, le=100)
     mem_pct: float | None = Field(default=None, ge=0, le=100)
+    # SPEC §22.2: worker generations still shutting down after reloads, and the node's TCP sockets
+    # (all / TIME_WAIT); older agents omit them
+    draining_workers: int | None = Field(default=None, ge=0, le=100_000)
+    sock_tcp: int | None = Field(default=None, ge=0, le=10**9)
+    sock_tw: int | None = Field(default=None, ge=0, le=10**9)
 
 
 CAP_MODULES_MAX = 64
@@ -93,6 +100,12 @@ class Capabilities(BaseModel):
     net_guard: bool = False
     # SPEC §16.9: pcdn-fn installed (install.sh --functions) and its sandbox self-test passing
     edge_functions: bool = False
+    # SPEC §22 (wave 13): the agent enforces drain (§22.1), runs the tunnel probe (§22.3), builds
+    # internal pools for `origins` paths (§22.4), nginx has `server … resolve` in upstreams (§22.7)
+    drain: bool = False
+    tunnel_probe: bool = False
+    tunnel_multi_origin: bool = False
+    upstream_resolve: bool = False
 
     @field_validator("l4_port_range", mode="before")
     @classmethod
@@ -123,6 +136,99 @@ class Capabilities(BaseModel):
             if isinstance(m, str) and CAP_MODULE_RE.match(m) and m not in out:
                 out.append(m)
         return sorted(out)[:CAP_MODULES_MAX]
+
+
+def _clip(v, n: int):
+    return v[:n] if isinstance(v, str) else v
+
+
+class DrainReport(BaseModel):
+    """Heartbeat `drain` (SPEC §22.1)."""
+    state: Literal["", "draining", "drained"] = ""
+    conns: int | None = Field(default=None, ge=0, le=10**9)
+    since: datetime | None = None
+
+
+class ProbeResult(BaseModel):
+    """One probe of heartbeat `tunnel_probe` (SPEC §22.3): ws / grpc, or {"unsupported": true}."""
+    unsupported: bool | None = None
+    ok: bool | None = None
+    setup_ms: int | None = Field(default=None, ge=0, le=10**7)
+    echo_ok: bool | None = None
+    down_kbps: int | None = Field(default=None, ge=0, le=10**9)
+    up_kbps: int | None = Field(default=None, ge=0, le=10**9)
+    error: str | None = None
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _error(cls, v):
+        from .edge_state import scrub
+
+        return scrub(v, 120) if isinstance(v, str) else None
+
+
+class TunnelProbe(BaseModel):
+    at: datetime
+    ok: bool
+    ws: ProbeResult | None = None
+    grpc: ProbeResult | None = None
+    consecutive_fail: int = Field(default=0, ge=0, le=10**6)
+
+
+class Reloads(BaseModel):
+    """Heartbeat `reloads` (SPEC §22.2)."""
+    count_1h: int = Field(default=0, ge=0, le=10**6)
+    count_24h: int = Field(default=0, ge=0, le=10**7)
+    last_at: datetime | None = None
+    coalesced_1h: int = Field(default=0, ge=0, le=10**6)
+    pending_s: int = Field(default=0, ge=0, le=10**8)
+    deferred: bool = False
+    wst_s: int | None = Field(default=None, ge=0, le=10**7)
+    forced_shutdowns_24h: int = Field(default=0, ge=0, le=10**6)
+
+
+class TuningMismatch(BaseModel):
+    key: str = Field(default="", max_length=256)
+    want: str = ""
+    have: str = ""
+
+    @field_validator("key", "want", "have", mode="before")
+    @classmethod
+    def _cut(cls, v):
+        return _clip(str(v) if v is not None else "", 64)
+
+
+class Tuning(BaseModel):
+    """Heartbeat `tuning` (SPEC §22.6)."""
+    profile: Literal["auto", "off"] = "auto"
+    ram_mb: int = Field(default=0, ge=0, le=10**8)
+    ok: bool = True
+    cc: str | None = None
+    qdisc: str | None = None
+    nofile: int | None = Field(default=None, ge=0, le=10**10)
+    mismatches: list[TuningMismatch] = Field(default_factory=list)
+
+    @field_validator("cc", "qdisc", mode="before")
+    @classmethod
+    def _short(cls, v):
+        return _clip(v, 64) if isinstance(v, str) else None
+
+    @field_validator("mismatches", mode="before")
+    @classmethod
+    def _cap(cls, v):
+        return list(v)[:20] if isinstance(v, list) else []
+
+
+def _ignore_malformed(name: str):
+    """A malformed wave-13 heartbeat object is ignored (None), never a 422: a heartbeat must not
+    fail on an informational field."""
+    def wrap(cls, v, handler):
+        try:
+            return handler(v)
+        except PydanticValidationError:
+            log.warning("ignoring malformed %s in an edge heartbeat", name)
+            return None
+    return wrap
 
 
 class Heartbeat(BaseModel):
@@ -161,6 +267,17 @@ class Heartbeat(BaseModel):
     def _wr(cls, v):
         return None if v is None else wr_mod.clean_heartbeat(v)
 
+    # wave 13 (SPEC §22), older agents omit them; malformed values are ignored (never a 422)
+    drain: DrainReport | None = None
+    tunnel_probe: TunnelProbe | None = None
+    reloads: Reloads | None = None
+    tuning: Tuning | None = None
+
+    _drain = field_validator("drain", mode="wrap")(classmethod(_ignore_malformed("drain")))
+    _probe = field_validator("tunnel_probe", mode="wrap")(classmethod(_ignore_malformed("tunnel_probe")))
+    _reloads = field_validator("reloads", mode="wrap")(classmethod(_ignore_malformed("reloads")))
+    _tuning = field_validator("tuning", mode="wrap")(classmethod(_ignore_malformed("tuning")))
+
     @field_validator("capabilities", mode="wrap")
     @classmethod
     def _capabilities(cls, v, handler):
@@ -195,7 +312,11 @@ def heartbeat(body: Heartbeat, request: Request, edge: Edge = Depends(require_ed
     edge.last_seen_at = utcnow()
     edge.applied_version = body.applied_version
     edge.last_error = body.error
+    now = edge.last_seen_at
     if body.bundle_version is not None:
+        if edge.bundle_version and body.bundle_version != edge.bundle_version:
+            # SPEC §22.12/§22.13: a node upgrade is a maintenance event (no address, no secret)
+            edge_state.add_event(db, edge, "upgrade", {"version": body.bundle_version}, now)
         edge.bundle_version = body.bundle_version
     # a fresh node reports its region/role once; never override an operator's later panel edit
     if first_contact:
@@ -213,8 +334,81 @@ def heartbeat(body: Heartbeat, request: Request, edge: Edge = Depends(require_ed
         edge.errors_last_hour = body.errors_last_hour
     if body.waiting_room is not None:
         wr_mod.record_heartbeat(edge, body.waiting_room, edge.last_seen_at)
+    # wave 13 (SPEC §22): drain progress, tunnel probe (degraded hysteresis), reload / tuning reports.
+    # A heartbeat without them leaves the stored state untouched (old agents are never degraded).
+    if body.drain is not None:
+        edge_state.record_drain_report(db, edge, body.drain.model_dump(), now)
+    if body.tunnel_probe is not None:
+        edge_state.record_probe(db, edge, body.tunnel_probe.model_dump(mode="json", exclude_none=True), now)
+    if body.reloads is not None:
+        edge_state.record_reloads(edge, body.reloads.model_dump(mode="json"))
+    if body.tuning is not None:
+        edge_state.record_tuning(edge, body.tuning.model_dump(mode="json"))
     db.commit()
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ drain (SPEC §22.1)
+
+DRAIN_RATE_PER_MIN = 10
+_drain_calls: dict[int, list[float]] = {}
+_drain_lock = threading.Lock()
+
+
+class DrainIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["start", "stop"]
+    minutes: int | None = Field(default=None, ge=1, le=120)
+    reason: str | None = Field(default=None, pattern=r"^[\x20-\x7e]{1,64}$")
+
+
+def _drain_rate(edge_id: int) -> None:
+    from fastapi import HTTPException
+
+    now = time.monotonic()
+    with _drain_lock:
+        calls = [t for t in _drain_calls.get(edge_id, []) if now - t < 60]
+        if len(calls) >= DRAIN_RATE_PER_MIN:
+            _drain_calls[edge_id] = calls
+            raise HTTPException(429, "too many drain calls", headers={"Retry-After": str(int(60 - (now - calls[0])) + 1)})
+        calls.append(now)
+        _drain_calls[edge_id] = calls
+
+
+@router.post("/drain")
+def drain(body: DrainIn, request: Request, edge: Edge = Depends(require_edge), db: Session = Depends(get_db)):
+    """The node drains / undrains ITSELF (bootstrap.sh / install.sh --upgrade --drain). 409
+    {"detail": "last_edge"} when it is the last active edge of its group+region (no force here)."""
+    from fastapi import HTTPException
+
+    from .audit import record_audit
+    from .services import sync_all_dns
+
+    _drain_rate(edge.id)
+    now = utcnow()
+    edge.last_seen_at = now
+    ip = request.client.host if request.client else None
+    if body.action == "start":
+        minutes = body.minutes or settings.drain_default_minutes
+        reason = body.reason or "upgrade"
+        if not edge_state.is_draining(edge) and edge_state.is_last_edge(db, edge, now):
+            db.commit()
+            raise HTTPException(409, "last_edge")
+        edge_state.start_drain(db, edge, minutes, reason, "edge", now)
+        db.commit()
+        record_audit(db, actor=edge.name, actor_kind="edge", action="edge.drain", target=edge.name,
+                     detail={"minutes": minutes, "reason": reason, "force": False}, ip=ip)
+    else:
+        changed = edge_state.stop_drain(db, edge, "edge", now)
+        db.commit()
+        if changed:
+            record_audit(db, actor=edge.name, actor_kind="edge", action="edge.undrain", target=edge.name,
+                         detail={}, ip=ip)
+    alerts.resolve_alert(f"edge_drain_stuck:{edge.id}", notify=False)
+    sync_all_dns(db)
+    return {"state": edge.drain_state if edge_state.is_draining(edge) else "",
+            "until": edge_state.iso(edge.drain_until) if edge_state.is_draining(edge) else None,
+            "refuse_after": edge_state.iso(edge_state.refuse_after(edge))}
 
 
 # centralized node logs (SPEC §11.2): the agent ships only recent operational WARN/ERROR/crit
@@ -290,7 +484,9 @@ TUNNEL_PATH_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 TUNNEL_MAX_PATHS = 50
 TUNNEL_ERROR_KEYS = ("origin_refused", "origin_timeout", "origin_error", "limit", "country", "protocol", "edge")
 TUNNEL_PATH_COUNTERS = ("sessions", "seconds", "bytes_up", "bytes_down", "abnormal", "connect_ms_sum",
-                        "connect_n")
+                        "connect_n", "reused_n")
+# SPEC §22.12: how accepted tunnel sessions of a host-hour ended (pre-wave-13 agents omit `ends`)
+TUNNEL_END_KEYS = ("normal", "idle_timeout", "origin", "node_reload", "node_drain", "other")
 
 
 class TunnelPathErrors(BaseModel):
@@ -304,6 +500,16 @@ class TunnelPathErrors(BaseModel):
     edge: int = Field(0, ge=0, le=BIG)
 
 
+class TunnelPathEnds(BaseModel):
+    """Session ends per reason (SPEC §22.12); unknown keys are ignored (dropped)."""
+    normal: int = Field(0, ge=0, le=BIG)
+    idle_timeout: int = Field(0, ge=0, le=BIG)
+    origin: int = Field(0, ge=0, le=BIG)
+    node_reload: int = Field(0, ge=0, le=BIG)
+    node_drain: int = Field(0, ge=0, le=BIG)
+    other: int = Field(0, ge=0, le=BIG)
+
+
 class TunnelPathUsage(BaseModel):
     """One path id of one host-hour (SPEC §15.1); unknown keys are ignored (dropped)."""
     sessions: int = Field(0, ge=0, le=BIG)
@@ -313,7 +519,11 @@ class TunnelPathUsage(BaseModel):
     abnormal: int = Field(0, ge=0, le=BIG)
     connect_ms_sum: float = Field(0, ge=0, le=BIG)
     connect_n: int = Field(0, ge=0, le=BIG)
+    # SPEC §22.7: tunnel requests whose upstream connect time was exactly 0.000 (reused connection)
+    reused_n: int = Field(0, ge=0, le=BIG)
     errors: TunnelPathErrors = Field(default_factory=TunnelPathErrors)
+    # SPEC §22.12 (optional): None = the agent does not classify session ends yet
+    ends: TunnelPathEnds | None = None
 
 
 class TunnelUsage(BaseModel):
@@ -575,6 +785,13 @@ def merge_tunnel_paths(dst: dict, add: dict) -> dict:
             errs = p["errors"] = {}
         for k in TUNNEL_ERROR_KEYS:
             errs[k] = num(errs.get(k)) + num(_obj(src.get("errors")).get(k))
+        # SPEC §22.12: only reports that classify ends create the key (has_data of the drops report)
+        if isinstance(src.get("ends"), dict):
+            ends = p.get("ends")
+            if not isinstance(ends, dict):
+                ends = p["ends"] = {}
+            for k in TUNNEL_END_KEYS:
+                ends[k] = num(ends.get(k)) + num(src["ends"].get(k))
     return dst
 
 

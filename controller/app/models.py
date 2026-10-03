@@ -78,6 +78,10 @@ class Site(Base):
     ssl_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ssl_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     ssl_source: Mapped[str | None] = mapped_column(String(12), nullable=True)  # letsencrypt | custom
+    # SPEC §22.8 (ACME_DUAL_RSA): an RSA-2048 certificate for the same names next to the ECDSA one;
+    # the key is encrypted at rest like ssl_key (use the `ssl_key_rsa` property)
+    ssl_cert_rsa: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ssl_key_rsa_stored: Mapped[str | None] = mapped_column("ssl_key_rsa", Text, nullable=True)
 
     # authenticated origin pulls, custom mode (SPEC §14.2): the customer's client certificate (PEM,
     # chain allowed) the edges present to the origin, and its private key — encrypted at rest like
@@ -107,6 +111,14 @@ class Site(Base):
     @ssl_key.setter
     def ssl_key(self, value: str | None):
         self.ssl_key_stored = crypto.encrypt(value)
+
+    @property
+    def ssl_key_rsa(self) -> str | None:
+        return crypto.decrypt(self.ssl_key_rsa_stored)
+
+    @ssl_key_rsa.setter
+    def ssl_key_rsa(self, value: str | None):
+        self.ssl_key_rsa_stored = crypto.encrypt(value)
 
     @property
     def origin_client_key(self) -> str | None:
@@ -259,6 +271,31 @@ class Edge(Base):
     errors_last_hour: Mapped[int | None] = mapped_column(Integer, nullable=True)
     waiting_room: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # ---- wave 13 (SPEC §22, migration 0022)
+    # §22.1 drain before upgrade/restart: "" | draining | drained. A draining/drained edge is left out
+    # of DNS answers (never emptying a group+region pool); by = admin | edge; conns from the heartbeat
+    drain_state: Mapped[str] = mapped_column(String(10), default="")
+    drain_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    drain_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    drain_by: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    drain_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    drain_conns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # §22.2 latest heartbeat `reloads` object (JSON)
+    reload_stats: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # §22.3 latest heartbeat `tunnel_probe` object (JSON), consecutive failing / ok probe reports and
+    # the tunnel-degraded state (left out of tunnel sites' DNS answers within a budget)
+    tunnel_probe: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tunnel_probe_fail: Mapped[int] = mapped_column(Integer, default=0)
+    tunnel_probe_ok: Mapped[int] = mapped_column(Integer, default=0)
+    tunnel_degraded: Mapped[bool] = mapped_column(Boolean, default=False)
+    tunnel_degraded_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # §22.6 latest heartbeat `tuning` object (JSON)
+    tuning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # §22.9 per-node HTTP/3 switch (QUIC rendered only where the node can and this is on)
+    http3_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # §22.10 load level of the capacity-weighted DNS (0 = 1.0, 1 = 0.5, 2 = 0.25), with hysteresis
+    dns_weight_level: Mapped[int] = mapped_column(Integer, default=0)
+
     # additional addresses of the same node for health-based failover (SPEC §12); ipv4/ipv6
     # above stay the primary address
     addresses: Mapped[list["EdgeAddress"]] = relationship(
@@ -292,6 +329,21 @@ class EdgeAddress(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     edge: Mapped["Edge"] = relationship(back_populates="addresses")
+
+
+class EdgeEvent(Base):
+    """A node maintenance / health transition (SPEC §22.13): drain_start | drain_end | drained |
+    degraded | recovered | upgrade. `data` is a small JSON document (≤ 2 KB) that never holds an
+    address or a secret. The tunnel drops report (§22.12) shows drain/upgrade rows WITHOUT the node's
+    identity. Pruned after EDGE_EVENTS_RETENTION_DAYS (90) by job_cleanup."""
+
+    __tablename__ = "edge_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id", ondelete="CASCADE"), index=True)
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    data: Mapped[str] = mapped_column(Text, default="{}")
 
 
 class EdgeUptime(Base):

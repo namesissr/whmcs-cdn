@@ -44,10 +44,15 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # (shed_high / shed_since, F25); 0013: origin shield flag + heartbeat capabilities (SPEC §14.1)
     added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "edges")
     # 0020: errors_last_hour + waiting_room (wave 10 heartbeat, SPEC §18.4 / §18.1)
-    assert added == ["bundle_version", "capabilities", "capacity_mbps", "cpu_high", "errors_last_hour", "group",
-                     "load_high", "logs", "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
-                     "probe_fail4", "probe_fail6", "probe_ms", "probe_ok", "probe_ok4", "probe_ok6",
-                     "shed", "shed_high", "shed_since", "shield", "waiting_room"], diff
+    # 0022: drain / reload stats / tunnel probe / tuning / http3_enabled / dns_weight_level (SPEC §22.13)
+    assert added == sorted([
+        "bundle_version", "capabilities", "capacity_mbps", "cpu_high", "errors_last_hour", "group",
+        "load_high", "logs", "logs_at", "metrics", "metrics_at", "probe_at", "probe_error", "probe_fail",
+        "probe_fail4", "probe_fail6", "probe_ms", "probe_ok", "probe_ok4", "probe_ok6",
+        "shed", "shed_high", "shed_since", "shield", "waiting_room",
+        "drain_state", "drain_started_at", "drain_until", "drain_by", "drain_reason", "drain_conns",
+        "reload_stats", "tunnel_probe", "tunnel_probe_fail", "tunnel_probe_ok", "tunnel_degraded",
+        "tunnel_degraded_since", "tuning", "http3_enabled", "dns_weight_level"]), diff
     # 0006: purges.prefixes / everything
     purge_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "purges")
     assert purge_added == ["everything", "prefixes"], diff
@@ -56,9 +61,11 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     site_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "sites")
     # 0019: sites.client_id (owning WHMCS client, security review C1); 0021: owner_kind, operator_note,
     # billing_since (operator sites and domain transfer, SPEC §19)
+    # 0022: the optional RSA certificate (SPEC §22.8)
     assert site_added == ["billing_since", "client_id", "integration_secrets", "operator_note",
                           "origin_client_cert", "origin_client_expires_at", "origin_client_key", "owner_kind",
-                          "quota_warned_at", "reseller_client_id", "reseller_label"], diff
+                          "quota_warned_at", "reseller_client_id", "reseller_label", "ssl_cert_rsa",
+                          "ssl_key_rsa"], diff
     # 0004: the edge_uptime table; 0005: incidents + incident_updates; 0007: api_keys;
     # 0010: edge_addresses (multi-address edges / health-based failover);
     # 0011: usage_batches (idempotent usage reports, F7); 0012: audit_log (SPEC §13.2);
@@ -67,10 +74,12 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
     # 0017: l4_ports (TCP/UDP proxy edge ports, SPEC §16.4)
     # 0018: storage_buckets + storage_usage_hourly (object storage, SPEC §16.8)
     # 0020: access_otp (rate limits of the access one-time codes, SPEC §18.2)
+    # 0022: edge_events (node drain / probe / upgrade transitions, SPEC §22.13)
     tables = {d[1].name for d in flat if d[0] == "add_table"}
     assert {"edge_uptime", "incidents", "incident_updates", "api_keys", "edge_addresses",
             "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
-            "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly", "access_otp"} <= tables, diff
+            "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly", "access_otp",
+            "edge_events"} <= tables, diff
     # 0017: weighted / controller-checked DNS records (SPEC §16.7); 0018: records.storage_bucket
     record_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "records")
     assert record_added == ["health_at", "health_error", "health_fail", "health_ms", "health_ok", "health_path",
@@ -82,7 +91,8 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
              and not (d[0] == "add_index" and d[1].table.name in
                       ("edge_uptime", "incident_updates", "api_keys", "sites", "edge_addresses",
                        "usage_batches", "audit_log", "analytics_minute", "log_spool", "webhook_delivery",
-                       "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly", "access_otp"))]
+                       "site_events", "l4_ports", "storage_buckets", "storage_usage_hourly", "access_otp",
+                       "edge_events"))]
     assert other == [], other
 
 
@@ -123,6 +133,13 @@ def test_legacy_create_all_database_is_stamped_and_upgraded(any_engine):
             'SELECT "group", capacity_mbps, shed, load_high, cpu_high, metrics, probe_fail, probe_ok,'
             " shield, capabilities FROM edges")).one()) \
             == ("general", 0, False, 0, 0, None, 0, None, False, None)
+        # 0022: no drain, never degraded, HTTP/3 allowed, weight level 0 (today's behaviour)
+        assert tuple(c.execute(text(
+            "SELECT drain_state, drain_until, tunnel_probe_fail, tunnel_probe_ok, tunnel_degraded,"
+            " http3_enabled, dns_weight_level, reload_stats, tuning FROM edges")).one()) \
+            == ("", None, 0, 0, False, True, 0, None, None)
+        assert tuple(c.execute(text("SELECT ssl_cert_rsa, ssl_key_rsa FROM sites")).one()) == (None, None)
+        assert c.execute(text("SELECT count(*) FROM edge_events")).scalar() == 0
         assert not migrate.is_legacy(c)
 
 

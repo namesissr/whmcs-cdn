@@ -39,7 +39,7 @@ def test_f2_cert_served_through_failed_renewal_and_pending(client, monkeypatch):
             cfg = services.build_edge_config(db)
             return next(x for x in cfg["sites"] if x["domain"] == "example.com")["ssl"]
 
-    assert ssl_of() == {"cert": "CERTDATA", "key": "KEYDATA"}  # before a renewal
+    assert ssl_of() == {"cert": "CERTDATA", "key": "KEYDATA", "ocsp": False}  # before a renewal
 
     # a renewal that fails must NOT drop the still-valid cert
     monkeypatch.setattr(sslmod, "issue", lambda s: (_ for _ in ()).throw(RuntimeError("acme boom")))
@@ -47,14 +47,14 @@ def test_f2_cert_served_through_failed_renewal_and_pending(client, monkeypatch):
         scheduler.job_ssl(db)  # picks the renewal-window site, issue() raises
         s = db.query(Site).filter_by(domain="example.com").one()
         assert s.ssl_status == "active" and s.ssl_error  # kept active, error recorded
-    assert ssl_of() == {"cert": "CERTDATA", "key": "KEYDATA"}  # after a failed renewal
+    assert ssl_of() == {"cert": "CERTDATA", "key": "KEYDATA", "ocsp": False}  # after a failed renewal
 
     # a manual re-request (request_ssl) flips to pending but keeps the cert served
     with SessionLocal() as db:
         s = db.query(Site).filter_by(domain="example.com").one()
         s.ssl_status = "pending"
         db.commit()
-    assert ssl_of() == {"cert": "CERTDATA", "key": "KEYDATA"}
+    assert ssl_of() == {"cert": "CERTDATA", "key": "KEYDATA", "ocsp": False}
 
     # only when the cert is genuinely unusable (expired + reissue failed) do we drop HTTPS
     with SessionLocal() as db:
@@ -77,7 +77,7 @@ def test_f2_request_ssl_endpoint_keeps_cert(client):
         s = db.query(Site).filter_by(domain="example.com").one()
         assert s.ssl_status == "pending" and s.ssl_cert == "C"  # cert not cleared by re-request
         cfg = services.build_edge_config(db)
-        assert next(x for x in cfg["sites"] if x["domain"] == "example.com")["ssl"] == {"cert": "C", "key": "K"}
+        assert next(x for x in cfg["sites"] if x["domain"] == "example.com")["ssl"] == {"cert": "C", "key": "K", "ocsp": False}
 
 
 # ------------------------------------------------------------------ F7: usage idempotency
