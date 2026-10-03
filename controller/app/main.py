@@ -1,15 +1,18 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from . import (
     routes_admin,
     routes_bundle,
     routes_capi,
+    routes_cx,
     routes_edge,
     routes_metrics,
     routes_ops,
+    routes_ops14,
     routes_platform,
     routes_reports,
     routes_storage,
@@ -18,6 +21,7 @@ from . import (
 )
 from .config import settings
 from .db import init_db
+from .errors import ApiError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # "Context impl ..." is logged on every revision lookup (e.g. each /healthz/deep); app.migrate logs upgrades
@@ -54,6 +58,33 @@ def secrets_at_rest():
         db.close()
 
 
+def wave14_startup():
+    """SPEC §23: EDGE_RELEASE must exist in EDGE_RELEASES_DIR (logged once, then ignored); backup key
+    conflicts are logged (never the values); the live database carries the pcdn_live_marker row."""
+    from . import backup, bundle
+    from .db import SessionLocal
+    from .models import LiveMarker
+
+    try:
+        bundle.configured_pin()
+        from . import edge_labels, keys
+
+        edge_labels.tag_key()  # the node tag / lookup-hash keys exist before any request needs them
+        keys.key("startup")
+        problem = backup.key_problem()
+        if problem:
+            log.error("backup encryption key problem: %s (backups fail until it is fixed)", problem)
+        db = SessionLocal()
+        try:
+            if db.get(LiveMarker, 1) is None:
+                db.add(LiveMarker(id=1))
+                db.commit()
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 - never block startup on this
+        log.exception("wave 14 startup checks failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from . import errortrack
@@ -67,6 +98,7 @@ async def lifespan(app: FastAPI):
     from . import pdns
 
     pdns.check_transport()  # M5: plain-HTTP PowerDNS API over a public network
+    wave14_startup()
     sched = None
     if settings.scheduler_enabled:
         from . import scheduler
@@ -84,7 +116,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pasargad CDN Controller", version="1.1.0", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
 app.include_router(routes_admin.router)
+# wave 14 (SPEC §23): config history / import / RUM / diagnostics — before routes_v2 so
+# /config/history is never taken for a section name
+app.include_router(routes_cx.router)
 app.include_router(routes_v2.router)
+# wave 14 (SPEC §23): releases, rollouts, backups, alerts, provisioning, abuse desk, SLO; the provisioner
+# API (bearer PROVISIONER_TOKEN) and the public abuse intake (ABUSE_ENABLED)
+app.include_router(routes_ops14.router)
+app.include_router(routes_ops14.provisioner_router)
+app.include_router(routes_ops14.public_router)
 # analytics & platform (SPEC §14.3): live analytics, log export, webhooks, SLA
 app.include_router(routes_platform.router)
 # wave 7 (SPEC §15.3/§15.4): tunnel quality, usage forecast, origin health
@@ -105,6 +145,31 @@ app.include_router(routes_bundle.router)
 app.include_router(routes_metrics.router)
 
 
+@app.exception_handler(ApiError)
+async def _api_error(request: Request, exc: ApiError):
+    return JSONResponse(exc.body, status_code=exc.status)
+
+
+@app.middleware("http")
+async def _config_actor(request: Request, call_next):
+    """SPEC §23.4: who a config version is attributed to. Admin requests carry the validated
+    X-PCDN-Actor of the WHMCS client / collaborator; the capi key resolver completes the capi entry."""
+    from . import audit, config_history
+
+    path = request.url.path
+    token = None
+    if path.startswith("/api/v1/"):
+        token = config_history.set_actor(kind="admin", actor="admin", on_behalf_of=audit.on_behalf_of(request))
+    elif path.startswith("/capi/v1/"):
+        token = config_history.set_actor(kind="capi", actor="capi", source="capi")
+    try:
+        return await call_next(request)
+    finally:
+        if token is not None:
+            config_history.ACTOR.reset(token)
+
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    # SPEC §23.1: + the platform version (PCDN_VERSION / VERSION file, "" when unknown)
+    return {"ok": True, "version": settings.app_version}

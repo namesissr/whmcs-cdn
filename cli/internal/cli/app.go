@@ -285,6 +285,10 @@ Commands:
   records delete <id>                    delete a record                           (scope dns)
   config get <section>                   print a config section as JSON            (scope dns)
   config set <section> [file|-]          replace a section from a JSON file/stdin  (scope dns)
+  config history [--limit N]             settings history (who / when / sections) (scope config)
+  config diff <v> [--against current|V]  changes of a version vs now or another one (scope config)
+  config restore <v> [--section S] [--dry-run]
+                                         restore sections of an older version      (scope config)
   purge --url U | --prefix P | --everything
                                          purge the cache                           (scope purge)
   analytics [--period 24h|7d|30d]        traffic analytics                         (scope stats)

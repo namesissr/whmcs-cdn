@@ -6,3 +6,5 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/pcdn-geoip-update
+# SPEC §23.7: the optional ASN database for RUM (a failure never fails the country refresh)
+ExecStart=-/usr/local/sbin/pcdn-geoip-update --asn

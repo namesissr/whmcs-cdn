@@ -16,6 +16,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE=(docker compose -f "$HERE/compose.yml")
 
+# the controller reports this as its version (/healthz, SPEC §23.1)
+if [ -z "${PCDN_VERSION:-}" ] && [ -f "$HERE/../../VERSION" ]; then
+  PCDN_VERSION="$(head -n1 "$HERE/../../VERSION")"
+  export PCDN_VERSION
+fi
+
 if [ "${STAGING_STORAGE:-0}" = 1 ]; then
   export STAGING_STORAGE=1
   export STAGING_STORAGE_ENDPOINT="${STAGING_STORAGE_ENDPOINT:-http://minio:9000}"

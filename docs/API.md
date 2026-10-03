@@ -236,3 +236,110 @@ Section `tunnel` paths gain `origins` (2..10, plan `max_tunnel_origins`), `balan
 (`failover` | `round_robin` | `sticky_ip`), `health` (`{"type": "tcp"|"http", "interval", "timeout",
 "path", "expect"}`) and `idle_timeout` (60..86400 or null = the section value); at most one of
 `origin` / `origins` / `pool`. Section `pools` `health` gains `type` (`http` default | `tcp`).
+
+## Wave 14 (SPEC §23) — release safety, operations and customer experience
+
+All admin routes use `Authorization: Bearer <ADMIN_API_KEY>`; capi routes use the service key with the
+scope shown. Error bodies of the new endpoints are flat: `{"detail": "<code>", …extra}`.
+
+### Versions and pinned edge releases (§23.1)
+- `GET /healthz` → `{"ok": true, "version": "2.1.0"}`; `/healthz/deep` gains `version`, `environment`
+  (`PCDN_ENVIRONMENT`) and `backup.{verify_age_s, verify_ok, offsite}`; `/metrics` gains
+  `pcdn_build_info{version} 1`.
+- Public, no auth (404 while `EDGE_RELEASES_DIR` is unset — the old behaviour):
+  `GET /edge/releases` → `{"pinned", "groups": {"general", "tunnel"}, "releases": [{"version", "sha256", "size"}]}`
+  (SemVer descending); `GET /edge/releases/vX.Y.Z.sha256` → `"<hex>  pcdn-edge-vX.Y.Z.tar.gz\n"`;
+  `GET /edge/bundle.tar.gz?version=vX.Y.Z` (422 bad format, 404 unknown; without `version` the
+  effective pin of `?group=` (default `general`) when one exists, else the live bundle);
+  `GET /edge/version` → `{"version", "release"}`.
+- `edge_to_dict` gains `release`, `pinned_release`, `release_ok`, `upgrade`, `display_city`,
+  `display_city_en`, `display_label`, `display_label_en`, `public_tag`. `GET /api/v1/edges?tag=<8 hex>`.
+  `PATCH /api/v1/edges/{id}` accepts `display_city` / `display_city_en` (letters, spaces, ZWNJ, ≤ 32; `""`
+  clears). The install one-liner adds `--version <pin>`.
+
+### Rollouts (§23.2)
+- `GET /api/v1/releases` → `{"releases": [{"version", "sha256", "size", "nodes"}], "pinned", "groups",
+  "controller", "nodes": {"<release>|null": n}}`.
+- `POST /api/v1/rollouts` `{"release", "groups": [..]|null, "soak_minutes" (5..1440), "ring_percent" (1..90),
+  "auto_rollback", "allow_no_rollback", "dry_run"}` → 201 rollout (200 + `"dry_run": true`, nothing stored);
+  404 `unknown_release`, 409 `rollout_active`, 422 `{"detail": "no_rollback_release", "edges": [names]}`.
+- `GET /api/v1/rollouts?limit=20`, `GET /api/v1/rollouts/{id}` → `{"id", "release", "state", "ring", "groups",
+  "soak_minutes", "ring_percent", "auto_rollback", "reason", "created_by", "created_at", "started_at",
+  "finished_at", "rings": [{"ring", "edges": [{"id", "name", "group", "region", "state", "from_release",
+  "started_at", "soak_until", "error", "gate": {"heartbeat", "probe", "tunnel_probe", "error_pct",
+  "limit_pct"}|null}]}]}`.
+- `POST /api/v1/rollouts/{id}/start|pause|resume|abort|rollback`,
+  `POST /api/v1/rollouts/{id}/edges/{edge_id}/skip|force|retry` → the rollout; 409
+  `{"detail": "invalid_state", "state"}`.
+- Edge config `node.upgrade = {"id": "<rollout>-<attempt>", "release", "sha256", "drain_minutes",
+  "rollback", "timeout_s"}` or null (non-rendered); `node.public_tag` (8 hex). Heartbeat: `release`,
+  `upgrade {id, release, state, error, at, rollback}`, capabilities `self_upgrade`, `rum`.
+
+### Backups (§23.3)
+`GET /api/v1/backups` → `{"enabled", "encrypted", "offsite", "schedule": {"backup_hour", "verify":
+{"enabled", "weekday", "hour", "scratch_db"}}, "last_backup", "last_verify", "runs" (≤ 30), "remote":
+{"count", "newest", "oldest", "bytes"}|null}`, run = `{"id", "kind", "started_at", "finished_at", "ok",
+"name", "size", "location", "level", "checks", "error"}`. `POST /api/v1/backups/run|verify` → 202
+`{"queued": true}` (409 when queued / running).
+
+### Config history (§23.4) — admin and capi (scope `config`; `functions` needs `functions`)
+`GET …/config/history?limit=&before=`, `GET …/config/history/{v}`, `GET …/config/history/{v}/diff?against=current|<v>&section=`,
+`POST …/config/history/{v}/restore {"sections": [..]|null, "dry_run"}` (10/hour/site → 429). Admin prefix
+`/api/v1/sites/{domain}`, capi `/capi/v1`. Actor kinds: `client`, `collaborator`, `support`, `api_key`,
+`system`. WHMCS sends `X-PCDN-Actor: client:<id>` / `share:<id>:<role>`.
+
+### Customer alerts (§23.5)
+`GET /api/v1/accounts/{client_id}/alerts`; `PUT …/alerts/subscriptions {"items": [..]}` (403
+`{"detail": "channel_not_in_plan"|"channel_unavailable", "channel"}`); `POST …/alerts/targets/sms {"phone"}` →
+202 `{"target_id", "expires_at"}`; `POST …/alerts/targets/{id}/verify {"code"}`;
+`POST …/alerts/targets/{bale|telegram}/link` → `{"code", "deep_link", "expires_at"}`;
+`GET …/alerts/targets/link/{code}` → `{"linked", "target_id"}`; `DELETE …/alerts/targets/{id}`;
+`POST …/alerts/test {"channel", "target_id"?}` → 202 (3/hour). The account must own ≥ 1 site (else 404).
+E-mail outbox: `GET /api/v1/notifications/outbox?channel=email&after=<id>&limit=200` →
+`{"items": [{"id", "client_id", "service_id", "site", "event", "severity", "lang", "subject", "text", "vars",
+"created_at"}], "next"}` (a row offered is re-offered after 30 min until acknowledged; start every cron run
+with `after=0` and follow `next`); `POST /api/v1/notifications/outbox/ack {"results": {"<id>":
+"sent"|"failed"|"skipped"}}`; `GET /api/v1/notifications/status`; capi `GET /capi/v1/alerts` (stats).
+New webhook events: `origin.down`, `origin.up`, `ssl.expiring`, `incident.opened`, `incident.resolved`;
+`site.suspended` / `site.unsuspended` carry `reason: "abuse"|"billing"`. Live items accept `oe`, `pe`.
+
+### Import (§23.6)
+`POST …/import/preview {"provider": "arvan"|"cloudflare", "api_key", "zone"?}` → `{"session_id",
+"expires_at", "provider", "zone", "report": {"records": {"total", "importable", "items"}, "sections",
+"unmapped"}}`; `POST …/import/apply {"session_id", "records", "replace_records", "record_names", "sections"}`;
+`DELETE …/import/{session_id}`. Admin `/api/v1/sites/{domain}`, capi `/capi/v1` (scopes `dns` + `config`).
+Malformed bodies → generic `{"detail": "invalid request"}` (never echoed); 422 `provider_auth`, 404
+`provider_zone_not_found`, 502 `provider_unreachable`, 429 after 10 previews/hour/site.
+
+### RUM, diagnostics (§23.7 / §23.8)
+`GET /api/v1/sites/{d}/rum?hours=24|168|720&by=country|isp|region|device|path` and `GET /capi/v1/rum`
+(stats; 404 without plan feature `rum`). Section `rum {enabled, sample_rate, inject, exclude_paths, spa}`.
+`GET /api/v1/sites/{d}/diagnostics?audience=customer|admin`, `GET /capi/v1/diagnostics` (customer only;
+20/hour/site).
+
+### Provisioning (§23.9) — `PROVISIONING_ENABLED`
+`GET|POST /api/v1/provisioning/proposals`, `GET …/{id}`, `POST …/{id}/approve {"region"?, "size"?, "count"?}`
+(422 `encryption_required`), `POST …/{id}/apply` (409 `plan_destroys`), `POST …/{id}/reject`;
+`POST /api/v1/edges/{id}/join-token` → `{"join_token", "expires_at", "install"}`. Provisioner (bearer
+`PROVISIONER_TOKEN`): `GET /api/v1/provisioner/jobs/next`, `POST /api/v1/provisioner/jobs/{id}/plan
+{"summary", "adds", "changes", "destroys"}`, `POST /api/v1/provisioner/jobs/{id}/result {"ok", "error"}`.
+Edge: `POST /edge/v1/join {"join_token", "hostname"?}` → `{"edge_id", "name", "token"}` (401 / 429).
+
+### Abuse desk (§23.10) — `ABUSE_ENABLED`
+Public (CORS `*`): `GET /public/v1/abuse/challenge` → `{"id", "salt", "bits", "expires_at"}`;
+`POST /public/v1/abuse/reports {"category", "urls", "description", "email"?, "challenge": {"id", "salt",
+"nonce"}, "website": ""}` → 201 `{"ticket", "status_token"}` (PoW: `sha256(UTF-8(salt + nonce))` with ≥ `bits`
+leading zero bits, nonce = decimal string); `GET /public/v1/abuse/reports/{ticket}?token=`. Admin:
+`POST /api/v1/abuse/reports` (+ `X-PCDN-Reporter-IP`), `GET /api/v1/abuse/reports?status=&category=&q=&limit=`,
+`GET|PATCH /api/v1/abuse/reports/{id}`, `POST …/{id}/notify {"deadline_hours", "lang", "message"?}`,
+`POST …/{id}/action {"action": "warn"|"suspend"|"unsuspend"|"close"|"reject", "public_note"?}`.
+`overview.abuse_open`; site dict `abuse_suspended`.
+
+### SLO (§23.11)
+`GET /api/v1/slo?month=YYYY-MM`; `/metrics`: `pcdn_slo_objective`, `pcdn_slo_ratio{window="30d"|"month"}`,
+`pcdn_slo_error_budget_remaining`, `pcdn_slo_burn_rate{window="5m"|"30m"|"1h"|"6h"}`,
+`pcdn_rollout_state{rollout,state}`, `pcdn_rollout_edges{state}`.
+
+### Node naming (§23.12)
+`/tunnel/quality` `edges[]` = `{name (= fa label), label_en, key (public tag), sessions, …}`; never an
+internal name or id. Site dict `edge_ips` is sorted numerically (IPv4 then IPv6), de-duplicated, unlabeled.

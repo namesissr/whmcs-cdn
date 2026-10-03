@@ -354,3 +354,45 @@ func (c *Client) sendJSON(ctx context.Context, r request) (json.RawMessage, erro
 	}
 	return json.RawMessage(resp.Body), nil
 }
+
+// ---------------------------------------------------------------- config history (SPEC §23.4)
+
+// ConfigHistory is GET /config/history?limit=&before= (scope config). before = 0 means "newest".
+func (c *Client) ConfigHistory(ctx context.Context, limit int, before int64) (json.RawMessage, error) {
+	q := url.Values{"limit": {strconv.Itoa(limit)}}
+	if before > 0 {
+		q.Set("before", strconv.FormatInt(before, 10))
+	}
+	return c.getJSON(ctx, "/config/history", q)
+}
+
+// ConfigVersion is GET /config/history/{version}: every section as of that version (redacted).
+func (c *Client) ConfigVersion(ctx context.Context, version int64) (json.RawMessage, error) {
+	return c.getJSON(ctx, "/config/history/"+strconv.FormatInt(version, 10), nil)
+}
+
+// ConfigDiff is GET /config/history/{version}/diff?against=current|<v>&section=.
+func (c *Client) ConfigDiff(ctx context.Context, version int64, against, section string) (json.RawMessage, error) {
+	q := url.Values{}
+	if against != "" {
+		q.Set("against", against)
+	}
+	if section != "" {
+		q.Set("section", section)
+	}
+	return c.getJSON(ctx, "/config/history/"+strconv.FormatInt(version, 10)+"/diff", q)
+}
+
+// RestoreInput is the body of POST /config/history/{version}/restore. A nil Sections restores every
+// section that differs.
+type RestoreInput struct {
+	Sections []string `json:"sections"`
+	DryRun   bool     `json:"dry_run"`
+}
+
+// ConfigRestore is POST /config/history/{version}/restore. Not retried on 5xx (not idempotent: each
+// restore writes a new version); 429 is retried.
+func (c *Client) ConfigRestore(ctx context.Context, version int64, in RestoreInput) (json.RawMessage, error) {
+	return c.sendJSON(ctx, request{Method: http.MethodPost, Path: "/config/history/" + strconv.FormatInt(version, 10) + "/restore",
+		Body: in})
+}

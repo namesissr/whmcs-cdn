@@ -5,6 +5,10 @@
 #
 # The token may instead come from the environment (PCDN_EDGE_TOKEN, what bootstrap.sh uses, so it never
 # shows up in `ps`) or from a file (--token-file /root/edge.token).
+# SPEC §23.9: instead of an edge token, a one-time JOIN token (jt_..., from an approved provisioning
+# proposal or POST /api/v1/edges/{id}/join-token) in PCDN_JOIN_TOKEN or --join-token-file FILE (never
+# argv): install.sh exchanges it at POST /edge/v1/join for the node's edge token (https only unless
+# --insecure-http) and writes that into agent.conf (0600).
 #
 # Uses the distribution nginx (1.24) with the distro dynamic modules:
 #   libnginx-mod-http-js (njs >= 0.8.1), -geoip2, -image-filter, -brotli-filter
@@ -60,6 +64,12 @@
 #                      undrains itself after its first good config apply + tunnel probe. The last active
 #                      node of a group is refused (exit 1: upgrade without --drain); an older agent or
 #                      controller without drain support -> warning, upgrade without drain.
+#   --release vX.Y.Z   (SPEC §23.1) the release this bundle must be: refused when the bundle's edge/RELEASE
+#                      differs (bootstrap.sh --version passes it). edge/RELEASE is copied to
+#                      /etc/pcdn/release (no file in the bundle -> removed: release unknown), and the
+#                      verified tarball (PCDN_RELEASE_TARBALL, from bootstrap.sh / the agent's self-upgrade)
+#                      is kept as RELEASES_DIR/<vX.Y.Z>.tar.gz (0600, the 3 newest) for a rollback.
+#   --join-token-file FILE  (SPEC §23.9) one-time join token instead of --token (see above)
 #   --shutdown-timeout auto|<time>  worker_shutdown_timeout (SPEC §22.2). auto (default): RAM < 4 GiB 30m,
 #                      4-8 GiB 2h, >= 8 GiB 4h. An explicit value (e.g. 1h; never seconds below 60) is
 #                      kept in agent.conf (SHUTDOWN_TIMEOUT) for later --upgrades; an --upgrade of an edge
@@ -94,6 +104,8 @@ ORIGIN_GUARD="" # yes | no ("" = not given: yes, or the installed value on --upg
 INSECURE_HTTP=no
 OG_NEW=no      # yes: an --upgrade turns the origin guard on for the first time (upgrade note at the end)
 TOKEN="${PCDN_EDGE_TOKEN:-}"
+JOIN_TOKEN="${PCDN_JOIN_TOKEN:-}"   # SPEC §23.9 one-time join token (env / --join-token-file, never argv)
+RELEASE_ARG=""                      # --release vX.Y.Z (SPEC §23.1)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 while [ $# -gt 0 ]; do
@@ -101,6 +113,9 @@ while [ $# -gt 0 ]; do
     --controller) CONTROLLER="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
     --token-file) TOKEN="$(tr -d ' \t\r\n' < "$2")"; shift 2 ;;
+    --join-token-file) JOIN_TOKEN="$(tr -d ' \t\r\n' < "$2")"; shift 2 ;;
+    --release) RELEASE_ARG="${2:-}"; shift 2 ;;
+    --release=*) RELEASE_ARG="${1#--release=}"; shift ;;
     --insecure-http) INSECURE_HTTP=yes; shift ;;
     --origin-guard) ORIGIN_GUARD=yes; shift ;;
     --no-origin-guard) ORIGIN_GUARD=no; shift ;;
@@ -161,6 +176,22 @@ if [ -n "$SHUTDOWN_TIMEOUT" ] && [ "$SHUTDOWN_TIMEOUT" != auto ] && ! wst_valid 
   echo "--shutdown-timeout must be auto or an nginx time like 30m / 2h (never seconds below 60: a hard cut)"; exit 1
 fi
 # <<< pcdn arg checks
+# >>> pcdn release check (SPEC §23.1; edge/tests/test_wave14.py runs this block)
+# the bundle's own release (edge/RELEASE, one line vX.Y.Z; absent in a live bundle) and --release, which
+# must name exactly that release (a pinned bootstrap / self-upgrade never installs a different one)
+REL_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+BUNDLE_RELEASE=""
+if [ -f "$HERE/RELEASE" ]; then BUNDLE_RELEASE="$(head -n 1 "$HERE/RELEASE" | tr -d ' \t\r')"; fi
+if [ -n "$BUNDLE_RELEASE" ] && ! [[ "$BUNDLE_RELEASE" =~ $REL_RE ]]; then
+  echo "warning: ignoring the malformed edge/RELEASE of this bundle"; BUNDLE_RELEASE=""
+fi
+if [ -n "$RELEASE_ARG" ]; then
+  [[ "$RELEASE_ARG" =~ $REL_RE ]] || { echo "--release must look like vX.Y.Z"; exit 1; }
+  if [ "$RELEASE_ARG" != "$BUNDLE_RELEASE" ]; then
+    echo "--release $RELEASE_ARG does not match this bundle's edge/RELEASE (${BUNDLE_RELEASE:-none}): not installed"; exit 1
+  fi
+fi
+# <<< pcdn release check
 
 case "${REGION:-}" in ""|home|global) ;; *) echo "--region must be home or global"; exit 1 ;; esac
 case "${ROLE:-}" in ""|general|tunnel) ;; *) echo "--role must be general or tunnel"; exit 1 ;; esac
@@ -197,7 +228,7 @@ if [ "$UPGRADE" = yes ]; then
   # kept across --upgrade: log-export tunables (SPEC §14.3.2) and the wave-7 node settings an operator
   # may have added (SPEC §15.2 fair-share capacity / share, §15.6 speed-test node name / file)
   # and the wave-8 settings (SPEC §16.3 GUARD_* values, §16.4 L4_*, §16.6 IMAGE*/IMAGED)
-  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS)|ORIGIN_PRIVATE_ALLOW|INTERNAL_SRC|RELOAD_MAX_WAIT|MEM_GUARD_PCT|DRAIN_IDLE_CONNS|PROBE_(ENABLED|INTERVAL|BYTES|ECHO_PORT|H2C_PORT)|ORIGIN_TCP_HEALTH|TUNE_PROFILE)=' \
+  KEEP_CONF="$(grep -E '^(LOGSHIP_(SPOOL_DIR|SPOOL_MAX_MB|INTERVAL|TIMEOUT)|CAPACITY_MBPS|FAIR_SHARE_PCT|NODE_NAME|SPEED_FILE|L4_PORT_RANGE|L4_ACCESS_LOG|IMAGED|IMAGE_(PORT|WORKERS|MAX_SOURCE_MB)|GUARD_(SSH_PORTS|ALLOW|SYN_RATE|SYN_BURST|SYN_GLOBAL|UDP_RATE|ICMP_RATE|SYNPROXY)|FN_(WALL_MS|WORKERS|SITE_WORKERS|MAX_FETCHES|FETCH_TIMEOUT_MS|STARTUP_MS|QUEUE_MS)|ORIGIN_PRIVATE_ALLOW|INTERNAL_SRC|RELOAD_MAX_WAIT|MEM_GUARD_PCT|DRAIN_IDLE_CONNS|PROBE_(ENABLED|INTERVAL|BYTES|ECHO_PORT|H2C_PORT)|ORIGIN_TCP_HEALTH|TUNE_PROFILE|RUM_ASN_DB|RUM_REGION_DB|RUM_LOG|UPGRADE_DIR|RELEASES_DIR|SELF_UPGRADE)=' \
     /etc/pcdn/agent.conf || true)"
 fi
 TCP_CC="${TCP_CC:-bbr}"
@@ -206,8 +237,9 @@ HARDEN_NET="${HARDEN_NET:-no}"
 AVIF="${AVIF:-yes}"
 FUNCTIONS="${FUNCTIONS:-no}"
 ORIGIN_GUARD="${ORIGIN_GUARD:-yes}"
-[ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] || {
-  echo "usage: $0 --controller URL --token TOKEN (or PCDN_EDGE_TOKEN=... / --token-file FILE)"; exit 1; }
+[ -n "$CONTROLLER" ] && { [ -n "$TOKEN" ] || [ -n "$JOIN_TOKEN" ]; } || {
+  echo "usage: $0 --controller URL --token TOKEN (or PCDN_EDGE_TOKEN=... / --token-file FILE /"
+  echo "       a one-time join token: PCDN_JOIN_TOKEN=jt_... / --join-token-file FILE)"; exit 1; }
 case "$CONTROLLER" in
   https://*) ;;
   *) if [ "$INSECURE_HTTP" = yes ]; then echo "warning: plain-http controller URL $CONTROLLER (--insecure-http)"
@@ -238,6 +270,8 @@ if [ -n "$DRAIN" ]; then
       0) DRAINED=yes ;;
       3) echo "این آخرین نود فعال گروه است؛ بدون --drain به‌روزرسانی کنید"
          echo "this is the last active node of its group; upgrade without --drain"
+         # SPEC §23.2: the agent's self-upgrade reports exit 3 as last_edge
+         if [ -n "${PCDN_SELF_UPGRADE:-}" ]; then exit 3; fi
          exit 1 ;;
       *) echo "warning: the node could not be drained (exit $rc); upgrading without drain" ;;
     esac
@@ -373,6 +407,7 @@ rm -rf "$AGENT_LIB/pcdn_agent.old"
 install -D -m 755 "$HERE/pcdn-agent.py" /usr/local/bin/pcdn-agent
 # <<< pcdn agent files
 install -m 644 "$HERE"/pages/*.html /usr/share/pcdn/pages/
+install -m 644 "$HERE/pages/rum.js" /usr/share/pcdn/pages/rum.js   # SPEC §23.7 RUM beacon script
 install -m 644 "$HERE/njs/pcdn.js" /usr/share/pcdn/njs/pcdn.js
 install -m 644 "$HERE/nginx/pcdn-base.conf" /usr/share/pcdn/nginx/pcdn-base.conf
 install -m 644 "$HERE/systemd/pcdn-agent.service" /etc/systemd/system/pcdn-agent.service
@@ -382,6 +417,33 @@ install -m 644 "$HERE/systemd/pcdn-geoip-retry.service" /etc/systemd/system/pcdn
 install -m 644 "$HERE/systemd/pcdn-geoip-retry.timer" /etc/systemd/system/pcdn-geoip-retry.timer
 install -m 755 "$HERE/pcdn-geoip-update.sh" /usr/local/sbin/pcdn-geoip-update
 install -m 644 "$HERE/systemd/pcdn-imaged.service" /etc/systemd/system/pcdn-imaged.service
+# >>> pcdn release files (SPEC §23.1 / §23.2; edge/tests/test_wave14.py runs this block into a temporary root)
+# /etc/pcdn/release = the bundle's release (the agent reports it; no RELEASE -> removed = unknown) and the
+# verified tarball this bundle came from kept for a rollback: RELEASES_DIR/<release>.tar.gz, 0600, 3 newest
+RELEASE_FILE="${RELEASE_FILE:-/etc/pcdn/release}"
+if [ -z "${RELEASES_DIR:-}" ]; then
+  RELEASES_DIR="$(sed -n 's/^RELEASES_DIR=//p' /etc/pcdn/agent.conf 2>/dev/null | tail -1 | tr -d "\"' \r")"
+fi
+RELEASES_DIR="${RELEASES_DIR:-/var/lib/pcdn/releases}"
+if [ -n "$BUNDLE_RELEASE" ]; then
+  printf '%s\n' "$BUNDLE_RELEASE" > "$RELEASE_FILE.tmp"
+  chmod 644 "$RELEASE_FILE.tmp"
+  mv -f "$RELEASE_FILE.tmp" "$RELEASE_FILE"
+else
+  rm -f "$RELEASE_FILE"
+fi
+if [ -n "$BUNDLE_RELEASE" ] && [ -n "${PCDN_RELEASE_TARBALL:-}" ] && [ -f "$PCDN_RELEASE_TARBALL" ]; then
+  install -d -m 700 "$RELEASES_DIR"
+  REL_DEST="$RELEASES_DIR/$BUNDLE_RELEASE.tar.gz"
+  if [ "$(readlink -f "$PCDN_RELEASE_TARBALL")" != "$(readlink -f "$REL_DEST")" ]; then
+    install -m 600 "$PCDN_RELEASE_TARBALL" "$REL_DEST.tmp"
+    mv -f "$REL_DEST.tmp" "$REL_DEST"
+  fi
+  chmod 600 "$REL_DEST"
+  touch "$REL_DEST"   # the installed release is the newest: never rotated away
+  ls -1t "$RELEASES_DIR"/v*.tar.gz 2>/dev/null | tail -n +4 | while IFS= read -r old; do rm -f -- "$old"; done
+fi
+# <<< pcdn release files
 # the agent renders /etc/nginx/pcdn/http.conf (base config) + sites; conf.d only includes it
 echo 'include /etc/nginx/pcdn/http.conf;' > /etc/nginx/conf.d/00-pcdn.conf
 rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
@@ -457,6 +519,38 @@ LimitNOFILE=1048576
 OOMScoreAdjust=-500
 EOF
 
+# >>> pcdn join (SPEC §23.9; edge/tests/test_wave14.py runs this block with a fake curl)
+# a one-time join token is exchanged for the node's edge token right before agent.conf is written (the
+# token is single use: nothing that could fail comes between the exchange and the file). The request body
+# goes through stdin, never argv.
+if [ -z "$TOKEN" ] && [ -n "$JOIN_TOKEN" ]; then
+  if ! [[ "$JOIN_TOKEN" =~ ^jt_[0-9a-f]{40}$ ]]; then echo "join: the join token must look like jt_<40 hex>"; exit 1; fi
+  case "$CONTROLLER" in
+    https://*) JPROTO=(--proto '=https' --proto-redir '=https') ;;
+    *) if [ "$INSECURE_HTTP" != yes ]; then
+         echo "join: refusing to send the join token to a plain-http controller (use https:// or --insecure-http)"; exit 1
+       fi
+       JPROTO=(--proto '=http,https' --proto-redir '=http,https') ;;
+  esac
+  JHOST="$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-' | cut -c1-253 || true)"
+  JOUT="$(mktemp)"
+  JCODE="$(printf '{"join_token": "%s", "hostname": "%s"}' "$JOIN_TOKEN" "$JHOST" \
+    | curl -sS "${JPROTO[@]}" --max-time 60 -o "$JOUT" -w '%{http_code}' -H 'Content-Type: application/json' \
+        --data-binary @- "${CONTROLLER%/}/edge/v1/join" 2>/dev/null)" || JCODE="${JCODE:-000}"
+  case "$JCODE" in
+    200) TOKEN="$(sed -n 's|.*"token"[[:space:]]*:[[:space:]]*"\(edge_[A-Za-z0-9._~+/=-]*\)".*|\1|p' "$JOUT" | head -n 1)" ;;
+    401) rm -f "$JOUT"
+         echo "توکن پیوستن نامعتبر یا منقضی است"
+         echo "join token invalid or expired"; exit 1 ;;
+    404) rm -f "$JOUT"; echo "join: this controller does not support join tokens (POST /edge/v1/join: 404)"; exit 1 ;;
+    429) rm -f "$JOUT"; echo "join: too many attempts, retry in a minute"; exit 1 ;;
+    *) rm -f "$JOUT"; echo "join: the controller answered HTTP $JCODE"; exit 1 ;;
+  esac
+  rm -f "$JOUT"
+  [ -n "$TOKEN" ] || { echo "join: the controller's answer carries no edge token"; exit 1; }
+  echo "==> joined the controller (edge token stored in /etc/pcdn/agent.conf)"
+fi
+# <<< pcdn join
 umask 077
 cat > /etc/pcdn/agent.conf <<EOF
 CONTROLLER_URL=$CONTROLLER
@@ -510,7 +604,7 @@ fi
 umask 022
 
 cat > /etc/logrotate.d/pcdn <<'EOF'
-/var/log/nginx/pcdn-access.log /var/log/nginx/pcdn-l4.log {
+/var/log/nginx/pcdn-access.log /var/log/nginx/pcdn-l4.log /var/log/nginx/pcdn-rum.log {
     daily
     rotate 6
     maxsize 1G
@@ -763,6 +857,8 @@ echo "==> GeoIP (DB-IP IP to Country Lite, CC BY 4.0)"
 systemctl daemon-reload
 if [ "$GEOIP" = yes ]; then
   /usr/local/sbin/pcdn-geoip-update || echo "warning: GeoIP download failed; the daily retry timer will keep trying"
+  # SPEC §23.7: the optional ASN database for RUM reports (absent -> ASN 0; refreshed by the same timer)
+  /usr/local/sbin/pcdn-geoip-update --asn || echo "warning: ASN database download failed (RUM shows no ISP until it lands)"
   systemctl enable --now pcdn-geoip.timer
   systemctl enable --now pcdn-geoip-retry.timer   # F9: retry daily while the DB is missing
 fi

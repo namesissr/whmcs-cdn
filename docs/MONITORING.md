@@ -294,6 +294,31 @@ amtool check-config /tmp/am/alertmanager.yml
 `check_monitoring.py` نام‌های سری را مستقیم از `controller/app/routes_metrics.py` و
 `json-exporter/config.yml` می‌خواند؛ اگر متریکی در کنترلر تغییر نام دهد، CI شکست می‌خورد.
 
+## ۸ب. موج ۱۴ — هشدارها و متریک‌های جدید (SPEC §23)
+
+| هشدار | شدت | معنا |
+|---|---|---|
+| `rollout_blocked:<id>` | هشدار (بحرانی هنگام بازگردانی) | انتشار به آخرین نود یک استخر رسید و متوقف شد |
+| `rollout_failed:<id>` | بحرانی | نودی در پایش رد شد؛ بازگردانی خودکار (با `rolled_back` رفع می‌شود) |
+| `backup_not_offsite` / `backup_unencrypted_offsite` | اطلاع / هشدار | پشتیبان فقط محلی است / بدون رمز به S3 می‌رود |
+| `backup_verify_failed` / `backup_verify_partial` | بحرانی / اطلاع | آزمون بازیابی هفتگی ناموفق / دو هفته فقط جزئی |
+| `provision_proposed:<group>` / `provision_failed:<id>` | اطلاع / هشدار | پیشنهاد نود جدید / اجرای terraform ناموفق |
+| `abuse_overdue:<id>` | هشدار | مهلت مالک برای رسیدگی به گزارش تخلف گذشت |
+| `slo_burn_fast:<g>:<sli>` | بحرانی | نرخ مصرف بودجه ≥ ۱۴٫۴ در ۱ ساعت و ۵ دقیقه |
+| `slo_burn_slow:<g>:<sli>` | هشدار | نرخ مصرف ≥ ۶ در ۶ ساعت و ۳۰ دقیقه |
+| `slo_budget_exhausted:<g>:<sli>` | هشدار | بودجهٔ خطای ماه تمام شد |
+
+هشدار SLO فقط با نمونهٔ کافی باز می‌شود (۳۰ تیک در ۱ ساعت برای سریع، ۱۸۰ در ۶ ساعت برای کند، ۱۰۰۰ درخواست برای
+خطاها) و با پایین آمدن پنجرهٔ کوتاه رفع می‌شود. یا این هشدارها یا قواعد `pcdn-slo.yml` را pager کنید، نه هر دو.
+
+متریک‌ها: `pcdn_build_info{version}`، `pcdn_rollout_state{rollout,state}`، `pcdn_rollout_edges{state}`،
+`pcdn_slo_objective{group,sli}`، `pcdn_slo_ratio{group,sli,window="30d"|"month"}`،
+`pcdn_slo_error_budget_remaining{group,sli}`، `pcdn_slo_burn_rate{group,sli,window="5m"|"30m"|"1h"|"6h"}`.
+SLIها: دسترس‌پذیری (هر تیک پروب: در هر استخر منطقه دست‌کم یک نود فعال و غیرتخلیه سالم)، تأخیر (پروب‌های
+موفق ≤ `SLO_LATENCY_MS`) و خطا (`pe` دقیقه‌ای، در نبود آن خطاهای پلتفرم ساعتی). هدف‌ها: `SLO_AVAILABILITY`،
+`SLO_LATENCY`، `SLO_ERRORS`، `SLO_OVERRIDES`. `/healthz/deep` حالا `version`، `environment` و
+`backup.verify_age_s|verify_ok|offsite` دارد.
+
 ## ۹. عیب‌یابی
 
 | نشانه | علت محتمل |

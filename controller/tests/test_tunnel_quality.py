@@ -165,15 +165,19 @@ def test_quality_math_edges_series_removed_and_advice(client):
     assert old["id"] == "old9" and old["removed"] is True and old["path"] is None and old["protocol"] is None
     assert old["success_pct"] == 0.0 and old["top_issue"] == "origin_refused"
     assert old["advice"] == "سرور شما روی پورت مسیر اتصال را رد می‌کند؛ سرویس Xray/sing-box و پورت را بررسی کنید."
-    assert q["edges"] == [
-        {"name": "edge-1", "sessions": 7, "abnormal_pct": 0.0, "connect_ms_avg": 60.0, "error_total": 2},
-        {"name": "edge-2", "sessions": 5, "abnormal_pct": 20.0, "connect_ms_avg": 84.0, "error_total": 1}]
+    # SPEC §23.12: city labels + public tag, never the internal edge name
+    assert [{k: v for k, v in e.items() if k != "key"} for e in q["edges"]] == [
+        {"name": "نود ایران ۱", "label_en": "Iran node 1", "sessions": 7, "abnormal_pct": 0.0,
+         "connect_ms_avg": 60.0, "error_total": 2},
+        {"name": "نود ایران ۲", "label_en": "Iran node 2", "sessions": 5, "abnormal_pct": 20.0,
+         "connect_ms_avg": 84.0, "error_total": 1}]
+    assert all(len(e["key"]) == 8 for e in q["edges"]) and "edge-1" not in r.text
     assert q["series"][-1] == {"t": hour_iso(now).replace("+00:00", ""), "sessions": 7, "errors": 2, "abnormal": 0}
     assert q["series"][-3]["sessions"] == 5 and q["series"][-3]["errors"] == 1
     assert sum(p["sessions"] for p in q["series"]) == 12
     # 1-hour window leaves out the older edge-2 hour
     one = client.get(f"{S}/tunnel/quality?hours=1").json()
-    assert one["paths"][0]["sessions"] == 7 and [e["name"] for e in one["edges"]] == ["edge-1"]
+    assert one["paths"][0]["sessions"] == 7 and [e["name"] for e in one["edges"]] == ["نود ایران ۱"]
     for bad in (0, 745, "x"):
         assert client.get(f"{S}/tunnel/quality?hours={bad}").status_code == 422
     assert client.get(f"{S}/tunnel/quality").json()["hours"] == 24

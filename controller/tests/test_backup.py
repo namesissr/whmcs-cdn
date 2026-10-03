@@ -286,7 +286,7 @@ def test_backup_job_schedule_failure_alert_and_recovery(client, env, alert_setti
     monkeypatch.setattr(backup, "dump_controller_db", dump)
     nxt = day + dt.timedelta(days=1, hours=1)
     run(nxt.replace(hour=3))
-    assert [c["key"] for c in alerts.open_alerts()] == ["backup_failed"]
+    assert [c["key"] for c in alerts.open_alerts()] == ["backup_not_offsite", "backup_failed"]
     assert sent[-1][0] == "critical" and "connection refused" in sent[-1][2]
     n = len(sent)
     run(nxt.replace(hour=3, minute=30))
@@ -295,7 +295,8 @@ def test_backup_job_schedule_failure_alert_and_recovery(client, env, alert_setti
     broken["on"] = False
     run(nxt.replace(hour=4, minute=5))
     assert len(backup.list_local()) == 2
-    assert alerts.open_alerts() == []
+    # SPEC §23.3: without BACKUP_S3_* the info alert backup_not_offsite stays open
+    assert [c["key"] for c in alerts.open_alerts()] == ["backup_not_offsite"]
     assert sent[-1][0] == "resolved" and "پشتیبان‌گیری دوباره موفق شد" in sent[-1][2]
     with SessionLocal() as db:
         assert db.get(State, "backup:last_success_day").value == nxt.date().isoformat()

@@ -154,6 +154,33 @@ def _map_storage_secrets(db, fn, plaintext_only: bool) -> int:
     return changed
 
 
+# SPEC §23.13 (wave 14): encrypted columns of the new tables, (model name, ORM attribute)
+WAVE14_SECRETS = (("NotificationTarget", "value_stored"), ("AbuseReport", "reporter_email_stored"),
+                  ("ImportSession", "data"), ("ProvisionProposal", "join_tokens_enc"))
+
+
+def _wave14_values(db):
+    """(row, attribute) of every stored wave-14 secret."""
+    from sqlalchemy import select
+
+    from . import models
+
+    for name, attr in WAVE14_SECRETS:
+        model = getattr(models, name)
+        for row in db.scalars(select(model).where(getattr(model, attr).is_not(None))):
+            yield row, attr
+
+
+def _map_wave14(db, fn, plaintext_only: bool) -> int:
+    changed = 0
+    for row, attr in list(_wave14_values(db)):
+        v = getattr(row, attr)
+        if v and not (plaintext_only and is_encrypted(v)):
+            setattr(row, attr, fn(v))
+            changed += 1
+    return changed
+
+
 def _secret_rows(db):
     from sqlalchemy import select
 
@@ -211,6 +238,7 @@ def status(db) -> dict:
     values += [doc.get(f) for _, doc, fields in _state_docs(db) for f in fields]
     values += [v for site in _secret_rows(db) for v in site_secrets.values(site)]
     values += [getattr(b, a) for b in _storage_rows(db) for a in STORAGE_SECRETS]
+    values += [getattr(row, attr) for row, attr in _wave14_values(db)]
     sample = None
     for v in values:
         if not v:
@@ -245,6 +273,7 @@ def encrypt_existing(db) -> int:
         changed += site_secrets.map_values(site, encrypt, plaintext_only=True)
     changed += _map_state_secrets(db, encrypt, plaintext_only=True)
     changed += _map_storage_secrets(db, encrypt, plaintext_only=True)
+    changed += _map_wave14(db, encrypt, plaintext_only=True)
     db.commit()
     return changed
 
@@ -265,6 +294,7 @@ def rotate_all(db) -> int:
         changed += site_secrets.map_values(site, rotate, plaintext_only=False)
     changed += _map_state_secrets(db, rotate, plaintext_only=False)
     changed += _map_storage_secrets(db, rotate, plaintext_only=False)
+    changed += _map_wave14(db, rotate, plaintext_only=False)
     db.commit()
     return changed
 
@@ -330,5 +360,17 @@ def drop_unreadable(db) -> list[str]:
             b.secret_key_stored = ""
         if not _readable(b.origin_token_stored):
             b.origin_token = pysecrets.token_hex(24)
+    # SPEC §23: unreadable wave-14 secrets are forgotten (targets disabled; sessions / tokens dropped)
+    from .models import utcnow
+
+    for row, attr in list(_wave14_values(db)):
+        if _readable(getattr(row, attr)):
+            continue
+        if attr == "value_stored":
+            row.value_stored, row.disabled_at = "", utcnow()
+        elif attr == "data":
+            db.delete(row)
+        else:
+            setattr(row, attr, None)
     db.commit()
     return affected

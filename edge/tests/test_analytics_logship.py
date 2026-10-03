@@ -127,7 +127,8 @@ def test_minute_bucketing_and_top_n(tmp_path):
     k1, k2 = m1.strftime("%Y-%m-%dT%H:%M:00Z"), m2.strftime("%Y-%m-%dT%H:%M:00Z")
     a1 = items[("a.com", k1)]
     assert a1 == {"host": "a.com", "minute": k1, "requests": 2, "bytes": 30, "cache_hits": 1,
-                  "status": {"2xx": 1, "4xx": 1}, "countries": {"IR": 1, "DE": 1}, "paths": {"/a": 2}}
+                  "status": {"2xx": 1, "4xx": 1}, "countries": {"IR": 1, "DE": 1}, "paths": {"/a": 2},
+                  "oe": 0, "pe": 0}
     assert items[("b.a.com", k1)]["status"] == {"5xx": 1} and items[("b.a.com", k1)]["countries"] == {}
     a2 = items[("a.com", k2)]
     # 1xx (WebSocket 101) is not one of the four status classes; tunnels still count as requests
@@ -851,9 +852,10 @@ def test_fair_hot_hysteresis_and_node_block(tmp_path):
     assert agent.fair_hot(810, 1000, True) and not agent.fair_hot(799, 1000, True)
     assert not agent.fair_hot(10_000, 0, True)                      # unknown capacity: never hot
     cfg = make_cfg(tmp_path, NODE_NAME="ir-1", CAPACITY_MBPS="900", FAIR_SHARE_PCT="30")
-    assert agent.norm_node({}, cfg) == {"capacity_mbps": 900, "fair_share_pct": 30, "name": "ir-1", "http3": True}
+    assert agent.norm_node({}, cfg) == {"capacity_mbps": 900, "fair_share_pct": 30, "name": "ir-1", "http3": True,
+                                     "public_tag": ""}
     assert agent.norm_node({"node": {"capacity_mbps": 2000, "fair_share_pct": 500, "name": "x"}}, cfg) == \
-        {"capacity_mbps": 2000, "fair_share_pct": 100, "name": "x", "http3": True}
+        {"capacity_mbps": 2000, "fair_share_pct": 100, "name": "x", "http3": True, "public_tag": ""}
     assert agent.norm_node({"node": "junk"}, make_cfg(tmp_path))["fair_share_pct"] == 25
     tag = agent.node_tag("ir-1")
     assert re.fullmatch(r"[0-9a-f]{8}", tag) and tag == agent.node_tag("ir-1") != agent.node_tag("ir-2")

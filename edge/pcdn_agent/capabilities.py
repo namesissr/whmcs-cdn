@@ -179,3 +179,15 @@ def module_blocks(text: str, modules) -> str:
     while prev != text:   # nested guards resolve from the inside out
         prev, text = text, _GUARD.sub(sub, text)
     return text
+
+
+# ----------------------------------------------------------------- self-upgrade (SPEC §23.2)
+
+def self_upgrade_enabled(cfg: dict) -> bool:
+    """SELF_UPGRADE (agent.conf, default yes): no / false / 0 / off turn the self-upgrade off."""
+    return str(cfg.get("SELF_UPGRADE") or "yes").strip().lower() not in ("no", "false", "0", "off")
+
+
+def self_upgrade_capable(cfg: dict) -> bool:
+    """capabilities.self_upgrade: switched on and the node can start a transient unit (systemd-run)."""
+    return self_upgrade_enabled(cfg) and shutil.which("systemd-run") is not None

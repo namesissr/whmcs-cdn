@@ -236,3 +236,33 @@ body {
   .refresh span { display: none; }
   .refresh { padding: 8px 10px; }
 }
+
+/* ---------- abuse report form (abuse.html, SPEC §23.10) */
+.intro, .privacy { color: var(--text-2); line-height: 1.8; margin: 0 0 14px; }
+.privacy { font-size: .85rem; margin: 14px 0 0; }
+.abuse-form { display: grid; gap: 12px; }
+.abuse-form.inline { grid-template-columns: 1fr 1fr auto; align-items: end; }
+.abuse-form label { display: grid; gap: 6px; font-size: .9rem; color: var(--text-2); }
+.abuse-form input, .abuse-form select, .abuse-form textarea {
+  font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; width: 100%;
+}
+.abuse-form textarea { resize: vertical; }
+.abuse-form .hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+.primary {
+  font: inherit; cursor: pointer; border: 0; border-radius: 8px; padding: 9px 18px;
+  background: var(--info); color: #fff; justify-self: start;
+}
+.primary[disabled] { opacity: .6; cursor: progress; }
+.msg { margin: 6px 0 0; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--neutral-bd); background: var(--neutral-bg); }
+.msg-bad { border-color: var(--bad-bd); background: var(--bad-bg); color: var(--bad); }
+.msg-info { border-color: var(--info-bd); background: var(--info-bg); color: var(--info); }
+.result { margin-top: 14px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--ok-bd); background: var(--ok-bg); }
+.result code { font-size: 1rem; user-select: all; }
+.warnline { color: var(--warn); font-size: .9rem; }
+.statusbox { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 12px 0 0; }
+.statusbox dt { color: var(--muted); }
+.statusbox dd { margin: 0; }
+.foot a { color: var(--info); }
+@media (max-width: 600px) { .abuse-form.inline { grid-template-columns: 1fr; } }
+.abuse-link { color: var(--muted); font-size: .85rem; }

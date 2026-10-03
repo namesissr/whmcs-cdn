@@ -1,0 +1,86 @@
+<!doctype html>
+<!--
+  فرم عمومی گزارش تخلف «پاسارگاد سی‌دی‌ان» — SPEC §23.10 (Public abuse report form)
+  مستقل و بدون وابستگی، مثل index.html؛ نشانی کنترلر مثل status.js: ?api=  ←  ABUSE_API_BASE در abuse.js  ←  همان مبدأ.
+  نیاز به ABUSE_ENABLED=true روی کنترلر دارد (در غیر این‌صورت پیام «فعال نیست» نمایش داده می‌شود).
+-->
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>گزارش تخلف — پاسارگاد سی‌دی‌ان</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232f9e44' d='M13 2 3 14h9l-1 8 10-12h-9z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="status.css">
+</head>
+<body>
+<main class="wrap" id="app">
+  <header class="top">
+    <div class="brand">
+      <span class="bolt" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>
+      </span>
+      <div>
+        <h1 data-t="title">گزارش تخلف</h1>
+        <p class="sub" data-t="sub">پاسارگاد سی‌دی‌ان</p>
+      </div>
+    </div>
+    <button type="button" class="refresh" id="langBtn"><span data-t="lang">English</span></button>
+  </header>
+
+  <section class="card">
+    <p class="intro" data-t="intro"></p>
+    <form id="form" class="abuse-form" novalidate>
+      <label><span data-t="category"></span>
+        <select id="category" required>
+          <option value="phishing"></option><option value="malware"></option><option value="illegal"></option>
+          <option value="spam"></option><option value="copyright"></option><option value="other"></option>
+        </select>
+      </label>
+      <label><span data-t="urls"></span>
+        <textarea id="urls" rows="4" dir="ltr" required placeholder="https://example.com/page"></textarea>
+      </label>
+      <label><span data-t="desc"></span>
+        <textarea id="desc" rows="5" maxlength="4000"></textarea>
+      </label>
+      <label><span data-t="email"></span>
+        <input id="email" type="email" dir="ltr" maxlength="254" autocomplete="email">
+      </label>
+      <!-- honeypot: humans never see or fill it -->
+      <div class="hp" aria-hidden="true"><label>Website <input id="website" type="text" tabindex="-1" autocomplete="off"></label></div>
+      <button type="submit" class="primary" id="send" data-t="submit">ارسال گزارش</button>
+      <p class="msg" id="formMsg" role="status" aria-live="polite" hidden></p>
+    </form>
+    <div class="result" id="result" hidden>
+      <strong data-t="done"></strong>
+      <p><span data-t="ticket"></span>: <code id="resTicket" dir="ltr"></code></p>
+      <p><span data-t="token"></span>: <code id="resToken" dir="ltr"></code></p>
+      <p class="warnline" data-t="keep"></p>
+    </div>
+    <p class="privacy" data-t="privacy"></p>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title" data-t="lookup"></h2>
+    <form id="lookupForm" class="abuse-form inline">
+      <label><span data-t="ticket"></span><input id="ticketIn" dir="ltr" maxlength="11" placeholder="AB-XXXXXXXX"></label>
+      <label><span data-t="token"></span><input id="tokenIn" dir="ltr" maxlength="64" autocomplete="off"></label>
+      <button type="submit" class="primary" data-t="check">نمایش وضعیت</button>
+    </form>
+    <p class="msg" id="lookupMsg" role="status" aria-live="polite" hidden></p>
+    <dl class="statusbox" id="statusBox" hidden>
+      <dt data-t="status"></dt><dd id="stStatus"></dd>
+      <dt data-t="created"></dt><dd id="stCreated"></dd>
+      <dt data-t="updated"></dt><dd id="stUpdated"></dd>
+      <dt data-t="note"></dt><dd id="stNote"></dd>
+    </dl>
+  </section>
+
+  <footer class="foot">
+    <a id="backLink" href="index.html" data-t="back">صفحهٔ وضعیت</a>
+  </footer>
+</main>
+<script src="abuse.js" defer></script>
+</body>
+</html>

@@ -262,6 +262,22 @@ DEFAULTS = {
     "SYSCTL_DIR": "/etc/sysctl.d",
     # nginx master pid file (§22.6 open-files check)
     "NGINX_PID_FILE": "/run/nginx.pid",
+    # ---- SPEC §23 (wave 14: release safety, operations and customer experience)
+    # §23.1: the installed release ("vX.Y.Z", copied by install.sh from the bundle's edge/RELEASE; absent =
+    # unknown) reported in every heartbeat as `release`
+    "RELEASE_FILE": "/etc/pcdn/release",
+    # §23.2 self-upgrade: SELF_UPGRADE=no -> capabilities.self_upgrade false (rollouts list the node as
+    # `manual`); UPGRADE_DIR holds the unpacked bundle of a running upgrade (0700), RELEASES_DIR the
+    # installed release tarballs kept for rollback (0600, the last 3, written by install.sh)
+    "SELF_UPGRADE": "yes",
+    "UPGRADE_DIR": "/var/lib/pcdn/upgrade",
+    "RELEASES_DIR": "/var/lib/pcdn/releases",
+    # §23.7 RUM: optional DB-IP "IP to ASN Lite" mmdb (used only if present; else asn 0) and optional
+    # city / subdivision mmdb for the region (empty = no region). RUM_LOG: the beacon log the agent
+    # tails (one sanitized JSON line per beacon, no IP field exists in its format)
+    "RUM_ASN_DB": "/usr/share/pcdn/geo/asn.mmdb",
+    "RUM_REGION_DB": "",
+    "RUM_LOG": "/var/log/nginx/pcdn-rum.log",
 }
 
 

@@ -114,7 +114,7 @@ def base_url() -> str:
 
 
 def install_command(token: str, region: str | None = None, role: str | None = None,
-                    extra: str = "") -> str:
+                    extra: str = "", version: str | None = None) -> str:
     """The copy-paste one-command install for a node with this one-time token (SPEC §11.1). The
     token travels in the environment (PCDN_EDGE_TOKEN, read by edge/bootstrap.sh), not on bash's
     argv, so it is not visible to other local users in ps / /proc/<pid>/cmdline while it installs."""
@@ -125,6 +125,129 @@ def install_command(token: str, region: str | None = None, role: str | None = No
         cmd += f" --region {region}"
     if role in _VALID_ROLE:
         cmd += f" --role {role}"
+    if version and VERSION_RE.match(version):  # SPEC §23.1: the pinned release of the edge's group
+        cmd += f" --version {version}"
     if extra:
         cmd += f" {extra}"
     return cmd
+
+
+# ---- pinned edge releases (SPEC §23.1) -------------------------------------
+#
+# EDGE_RELEASES_DIR holds pcdn-edge-vX.Y.Z.tar.gz + pcdn-edge-vX.Y.Z.tar.gz.sha256 (sha256sum format),
+# filled by the operator (tools/release/fetch-edge-release.sh / build-edge-bundle.sh). Empty = off:
+# every bundle route behaves exactly as before. File names are always built from a validated version.
+
+import logging  # noqa: E402
+import re  # noqa: E402
+
+log = logging.getLogger("pcdn.bundle")
+
+VERSION_RE = re.compile(r"^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
+GROUP_PIN_KEY = "edge_release:group:{}"
+GROUPS = ("general", "tunnel")
+_warned: set[str] = set()
+
+
+def releases_dir() -> str | None:
+    d = settings.edge_releases_dir
+    return d if d and os.path.isdir(d) else None
+
+
+def releases_enabled() -> bool:
+    return bool(settings.edge_releases_dir)
+
+
+def release_file(version: str) -> str | None:
+    """Absolute path of the tarball of a validated version, or None (no dir / unknown version)."""
+    d = releases_dir()
+    if d is None or not VERSION_RE.match(version or ""):
+        return None
+    path = os.path.join(d, f"pcdn-edge-{version}.tar.gz")
+    return path if os.path.isfile(path) else None
+
+
+def _hash_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def release_sha256(version: str) -> str | None:
+    """The sha256 of a release: its .sha256 file (sha256sum format), else computed from the tarball."""
+    path = release_file(version)
+    if path is None:
+        return None
+    try:
+        with open(path + ".sha256", encoding="utf-8") as f:
+            first = (f.read().split() or [""])[0].lower()
+        if re.match(r"^[0-9a-f]{64}$", first):
+            return first
+    except OSError:
+        pass
+    return _hash_file(path)
+
+
+def semver_key(version: str):
+    """Sort key per SemVer §11 (a pre-release sorts before its release)."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$", version or "")
+    if not m:
+        return (0, 0, 0, 0, ())
+    pre = m.group(4)
+    ids = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")) if pre else ()
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if pre else 1, ids)
+
+
+def list_releases() -> list[dict]:
+    """[{"version", "sha256", "size"}] of EDGE_RELEASES_DIR, newest SemVer first."""
+    d = releases_dir()
+    if d is None:
+        return []
+    out = []
+    for name in os.listdir(d):
+        m = re.match(r"^pcdn-edge-(v.+)\.tar\.gz$", name)
+        if not m or not VERSION_RE.match(m.group(1)):
+            continue
+        v = m.group(1)
+        out.append({"version": v, "sha256": release_sha256(v), "size": os.path.getsize(os.path.join(d, name))})
+    out.sort(key=lambda r: semver_key(r["version"]), reverse=True)
+    return out
+
+
+def configured_pin() -> str | None:
+    """EDGE_RELEASE when it exists in EDGE_RELEASES_DIR (else logged once and ignored)."""
+    v = settings.edge_release
+    if not v:
+        return None
+    if release_file(v) is None:
+        if v not in _warned:
+            _warned.add(v)
+            log.error("EDGE_RELEASE=%s is not in EDGE_RELEASES_DIR (or the format is invalid); ignored, "
+                      "new installs get the live bundle", v[:40])
+        return None
+    return v
+
+
+def group_pin(db, group: str) -> str | None:
+    """Effective pin of an edge group: a completed rollout's state value, else EDGE_RELEASE."""
+    if not releases_enabled():
+        return None
+    from . import kv
+
+    row = kv.get_json(db, GROUP_PIN_KEY.format(group)) if db is not None else {}
+    v = row.get("release") if isinstance(row, dict) else None
+    if v and release_file(v):
+        return v
+    return configured_pin()
+
+
+def set_group_pin(db, group: str, release: str) -> None:
+    from . import kv
+
+    kv.set_json(db, GROUP_PIN_KEY.format(group), {"release": release})
+
+
+def pins(db) -> dict[str, str | None]:
+    return {g: group_pin(db, g) for g in GROUPS}

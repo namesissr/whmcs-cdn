@@ -795,6 +795,68 @@ PATCH /api/v1/incidents/{id}             # {title?, body?, severity?, status?}
 تمدید بعدی دوباره تلاش می‌شود). OCSP stapling فقط برای گواهی‌هایی روشن می‌شود که آدرس OCSP دارند (گواهی‌های
 Let's Encrypt از ۲۰۲۵ ندارند).
 
+## ۱۰. موج ۱۴ — انتشار نسخه، پشتیبان، هشدار مشتری، نود جدید و گزارش تخلف (SPEC §23)
+
+همهٔ کلیدهای این بخش به‌صورت پیش‌فرض رفتار قبلی را نگه می‌دارند (فهرست کامل در `.env.example`).
+
+### انتشار مرحله‌ای نسخهٔ نودها (rollout)
+1. فایل‌های انتشار را در `EDGE_RELEASES_DIR` بگذارید (`tools/release/fetch-edge-release.sh vX.Y.Z --dir …`).
+   بدون این مسیر همهٔ مسیرهای bundle مثل قبل رفتار می‌کنند.
+2. پیش‌نمایش: `POST /api/v1/rollouts {"release": "v2.1.0", "dry_run": true}` — حلقه‌ها (ring 0 = یک canary
+   در هر گروه، ring 1 = ۲۵٪، ring 2 = بقیه) و نودهای `manual` (عامل بدون `self_upgrade`) را نشان می‌دهد.
+3. ایجاد و `POST /api/v1/rollouts/{id}/start`. کار `job_rollout` در هر تیک نودها را با رعایت
+   `ROLLOUT_PARALLEL` در هر استخر گروه+منطقه شروع می‌کند، `node.upgrade` را در پیکربندی همان نود می‌گذارد،
+   پس از گزارش `upgrade.state = done` دورهٔ پایش (`soak_minutes`) را اجرا می‌کند و دروازهٔ سلامت را
+   می‌سنجد: ضربان قلب، نبود `last_error` و اعمال نسخهٔ پیکربندی ظرف ۱۰ دقیقه، پروب کنترلر، پروب تونل
+   (فقط با قابلیت `tunnel_probe`) و درصد خطای پلتفرم (پس از ۲۰۰ درخواست؛ سقف `max(ROLLOUT_MAX_ERROR_PCT,
+   ۲ × خط پایه)`).
+4. خرابی → با `auto_rollback` همهٔ نودهای ارتقایافته به `from_release` برمی‌گردند (هشدار بحرانی
+   `rollout_failed:<id>`). آخرین نود یک استخر هرگز بی‌صدا ارتقا نمی‌یابد: انتشار با `last_edge:<name>` متوقف
+   می‌شود (هشدار `rollout_blocked:<id>`) و شما «رد کردن» (`skip`) یا «ارتقا بدون تخلیه» (`force`) را
+   انتخاب می‌کنید. پس از پایان، نسخهٔ پین‌شدهٔ هر گروهِ کاملاً به‌روز (`edge_release:group:<g>`) جلو می‌رود.
+5. ادغام، تگ و انتشار GitHub تصمیم مالک است (docs/RELEASE.md).
+
+### پشتیبان خارج از سرور و آزمون بازیابی هفتگی
+- `BACKUP_ENCRYPTION_KEY` (نام جدید `BACKUP_PASSPHRASE`؛ اگر هر دو باشند باید برابر باشند) و هرگز برابر
+  `DATA_ENCRYPTION_KEY`. پس از هر بارگذاری، شیء با `HEAD` (اندازه + `x-amz-meta-sha256`) دوباره خوانده می‌شود.
+- هشدارها: `backup_not_offsite` (اطلاع)، `backup_unencrypted_offsite` (هشدار؛ با
+  `BACKUP_REQUIRE_ENCRYPTION=true` بارگذاری رد می‌شود)، `backup_verify_failed` (بحرانی)،
+  `backup_verify_partial` (دو هفتهٔ پیاپی سطح جزئی).
+- آزمون بازیابی: `BACKUP_VERIFY_ENABLED=true` (روز `BACKUP_VERIFY_WEEKDAY`، ساعت `BACKUP_VERIFY_HOUR` UTC).
+  برای PostgreSQL یک پایگاه آزمایشی جدا در `BACKUP_VERIFY_DATABASE_URL` بسازید (هرگز همان پایگاه زنده؛
+  کنترلر پایگاهی را که جدول `pcdn_live_marker` دارد رد می‌کند). اجرای دستی:
+  `POST /api/v1/backups/run` و `POST /api/v1/backups/verify`؛ وضعیت: `GET /api/v1/backups`.
+
+### ارائه‌دهندگان پیامک و ربات‌های مشتری
+- `SMS_PROVIDER=kavenegar|smsir|melipayamak` + `SMS_API_KEY` + `SMS_SENDER`؛ ربات‌ها
+  `TELEGRAM_CUSTOMER_BOT_TOKEN/USERNAME` و `BALE_BOT_TOKEN/USERNAME` (جدا از ربات هشدار اپراتور). کلیدها فقط در
+  env هستند و در پایگاه داده، لاگ، حسابرسی یا پاسخ API دیده نمی‌شوند (`GET /api/v1/notifications/status`).
+- `job_bots` هر ~۳۰ ثانیه `getUpdates` می‌گیرد (`/start <code>` اتصال، `/stop` لغو). `job_notify` پیامک/پیام را
+  با سه تلاش دوباره (۱، ۵، ۱۵ دقیقه) می‌فرستد؛ ایمیل‌ها را افزونهٔ WHMCS از outbox می‌کشد.
+- قوانین: سقف‌ها `NOTIFY_RATE_*` (بیش از سقف → یک خلاصه در ساعت)، حذف تکرار `NOTIFY_DEDUP_MINUTES`، ساعات سکوت
+  به وقت تهران، و پیامک فقط با قابلیت پلن `alert_sms` و بله/تلگرام با `alert_messengers`.
+
+### پیشنهاد افزودن نود (دو تأیید)
+`PROVISIONING_ENABLED=true` و `PROVISIONER_TOKEN` (≥ ۳۲ نویسه) و `DATA_ENCRYPTION_KEY` لازم است. هشدار ظرفیت
+→ پیشنهاد (اندازه‌گیری فقط از ظرفیت) → «تأیید» (نودها با `0.0.0.0` و توکن پیوستن یک‌بارمصرف ساخته
+می‌شوند) → provisioner طرح terraform را بارگذاری می‌کند → «اجرای طرح» (طرحی که چیزی را حذف کند رد می‌شود) →
+اجرا → پیوستن نودها. برای نودی که هنوز وصل نشده: `POST /api/v1/edges/{id}/join-token`.
+
+### میز رسیدگی به تخلف
+`ABUSE_ENABLED=true` فرم عمومی را فعال می‌کند (اثبات کار با `ABUSE_POW_BITS`، سقف `ABUSE_RATE_PER_HOUR` در
+ساعت برای هر IP). روال: بررسی (`triage`) → «اطلاع به مالک» (ایمیل `abuse.notice` با مهلت
+`ABUSE_DEADLINE_HOURS`؛ هویت گزارش‌دهنده هرگز فرستاده نمی‌شود) → در صورت لزوم «تعلیق» (`abuse_suspended`؛
+رفع تعلیق صورت‌حساب آن را پاک نمی‌کند) → «بستن». مهلت گذشته → هشدار `abuse_overdue:<id>`. ایمیل گزارش‌دهنده
+`ABUSE_RETENTION_DAYS` پس از بستن و هش IP پس از ۳۰ روز پاک می‌شوند.
+
+### تاریخچهٔ تنظیمات، واردکردن از آروان، RUM و SLO
+- هر تغییر بخش‌ها یک نسخه می‌سازد (`CONFIG_HISTORY_*`؛ هرس روزانه در `job_cleanup`).
+- واردکردن از ArvanCloud/Cloudflare: کلید مشتری فقط در همان درخواست استفاده می‌شود؛ دادهٔ دریافتی
+  رمزنگاری‌شده در `import_sessions` (بدون `DATA_ENCRYPTION_KEY` فقط در حافظهٔ همین پردازه).
+- RUM: `RUM_RETENTION_DAYS`؛ هیچ بخش انتخاب نود از دادهٔ RUM استفاده نمی‌کند.
+- SLO: `GET /api/v1/slo`، هشدارهای `slo_burn_fast|slow|budget_exhausted` (فقط اپراتور؛ `SLO_ENABLED=false` برای
+  خاموش کردن). یا هشدارهای کنترلر یا قواعد Prometheus را pager کنید، نه هر دو.
+
 ## مرجع دستورهای مدیریتی
 
 ```text

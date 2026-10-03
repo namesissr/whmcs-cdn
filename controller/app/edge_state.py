@@ -27,7 +27,9 @@ log = logging.getLogger("pcdn.edge_state")
 
 DRAIN_STATES = ("", "draining", "drained")
 DRAIN_GRACE_EXTRA = 30  # seconds after PROXIED_TTL before the node refuses NEW tunnel connections
-EVENT_KINDS = ("drain_start", "drain_end", "drained", "degraded", "recovered", "upgrade")
+EVENT_KINDS = ("drain_start", "drain_end", "drained", "degraded", "recovered", "upgrade",
+               # SPEC §23.2 / §23.9 (wave 14)
+               "rollout_start", "rollout_done", "rollback", "joined")
 EVENT_DATA_MAX = 2048
 EDGE_EVENTS_RETENTION_DAYS = 90
 # a degraded edge stays degraded at least this long, even after TUNNEL_PROBE_OK_CHECKS good reports

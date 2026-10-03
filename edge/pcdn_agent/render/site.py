@@ -203,6 +203,54 @@ def speed_locations(cfg: dict, njs_ok: bool, brotli_ok: bool, flv_ok: bool = Tru
     return out
 
 
+# ----------------------------------------------------------------- RUM (SPEC §23.7)
+
+RUM_SAMPLE_MIN, RUM_SAMPLE_MAX = 0.01, 1.0
+RUM_EXCLUDE_MAX = 20
+RUM_EXCLUDE = re.compile(r"^/[A-Za-z0-9._~%/+,=:@!&()*-]{0,199}$")
+
+
+def norm_rum(site: dict) -> dict | None:
+    """Per-site edge config `rum` {"enabled", "sample", "inject", "exclude", "spa"} -> normalised, or None
+    when absent / disabled (an old controller sends none). Unsafe exclude prefixes are dropped."""
+    r = site.get("rum")
+    if not isinstance(r, dict) or r.get("enabled") is not True:
+        return None
+    try:
+        sample = float(r.get("sample", 0.1))
+    except (TypeError, ValueError):
+        sample = 0.1
+    if sample != sample:   # NaN
+        sample = 0.1
+    sample = round(max(RUM_SAMPLE_MIN, min(RUM_SAMPLE_MAX, sample)), 4)
+    exclude = []
+    for x in r.get("exclude") if isinstance(r.get("exclude"), list) else []:
+        if isinstance(x, str) and RUM_EXCLUDE.match(x) and x not in exclude and len(exclude) < RUM_EXCLUDE_MAX:
+            exclude.append(x)
+    return {"sample": sample, "inject": "manual" if r.get("inject") == "manual" else "auto",
+            "exclude": exclude, "spa": r.get("spa") is True}
+
+
+def rum_locations(cfg: dict) -> list[str]:
+    """The beacon script and the ingestion endpoint of a RUM site (SPEC §23.7). The ingestion location
+    logs only to RUM_LOG in the pcdn_rum format (the sanitized line pcdn.rumIngest sets; no address
+    field) - never to the access log, so beacons are not billed, not in fair share or tunnel telemetry.
+    The rate-limit rejections are logged at info level (below the error log's level: no address there)."""
+    js = os.path.join(cfg.get("PAGES_DIR") or "/usr/share/pcdn/pages", "rum.js")
+    if not os.path.isfile(js):
+        js = os.path.join(HERE, "pages", "rum.js")
+    log_path = cfg.get("RUM_LOG") or "/var/log/nginx/pcdn-rum.log"
+    if not SAFE_FSPATH.match(js) or not SAFE_FSPATH.match(log_path):
+        raise ValueError("unsafe PAGES_DIR / RUM_LOG")
+    return ["    location = /__pcdn/rum.js { access_log off; types { } default_type application/javascript; "
+            "charset utf-8; add_header Cache-Control \"public, max-age=3600\" always; "
+            f"add_header X-Content-Type-Options nosniff always; alias {js}; }}",
+            "    location = /__pcdn/rum { limit_req zone=pcdn_rum burst=20 nodelay; limit_req_status 429; "
+            "limit_req_log_level info; client_max_body_size 2k; client_body_buffer_size 2k; "
+            f"client_body_in_single_buffer on; access_log {log_path} pcdn_rum if=$pcdn_rum_line; "
+            "add_header Cache-Control no-store always; js_content pcdn.rumIngest; }"]
+
+
 CTL_URL = re.compile(r"^(https?)://([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::(\d{1,5}))?(/[A-Za-z0-9._~/-]{0,200})?/?$")
 SAFE_EDGE_TOKEN = re.compile(r"^[A-Za-z0-9._~+/=-]{8,512}$")
 ACCESS_OTP_PATH = "/edge/v1/access/otp"   # controller endpoint of the one-time codes (SPEC §18.2)
@@ -621,7 +669,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         for n in dict.fromkeys(list(hides) + resp_hide + tf_hide):
             lines.append(f"proxy_hide_header {n};")
         lines += list(extra_add)
-        lines.append("add_header X-Served-By $hostname always;")
+        # SPEC §23.12.2: the node's public tag ($pcdn_node), never the OS host name
+        lines.append("add_header X-Served-By $pcdn_node always;")
         if hsts_var:
             lines.append(f"add_header Strict-Transport-Security {hsts_var} always;")
         if h3:
@@ -647,6 +696,14 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
         """mode: bypass | dynamic (honour origin; ttl>0 = default TTL) | aggressive | everything | static.
         uri: explicit URI variable for proxy_pass (default: the rewrite_path result, "" = unchanged)."""
         L, hides, adds = [], [], []
+        if rum_inject and mode != "static" and not stor_now:
+            # SPEC §23.7 auto injection: HTML responses only (sub_filter_types default text/html), once,
+            # per-path replacement from the site's map (an excluded path puts </head> back unchanged);
+            # sub_filter needs an uncompressed upstream body (the edge still compresses to clients)
+            L += [f"sub_filter '</head>' '$pcdn_rum_{sid}</head>';", "sub_filter_once on;"]
+            if not any(x.lower().startswith("proxy_set_header accept-encoding ") for x in proxy_hdrs):
+                L.append('proxy_set_header Accept-Encoding "";')
+            adds.append("add_header Server-Timing $pcdn_rum_st;")
         cacheable = mode != "bypass" and cache_on
         key = None
         if not cacheable:
@@ -795,6 +852,15 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
     # a learning site (SPEC §17.1) inspects bodies log-only even when its WAF mode is off
     body_on = bool(active and njs_ok and fallback == "origin" and body_packs
                    and (waf_sec.get("mode") in ("detect", "block") or norm_waf_learning(site) is not None))
+
+    # --- SPEC §23.7 RUM: beacon script + ingestion endpoint (needs njs), auto injection on origin content
+    rum = norm_rum(site) if (active and njs_ok) else None
+    rum_inject = bool(rum and rum["inject"] == "auto" and fallback == "origin")
+    if rum_inject:
+        spa = ' data-spa="1"' if rum["spa"] else ""
+        tag = f'<script src="/__pcdn/rum.js" data-s="{rum["sample"]:g}"{spa} defer></script>'
+        out.append(f"map $uri $pcdn_rum_{sid} {{\n    default '{tag}';\n"
+                   + "".join(f"    {_qre('~^' + re.escape(x))} \"\";\n" for x in rum["exclude"]) + "}")
 
     # --- authenticated origin pulls (SPEC §14.2): client certificate on origin-bound HTTPS hops only
     # (never on the edge -> shield hop, which carries the shield's own TLS; the shield itself presents
@@ -1256,6 +1322,8 @@ def _render_site(site: dict, cfg: dict, shield: dict | None = None,
             s.append("    location = /__pcdn_drain { internal; keepalive_timeout 0; "
                      "add_header Retry-After 30 always; return 503; }")
         s += speed_locations(cfg, njs_ok, brotli_ok, bool(caps.get("flv")))
+        if rum:
+            s += rum_locations(cfg)
         if njs_ok:
             s.append("    location ^~ /__pcdn/deny/ { internal; js_content pcdn.deny; }")
             s.append("    location = /__pcdn/verify { js_content pcdn.verify; }")

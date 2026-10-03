@@ -125,6 +125,10 @@ services:
       STORAGE_ADMIN_ACCESS_KEY: ${STAGING_STORAGE_ACCESS_KEY:-}
       STORAGE_ADMIN_SECRET_KEY: ${STAGING_STORAGE_SECRET_KEY:-}
       STORAGE_INSECURE_HTTP: "true"
+      # SPEC §23.1: /healthz reports the version (staging.sh exports it from VERSION) and /healthz/deep the
+      # environment; tools/release/staging-verify.sh refuses any controller reporting "production"
+      PCDN_VERSION: ${PCDN_VERSION:-}
+      PCDN_ENVIRONMENT: staging
     volumes:
       - ../../edge:/srv/edge:ro          # secret-free edge bundle served at /edge/bundle.tar.gz
     depends_on:

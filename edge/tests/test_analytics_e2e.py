@@ -262,7 +262,7 @@ def test_live_platform_errors_and_logship_end_to_end(env):
             paths[p] = paths.get(p, 0) + n
         # SPEC §15.4: the minute with the /tun request also carries the tunnel counters
         assert set(x) - {"tunnel_attempts", "tunnel_errors"} == {"host", "minute", "requests", "bytes", "cache_hits",
-                                                                  "status", "countries", "paths"}
+                                                                  "status", "countries", "paths", "oe", "pe"}
         assert x["minute"].endswith(":00Z")
     assert sum(x.get("tunnel_attempts", 0) for x in live) == 1 and sum(x.get("tunnel_errors", 0) for x in live) == 0
     assert paths["/page"] == 3 and all("?" not in p for p in paths)

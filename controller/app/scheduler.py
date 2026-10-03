@@ -311,6 +311,12 @@ def job_cleanup(db):
     storage.prune(db)
     # SPEC §22.13: edge_events are kept 90 days
     edge_state.prune_events(db)
+    # SPEC §23: config history retention (§23.4), RUM (§23.7), expired import sessions (§23.6)
+    from . import config_history, importer, rum
+
+    config_history.prune(db)
+    rum.prune(db)
+    importer.prune(db)
     db.commit()
 
 
@@ -333,12 +339,16 @@ BACKUP_RETRY = timedelta(hours=1)
 
 
 def job_backup(db, now: datetime | None = None, force: bool = False):
-    """Daily backup at BACKUP_HOUR (UTC); a missed hour runs later the same day."""
-    if not settings.backup_enabled and not force:
-        return
-    from . import backup
+    """Daily backup at BACKUP_HOUR (UTC); a missed hour runs later the same day. SPEC §23.3: a run
+    queued by POST /api/v1/backups/run is taken within one tick; every run is a backup_runs row and every
+    stored / alerted error is scrubbed of secrets."""
+    from . import backup, backup_runs
 
     now = now or utcnow()
+    queued = backup_runs.take(db, "backup")
+    force = force or queued
+    if not settings.backup_enabled and not force:
+        return
     today = now.date().isoformat()
     if not force:
         if now.hour < settings.backup_hour or _state(db, "backup:last_success_day") == today:
@@ -346,25 +356,63 @@ def job_backup(db, now: datetime | None = None, force: bool = False):
         last_fail = _state(db, "backup:last_failure_at")
         if last_fail and now - datetime.fromisoformat(last_fail) < BACKUP_RETRY:
             return
+    run = backup_runs.start(db, "backup", now)
     db.rollback()  # do not hold a transaction open while dumping the database
     try:
+        problem = backup.key_problem()
+        if problem:
+            raise backup.BackupError(problem)
         result = backup.create_backup(now=now)
     except Exception as e:  # noqa: BLE001
-        log.exception("backup failed")
+        err = backup.scrub(e)
+        log.error("backup failed: %s", err)
         _set_state(db, "backup:last_failure_at", now.isoformat())
-        _set_state(db, "backup:last_error", str(e)[-1000:])
+        _set_state(db, "backup:last_error", err)
         db.commit()
+        backup_runs.finish(db, run, False, error=err, checks={})
+        if queued:
+            backup_runs.done(db, "backup")
         alerts.raise_alert("backup_failed", "پشتیبان‌گیری ناموفق بود",
                            f"پشتیبان‌گیری خودکار کنترلر ناموفق بود؛ یک ساعت بعد دوباره تلاش می‌شود.\n"
-                           f"خطا: {str(e)[-600:]}", "critical")
+                           f"خطا: {err[-600:]}", "critical")
         return
     _set_state(db, "backup:last_success_day", today)
     _set_state(db, "backup:last_success_at", now.isoformat())
     _set_state(db, "backup:last_file", result["name"])
     _set_state(db, "backup:last_failure_at", "")
     db.commit()
+    backup_runs.finish(db, run, True, name=result["name"], size=result["size"], sha256=result.get("sha256"),
+                       location="both" if result.get("uploaded") else "local",
+                       checks={"encrypted": result["encrypted"], "uploaded": result["uploaded"],
+                               "offsite_verified": bool(result.get("uploaded"))})
+    if queued:
+        backup_runs.done(db, "backup")
+    backup_runs.offsite_alerts(result["encrypted"])
     alerts.resolve_alert("backup_failed", f"پشتیبان‌گیری دوباره موفق شد: {result['name']}"
                          + (" (در فضای ابری هم بارگذاری شد)" if result.get("uploaded") else ""))
+
+
+def job_backup_verify(db, now: datetime | None = None, force: bool = False):
+    """SPEC §23.3: the weekly restore test (BACKUP_VERIFY_ENABLED, weekday/hour UTC) or a queued one."""
+    from . import backup, backup_runs
+
+    now = now or utcnow()
+    queued = backup_runs.take(db, "verify")
+    if not (force or queued or backup_runs.verify_due(db, now)):
+        return None
+    run = backup_runs.start(db, "verify", now)
+    db.rollback()
+    result = backup.verify_backup()
+    backup_runs.finish(db, run, result["ok"], name=result["name"], size=result["size"], sha256=result["sha256"],
+                       location=result["location"], level=result["level"], checks=result["checks"],
+                       error=result["error"])
+    _set_state(db, "backup:verify_at", now.isoformat())
+    _set_state(db, "backup:verify_ok", "1" if result["ok"] else "0")
+    db.commit()
+    if queued:
+        backup_runs.done(db, "verify")
+    backup_runs.record_verify_alerts(db, result)
+    return result
 
 
 GEO_CHECK_INTERVAL = timedelta(minutes=10)
@@ -409,6 +457,14 @@ def job_probe(db, now: datetime | None = None, force: bool = False):
         return
     probe.run(db, now)
     _set_state(db, "probe:last_run", now.isoformat())
+    # SPEC §23.11: one availability / latency tick per edge group (operator SLO)
+    from . import slo
+
+    try:
+        slo.record_probe_tick(db, now)
+    except Exception:  # noqa: BLE001 - never fail the probe job on the SLO bookkeeping
+        log.exception("slo probe tick failed")
+        db.rollback()
     db.commit()
 
 
@@ -575,8 +631,65 @@ def job_tls_tickets(db, now: datetime | None = None, force: bool = False):
 
 def job_capacity(db, now: datetime | None = None, force: bool = False):
     """Daily: edge-group capacity alert from the 3-day p95 of the hourly tx (SPEC §15.5, leader
-    only)."""
-    return tunnel_quality.check_capacity(db, now, force=force)
+    only); SPEC §23.9: an open capacity alert writes a provisioning proposal (PROVISIONING_ENABLED)."""
+    report = tunnel_quality.check_capacity(db, now, force=force)
+    if report is not None and settings.provisioning_enabled:
+        from . import provisioning
+
+        provisioning.propose_from_capacity(db, report, now)
+    return report
+
+
+# ---- wave 14 (SPEC §23) -------------------------------------------------------------------------
+
+def job_rollout(db, now: datetime | None = None):
+    """SPEC §23.2: advance the active staged rollout (health gates, automatic rollback)."""
+    from . import rollout
+
+    return rollout.tick(db, now)
+
+
+BOTS_INTERVAL = timedelta(seconds=30)
+
+
+def job_bots(db, now: datetime | None = None, force: bool = False):
+    """SPEC §23.5: poll the customer Telegram / Bale bots (getUpdates) every ~30 s: /start <code>, /stop."""
+    from . import notify, notify_providers
+
+    if notify_providers.bot("telegram") is None and notify_providers.bot("bale") is None:
+        return 0
+    now = now or utcnow()
+    last = _state(db, "bots:last_run")
+    if not force and last and now - datetime.fromisoformat(last) < BOTS_INTERVAL:
+        return 0
+    _set_state(db, "bots:last_run", now.isoformat())
+    db.commit()
+    return notify.poll_bots(db, now)
+
+
+def job_notify(db, now: datetime | None = None):
+    """SPEC §23.5: web origin-down / up detection, daily ssl.expiring, send due SMS / bot messages."""
+    from . import notify
+
+    now = now or utcnow()
+    notify.check_web_origins(db, now)
+    notify.check_ssl_expiring(db, now)
+    return notify.run(db, now)
+
+
+def job_slo(db, now: datetime | None = None):
+    """SPEC §23.11: SLO error counters, hourly rollup, burn-rate alerts (SLO_ENABLED)."""
+    from . import slo
+
+    return slo.run(db, now)
+
+
+def job_abuse(db, now: datetime | None = None):
+    """SPEC §23.10 / §23.9: abuse overdue alerts + retention, provisioning proposal states."""
+    from . import abuse, provisioning
+
+    abuse.check(db, now)
+    provisioning.check(db, now)
 
 
 # metrics: per-job last-completed timestamps are stored in the State table under this prefix
@@ -586,9 +699,12 @@ JOBRUN_PREFIX = "jobrun:"
 # job_bot_ranges goes last: its (rare, daily) outbound fetch must not delay the other jobs of a tick
 JOBS = [job_drain, job_edges, job_uptime, job_probe, job_record_health, job_alerts, job_geo, job_ns, job_quota,
         job_tunnel_origin, job_capacity, job_tls_tickets, job_cleanup, job_prune_audit, job_ssl, job_backup, job_origin_pull, job_webhooks,
-        job_log_export, job_storage, job_storage_rotation, job_security_audit, job_waf_learning, job_bot_ranges]
+        job_log_export, job_storage, job_storage_rotation, job_security_audit, job_waf_learning,
+        # wave 14 (SPEC §23)
+        job_rollout, job_notify, job_slo, job_abuse, job_backup_verify, job_bots,
+        job_bot_ranges]
 # run again between two full ticks (every FAST_INTERVAL seconds) while this instance leads
-FAST_JOBS = [job_webhooks]
+FAST_JOBS = [job_webhooks, job_bots]
 FAST_INTERVAL = 30.0
 
 
@@ -614,9 +730,14 @@ def run_once():
         db.rollback()
     finally:
         db.close()
+    from . import config_history
+
     for job in JOBS:
         db = SessionLocal()
         failed = None
+        # SPEC §23.4: config versions written by a job are attributed to it (actor system, job:<name>)
+        token = config_history.set_actor(kind="system", actor=f"job:{job.__name__}",
+                                         source="waf_learning" if job.__name__ == "job_waf_learning" else "system")
         try:
             job(db)
         except Exception as e:  # noqa: BLE001
@@ -625,6 +746,7 @@ def run_once():
             failed = e
         finally:
             db.close()
+            config_history.ACTOR.reset(token)
         key = f"job_failed:{job.__name__}"
         if failed is not None:
             alerts.raise_alert(key, f"خطا در کار زمان‌بندی‌شده {job.__name__}",

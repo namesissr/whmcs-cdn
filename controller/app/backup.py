@@ -178,12 +178,14 @@ class S3Client:
         return f"{base.scheme}://{base.netloc.decode()}{path}", path
 
     def sign(self, method: str, url: str, path: str, query: dict[str, str], payload_hash: str,
-             now: dt.datetime | None = None) -> dict[str, str]:
+             now: dt.datetime | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
         now = now or dt.datetime.now(dt.timezone.utc)
         amz_date, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
         u = httpx.URL(url)
         host = u.host + (f":{u.port}" if u.port else "")
         headers = {"host": host, "x-amz-content-sha256": payload_hash, "x-amz-date": amz_date}
+        # SPEC §23.3: x-amz-meta-* headers (e.g. the archive's sha256) are part of the signature
+        headers.update({k.lower(): v for k, v in (extra or {}).items()})
         signed = ";".join(sorted(headers))
         canonical_query = "&".join(
             f"{quote(k, safe='-_.~')}={quote(v, safe='-_.~')}" for k, v in sorted(query.items()))
@@ -199,6 +201,7 @@ class S3Client:
         out = {"x-amz-content-sha256": payload_hash, "x-amz-date": amz_date,
                "Authorization": f"AWS4-HMAC-SHA256 Credential={self.access_key}/{scope}, "
                                 f"SignedHeaders={signed}, Signature={sig}"}
+        out.update({k.lower(): v for k, v in (extra or {}).items()})
         return out
 
     def _request(self, method: str, key: str = "", query: dict | None = None, content=None,
@@ -221,12 +224,13 @@ class S3Client:
             raise BackupError(f"S3 {method} {key or self.bucket}: HTTP {r.status_code} {r.text[:300]}")
         return r
 
-    def put_file(self, key: str, path: str):
+    def put_file(self, key: str, path: str, meta: dict[str, str] | None = None):
         digest = _sha256_file(path)
         size = os.path.getsize(path)
         with open(path, "rb") as f:
             url, upath = self._url_and_path(key)
-            headers = self.sign("PUT", url, upath, {}, digest)
+            extra = {f"x-amz-meta-{k}": v for k, v in (meta or {}).items()}
+            headers = self.sign("PUT", url, upath, {}, digest, extra=extra)
             headers["Content-Length"] = str(size)
             headers["Content-Type"] = "application/octet-stream"
             r = self.http.put(url, headers=headers, content=f)
@@ -267,6 +271,15 @@ class S3Client:
 
     def delete(self, key: str):
         self._request("DELETE", key)
+
+    def head(self, key: str) -> dict:
+        """SPEC §23.3 off-site check: {"size", "sha256" (x-amz-meta-sha256 or None)}."""
+        r = self._request("HEAD", key)
+        try:
+            size = int(r.headers.get("content-length") or -1)
+        except ValueError:
+            size = -1
+        return {"size": size, "sha256": r.headers.get("x-amz-meta-sha256")}
 
     def download(self, key: str, path: str):
         self._request("GET", key, stream_to=path)
@@ -386,7 +399,7 @@ def create_backup(out_dir: str | None = None, passphrase: str | None = None, upl
                   s3: S3Client | None = None, now: dt.datetime | None = None) -> dict:
     """Write one archive to out_dir (BACKUP_DIR), rotate, upload. Raises BackupError."""
     out_dir = out_dir or settings.backup_dir
-    passphrase = settings.backup_passphrase if passphrase is None else passphrase
+    passphrase = backup_key() if passphrase is None else passphrase
     os.makedirs(out_dir, mode=0o700, exist_ok=True)
     name = backup_name(now, encrypted=bool(passphrase))
     final = os.path.join(out_dir, name)
@@ -415,9 +428,15 @@ def create_backup(out_dir: str | None = None, passphrase: str | None = None, upl
             "format": FORMAT_VERSION,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "alembic_revision": _alembic_revision(),
+            "app_version": settings.app_version,
+            # SPEC §23.3: row counts of the dump and the sha256 of every member file (restore test)
+            "counts": _dump_counts(db_file, contents["controller"]["kind"]),
+            "sha256": {f: _sha256_file(os.path.join(stage, f)) for f in sorted(os.listdir(stage))},
             "contents": contents,
             "warnings": warnings,
         }
+        if "pdns" in contents:
+            contents["pdns"]["domains"] = _pdns_domains(os.path.join(stage, "pdns.sqlite3"))
         tar_path = os.path.join(tmp, "backup.tar.gz")
         with tarfile.open(tar_path, "w:gz") as tar:
             data = json.dumps(manifest, indent=2).encode()
@@ -436,17 +455,28 @@ def create_backup(out_dir: str | None = None, passphrase: str | None = None, upl
         os.replace(tar_path, final)
     for w in warnings:
         log.warning("backup: %s", w)
+    digest = _sha256_file(final)
     result = {"path": final, "name": name, "size": os.path.getsize(final), "encrypted": bool(passphrase),
-              "warnings": warnings, "uploaded": False, "pruned_local": prune_local(out_dir, settings.backup_keep)}
+              "sha256": digest, "warnings": warnings, "uploaded": False,
+              "pruned_local": prune_local(out_dir, settings.backup_keep)}
     if upload:
         s3 = s3 or S3Client.from_settings()
         if s3 is not None:
+            if not passphrase and settings.backup_require_encryption:
+                raise BackupError("backup_unencrypted_refused")
             key = settings.backup_s3_prefix + name
-            s3.put_file(key, final)
+            s3.put_file(key, final, meta={"sha256": digest})
+            # SPEC §23.3: read the object back (HEAD: size + the sha256 set on PUT)
+            head = s3.head(key)
+            if head["size"] != result["size"] or (head["sha256"] or "").lower() != digest:
+                raise BackupError("offsite_verify_failed")
             result["uploaded"] = True
             result["remote_key"] = key
             result["pruned_remote"] = prune_remote(s3, settings.backup_s3_prefix,
                                                    settings.backup_s3_keep or settings.backup_keep)
+            if settings.backup_s3_keep_days > 0:
+                result["pruned_remote"] += prune_remote_days(s3, settings.backup_s3_prefix,
+                                                             settings.backup_s3_keep_days, now)
     log.info("backup written: %s (%d bytes, encrypted=%s, uploaded=%s)",
              final, result["size"], result["encrypted"], result["uploaded"])
     return result
@@ -562,7 +592,7 @@ def restore_dir(src: str, target: str):
 def restore(path: str, passphrase: str | None = None, controller: bool = True, pdns_target: str | None = None,
             acme_target: str | None = None, extract_to: str | None = None, url: str | None = None) -> dict:
     """Restore selected parts of a backup. Callers must have confirmed (--yes)."""
-    passphrase = settings.backup_passphrase if passphrase is None else passphrase
+    passphrase = backup_key() if passphrase is None else passphrase
     done = []
     with tempfile.TemporaryDirectory(prefix="pcdn-restore-") as work:
         out, manifest = open_archive(path, passphrase, work)
@@ -590,3 +620,290 @@ def restore(path: str, passphrase: str | None = None, controller: bool = True, p
             restore_dir(os.path.join(out, "acme"), acme_target)
             done.append(f"acme.sh home -> {acme_target}")
     return {"manifest": manifest, "restored": done}
+
+
+# ================================================================== wave 14 (SPEC §23.3)
+
+COUNT_TABLES = ("sites", "records", "edges", "api_keys", "site_config_versions", "audit_log")
+MARKER_TABLE = "pcdn_live_marker"
+
+
+def backup_key() -> str:
+    """BACKUP_ENCRYPTION_KEY (preferred) / BACKUP_PASSPHRASE. Both set and different ->
+    backup_key_conflict; equal to a DATA_ENCRYPTION_KEY -> backup_key_equals_data_key (losing one key
+    must never expose the other)."""
+    a, b = settings.backup_encryption_key or "", settings.backup_passphrase or ""
+    if a and b and a != b:
+        raise BackupError("backup_key_conflict")
+    key = a or b
+    if key and key in [k.strip() for k in (settings.data_encryption_key or "").split(",") if k.strip()]:
+        raise BackupError("backup_key_equals_data_key")
+    return key
+
+
+def key_problem() -> str | None:
+    try:
+        backup_key()
+    except BackupError as e:
+        return str(e)
+    return None
+
+
+_URL_CRED_RE = re.compile(r"([a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
+_AUTH_RE = re.compile(r"(Authorization[\"']?\s*[:=]\s*[\"']?)[^\"'\n,]+", re.I)
+_SIG_RE = re.compile(r"(X-Amz-Signature=)[0-9a-fA-F]+", re.I)
+_SIG2_RE = re.compile(r"(Signature=)[0-9a-fA-F]{16,}")
+
+
+def scrub(text) -> str:
+    """Remove every backup / data secret from a text before it is stored, alerted or logged."""
+    text = str(text or "")
+    for secret in (settings.backup_encryption_key, settings.backup_passphrase, settings.backup_s3_secret_key,
+                   settings.backup_s3_access_key, *(k.strip() for k in (settings.data_encryption_key or "").split(","))):
+        if secret and len(secret) >= 3:
+            text = text.replace(secret, "***")
+    text = _URL_CRED_RE.sub(r"\1***@", text)
+    text = _AUTH_RE.sub(r"\1***", text)
+    text = _SIG_RE.sub(r"\1***", text)
+    text = _SIG2_RE.sub(r"\1***", text)
+    return text[-1000:]
+
+
+def _sqlite_counts(path: str) -> dict:
+    out = {}
+    c = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+    try:
+        names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for t in COUNT_TABLES:
+            if t in names:
+                out[t] = c.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
+    finally:
+        c.close()
+    return out
+
+
+def _dump_counts(db_file: str, kind: str) -> dict:
+    """Row counts of the dump: exact for SQLite (counted in the copy); for PostgreSQL counted on the
+    live database right after the dump (the restore test compares these with the restored rows)."""
+    try:
+        if kind == "sqlite":
+            return _sqlite_counts(db_file)
+        from sqlalchemy import inspect, text
+
+        from .db import engine
+
+        names = set(inspect(engine).get_table_names())
+        with engine.connect() as c:
+            return {t: int(c.execute(text(f'SELECT count(*) FROM "{t}"')).scalar() or 0)
+                    for t in COUNT_TABLES if t in names}
+    except Exception as e:  # noqa: BLE001 - counts are informational at backup time
+        log.warning("backup: row counts unavailable (%s)", type(e).__name__)
+        return {}
+
+
+def _pdns_domains(path: str) -> int | None:
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        try:
+            return int(c.execute("SELECT count(*) FROM domains").fetchone()[0])
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
+
+def _stamp(name: str) -> dt.datetime | None:
+    m = NAME_RE.match(name)
+    if not m:
+        return None
+    return dt.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def prune_remote_days(s3: S3Client, prefix: str, days: int, now: dt.datetime | None = None) -> list[str]:
+    """BACKUP_S3_KEEP_DAYS: remote archives older than N days are deleted; the newest is never deleted."""
+    if days <= 0:
+        return []
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    keys = sorted(o["key"] for o in s3.list(prefix) if NAME_RE.match(o["key"][len(prefix):]))
+    removed = []
+    for k in keys[:-1]:
+        ts = _stamp(k[len(prefix):])
+        if ts is not None and now - ts > dt.timedelta(days=days):
+            s3.delete(k)
+            removed.append(k)
+    return removed
+
+
+def remote_summary(s3: S3Client | None = None) -> dict | None:
+    s3 = s3 or S3Client.from_settings()
+    if s3 is None:
+        return None
+    try:
+        objs = [o for o in s3.list(settings.backup_s3_prefix)
+                if NAME_RE.match(o["key"][len(settings.backup_s3_prefix):])]
+    except BackupError:
+        return None
+    names = sorted(o["key"][len(settings.backup_s3_prefix):] for o in objs)
+    return {"count": len(objs), "newest": names[-1] if names else None, "oldest": names[0] if names else None,
+            "bytes": sum(o["size"] for o in objs)}
+
+
+# ---------------------------------------------------------------- restore test (verify)
+
+def _same_database(a: str, b: str) -> bool:
+    ua, ub = make_url(a), make_url(b)
+    if ua.get_backend_name() != ub.get_backend_name():
+        return False
+    if ua.get_backend_name() == "sqlite":
+        return os.path.abspath(ua.database or "") == os.path.abspath(ub.database or "")
+    return ((ua.host or "localhost"), (ua.port or 5432), ua.database) == ((ub.host or "localhost"), (ub.port or 5432),
+                                                                          ub.database)
+
+
+def _revision_ok(rev: str | None, head: str | None) -> bool:
+    try:
+        return rev is not None and head is not None and int(rev) <= int(head)
+    except ValueError:
+        return rev == head
+
+
+def _check_restored(engine, manifest: dict, checks: dict) -> None:
+    """alembic revision (older -> migrated to prove upgradeability), counts, one decryptable secret."""
+    from sqlalchemy import inspect, text
+
+    from . import crypto, migrate
+
+    with engine.connect() as c:
+        rev = c.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    head = migrate.head_revision()
+    checks["revision"] = rev == manifest.get("alembic_revision") and _revision_ok(rev, head)
+    if checks["revision"] and rev != head:
+        migrate.upgrade(engine)
+        checks["upgrade"] = migrate.current_revision(engine) == head
+    want = manifest.get("counts") or {}
+    names = set(inspect(engine).get_table_names())
+    with engine.connect() as c:
+        got = {t: int(c.execute(text(f'SELECT count(*) FROM "{t}"')).scalar() or 0) for t in want if t in names}
+        checks["counts"] = bool(want) and got == {t: int(v) for t, v in want.items()}
+        secret = c.execute(text("SELECT secret FROM sites ORDER BY id LIMIT 1")).scalar() if "sites" in names else None
+    try:
+        if secret is not None:
+            crypto.decrypt(secret)
+        checks["decrypt_secret"] = True
+    except crypto.CryptoError:
+        checks["decrypt_secret"] = False
+
+
+def _verify_sqlite(src: str, manifest: dict, checks: dict, work: str) -> None:
+    from sqlalchemy import create_engine
+
+    target = os.path.join(work, "restore.sqlite3")
+    restore_controller_db(src, "sqlite", f"sqlite:///{target}")
+    eng = create_engine(f"sqlite:///{target}")
+    try:
+        _check_restored(eng, manifest, checks)
+    finally:
+        eng.dispose()
+
+
+def _verify_pg_full(src: str, manifest: dict, checks: dict, scratch: str) -> None:
+    from sqlalchemy import create_engine, inspect, text
+
+    if _same_database(scratch, settings.database_url):
+        raise BackupError("scratch_is_live_database")
+    eng = create_engine(scratch)
+    try:
+        if MARKER_TABLE in set(inspect(eng).get_table_names()):
+            raise BackupError("scratch_has_live_marker")
+        with eng.begin() as c:
+            c.execute(text("DROP SCHEMA public CASCADE"))
+            c.execute(text("CREATE SCHEMA public"))
+        _run(["pg_restore", "--no-owner", "--no-privileges", "--exit-on-error", "--dbname",
+              make_url(scratch).database, src], _pg_env(scratch))
+        with eng.begin() as c:  # the dump brings the live marker along: never leave it in a scratch DB
+            c.execute(text(f"DROP TABLE IF EXISTS {MARKER_TABLE}"))
+        _check_restored(eng, manifest, checks)
+        with eng.begin() as c:
+            c.execute(text("DROP SCHEMA public CASCADE"))
+            c.execute(text("CREATE SCHEMA public"))
+    finally:
+        eng.dispose()
+
+
+def verify_backup(passphrase: str | None = None, s3: S3Client | None = None, scratch_url: str | None = None,
+                  out_dir: str | None = None) -> dict:
+    """The weekly restore test: newest remote archive (local without S3) -> download, decrypt, member
+    sha256s, then a full restore into a scratch database (SQLite: a temp file; PostgreSQL with
+    BACKUP_VERIFY_DATABASE_URL) or the partial checks. Returns {ok, level, checks, name, size,
+    location, error}; never raises."""
+    passphrase = backup_key() if passphrase is None else passphrase
+    scratch_url = settings.backup_verify_database_url if scratch_url is None else scratch_url
+    checks: dict[str, bool] = {}
+    result = {"ok": False, "level": None, "checks": checks, "name": None, "size": None, "location": None,
+              "sha256": None, "error": None}
+    try:
+        with tempfile.TemporaryDirectory(prefix="pcdn-verify-") as work:
+            s3 = s3 if s3 is not None else S3Client.from_settings()
+            path = None
+            if s3 is not None:
+                keys = sorted(o["key"] for o in s3.list(settings.backup_s3_prefix)
+                              if NAME_RE.match(o["key"][len(settings.backup_s3_prefix):]))
+                if keys:
+                    result["name"] = keys[-1][len(settings.backup_s3_prefix):]
+                    path = os.path.join(work, result["name"])
+                    s3.download(keys[-1], path)
+                    result["location"] = "s3"
+            if path is None:
+                names = list_local(out_dir)
+                if not names:
+                    raise BackupError("no_backup_found")
+                result["name"] = names[-1]
+                path = os.path.join(out_dir or settings.backup_dir, names[-1])
+                result["location"] = "local"
+            checks["download"] = True
+            result["size"] = os.path.getsize(path)
+            result["sha256"] = _sha256_file(path)
+            out, manifest = open_archive(path, passphrase, work)
+            checks["decrypt"] = True
+            sums = manifest.get("sha256") or {}
+            checks["members"] = all(os.path.isfile(os.path.join(out, f)) and _sha256_file(os.path.join(out, f)) == h
+                                    for f, h in sums.items()) if sums else False
+            contents = manifest.get("contents", {})
+            ctl = contents.get("controller") or {}
+            src = os.path.join(out, ctl.get("file") or "")
+            if ctl.get("kind") == "sqlite":
+                _verify_sqlite(src, manifest, checks, work)
+                result["level"] = "full"
+            elif ctl.get("kind") == "postgresql" and scratch_url:
+                _verify_pg_full(src, manifest, checks, scratch_url)
+                result["level"] = "full"
+            elif ctl.get("kind") == "postgresql":
+                listing = _run(["pg_restore", "--list", src], dict(os.environ))
+                checks["pg_restore_list"] = bool(listing.stdout.strip())
+                from . import migrate
+
+                checks["revision"] = _revision_ok(manifest.get("alembic_revision"), migrate.head_revision())
+                checks["counts"] = bool(manifest.get("counts"))
+                result["level"] = "partial"
+            else:
+                raise BackupError("backup has no controller database")
+            if "pdns" in contents:
+                c = sqlite3.connect(os.path.join(out, "pdns.sqlite3"))
+                try:
+                    ok = c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                    if ok and (contents["pdns"].get("domains") or 0) > 0:
+                        ok = c.execute("SELECT count(*) FROM domains").fetchone()[0] > 0
+                finally:
+                    c.close()
+                checks["pdns"] = ok
+            if "acme" in contents:
+                checks["acme"] = os.path.isdir(os.path.join(out, "acme"))
+            result["ok"] = all(checks.values())
+            if not result["ok"]:
+                result["error"] = "checks failed: " + ",".join(k for k, v in checks.items() if not v)
+    except Exception as e:  # noqa: BLE001 - reported as a failed run (scrubbed)
+        result["error"] = scrub(e if isinstance(e, BackupError) else f"{type(e).__name__}: {e}")
+        result["ok"] = False
+    return result

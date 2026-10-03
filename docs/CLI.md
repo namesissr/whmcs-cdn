@@ -85,6 +85,9 @@ pcdn site
 | `pcdn records delete <id>` | حذف رکورد | `dns` |
 | `pcdn config get <section>` | خواندن یک بخش تنظیمات (JSON) | `dns` |
 | `pcdn config set <section> [file\|-]` | جایگزینی یک بخش از فایل یا stdin | `dns` |
+| `pcdn config history [--limit N] [--before V]` | تاریخچهٔ تنظیمات: چه کسی، کی، کدام بخش‌ها | `config` |
+| `pcdn config diff <v> [--against current\|V] [--section S]` | تغییرات یک نسخه نسبت به حالا یا نسخهٔ دیگر | `config` |
+| `pcdn config restore <v> [--section S …] [--dry-run]` | بازگردانی بخش‌های یک نسخهٔ قدیمی‌تر | `config` (`functions` به `functions` هم نیاز دارد) |
 | `pcdn purge --url … / --prefix … / --everything` | پاکسازی کش | `purge` |
 | `pcdn analytics [--period 24h\|7d\|30d]` | آمار ترافیک | `stats` |
 | `pcdn analytics live [--minutes N]` | آمار دقیقه‌ای زنده (۱ تا ۱۴۴۰ دقیقه) | `stats` |
@@ -136,6 +139,26 @@ jq '.enabled = true' waf.json | pcdn config set waf -
 - هشدارهای غیرمسدودکنندهٔ کنترلر (`X-Pcdn-Warnings`) روی stderr چاپ می‌شوند.
 - برای بخش `webhooks` پاسخ ممکن است `new_secrets` داشته باشد؛ این رازها **فقط یک‌بار** نمایش داده
   می‌شوند، آن‌ها را نگه دارید.
+
+### تاریخچه، مقایسه و بازگردانی تنظیمات
+
+هر تغییر تنظیمات (از پنل، API، CLI، Terraform، یادگیری WAF یا انتقال) یک **نسخه** می‌سازد (SPEC §23.4):
+
+```bash
+pcdn config history                          # جدیدترین ۵۰ نسخه؛ --limit 1..200، --before V برای صفحهٔ بعد
+pcdn config diff 9                           # تغییرات از نسخهٔ ۹ تا حالا
+pcdn config diff 9 --against 12 --section waf
+pcdn config restore 9 --dry-run              # پیش‌نمایش: چه بخش‌هایی اعمال / بدون تغییر / حذف می‌شوند
+pcdn config restore 9 --section cache --section waf   # یا --section cache,waf
+```
+
+- ستون «BY»: `account owner`، `collaborator <نام>`، `support`، `API key <نام>` یا `system (<کار>)`.
+- مقادیر حساس (رازها، سرآیندهای احراز هویت) در خروجی `"[redacted]"` هستند؛ کد توابع هرگز در diff نیست.
+- بازگردانی یک نسخهٔ **تازه** با «restored from» می‌سازد؛ رازهای ذخیره‌شده تغییر نمی‌کنند. بخش‌هایی که پلن فعلی
+  اجازه نمی‌دهد حذف و فهرست‌های بیش از سقف پلن کوتاه می‌شوند (`Dropped: …` و `Warning: …` در خروجی). بدون
+  `--section` همهٔ بخش‌هایی که فرق دارند بازگردانده می‌شوند.
+- `restore` یک نوشتن غیرتکراری است: پس از 5xx خودکار دوباره فرستاده نمی‌شود (۴۲۹ چرا). سقف: ۱۰ بازگردانی در
+  ساعت برای هر سایت.
 
 ### پاکسازی کش
 

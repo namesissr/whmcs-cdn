@@ -319,6 +319,21 @@ sudo tools/drill/dr-drill.sh --env-file /secure/pcdn.env \
 - [ ] استک تمرین حذف شد (پیش‌فرض)، یا اگر `--keep` بود، دستی `down -v` شد.
 - [ ] هر سه ماه یک‌بار: runbook بخش ۲-ب روی همین VM دستی تا آخر (شامل `dns-sync` و اتصال یک نود آزمایشی) اجرا شد.
 
+## ۸ب. آزمون بازیابی خودکار هفتگی (SPEC §23.3)
+
+- `BACKUP_VERIFY_ENABLED=true` → هر هفته (`BACKUP_VERIFY_WEEKDAY` / `BACKUP_VERIFY_HOUR` UTC) جدیدترین آرشیو
+  خارج از سرور (یا محلی بدون S3) دانلود، رمزگشایی و sha256 تک‌تک اعضا بررسی می‌شود.
+- SQLite: بازیابی کامل در یک فایل موقت. PostgreSQL با `BACKUP_VERIFY_DATABASE_URL`: بازیابی کامل در پایگاه
+  آزمایشی (اسکیمای public پاک و دوباره ساخته می‌شود؛ پایگاهی که میزبان+پورت+نامش با `DATABASE_URL` یکی باشد یا
+  از قبل جدول `pcdn_live_marker` داشته باشد رد می‌شود). بررسی‌ها: `alembic_version` = مانیفست و ≤ head (نسخهٔ
+  قدیمی‌تر با migrate ارتقا داده می‌شود)، شمار ردیف‌ها = `counts` مانیفست، رمزگشایی یک `sites.secret` با کلید
+  فعلی، سلامت پایگاه PowerDNS و وجود acme. بدون پایگاه آزمایشی سطح «جزئی» است (`pg_restore --list`).
+- پایگاه آزمایشی را با کاربر جدا و فقط برای همین کار بسازید:
+  `CREATE DATABASE pcdn_verify OWNER pcdn_verify;`
+- نتیجه در `GET /api/v1/backups` (`last_verify.level`) و `/healthz/deep` (`backup.verify_ok`)؛ خرابی → هشدار
+  بحرانی `backup_verify_failed`. اجرای دستی: `POST /api/v1/backups/verify`.
+- مانیفست حالا `counts`، `app_version` و `sha256` هر عضو را دارد؛ بارگذاری S3 با `HEAD` دوباره خوانده می‌شود.
+
 ## ۹. ارتقا و بازگشت نسخه (rollback) دیتابیس
 
 کنترلر در شروع، migrationها را خودکار تا head اجرا می‌کند (جزئیات در [`docs/UPGRADE.md`](UPGRADE.md)).

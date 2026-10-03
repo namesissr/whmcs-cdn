@@ -436,7 +436,43 @@ def queues():
     return d
 
 
-ALL = [overview, edges, traffic, security, tunnel, queues]
+def slo():
+    d = Dash("pcdn-slo", "Pasargad CDN — SLO & error budget",
+             "Operator SLOs per edge group (SPEC §23.11): availability, latency and platform errors against "
+             "their objectives, error budget left this month and multi-window burn rates. Alerts: "
+             "prometheus/rules/pcdn-slo.yml OR the controller's own slo_* alerts — page from one source only.",
+             tags=["slo"])
+    d.row("This month")
+    stat(d, "Lowest budget left", "min(pcdn_slo_error_budget_remaining)", unit="percent", w=6,
+         steps=((None, "red"), (10, "orange"), (40, "green")))
+    stat(d, "Highest 1h burn", 'max(pcdn_slo_burn_rate{window="1h"})', unit="none", w=6, decimals=2,
+         steps=((None, "green"), (6, "orange"), (14.4, "red")))
+    stat(d, "Highest 6h burn", 'max(pcdn_slo_burn_rate{window="6h"})', unit="none", w=6, decimals=2,
+         steps=((None, "green"), (1, "orange"), (6, "red")))
+    stat(d, "Lowest month ratio", 'min(pcdn_slo_ratio{window="month"})', unit="percent", w=6, decimals=3,
+         steps=((None, "red"), (99, "orange"), (99.9, "green")))
+    table(d, "Objective vs actual per group / SLI",
+          [{"ref": "A", "expr": "max by (group, sli) (pcdn_slo_objective)"},
+           {"ref": "B", "expr": 'max by (group, sli) (pcdn_slo_ratio{window="month"})'},
+           {"ref": "C", "expr": 'max by (group, sli) (pcdn_slo_ratio{window="30d"})'},
+           {"ref": "D", "expr": "max by (group, sli) (pcdn_slo_error_budget_remaining)"}],
+          w=24, h=8, rename={"Value #A": "objective %", "Value #B": "month %", "Value #C": "30 days %",
+                             "Value #D": "budget left %"},
+          units={"objective %": "percent", "month %": "percent", "30 days %": "percent",
+                 "budget left %": "percent"})
+    d.row("Burn rate (1 = spending exactly the monthly budget)")
+    ts(d, "Burn rate 1h (fast alert >= 14.4 with 5m)",
+       [q('max by (group, sli) (pcdn_slo_burn_rate{window="1h"})', "{{group}} {{sli}}")], min_=0)
+    ts(d, "Burn rate 6h (slow alert >= 6 with 30m)",
+       [q('max by (group, sli) (pcdn_slo_burn_rate{window="6h"})', "{{group}} {{sli}}")], min_=0)
+    ts(d, "Error budget left %", [q("max by (group, sli) (pcdn_slo_error_budget_remaining)", "{{group}} {{sli}}")],
+       unit="percent", max_=100)
+    ts(d, "SLI ratio (30 days)", [q('max by (group, sli) (pcdn_slo_ratio{window="30d"})', "{{group}} {{sli}}")],
+       unit="percent", max_=100)
+    return d
+
+
+ALL = [overview, edges, traffic, security, tunnel, queues, slo]
 
 
 def render() -> dict[str, str]:

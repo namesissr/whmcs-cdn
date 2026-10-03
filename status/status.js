@@ -282,6 +282,9 @@ const REFRESH_MS = 30000;
   }
 
   el.refresh.addEventListener("click", load);
+  // پیوند فرم گزارش تخلف (SPEC §23.10) همان ?api= را نگه می‌دارد
+  const abuseLink = document.getElementById("abuseLink");
+  if (abuseLink && location.search) abuseLink.href = "abuse.html" + location.search;
   // به‌روزرسانی برچسب زمان هر ۲۰ ثانیه بدون درخواست تازه
   setInterval(updateStamp, 20000);
   setInterval(load, REFRESH_MS);

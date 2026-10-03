@@ -2188,6 +2188,69 @@ function accessLogout(r) {
     r.return(302, safeNext(q.next));
 }
 
+// ------------------------------------------------------------------ RUM ingestion (SPEC §23.7)
+//
+// POST /__pcdn/rum (sendBeacon / fetch keepalive from /__pcdn/rum.js). Only a POST with a text/plain or
+// application/json body whose Origin (else Referer) host is the request's own host is kept; everything
+// else gets the same 204 and is dropped. The kept beacon becomes ONE sanitized JSON line in
+// $pcdn_rum_line (the pcdn_rum log): minute, host, country, ASN, region, the validated dimensions and
+// the clamped metrics. The client address is read by nginx only for the ASN / region lookup; it is never
+// part of the line (the log format has no other field).
+
+const RUM_MS = ['ttfb', 'fcp', 'lcp', 'inp', 'dns', 'tcp', 'tls', 'dom', 'load'];
+const RUM_MS_MAX = 60000, RUM_CLS_MAX = 10;
+const RUM_NT = { navigate: 1, reload: 1, back_forward: 1, prerender: 1, soft: 1 };
+const RUM_CS = { HIT: 1, MISS: 1, BYPASS: 1, EXPIRED: 1, STALE: 1 };
+const RUM_DEV = { m: 1, t: 1, d: 1 };
+const RUM_PATH = /^\/[^\s?#]{0,199}$/;
+const RUM_CT = /^(?:text\/plain|application\/json)\s*(?:;|$)/i;
+const RUM_HOST = /^[a-z0-9.-]{1,253}$/;
+
+function rumUrlHost(v) {
+    const m = /^[a-z][a-z0-9+.-]*:\/\/([^\/?#\s]+)/i.exec(String(v || ''));
+    return m ? m[1].replace(/^.*@/, '').replace(/:\d+$/, '').toLowerCase() : null;
+}
+
+function rumNum(v, hi, ms) {
+    if (typeof v !== 'number' || !isFinite(v)) return null;
+    const n = Math.min(hi, Math.max(0, v));
+    return ms ? Math.round(n) : Math.round(n * 10000) / 10000;
+}
+
+function rumLine(r) {
+    if (r.method !== 'POST' || !RUM_CT.test(String(r.headersIn['Content-Type'] || ''))) return '';
+    const host = String(r.variables.host || '').toLowerCase();
+    if (!RUM_HOST.test(host)) return '';
+    const origin = r.headersIn['Origin'];
+    const from = origin !== undefined ? rumUrlHost(origin) : rumUrlHost(r.headersIn['Referer']);
+    if (from !== host) return '';
+    let b;
+    try { b = JSON.parse(r.requestText || ''); } catch (e) { return ''; }
+    if (!b || typeof b !== 'object' || Array.isArray(b) || b.v !== 1) return '';
+    const cc = String(r.variables.pcdn_country || '').toUpperCase();
+    const asn = parseInt(r.variables.pcdn_asn || '0', 10);
+    const o = { t: new Date().toISOString().slice(0, 16) + ':00Z', h: host, cc: /^[A-Z]{2}$/.test(cc) ? cc : '',
+        asn: asn >= 0 && asn <= 4294967295 ? asn : 0, rg: String(r.variables.pcdn_region || '').substring(0, 64),
+        p: typeof b.p === 'string' && RUM_PATH.test(b.p) ? b.p : '/' };
+    if (typeof b.nt === 'string' && RUM_NT[b.nt] === 1) o.nt = b.nt;
+    if (typeof b.dev === 'string' && RUM_DEV[b.dev] === 1) o.dev = b.dev;
+    o.cs = typeof b.cs === 'string' && RUM_CS[b.cs] === 1 ? b.cs : '';
+    RUM_MS.forEach(function (k) {
+        const v = rumNum(b[k], RUM_MS_MAX, true);
+        if (v !== null) o[k] = v;
+    });
+    const cls = rumNum(b.cls, RUM_CLS_MAX, false);
+    if (cls !== null) o.cls = cls;
+    return JSON.stringify(o);
+}
+
+function rumIngest(r) {
+    let line = '';
+    try { line = rumLine(r); } catch (e) { line = ''; }
+    if (line) r.variables.pcdn_rum_line = line;
+    r.return(204);
+}
+
 export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
     bodyNeed, bodyInspect, tfHeaders, tunnelFair, tunnelDrain, fairSet, hcSet, speedDown, speedUp, videoNext,
-    accessEmail, accessLogin, accessSend, accessVerify, accessLogout };
+    accessEmail, accessLogin, accessSend, accessVerify, accessLogout, rumIngest };

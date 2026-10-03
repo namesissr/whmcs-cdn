@@ -36,9 +36,10 @@ from .render.tree import render_tree
 from .settings import AGENT_ERRORS, agent_source_files, log
 from .tcphealth import TcpHealth, tcp_targets
 from .tuning import TuningCheck
+from .upgrade import Upgrader, heartbeat_upgrade, norm_upgrade, running_release
 from .usage import (
-    gate_hour_merge, learn_hosts, live_cutoff, live_items, read_l4_usage, read_usage, trim_live_backlog, usage_item,
-    video_hosts,
+    gate_hour_merge, learn_hosts, live_cutoff, live_items, read_l4_usage, read_rum_usage, read_usage,
+    trim_live_backlog, usage_item, video_hosts,
 )
 from .validation.gates import gate_sites
 from .validation.rules import key_infos, with_cached_bot_ranges
@@ -164,6 +165,22 @@ class Agent:
         return self._lazy("_tuning", lambda: TuningCheck(self.cfg))
 
     @property
+    def upgrader(self) -> Upgrader:
+        """SPEC §23.2 self-upgrade state machine, bound to the current state (saved under the state lock)."""
+        up = self.__dict__.get("_upgrader")
+        if up is None or up.state is not self.state:
+            up = self.__dict__["_upgrader"] = Upgrader(self.cfg, self.state, save=self._save)
+        return up
+
+    def upgrade_step(self):
+        """SPEC §23.2: poll an upgrade in progress / start the one node.upgrade asks for (the last full
+        config's value, kept across 304 answers in state["ctl_upgrade"])."""
+        before = (self.state.get("upgrade") or {}).get("state")
+        self.upgrader.step(self.state.get("ctl_upgrade"))
+        if (self.state.get("upgrade") or {}).get("state") != before:
+            self.last_heartbeat = 0.0   # report the transition at once
+
+    @property
     def logship(self) -> LogShip:
         """The log-export sampler / spool / shipper (SPEC §14.3.2), bound to the current state."""
         ls = self.__dict__.get("_logship")
@@ -273,6 +290,8 @@ class Agent:
                 log.info("node drain %s by the controller", "started" if ev == "start" else "ended")
                 if ev == "end":
                     self.drain_step()
+            # SPEC §23.2 node.upgrade (non-rendered; None = no upgrade asked / old controller)
+            st["ctl_upgrade"] = norm_upgrade(body)
             pn = norm_probe_node(body)
             self.probe_runner.interval = pn["interval"]
             echo = self.__dict__.get("_echo")
@@ -425,6 +444,10 @@ class Agent:
             read_l4_usage(self.state, self.cfg.get("L4_ACCESS_LOG") or "/var/log/nginx/pcdn-l4.log")
         except Exception as e:  # noqa: BLE001 - never let L4 accounting break HTTP usage
             log.error("L4 usage read failed: %s", e)
+        try:   # SPEC §23.7: RUM beacon lines (absent on nodes without RUM sites)
+            read_rum_usage(self.state, self.cfg.get("RUM_LOG") or "/var/log/nginx/pcdn-rum.log")
+        except Exception as e:  # noqa: BLE001 - never let RUM aggregation break HTTP usage
+            log.error("RUM usage read failed: %s", e)
         if functions_enabled(self.cfg):   # SPEC §16.9: pcdn-fn usage lines
             try:
                 read_fn_usage(self.state, self.cfg.get("FN_USAGE_LOG") or "/var/log/pcdn-fn/usage.log")
@@ -489,7 +512,11 @@ class Agent:
         """Base heartbeat body: bundle version + (when configured) region/role, so a fresh node
         self-registers into the right pool (SPEC §11.1). Overrides fill applied_version/error/metrics."""
         body: dict = {"bundle_version": bundle_version(self.cfg), "geoip": geoip_present(self.cfg),
-                      "capabilities": heartbeat_capabilities(self.cfg)}   # SPEC §14.1
+                      "capabilities": heartbeat_capabilities(self.cfg),   # SPEC §14.1
+                      "release": running_release(self.cfg)}               # SPEC §23.1 (null = unknown)
+        up = heartbeat_upgrade(self.__dict__.get("state") or {})   # SPEC §23.2, omitted when never upgraded
+        if up:
+            body["upgrade"] = up
         if self.cfg.get("REGION"):
             body["region"] = self.cfg["REGION"]
         if self.cfg.get("GROUP"):
@@ -698,7 +725,7 @@ class Agent:
                 step()
             except Exception as e:  # noqa: BLE001
                 log.error("%s failed: %s", step.__name__, e)
-        for step in (self.drain_step, self.maybe_upgrade_undrain):   # SPEC §22.1
+        for step in (self.drain_step, self.maybe_upgrade_undrain, self.upgrade_step):   # SPEC §22.1, §23.2
             try:
                 step()
             except Exception as e:  # noqa: BLE001

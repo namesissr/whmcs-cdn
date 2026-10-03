@@ -337,7 +337,8 @@ def test_metrics_aggregates_without_identifiers(client):
 
 def test_new_jobs_are_registered_leader_jobs():
     assert scheduler.job_webhooks in scheduler.JOBS and scheduler.job_log_export in scheduler.JOBS
-    assert scheduler.FAST_JOBS == [scheduler.job_webhooks] and scheduler.FAST_INTERVAL == 30.0
+    # SPEC §23.5: the customer bots are polled every ~30 s too
+    assert scheduler.FAST_JOBS == [scheduler.job_webhooks, scheduler.job_bots] and scheduler.FAST_INTERVAL == 30.0
 
 
 def test_fast_lane_runs_between_ticks_only_while_leading(monkeypatch):

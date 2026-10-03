@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -109,6 +109,11 @@ class FeaturesIn(BaseModel):
     # wave 10 (SPEC §18.1 / §18.2): sections `waiting_room` and `access`
     waiting_room: bool | None = None
     access: bool | None = None
+    # wave 14 (SPEC §23.15): RUM section, customer alert channels
+    rum: bool | None = None
+    alert_sms: bool | None = None
+    alert_messengers: bool | None = None
+    max_alert_subscriptions: int | None = Field(default=None, ge=0, le=100)
 
 
 class Plan(BaseModel):
@@ -254,6 +259,16 @@ class EdgePatch(BaseModel):
     region: str | None = Field(default=None, pattern="^(home|global)$")
     shield: bool | None = None  # origin shield / tiered cache node (SPEC §14.1)
     http3_enabled: bool | None = None  # SPEC §22.9: QUIC on this node (where its nginx can)
+    # SPEC §23.12: customer-visible city label (letters, spaces, ZWNJ; "" clears it)
+    display_city: str | None = Field(default=None, max_length=32)
+    display_city_en: str | None = Field(default=None, max_length=32)
+
+    @field_validator("display_city", "display_city_en")
+    @classmethod
+    def _city(cls, v):
+        from . import edge_labels
+
+        return edge_labels.clean_city(v)
 
 
 class EdgeDrainIn(BaseModel):
@@ -511,16 +526,19 @@ def update_operator_note(domain: str, body: OperatorNoteIn, request: Request, db
 def transfer_site(domain: str, body: TransferIn, request: Request, db: Session = Depends(get_db)):
     """Domain transfer to another owner (SPEC §19.2, transfer.py): one transaction; `dry_run`
     returns the same answer without changing anything. 422 (Persian `detail`) when refused."""
+    from . import config_history
+
     site = get_site(db, domain)
-    try:
-        result, post = transfer.transfer(db, site, body)
-    except transfer.TransferError as e:
-        db.rollback()
-        raise HTTPException(422, str(e))
-    if body.dry_run:
-        db.rollback()
-        return result
-    db.commit()
+    with config_history.source("transfer"):  # SPEC §23.4: the integration pause is a "transfer" version
+        try:
+            result, post = transfer.transfer(db, site, body)
+        except transfer.TransferError as e:
+            db.rollback()
+            raise HTTPException(422, str(e))
+        if body.dry_run:
+            db.rollback()
+            return result
+        db.commit()
     transfer.after_commit(db, result, post)  # TSIG push to PowerDNS, storage keys on MinIO
     _audit(db, request, "site.transfer", result["domain"],
            {k: result[k] for k in ("from", "to", "related", "revoked_keys", "paused", "billing_since", "rotated")})
@@ -561,8 +579,8 @@ def update_settings(domain: str, body: SiteSettings, db: Session = Depends(get_d
 @router.post("/sites/{domain}/suspend")
 def suspend(domain: str, db: Session = Depends(get_db)):
     site = lock_site(db, get_site(db, domain))  # one webhook per transition, also when concurrent
-    if not site.suspended:  # webhook on the transition only (SPEC §14.3.3)
-        webhooks.emit(db, site, "site.suspended", {"status": "suspended"})
+    if not site.suspended and not site.abuse_suspended:  # webhook on the transition only (SPEC §14.3.3)
+        webhooks.emit(db, site, "site.suspended", {"status": "suspended", "reason": "billing"})
     site.suspended = True
     db.commit()
     return {"ok": True}
@@ -573,7 +591,9 @@ def unsuspend(domain: str, db: Session = Depends(get_db)):
     site = lock_site(db, get_site(db, domain))
     if site.suspended:
         site.suspended = False
-        webhooks.emit(db, site, "site.unsuspended", {"status": site.effective_status})
+        # SPEC §23.10: a billing unsuspend never clears an abuse suspension (the site stays suspended)
+        if not site.abuse_suspended:
+            webhooks.emit(db, site, "site.unsuspended", {"status": site.effective_status, "reason": "billing"})
     db.commit()
     return {"ok": True}
 
@@ -1006,16 +1026,51 @@ def edge_to_dict(e: Edge, uptime: dict | None = None, q: int | None = None) -> d
         "tuning": edge_state.public(edge_state.loads(e.tuning)),
         "http3_enabled": True if e.http3_enabled is None else bool(e.http3_enabled),
         "dns_weight": edge_state.dns_weight_dict(e, q),
+        **_wave14_edge(e),
+    }
+
+
+def _wave14_edge(e: Edge) -> dict:
+    """SPEC §23.1 / §23.2 / §23.12 admin fields: release + effective pin of the group, the latest
+    self-upgrade report, the customer-visible label and the public tag."""
+    from sqlalchemy.orm import object_session
+
+    from . import edge_labels, rollout
+
+    db = object_session(e)
+    pin = bundle.group_pin(db, dnsbuild.edge_group(e)) if db is not None else None
+    label = edge_labels.label_of(db, e.id) if db is not None and e.id is not None else \
+        edge_labels.label_for(*edge_labels.city_of(e), None)
+    up = rollout.upgrade_report(e)
+    return {
+        "release": e.release,
+        "pinned_release": pin,
+        "release_ok": (e.release == pin) if pin else None,
+        "upgrade": up or None,
+        "display_city": e.display_city,
+        "display_city_en": e.display_city_en,
+        "display_label": label["fa"],
+        "display_label_en": label["en"],
+        "public_tag": edge_labels.public_tag(e.id, db) if e.id is not None else None,
     }
 
 
 @router.get("/edges")
-def list_edges(db: Session = Depends(get_db)):
+def list_edges(tag: str | None = None, db: Session = Depends(get_db)):
+    """?tag=<8 hex> (SPEC §23.12.2): the edge whose public tag a customer reported (X-Served-By)."""
+    from . import edge_labels
     from . import uptime as up
 
+    edges = list(db.scalars(select(Edge).order_by(Edge.id)))
+    if tag is not None:
+        tag = tag.strip().lower()
+        if not edge_labels.TAG_RE.match(tag):
+            bad(ValidationError("tag باید ۸ نویسهٔ هگز باشد"))
+        tags = edge_labels.tags(db)
+        edges = [e for e in edges if tags.get(e.id) == tag]
     ups = up.summaries(db)
     qs = _dns_qs(db)
-    return [edge_to_dict(e, ups.get(e.id), qs.get(e.id)) for e in db.scalars(select(Edge).order_by(Edge.id))]
+    return [edge_to_dict(e, ups.get(e.id), qs.get(e.id)) for e in edges]
 
 
 def _dns_qs(db: Session) -> dict[int, int]:
@@ -1041,8 +1096,13 @@ def edge_uptime(edge_id: int, days: int = 30, db: Session = Depends(get_db)):
 
 
 def _edge_install(edge: Edge, token: str) -> str:
-    """The one-command install one-liner for this node (SPEC §11.1); role == edge group."""
-    return bundle.install_command(token, region=edge.region, role=edge.group)
+    """The one-command install one-liner for this node (SPEC §11.1); role == edge group; SPEC §23.1:
+    + --version <pin> when the edge's group has an effective pinned release."""
+    from sqlalchemy.orm import object_session
+
+    db = object_session(edge)
+    pin = bundle.group_pin(db, edge.group) if db is not None else None
+    return bundle.install_command(token, region=edge.region, role=edge.group, version=pin)
 
 
 @router.post("/edges", status_code=201)
@@ -1129,7 +1189,7 @@ def update_edge(edge_id: int, request: Request, enabled: bool | None = None,
     if not changes:
         bad(ValidationError("هیچ تغییری ارسال نشده است"))
     for k, v in changes.items():
-        setattr(edge, k, v)
+        setattr(edge, k, (v or None) if k in ("display_city", "display_city_en") else v)
     update_shed(edge)
     db.commit()
     _audit(db, request, "edge.patch", edge.name, {"fields": sorted(changes), **changes})

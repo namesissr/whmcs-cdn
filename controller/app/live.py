@@ -74,15 +74,22 @@ def ingest(db: Session, items: list[dict], site_for_host, merge, now: datetime |
 
 
 TUNNEL_COUNTERS = ("tunnel_attempts", "tunnel_errors")
+# SPEC §23.5: origin-attributed 5xx / platform errors per minute; the key is present (also 0) whenever an
+# agent sent it, so readers can tell "no errors" from "agent does not count them"
+ERROR_COUNTERS = ("oe", "pe")
 
 
 def add_tunnel_counters(dst: dict, src: dict) -> None:
     """SPEC §15.4: sum the optional per-minute `tunnel_attempts` / `tunnel_errors` (origin errors)
-    into the minute bucket details; absent / zero counters add no key."""
+    into the minute bucket details; absent / zero counters add no key. SPEC §23.5: `oe` / `pe` are
+    summed whenever present."""
     for k in TUNNEL_COUNTERS:
         n = max(int(src.get(k) or 0), 0)
         if n:
             dst[k] = int(dst.get(k) or 0) + n
+    for k in ERROR_COUNTERS:
+        if src.get(k) is not None:
+            dst[k] = int(dst.get(k) or 0) + max(int(src.get(k) or 0), 0)
 
 
 def prune(db: Session, now: datetime | None = None) -> None:

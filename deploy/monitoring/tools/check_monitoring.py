@@ -161,7 +161,8 @@ def main() -> int:
                                capture_output=True, text=True)
             if r.returncode:
                 err("promtool check rules failed:\n" + r.stdout + r.stderr)
-            r = subprocess.run([promtool, "test", "rules", "tests/pcdn-alerts.test.yml"],
+            tests = sorted(str(p.relative_to(MON / "prometheus")) for p in (MON / "prometheus" / "tests").glob("*.test.yml"))
+            r = subprocess.run([promtool, "test", "rules", *tests],
                                cwd=MON / "prometheus", capture_output=True, text=True)
             if r.returncode:
                 err("promtool test rules failed:\n" + r.stdout + r.stderr)

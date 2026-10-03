@@ -31,6 +31,7 @@ Modules, lowest layer first (a module imports only from modules listed before it
     apply               write / test / reload / roll back, bootstrap, origin guard peers
     controller          controller API client
     drain               node drain: state lock, flag, drain / undrain commands (SPEC §22.1)
+    upgrade             self-upgrade to a target release, installed release (SPEC §23.1 / §23.2)
     imaged              `pcdn-agent imaged` image transformer
     agent               the Agent loop
     cli                 `pcdn-agent` command line
@@ -50,7 +51,7 @@ _MODULE_NAMES = ("settings", "common", "capabilities", "reload", "validation.ori
                  "validation.regex", "validation.rules", "validation.gates", "usage", "functions", "render.stream",
                  "render.guards", "render.shield", "render.http", "render.njs", "render.site", "render.probe", "render.tree",
                  "logship", "nodelogs", "tuning", "heartbeat", "probe", "tcphealth", "purge", "apply", "controller",
-                 "drain", "imaged", "agent", "cli")
+                 "drain", "upgrade", "imaged", "agent", "cli")
 _MODULES = tuple(importlib.import_module(f"{__name__}.{m}") for m in _MODULE_NAMES)
 _MISSING = object()
 

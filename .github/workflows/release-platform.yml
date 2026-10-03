@@ -1,0 +1,94 @@
+# Platform release (SPEC §23.1, docs/RELEASE.md). Trigger: a vX.Y.Z tag pushed by the repository owner
+# AFTER the release PR was merged to main (cli/v* and provider/v* tags stay with release.yml; "v*" does
+# not match them). This workflow never merges, tags or publishes: it checks the tag, runs every CI job
+# (ci.yml via workflow_call — never fewer checks), builds the pinned edge release bundle and creates a
+# DRAFT GitHub release. The owner reviews and publishes the draft.
+name: Release platform
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-platform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must equal v$(cat VERSION)
+        id: v
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(head -n1 VERSION)"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag $TAG is not vMAJOR.MINOR.PATCH[-pre]"; exit 1
+          fi
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match VERSION ($version): tag the merged release commit"; exit 1
+          fi
+          python3 tools/release/release_tool.py check-meta
+          tools/release/changelog-section.sh "$version" > /dev/null
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          { echo "version=$version"; echo "prerelease=$prerelease"; } >> "$GITHUB_OUTPUT"
+
+  tests:
+    needs: meta
+    uses: ./.github/workflows/ci.yml
+
+  draft-release:
+    needs: [meta, tests]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the edge release bundle from the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tools/release/build-edge-bundle.sh "$TAG" --from-tag --out dist
+          cd dist && sha256sum -c "pcdn-edge-$TAG.tar.gz.sha256"
+          tar -xzOf "pcdn-edge-$TAG.tar.gz" edge/RELEASE | grep -qx "$TAG"
+      - name: Rebuild and compare (deterministic)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tools/release/build-edge-bundle.sh "$TAG" --from-tag --out dist2
+          cmp "dist/pcdn-edge-$TAG.tar.gz" "dist2/pcdn-edge-$TAG.tar.gz"
+      - name: Release notes from CHANGELOG.md
+        run: tools/release/changelog-section.sh "${{ needs.meta.outputs.version }}" > dist/release-notes.md
+      - name: Create the DRAFT release (the owner publishes it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          assets=("dist/pcdn-edge-$TAG.tar.gz" "dist/pcdn-edge-$TAG.tar.gz.sha256")
+          if gh release view "$TAG" --json isDraft -q .isDraft > /tmp/isdraft 2>/dev/null; then
+            if [ "$(cat /tmp/isdraft)" != "true" ]; then
+              echo "::error::release $TAG is already published; not touching it"; exit 1
+            fi
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --notes-file dist/release-notes.md
+          else
+            flags=(--draft --verify-tag --title "Pasargad CDN $TAG" --notes-file dist/release-notes.md)
+            if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+            gh release create "$TAG" "${flags[@]}" "${assets[@]}"
+          fi
+          echo "Draft release $TAG created. The repository owner reviews and publishes it." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcdn-edge-${{ github.ref_name }}
+          path: dist/pcdn-edge-*

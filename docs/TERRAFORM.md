@@ -16,6 +16,11 @@
 - [۵. وارد کردن (import) منابع موجود](#۵-وارد-کردن-import-منابع-موجود)
 - [۶. محدودیت‌ها و رفتارهای مهم](#۶-محدودیتها-و-رفتارهای-مهم)
 - [۷. عیب‌یابی](#۷-عیبیابی)
+- [۸. افزودن نود با Terraform (ویژهٔ اپراتور)](#۸-افزودن-نود-با-terraform-ویژهٔ-اپراتور)
+
+> **دو چیز جدا:** بخش‌های ۱ تا ۷ دربارهٔ **provider مشتری** (`terraform-provider-pcdn/`، منابع یک سایت) است.
+> ساختن **نودهای لبه** روی ابر توسط اپراتور با پوشهٔ [`terraform/`](../terraform/) و ابزار `pcdn-provision`
+> انجام می‌شود — [بخش ۸](#۸-افزودن-نود-با-terraform-ویژهٔ-اپراتور).
 
 ## چه چیزهایی را مدیریت می‌کند
 
@@ -377,3 +382,79 @@ terraform import pcdn_config_section.cache cache  # نام بخش
 `terraform-provider-pcdn` اجرا می‌شوند (job `terraform` در CI). تست‌ها کاملاً آفلاین‌اند: چرخهٔ واقعی
 `terraform plan/apply/import/destroy` روی یک کنترلر جعلی (httptest)؛ به فایل اجرایی Terraform نیاز دارند
 (`TF_ACC_TERRAFORM_PATH` یا `terraform` در `PATH`) و بدون آن رد می‌شوند، مگر `PCDN_REQUIRE_TERRAFORM=1`.
+
+## ۸. افزودن نود با Terraform (ویژهٔ اپراتور)
+
+افزودن نود بر اساس **ظرفیت** (SPEC §23.9): وقتی هشدار ظرفیت یک گروه (`capacity:{group}`) باز می‌شود، کنترلر
+یک **پیشنهاد** می‌سازد (اندازه و تعداد فقط از p95 در برابر `capacity_mbps` — هرگز از دسترس‌پذیری، فیلترینگ یا
+دادهٔ ISP؛ هر نود تازه نشانی‌های معمولی و ثابت می‌گیرد). هیچ چیزی بدون **دو تأیید مدیر** ساخته نمی‌شود و کنترلر
+هرگز کلید ابری ندارد:
+
+```text
+پیشنهاد ──تأیید مدیر──▶ approved ──pcdn-provision: terraform plan──▶ planned (خلاصهٔ طرح در پنل)
+        ──تأیید «اجرای طرح»──▶ apply_approved ──pcdn-provision: terraform apply──▶ applied ──پیوستن نودها──▶ joined
+```
+
+### اجزا
+
+| مسیر | کار |
+|---|---|
+| `terraform/modules/pcdn-edge-node` | ماژول بی‌منبع و مستقل از ابر: برای هر نام نود `user_data` (cloud-init) با **توکن پیوستن یک‌بارمصرف** |
+| `terraform/providers/hcloud` | نمونهٔ Hetzner Cloud: یک `hcloud_server` برای هر نام؛ نوع سرور از `server_types` (اندازه‌های `PROVISION_SIZES`) و محل از `locations` (منطقه) |
+| `terraform/providers/fake` | provider ساختگی برای آزمون و CI: `terraform_data` + فایل cloud-init هر نود در `out/` — بدون ابر |
+| `tools/provision/pcdn-provision` | provisioner اپراتور (Python stdlib + `terraform`) |
+
+قرارداد cloud-init (SPEC §23.18 #8) — هر نود در اولین بوت اجرا می‌کند:
+
+```bash
+curl -fsSL --proto '=https' https://<controller>/edge/bootstrap.sh |
+  PCDN_JOIN_TOKEN=jt_… bash -s -- --controller https://<controller> --role <general|tunnel> --region <home|global> [--version vX.Y.Z]
+```
+
+توکن پیوستن (`jt_` + ۴۰ hex) یک‌بارمصرف است و پس از `JOIN_TOKEN_HOURS` (پیش‌فرض ۲۴) منقضی می‌شود؛ نود با آن
+`POST /edge/v1/join` می‌زند و توکن دائمی خودش را می‌گیرد. پس کپی توکن در metadata ابر یا state ترافرم پس از
+پیوستن بی‌ارزش است. `--version` همان نسخهٔ پین‌شدهٔ گروه است ([RELEASE.md](RELEASE.md)).
+
+### اجرای provisioner
+
+```bash
+# روی ماشین اپراتور (نه روی کنترلر)؛ کلید ابر فقط در محیط همین فرایند
+install -m 600 /dev/null /etc/pcdn/provisioner.token && $EDITOR /etc/pcdn/provisioner.token   # = PROVISIONER_TOKEN کنترلر (≥ ۳۲ نویسه)
+export HCLOUD_TOKEN=…            # یا متغیرهای ابر دیگر؛ هرگز در فایل‌های مخزن یا کنترلر
+tools/provision/pcdn-provision --controller https://cdn-api.example.com \
+    --token-file /etc/pcdn/provisioner.token --workdir /var/lib/pcdn-provision \
+    --module terraform/providers/hcloud            # --once برای یک کار و خروج (cron / آزمون)
+```
+
+- هر ۶۰ ثانیه (`--interval`) `GET /api/v1/provisioner/jobs/next` را می‌پرسد (Bearer `PROVISIONER_TOKEN`؛ کنترلر
+  با `PROVISIONING_ENABLED=true`).
+- **plan:** در `<workdir>/job-<id>/` (مجوز ۰۷۰۰) یک ماژول ریشهٔ کوچک می‌سازد که `--module` را صدا می‌زند،
+  `terraform.tfvars.json` (بدون راز) و `secrets.auto.tfvars.json` (۰۶۰۰، توکن‌های پیوستن) را می‌نویسد،
+  `terraform init` / `plan -out=plan.bin` / `show` را اجرا و خلاصهٔ طرح را با توکن‌های پوشانده (`jt_***`) به
+  `POST …/jobs/{id}/plan` می‌فرستد (`adds`/`changes`/`destroys` از `terraform show -json`).
+- **apply:** پس از تأیید دوم مدیر، `terraform apply plan.bin`؛ طرحی که چیزی را **حذف یا جایگزین** کند هرگز اجرا
+  نمی‌شود (`plan_destroys`، هم در کنترلر هم در provisioner)، و `terraform destroy` هرگز اجرا نمی‌شود. پس از apply
+  فایل راز و `plan.bin` پاک می‌شوند و نتیجه به `POST …/jobs/{id}/result` می‌رود.
+- خطاها (حداکثر ۵۰۰ نویسه) پیش از ارسال از هر توکن پیوستن پاک می‌شوند.
+- state ترافرم هر کار در `<workdir>/job-<id>/terraform.tfstate` می‌ماند (شامل user_data نودها)؛ پوشه را خصوصی نگه
+  دارید و برای حذف نود از پنل/دستی اقدام کنید — این ابزار چیزی را پاک نمی‌کند.
+
+### افزودن ابر دیگر
+
+پوشهٔ `terraform/providers/<name>` بسازید با **همان متغیرها** (`controller_url`، `names`، `join_tokens` حساس،
+`region`، `role`، `group`، `size`، `release`) که ماژول `../../modules/pcdn-edge-node` را صدا بزند و برای هر نام
+یک سرور با `user_data = module.node.user_data[name]` بسازد؛ کلید ابر فقط از محیط (مثل `HCLOUD_TOKEN`). نام
+منابع ابرهای دیگر (مثلاً IaaS ابر آروان) فرض‌هایی‌اند که باید روی حساب خودتان آزموده شوند؛ پوشهٔ آزموده‌نشده در
+مخزن قرار نمی‌گیرد.
+
+### بررسی محلی
+
+```bash
+terraform fmt -check -recursive terraform
+for d in terraform/modules/pcdn-edge-node terraform/providers/fake terraform/providers/hcloud; do
+  terraform -chdir=$d init -backend=false && terraform -chdir=$d validate
+done
+python3 -m pytest -q tools/provision/tests     # با terraform روی PATH، مسیر کامل با providers/fake هم آزموده می‌شود
+```
+
+CI همین‌ها را در کار `provisioning` اجرا می‌کند (`PCDN_REQUIRE_TERRAFORM=1`).

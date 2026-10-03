@@ -1184,15 +1184,25 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--miss-ratio", type=float, default=0.1,
                        help="share of requests with a unique query string = cache MISS (0.1)")
 
+    def threshold_opts(p):
+        # SPEC §23.1 staging gate: pass/fail thresholds of a fixed run (off unless given)
+        g = p.add_argument_group("pass/fail thresholds (exit code 3 when exceeded; off unless given)")
+        g.add_argument("--max-error-pct", type=float, default=None, metavar="PCT",
+                       help="fail when the error rate is above PCT percent (e.g. 0.5)")
+        g.add_argument("--max-p99-ms", type=float, default=None, metavar="MS",
+                       help="fail when the p99 latency (http: request, tunnels: echo RTT) is above MS")
+
     p = sub.add_parser("http", help="cache hit/miss mix over HTTP/1.1")
     common(p)
     http_opts(p)
+    threshold_opts(p)
     for name, hlp in (("ws", "WebSocket tunnel sessions"), ("httpupgrade", "HTTPUpgrade tunnel sessions"),
                       ("grpc", "gRPC (HTTP/2) tunnel streams"), ("h2", "raw HTTP/2 tunnel streams"),
                       ("xhttp", "XHTTP over HTTP/1.1 tunnel sessions")):
         p = sub.add_parser(name, help=hlp)
         common(p)
         tunnel_opts(p)
+        threshold_opts(p)
     p = sub.add_parser("ramp", help="step up connections until errors or p99 cross a threshold")
     common(p)
     g = p.add_argument_group("ramp")
@@ -1260,6 +1270,38 @@ def validate(a, ap):
         ap.error("ramp needs 1 <= --start <= --max and --step >= 1")
     if a.scenario != "ramp" and a.duration <= 0:
         ap.error("--duration must be > 0")
+    if a.scenario != "ramp":
+        if a.max_error_pct is not None and not 0 <= a.max_error_pct <= 100:
+            ap.error("--max-error-pct must be 0..100")
+        if a.max_p99_ms is not None and a.max_p99_ms <= 0:
+            ap.error("--max-p99-ms must be > 0")
+
+
+EXIT_THRESHOLD = 3
+
+
+def check_thresholds(rep: dict, max_error_pct=None, max_p99_ms=None) -> dict | None:
+    """Pass/fail of a fixed run against --max-error-pct / --max-p99-ms (SPEC §23.1 staging gate).
+
+    Returns None when no threshold was given, else {"max_error_pct", "max_p99_ms", "error_pct", "p99_ms",
+    "pass", "failures": [str]}. A run without any latency sample fails a p99 threshold (nothing measured)."""
+    if max_error_pct is None and max_p99_ms is None:
+        return None
+    r = rep.get("result") or {}
+    err_pct = round(float(r.get("error_rate") or 0.0) * 100, 4)
+    lat = r.get("latency_ms") or {}
+    key = "request" if rep.get("protocol") == "http" else "rtt"
+    p99 = (lat.get(key) or {}).get("p99")
+    failures = []
+    if max_error_pct is not None and err_pct > max_error_pct:
+        failures.append(f"error_pct {err_pct} > {max_error_pct}")
+    if max_p99_ms is not None:
+        if p99 is None:
+            failures.append("p99_ms not measured")
+        elif p99 > max_p99_ms:
+            failures.append(f"p99_ms {p99} > {max_p99_ms}")
+    return {"max_error_pct": max_error_pct, "max_p99_ms": max_p99_ms, "error_pct": err_pct, "p99_ms": p99,
+            "pass": not failures, "failures": failures}
 
 
 async def run(a) -> dict:
@@ -1295,6 +1337,11 @@ def main(argv=None) -> int:
             rep = asyncio.run(run(a))
     except ImportError:
         rep = asyncio.run(run(a))
+    th = None
+    if a.scenario != "ramp":
+        th = check_thresholds(rep, a.max_error_pct, a.max_p99_ms)
+        if th is not None:
+            rep["thresholds"] = th
     text = json.dumps(rep, ensure_ascii=False, indent=1)
     out = a.out or f"pcdn-loadtest-{a.scenario}-{rep['started_at'].replace(':', '')}.json"
     if out == "-":
@@ -1305,6 +1352,9 @@ def main(argv=None) -> int:
             f.write(text)
         print(fa_summary(rep))
         print(f"گزارش JSON: {out}")
+    if th is not None and not th["pass"]:
+        print("THRESHOLD FAILED / آستانه رد شد: " + "; ".join(th["failures"]), file=sys.stderr)
+        return EXIT_THRESHOLD
     return 0
 
 

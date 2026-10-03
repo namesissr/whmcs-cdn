@@ -840,10 +840,10 @@ def test_controller_node_block_and_fair_share_field(tmp_path):
     cfg = make_cfg(tmp_path, NODE_NAME="local", CAPACITY_MBPS="300")
     body = {"node": {"name": "ir-thr-1", "capacity_mbps": 1000, "fair_share_pct": 25}}
     assert agent.norm_node(body, cfg) == {"capacity_mbps": 1000, "fair_share_pct": 25, "name": "ir-thr-1",
-                                          "http3": True}
+                                          "http3": True, "public_tag": ""}
     # capacity 0 / name "" from the controller = unknown: the agent.conf fallbacks apply
     assert agent.norm_node({"node": {"name": "", "capacity_mbps": 0, "fair_share_pct": 25}}, cfg) == \
-        {"capacity_mbps": 300, "fair_share_pct": 25, "name": "local", "http3": True}
+        {"capacity_mbps": 300, "fair_share_pct": 25, "name": "local", "http3": True, "public_tag": ""}
     http = agent.render_all(dict(body, sites=[]), cfg)["http.conf"]
     assert agent.node_tag("ir-thr-1") in http and "ir-thr-1" not in http
     for flag, want in ((None, True), (True, True), (False, False)):
@@ -1111,7 +1111,9 @@ def test_heartbeat_reports_capabilities(tmp_path):
                                     "edge_functions": False,
                                     # SPEC §22 (wave 13)
                                     "drain": True, "tunnel_probe": True, "tunnel_multi_origin": True,
-                                    "upstream_resolve": False}
+                                    "upstream_resolve": False,
+                                    # SPEC §23 (wave 14)
+                                    "self_upgrade": agent.self_upgrade_capable(a.cfg), "rum": "njs" in ORG_MODULES}
     json.dumps(body)
 
 

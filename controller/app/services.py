@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import (access, botranges, crypto, dnsbuild, edge_state, images, l4, logexport, origin_guard, origin_pull,
-               pdns, sections, storage, tls_tickets, waf_learning, waiting_room, webhooks)
+from . import (access, botranges, crypto, dnsbuild, edge_labels, edge_state, images, l4, logexport, origin_guard,
+               origin_pull, pdns, rollout, rum, sections, storage, tls_tickets, waf_learning, waiting_room, webhooks)
 from .config import settings
 from .models import Edge, Purge, Site, State, UsageHourly, utcnow
 from .validation import fqdn
@@ -312,6 +312,8 @@ def site_to_dict(db: Session, site: Site) -> dict:
         "operator_note": site.operator_note,
         "billing_since": site.billing_since.isoformat() + "Z" if site.billing_since else None,
         "status": site.effective_status,
+        # SPEC §23.10: suspended by the abuse desk (a billing unsuspend does not clear it)
+        "abuse_suspended": bool(site.abuse_suspended),
         "ns_verified": site.ns_verified_at is not None,
         "ns_found": json.loads(site.ns_found or "[]"),
         "nameservers": settings.nameservers,
@@ -364,12 +366,21 @@ def _key_type(site: Site) -> str | None:
 
 
 def edge_ips(db: Session) -> list[str]:
-    ips = []
-    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True)).order_by(Edge.id)):
-        ips.append(e.ipv4)
-        if e.ipv6:
-            ips.append(e.ipv6)
-    return ips
+    """SPEC §23.12.4: the origin allow-list — the enabled edges' addresses, unlabeled and unordered by
+    node: de-duplicated, sorted numerically, IPv4 then IPv6, no names / cities / groups (the same
+    addresses as before; nothing beyond what an origin sees in its own access log)."""
+    import ipaddress
+
+    seen = set()
+    for e in db.scalars(select(Edge).where(Edge.enabled.is_(True))):
+        for raw in (e.ipv4, e.ipv6):
+            if not raw or raw == EDGE_IP_PLACEHOLDER:
+                continue
+            try:
+                seen.add(ipaddress.ip_address(raw))
+            except ValueError:
+                continue
+    return [str(ip) for ip in sorted(seen, key=lambda ip: (ip.version, int(ip)))]
 
 
 def cert_names(pem: str) -> list[str]:
@@ -637,6 +648,10 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             # SPEC §18.2: protected apps + access_secret (64 hex = 32 bytes, HMAC key = the raw bytes)
             "access": access.edge_block(site, cfg["access"], feats),
         })
+        # SPEC §23.7: per-site RUM block only when enabled (absent otherwise: old agents ignore it)
+        rum_block = rum.edge_block(site, cfg["rum"], feats)
+        if rum_block is not None:
+            out[-1]["rum"] = rum_block
     body = {
         "sites": out,
         # node-wide origin shield block (SPEC §14.1). `self`: this node is a shield (accepts shield
@@ -668,6 +683,10 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
             "http3": edge is None or edge.http3_enabled is not False,
             "tls_tickets": tls_tickets.edge_block(db),
             "dns_weight": _node_dns_weight(db, edge),
+            # SPEC §23.12.2: the node's public tag (8 hex, HMAC of its id; rendered as X-Served-By /
+            # X-Pcdn-Node instead of the host name) and §23.2 the self-upgrade request (non-rendered)
+            "public_tag": edge_labels.public_tag(edge.id, db) if edge is not None else None,
+            "upgrade": rollout.upgrade_block(db, edge),
         },
         # SPEC §16.4: the TCP/UDP proxy apps this node listens for — apps of the node's own edge
         # group, of active sites whose plan has l4_proxy, enabled apps only (l4.edge_block)
@@ -809,6 +828,14 @@ def delete_platform_data(db: Session, site_id: int) -> None:
     for model in (ApiKey, UsageHourly, SecurityEvent, Purge, AnalyticsMinute, LogSpool, WebhookDelivery,
                   StorageBucket, StorageUsageHourly, AccessOtp):
         db.execute(delete(model).where(model.site_id == site_id))
+    # SPEC §23: config history, RUM, import sessions, alert subscriptions (outbox rows keep no site)
+    from . import config_history, notify
+    from .models import ImportSession, RumHourly
+
+    for model in (RumHourly, ImportSession):
+        db.execute(delete(model).where(model.site_id == site_id))
+    config_history.delete_site(db, site_id)
+    notify.prune_site(db, site_id)
     l4.delete_site(db, site_id)  # SPEC §16.4: the site's edge ports are free again
     keys = [logexport.STATUS_KEY.format(site_id), logexport.DROPPED_KEY.format(site_id),
             webhooks.ATTACK_KEY.format(site_id)]

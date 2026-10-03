@@ -1,6 +1,8 @@
 """Usage accounting from the access log: per-host hourly usage, security events, tunnel quality
-(SPEC §15.1), live minute aggregates (SPEC §14.3.1), platform errors and L4 usage (SPEC §16.4)."""
+(SPEC §15.1), live minute aggregates (SPEC §14.3.1), platform / origin errors (SPEC §14.3.1, §23.5),
+L4 usage (SPEC §16.4) and the RUM beacon aggregates (SPEC §23.7)."""
 
+import bisect
 import hashlib
 import json
 import math
@@ -83,6 +85,26 @@ def platform_error(e: dict) -> bool:
     if str(e.get("v") or "ok").split(":", 1)[0] in SECURITY_ACTIONS + GATE_ACTIONS:
         return False
     return not e.get("pg")
+
+
+ORIGIN_5XX = (502, 503, 504)
+
+
+def origin_error(e: dict) -> bool:
+    """SPEC §23.5 live `oe`: an origin-attributed 5xx - status 502 / 503 / 504 with a non-empty upstream
+    status: the origin answered it, or nginx recorded the failed attempt (a failed upstream connect /
+    timeout is logged as "502" / "504" there), i.e. never a platform_error (whose upstream status is
+    empty). Not counted: lines without the "us" field (no evidence), responses served from the cache, the
+    site's own suspended / over-quota page and security answers."""
+    try:
+        code = int(e.get("s") or 0)
+    except (TypeError, ValueError):
+        return False
+    if code not in ORIGIN_5XX or "us" not in e or not str(e.get("us") or "").strip():
+        return False
+    if e.get("c") in CACHE_SERVED or e.get("pg"):
+        return False
+    return str(e.get("v") or "ok").split(":", 1)[0] not in SECURITY_ACTIONS + GATE_ACTIONS
 
 
 # ---- tunnel quality (SPEC §15.1)
@@ -285,9 +307,10 @@ def _prune_live(live: dict):
 
 
 def _account_live(live: dict, host: str, minute: str, nbytes: int, hit: bool, code: int, cc: str, path: str,
-                  tunnel: str | None = None):
+                  tunnel: str | None = None, pe: bool = False, oe: bool = False):
     """tunnel: None for a request without a tunnel path id, else its classify_tunnel() outcome
-    ("" when the line is not counted as a session or an error)."""
+    ("" when the line is not counted as a session or an error). pe / oe: the line is a platform error /
+    an origin-attributed 5xx (SPEC §23.5 live `pe` / `oe`)."""
     key = f"{host}|{minute}"
     b = live.get(key)
     if b is None:
@@ -298,6 +321,10 @@ def _account_live(live: dict, host: str, minute: str, nbytes: int, hit: bool, co
     b["bytes"] += nbytes
     if hit:
         b["cache_hits"] += 1
+    if pe:
+        b["pe"] = b.get("pe", 0) + 1
+    if oe:
+        b["oe"] = b.get("oe", 0) + 1
     if 200 <= code <= 599:
         _inc(b["status"], f"{code // 100}xx")
     if cc and (cc in b["countries"] or len(b["countries"]) < LIVE_CC_TRACK):
@@ -330,7 +357,9 @@ def live_item(key: str, b: dict) -> dict | None:
     item = {"host": host, "minute": minute, "requests": max(0, int(b.get("requests") or 0)),
             "bytes": max(0, int(b.get("bytes") or 0)), "cache_hits": max(0, int(b.get("cache_hits") or 0)),
             "status": cnt(b.get("status") or {}), "countries": cnt(_top(b.get("countries") or {}, LIVE_TOP)),
-            "paths": cnt(_top(b.get("paths") or {}, LIVE_TOP))}
+            "paths": cnt(_top(b.get("paths") or {}, LIVE_TOP)),
+            # SPEC §23.5: origin-attributed 5xx and platform errors of the minute (old controllers ignore them)
+            "oe": max(0, int(b.get("oe") or 0)), "pe": max(0, int(b.get("pe") or 0))}
     if b.get("tunnel_attempts"):   # SPEC §15.4, optional: only minutes with tunnel attempts carry them
         item["tunnel_attempts"] = max(0, int(b["tunnel_attempts"]))
         item["tunnel_errors"] = max(0, int(b.get("tunnel_errors") or 0))
@@ -738,11 +767,13 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
     if hit:
         a["cache_hits"] += 1
     code = int(e.get("s") or 0)
+    pe = False
     if 100 <= code <= 599:
         _inc(a["status"], f"{code // 100}xx")
         _inc(a["codes"], str(code))
         if code >= 500 and platform_error(e):
             a["platform_errors"] = a.get("platform_errors", 0) + 1
+            pe = True
     cc = str(e.get("cc") or "").upper()
     if not _CC.match(cc):
         cc = ""
@@ -787,7 +818,7 @@ def _account(e: dict, pending: dict, events: list, live: dict | None = None, cut
             src, rid = (parts[1], parts[2]) if len(parts) == 3 else ("", "")
             _account_learn(a, learn, host, hour, minute, e, path, src, rid, attack)
     if live is not None and minute >= cutoff:
-        _account_live(live, host, minute, nbytes, hit, code, cc, path, live_tn)
+        _account_live(live, host, minute, nbytes, hit, code, cc, path, live_tn, pe, code >= 500 and origin_error(e))
     if ship is not None:
         try:
             ship.offer(e, host, dt, raw)
@@ -1127,6 +1158,10 @@ def usage_item(key: str, a, learn_hours: dict | None = None) -> dict:
     if a.get("functions"):   # SPEC §16.9 (optional): edge function invocations of this host-hour
         item["functions"] = {k: int(a["functions"].get(k) or 0)
                              for k in ("invocations", "cpu_ms", "errors", "timeouts")}
+    if a.get("rum"):         # SPEC §23.7 (optional; old controllers drop it)
+        r = rum_item(a["rum"])
+        if r:
+            item["rum"] = r
     return item
 
 
@@ -1155,3 +1190,187 @@ def tpath_item(p: dict) -> dict:
 
 def usage_items(pending: dict, learn_hours: dict | None = None) -> list[dict]:
     return [usage_item(k, v, learn_hours) for k, v in pending.items()]
+
+
+# ----------------------------------------------------------------- RUM aggregates (SPEC §23.7)
+#
+# pcdn.rumIngest writes one sanitized JSON line per accepted beacon to RUM_LOG ({"t" minute, "h" host,
+# "cc", "asn", "rg", "p", "nt", "dev", "cs", metrics}; no address). The agent folds them per host-hour
+# into fixed-bucket histograms - the contract shared with the controller (pinned by golden tests):
+#   ms metrics: upper bounds RUM_MS_BOUNDS + infinity (17 counts), cls x1000: RUM_CLS_BOUNDS + inf (8).
+# The aggregates carry no node dimension and nothing per visitor.
+
+RUM_MS_METRICS = ("ttfb", "fcp", "lcp", "inp", "dns", "tcp", "tls", "dom", "load")
+RUM_MS_BOUNDS = (50, 100, 200, 300, 500, 800, 1000, 1500, 1800, 2000, 2500, 3000, 4000, 5000, 8000, 12000)
+RUM_CLS_BOUNDS = (10, 50, 100, 150, 250, 500, 1000)
+RUM_TOP = {"cc": 30, "asn": 20, "rg": 31, "dev": 3, "path": 50, "cs": 6}   # top-N per dimension (+ "other")
+RUM_TRACK = {"cc": 64, "asn": 64, "rg": 64, "dev": 3, "path": 200, "cs": 6}   # keys counted per host-hour
+RUM_DROP_ORDER = ("path", "rg", "asn", "cc", "cs", "dev")   # size cap: dimensions dropped in this order
+RUM_ITEM_MAX = 32 * 1024
+RUM_READ_MAX = 16 * 1024 * 1024    # bytes of the RUM log consumed per usage tick
+RUM_OTHER = "other"
+_RUM_CS = ("HIT", "MISS", "BYPASS", "EXPIRED", "STALE")
+_RUM_PATH = re.compile(r"^/[^\s?#]{0,199}$")
+
+
+def rum_bucket(value: float, bounds: tuple) -> int:
+    """Index of the histogram bucket of `value`: the first upper bound >= value (len(bounds) = infinity)."""
+    return bisect.bisect_left(bounds, value)
+
+
+def _rum_h() -> dict:
+    return {"n": 0}
+
+
+def _rum_add(h: dict, vals: dict):
+    h["n"] = int(h.get("n") or 0) + 1
+    for k, (v, bounds) in vals.items():
+        lst = h.get(k)
+        if not isinstance(lst, list) or len(lst) != len(bounds) + 1:
+            lst = h[k] = [0] * (len(bounds) + 1)
+        lst[rum_bucket(v, bounds)] += 1
+
+
+def _rum_merge(dst: dict, src: dict):
+    dst["n"] = int(dst.get("n") or 0) + int(src.get("n") or 0)
+    for k, v in src.items():
+        if k == "n" or not isinstance(v, list):
+            continue
+        cur = dst.get(k)
+        if not isinstance(cur, list) or len(cur) != len(v):
+            dst[k] = list(v)
+        else:
+            dst[k] = [a + b for a, b in zip(cur, v)]
+
+
+def rum_values(e: dict) -> dict:
+    """The metrics of one RUM line -> {metric: (value, bounds)} (cls scaled x1000); invalid ones skipped."""
+    out = {}
+    for k in RUM_MS_METRICS + ("cls",):
+        v = e.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0:
+            continue
+        out[k] = (min(float(v), 60000.0), RUM_MS_BOUNDS) if k != "cls" else (min(float(v), 10.0) * 1000, RUM_CLS_BOUNDS)
+    return out
+
+
+def rum_dims(e: dict) -> dict:
+    """The breakdown keys of one RUM line ({dim: key}); unknown / empty dimensions are left out."""
+    d = {}
+    cc = str(e.get("cc") or "").upper()
+    if _CC.match(cc):
+        d["cc"] = cc
+    try:
+        asn = int(e.get("asn") or 0)
+    except (TypeError, ValueError):
+        asn = 0
+    if 0 < asn <= 4294967295:
+        d["asn"] = str(asn)
+    rg = "".join(c for c in str(e.get("rg") or "") if c.isprintable())[:64].strip()
+    if rg:
+        d["rg"] = rg
+    if e.get("dev") in ("m", "t", "d"):
+        d["dev"] = e["dev"]
+    p = e.get("p")
+    d["path"] = p if isinstance(p, str) and _RUM_PATH.match(p) else "/"
+    if e.get("cs") in _RUM_CS:
+        d["cs"] = e["cs"]
+    return d
+
+
+def _account_rum(e: dict, pending: dict):
+    host = str(e.get("h") or "").lower()
+    if not SAFE_NAME.match(host) or len(host) > 253:
+        return
+    _, hour, _ = _times(e["t"])
+    a = _bucket(pending, f"{host}|{hour}")
+    R = a.get("rum")
+    if not isinstance(R, dict):
+        R = a["rum"] = {"n": 0, "all": _rum_h(), "by": {}}
+    vals = rum_values(e)
+    R["n"] = int(R.get("n") or 0) + 1
+    _rum_add(R.setdefault("all", _rum_h()), vals)
+    by = R.setdefault("by", {})
+    for dim, key in rum_dims(e).items():
+        d = by.setdefault(dim, {})
+        if key not in d and len(d) >= RUM_TRACK[dim]:
+            key = RUM_OTHER
+        _rum_add(d.setdefault(key, _rum_h()), vals)
+
+
+def _rum_wire(h: dict) -> dict:
+    out = {"n": max(0, int(h.get("n") or 0))}
+    for k in RUM_MS_METRICS + ("cls",):
+        v = h.get(k)
+        if isinstance(v, list):
+            out[k] = [max(0, int(x or 0)) for x in v]
+    return out
+
+
+def rum_item(R: dict) -> dict | None:
+    """The usage item's `rum` object: totals, then per dimension the top-N keys by n with the rest summed
+    into "other"; at most RUM_ITEM_MAX bytes of JSON (path, then rg, ... dropped first). None when empty."""
+    if not isinstance(R, dict) or not int(R.get("n") or 0):
+        return None
+    out = {"n": int(R["n"]), "all": _rum_wire(R.get("all") or {}), "by": {}}
+    for dim, top in RUM_TOP.items():
+        d = (R.get("by") or {}).get(dim)
+        if not isinstance(d, dict) or not d:
+            continue
+        ranked = sorted(((k, h) for k, h in d.items() if k != RUM_OTHER and isinstance(h, dict)),
+                        key=lambda kv: (-int(kv[1].get("n") or 0), kv[0]))
+        res = {k: _rum_wire(h) for k, h in ranked[:top]}
+        rest = [h for _, h in ranked[top:]] + ([d[RUM_OTHER]] if isinstance(d.get(RUM_OTHER), dict) else [])
+        if rest:
+            other = _rum_h()
+            for h in rest:
+                _rum_merge(other, h)
+            res[RUM_OTHER] = _rum_wire(other)
+        out["by"][dim] = res
+    for dim in RUM_DROP_ORDER:
+        if len(json.dumps(out, separators=(",", ":"))) <= RUM_ITEM_MAX:
+            break
+        out["by"].pop(dim, None)
+    return out
+
+
+def _consume_rum(path: str, pos: int, pending: dict, max_bytes: int) -> int:
+    read = 0
+    with open(path, "rb", buffering=1 << 20) as f:
+        f.seek(pos)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break
+            pos += len(raw)
+            read += len(raw)
+            try:
+                e = json.loads(raw)
+                if isinstance(e, dict):
+                    _account_rum(e, pending)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
+            if read >= max_bytes:
+                break
+    return pos
+
+
+def read_rum_usage(state: dict, path: str, max_bytes: int = RUM_READ_MAX) -> None:
+    """Fold new RUM log lines into state['pending'] (own offset / inode: rum_pos, rum_inode). After a
+    rotation the rest of the old file (<path>.1, same inode) is read first (as for the L4 log)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    pending = state.setdefault("pending", {})
+    pos, ino = int(state.get("rum_pos") or 0), state.get("rum_inode")
+    if ino is not None and ino != st.st_ino:
+        try:
+            if os.stat(path + ".1").st_ino == ino:
+                _consume_rum(path + ".1", pos, pending, max_bytes)
+        except OSError:
+            pass
+        pos = 0
+    elif st.st_size < pos:
+        pos = 0
+    state["rum_pos"] = _consume_rum(path, pos, pending, max_bytes)
+    state["rum_inode"] = st.st_ino

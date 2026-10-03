@@ -60,6 +60,11 @@ DEFAULT_FEATURES = {
     # wave 10 (SPEC §18.1 / §18.2): sections `waiting_room` and `access`, off by default
     "waiting_room": False,
     "access": False,
+    # wave 14 (SPEC §23.15): section `rum` (§23.7), customer alert channels (§23.5)
+    "rum": False,
+    "alert_sms": False,
+    "alert_messengers": False,
+    "max_alert_subscriptions": 20,
 }
 EDGE_GROUPS = ("general", "tunnel")
 WEBHOOKS_MAX = 50  # hard cap of section `webhooks` items, whatever the plan says
@@ -112,6 +117,10 @@ class Features(Strict):
     dns_secondary: bool = False
     waiting_room: bool = False
     access: bool = False
+    rum: bool = False
+    alert_sms: bool = False
+    alert_messengers: bool = False
+    max_alert_subscriptions: int = Field(20, ge=0, le=100)
 
 
 # ------------------------------------------------------------------ sections
@@ -1626,7 +1635,9 @@ class Logs(Strict):
 WEBHOOK_EVENTS = ("purge.completed", "ssl.issued", "ssl.failed", "quota.warning", "quota.exceeded",
                   "site.suspended", "site.unsuspended", "attack.detected",
                   # SPEC §15.4: the site's tunnel origin went down / came back
-                  "tunnel.origin_down", "tunnel.origin_up")
+                  "tunnel.origin_down", "tunnel.origin_up",
+                  # SPEC §23.5: web origin health, certificate expiry, platform incidents
+                  "origin.down", "origin.up", "ssl.expiring", "incident.opened", "incident.resolved")
 WEBHOOK_ID_RE = re.compile(r"^wh_[0-9a-f]{8}$")
 
 
@@ -1891,6 +1902,27 @@ class WaitingRoom(Strict):
         return _prefixes(v, "paths")
 
 
+class Rum(Strict):
+    """SPEC §23.7: real user monitoring (plan feature `rum`). No cookies, no identifiers, no IPs."""
+    enabled: bool = False
+    sample_rate: float = Field(0.1, ge=0.01, le=1.0)
+    inject: Literal["auto", "manual"] = "auto"
+    exclude_paths: list[str] = Field(default_factory=list, max_length=20)
+    spa: bool = False
+
+    @field_validator("exclude_paths")
+    @classmethod
+    def _exclude(cls, v):
+        out = []
+        for p in v:
+            p = (p or "").strip()
+            if not p.startswith("/") or len(p) > 200 or not PATH_PATTERN_RE.match(p) or p.startswith(RESERVED_PREFIX):
+                raise ValueError("مسیرهای مستثنا باید با / شروع شوند (حداکثر ۲۰۰ نویسه)")
+            if p not in out:
+                out.append(p)
+        return out
+
+
 def _emails(v: list[str]) -> list[str]:
     out = []
     for e in v:
@@ -2000,13 +2032,15 @@ SECTIONS: dict[str, type[BaseModel]] = {
     # wave 10 (SPEC §18.1 / §18.2)
     "waiting_room": WaitingRoom,
     "access": Access,
+    # wave 14 (SPEC §23.7)
+    "rum": Rum,
 }
 
 # section -> feature flag that must be on to write it
 FEATURE_GATES = {"waf": "waf", "ddos": "ddos", "pools": "load_balancer", "image": "image_optimization",
                  "tunnel": "tunnel", "logs": "log_export", "l4": "l4_proxy",
                  "functions": "edge_functions", "dns_secondary": "dns_secondary",
-                 "waiting_room": "waiting_room", "access": "access"}
+                 "waiting_room": "waiting_room", "access": "access", "rum": "rum"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -2450,7 +2484,7 @@ def _is_enabled(name: str, value: dict) -> bool:
         return bool(value["pools"])
     if name == "l4":
         return bool(value["apps"])
-    if name in ("tunnel", "logs", "access"):
+    if name in ("tunnel", "logs", "access", "rum"):
         return value["enabled"]
     if name == "waiting_room":
         return value["enabled"] and value["mode"] != "off"

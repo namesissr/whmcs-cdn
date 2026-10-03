@@ -6,6 +6,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -96,6 +97,9 @@ class Site(Base):
     integration_secrets: Mapped[str | None] = mapped_column(Text, nullable=True)
     # when the quota.warning webhook (80 % of bandwidth_limit_gb) was last emitted; once per month
     quota_warned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # SPEC §23.10: suspended by the abuse desk (independent of billing: a WHMCS unsuspend never
+    # clears it); effective_status is "suspended" while it is set
+    abuse_suspended: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -145,7 +149,7 @@ class Site(Base):
 
     @property
     def effective_status(self) -> str:
-        if self.suspended:
+        if self.suspended or self.abuse_suspended:
             return "suspended"
         if self.over_quota:
             return "over_quota"
@@ -295,6 +299,15 @@ class Edge(Base):
     http3_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # §22.10 load level of the capacity-weighted DNS (0 = 1.0, 1 = 0.5, 2 = 0.25), with hysteresis
     dns_weight_level: Mapped[int] = mapped_column(Integer, default=0)
+
+    # ---- wave 14 (SPEC §23, migration 0023)
+    # §23.12 customer-visible label: Persian city name (admin-set) and an optional English override
+    display_city: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    display_city_en: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # §23.1 platform release the node runs (heartbeat `release`, "vX.Y.Z") and §23.2 the latest
+    # heartbeat `upgrade` object (JSON)
+    release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    upgrade_state: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # additional addresses of the same node for health-based failover (SPEC §12); ipv4/ipv6
     # above stay the primary address
@@ -650,3 +663,321 @@ class AccessOtp(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
     email_hash: Mapped[str] = mapped_column(String(64), index=True)
     at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+# ====================================================================== wave 14 (SPEC §23, 0023)
+
+class SiteConfigVersion(Base):
+    """One version of a site's configuration (SPEC §23.4): the header; the changed sections live in
+    SiteConfigValue rows. The config of version N = per section the newest value with version <= N."""
+
+    __tablename__ = "site_config_versions"
+    __table_args__ = (UniqueConstraint("site_id", "version", name="uq_site_config_versions_site_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    actor_kind: Mapped[str] = mapped_column(String(16), default="system")
+    actor: Mapped[str] = mapped_column(String(120), default="")
+    on_behalf_of: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="system")
+    sections: Mapped[str] = mapped_column(Text, default="[]")
+    restored_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    values: Mapped[list["SiteConfigValue"]] = relationship(cascade="all, delete-orphan")
+
+
+class SiteConfigValue(Base):
+    __tablename__ = "site_config_values"
+    __table_args__ = (UniqueConstraint("version_id", "section", name="uq_site_config_values_version_section"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version_id: Mapped[int] = mapped_column(ForeignKey("site_config_versions.id", ondelete="CASCADE"), index=True)
+    section: Mapped[str] = mapped_column(String(32))
+    sha256: Mapped[str] = mapped_column(String(64))
+    value: Mapped[str] = mapped_column(Text)
+
+
+class BackupRun(Base):
+    """One backup or restore-test run (SPEC §23.3); the newest 200 rows are kept. `error` is scrubbed."""
+
+    __tablename__ = "backup_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8))  # backup | verify
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    name: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(8), nullable=True)  # local | s3 | both
+    level: Mapped[str | None] = mapped_column(String(8), nullable=True)  # full | partial
+    checks: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class LiveMarker(Base):
+    """SPEC §23.3: one row in the LIVE database only; a restore-test scratch database that already
+    holds this table before the restore is refused (it could be the live database)."""
+
+    __tablename__ = "pcdn_live_marker"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+
+class NotificationSubscription(Base):
+    """A customer alert subscription (SPEC §23.5), owned by a WHMCS client id (the account)."""
+
+    __tablename__ = "notification_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(Integer, index=True)
+    site_id: Mapped[int | None] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), nullable=True)
+    events: Mapped[str] = mapped_column(Text, default="[]")
+    channels: Mapped[str] = mapped_column(Text, default="[]")
+    lang: Mapped[str] = mapped_column(String(2), default="fa")
+    quiet_start: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    quiet_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    quiet_bypass_critical: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class NotificationTarget(Base):
+    """An SMS phone / Bale / Telegram chat of an account (SPEC §23.5). `value` is encrypted at rest;
+    `value_hash` (HMAC) is for uniqueness and lookups; `masked` is what the panel shows."""
+
+    __tablename__ = "notification_targets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(Integer, index=True)
+    channel: Mapped[str] = mapped_column(String(8))  # sms | bale | telegram
+    value_stored: Mapped[str] = mapped_column("value", Text)
+    value_hash: Mapped[str] = mapped_column(String(64), index=True)
+    masked: Mapped[str] = mapped_column(String(32), default="")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    @property
+    def value(self) -> str | None:
+        return crypto.decrypt(self.value_stored)
+
+    @value.setter
+    def value(self, v: str):
+        self.value_stored = crypto.encrypt(v)
+
+
+class NotificationLinkCode(Base):
+    """SMS verification codes and Bale/Telegram link codes (SPEC §23.5): only a hash is stored."""
+
+    __tablename__ = "notification_link_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(Integer, index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # sms_verify | bale | telegram
+    target_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    code_hash: Mapped[str] = mapped_column(String(64), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    tries: Mapped[int] = mapped_column(Integer, default=0)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class NotificationOutbox(Base):
+    """One message for one (delivery, channel, target) (SPEC §23.5). SMS / bot rows are sent by the
+    controller (job_notify); e-mail rows are pulled and acknowledged by the WHMCS addon cron."""
+
+    __tablename__ = "notification_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(Integer, index=True)
+    site_id: Mapped[int | None] = mapped_column(ForeignKey("sites.id", ondelete="SET NULL"), nullable=True)
+    event: Mapped[str] = mapped_column(String(32))
+    severity: Mapped[str] = mapped_column(String(8), default="info")
+    channel: Mapped[str] = mapped_column(String(8))
+    target_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lang: Mapped[str] = mapped_column(String(2), default="fa")
+    subject: Mapped[str] = mapped_column(Text, default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    vars: Mapped[str] = mapped_column(Text, default="{}")
+    dedup_key: Mapped[str] = mapped_column(String(128), default="", index=True)
+    status: Mapped[str] = mapped_column(String(10), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ImportSession(Base):
+    """Provider data fetched by an import preview (SPEC §23.6), encrypted, short-lived. Never the key."""
+
+    __tablename__ = "import_sessions"
+
+    id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    provider: Mapped[str] = mapped_column(String(16))
+    data: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class RumHourly(Base):
+    """RUM histograms per site, hour, dimension and key (SPEC §23.7). Never a node dimension."""
+
+    __tablename__ = "rum_hourly"
+    __table_args__ = (UniqueConstraint("site_id", "hour", "dim", "key", name="uq_rum_hourly"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"))
+    hour: Mapped[datetime] = mapped_column(DateTime, index=True)
+    dim: Mapped[str] = mapped_column(String(8))
+    key: Mapped[str] = mapped_column(String(200))
+    n: Mapped[int] = mapped_column(BigInteger, default=0)
+    hist: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class AbuseReport(Base):
+    """An abuse report (SPEC §23.10). The reporter e-mail is encrypted; IP only as a daily HMAC."""
+
+    __tablename__ = "abuse_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticket: Mapped[str] = mapped_column(String(12), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    category: Mapped[str] = mapped_column(String(16))
+    urls: Mapped[str] = mapped_column(Text, default="[]")
+    description: Mapped[str] = mapped_column(Text, default="")
+    reporter_email_stored: Mapped[str | None] = mapped_column("reporter_email", Text, nullable=True)
+    reporter_email_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reporter_ip_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    status_token_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(10), default="new", index=True)
+    site_id: Mapped[int | None] = mapped_column(ForeignKey("sites.id", ondelete="SET NULL"), nullable=True,
+                                                index=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    action: Mapped[str] = mapped_column(String(12), default="none")
+    public_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def reporter_email(self) -> str | None:
+        return crypto.decrypt(self.reporter_email_stored)
+
+    @reporter_email.setter
+    def reporter_email(self, v: str | None):
+        self.reporter_email_stored = crypto.encrypt(v) if v else None
+
+
+class AbuseEvent(Base):
+    __tablename__ = "abuse_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("abuse_reports.id", ondelete="CASCADE"), index=True)
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    actor: Mapped[str] = mapped_column(String(64), default="")
+    kind: Mapped[str] = mapped_column(String(16))
+    data: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class SloBucket(Base):
+    """SLI counters of one edge group per 5 minutes / hour (SPEC §23.11)."""
+
+    __tablename__ = "slo_buckets"
+    __table_args__ = (UniqueConstraint("group", "start", "res", name="uq_slo_buckets"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group: Mapped[str] = mapped_column(String(16))
+    start: Mapped[datetime] = mapped_column(DateTime)
+    res: Mapped[str] = mapped_column(String(3))  # 5m | 1h
+    avail_good: Mapped[int] = mapped_column(BigInteger, default=0)
+    avail_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    lat_good: Mapped[int] = mapped_column(BigInteger, default=0)
+    lat_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    requests: Mapped[int] = mapped_column(BigInteger, default=0)
+    errors: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class Rollout(Base):
+    """A staged node rollout to one platform release (SPEC §23.2)."""
+
+    __tablename__ = "rollouts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    release: Mapped[str] = mapped_column(String(40))
+    groups: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list, null = all
+    state: Mapped[str] = mapped_column(String(16), default="planned", index=True)
+    ring: Mapped[int] = mapped_column(Integer, default=0)
+    soak_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    ring_percent: Mapped[int] = mapped_column(Integer, default=25)
+    auto_rollback: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_no_rollback: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(64), default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RolloutEdge(Base):
+    __tablename__ = "rollout_edges"
+    __table_args__ = (UniqueConstraint("rollout_id", "edge_id", name="uq_rollout_edges"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rollout_id: Mapped[int] = mapped_column(ForeignKey("rollouts.id", ondelete="CASCADE"), index=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id", ondelete="CASCADE"))
+    ring: Mapped[int] = mapped_column(Integer, default=2)
+    from_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    state: Mapped[str] = mapped_column(String(16), default="pending")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    soak_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    force_no_drain: Mapped[bool] = mapped_column(Boolean, default=False)
+    baseline_err_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class EdgeJoinToken(Base):
+    """A one-time join token (SPEC §23.9): "jt_" + 40 hex, only its sha256 is stored."""
+
+    __tablename__ = "edge_join_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("edges.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_by: Mapped[str] = mapped_column(String(64), default="admin")
+
+
+class ProvisionProposal(Base):
+    """A capacity-driven node provisioning proposal (SPEC §23.9); two admin approvals before apply."""
+
+    __tablename__ = "provision_proposals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group: Mapped[str] = mapped_column(String(16))
+    region: Mapped[str] = mapped_column(String(16))
+    size: Mapped[str] = mapped_column(String(16))
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    state: Mapped[str] = mapped_column(String(16), default="proposed", index=True)
+    plan_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    plan_adds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_changes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_destroys: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    join_tokens_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    edge_ids: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

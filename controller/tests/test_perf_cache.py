@@ -272,7 +272,9 @@ WAVE8_CAPS = {"l4": False, "l4_port_range": None, "slice": False, "video": False
               "image_transform": False, "net_guard": False,
               "edge_functions": False,  # SPEC §16.9
               # SPEC §22 (wave 13)
-              "drain": False, "tunnel_probe": False, "tunnel_multi_origin": False, "upstream_resolve": False}
+              "drain": False, "tunnel_probe": False, "tunnel_multi_origin": False, "upstream_resolve": False,
+              # SPEC §23 (wave 14)
+              "self_upgrade": False, "rum": False}
 
 
 def test_heartbeat_capabilities_stored_and_sanitised(client):

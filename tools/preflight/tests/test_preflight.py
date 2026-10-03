@@ -239,3 +239,27 @@ def test_exit_code_rules():
     assert preflight.exit_code([C("a", "WARN")], False) == 0
     assert preflight.exit_code([C("a", "WARN")], True) == 1
     assert preflight.exit_code([C("a", "WARN"), C("b", "FAIL")], False) == 2
+
+
+# ----------------------------------------------------------------- backup verify age (SPEC §23.3)
+
+def test_backup_verify_age_rows():
+    import argparse
+    opts = argparse.Namespace(backup_verify_max_days=8)
+    chk = preflight.backup_verify_check
+    assert chk(None, opts).status == "SKIP"
+    assert chk({"enabled": True, "last_success_age_hours": 1}, opts).status == "SKIP"     # pre-wave-14
+    assert chk({"enabled": False, "verify_age_s": None}, opts).status == "SKIP"
+    assert chk({"enabled": True, "verify_age_s": None, "verify_ok": None}, opts).status == "WARN"
+    ok = chk({"enabled": True, "verify_age_s": 2 * 86400, "verify_ok": True, "offsite": True}, opts)
+    assert ok.status == "OK" and "2.0 d" in ok.detail
+    assert chk({"enabled": True, "verify_age_s": 9 * 86400, "verify_ok": True}, opts).status == "WARN"
+    assert chk({"enabled": True, "verify_age_s": 3600, "verify_ok": False}, opts).status == "FAIL"
+
+
+def test_backup_verify_row_in_run(capsys, key_env):
+    deep = healthy_routes()[("GET", "/healthz/deep")][1]
+    deep = dict(deep, backup=dict(deep["backup"], verify_age_s=3600, verify_ok=False, offsite=True))
+    with FakeController(healthy_routes({("GET", "/healthz/deep"): (200, deep)})) as ctl, FakeDNS() as ns1:
+        rc, out = run_main(capsys, *base_args(ctl, [ns1], closed_port()), "--json")
+    assert rc == 2 and rows(out)["backup verify age"]["status"] == "FAIL"

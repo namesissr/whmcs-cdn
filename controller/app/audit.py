@@ -67,6 +67,8 @@ DETAIL_WHITELIST = {
     # wave 13 (SPEC §22): edge.drain {minutes, reason, force}, edge.undrain {auto, hold_minutes},
     # edge.patch http3_enabled
     "minutes", "reason", "force", "auto", "hold_minutes", "http3_enabled",
+    # wave 14 (SPEC §23): rollout groups, edge patch display_city / display_city_en (city names only)
+    "groups", "display_city", "display_city_en",
 }
 # whitelisted keys that contain a _SECRET_HINTS substring but hold no secret (a count)
 _HINT_EXEMPT = {"revoked_keys"}

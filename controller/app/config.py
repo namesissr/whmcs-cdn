@@ -370,5 +370,128 @@ class Settings:
         default_factory=lambda: "capacity" if (os.getenv("DNS_WEIGHTS") or "off").strip().lower() == "capacity"
         else "off")
 
+    # ---- wave 14 (SPEC §23): release safety, operations and customer experience. Every switch
+    # defaults to today's behaviour (§23.14).
+    # §23.1 platform version (env PCDN_VERSION, else the VERSION file) and environment label
+    app_version: str = field(default_factory=lambda: _app_version())
+    environment: str = field(default_factory=lambda: os.getenv("PCDN_ENVIRONMENT", "").strip())
+    # §23.1 pinned edge releases: a directory of pcdn-edge-vX.Y.Z.tar.gz(+.sha256); empty = off
+    edge_releases_dir: str = field(default_factory=lambda: os.getenv("EDGE_RELEASES_DIR", "").strip())
+    edge_release: str = field(default_factory=lambda: os.getenv("EDGE_RELEASE", "").strip())
+    # §23.2 staged rollouts (inert until a rollout is created)
+    rollout_soak_minutes: int = field(default_factory=lambda: min(1440, max(5, _int("ROLLOUT_SOAK_MINUTES", 30))))
+    rollout_parallel: int = field(default_factory=lambda: min(10, max(1, _int("ROLLOUT_PARALLEL", 1))))
+    rollout_max_error_pct: float = field(default_factory=lambda: max(0.0, _float("ROLLOUT_MAX_ERROR_PCT", 1.0)))
+    rollout_auto_rollback: bool = field(default_factory=lambda: _bool("ROLLOUT_AUTO_ROLLBACK", True))
+    rollout_drain_minutes: int = field(default_factory=lambda: min(120, max(0, _int("ROLLOUT_DRAIN_MINUTES", 15))))
+    rollout_upgrade_timeout_minutes: int = field(
+        default_factory=lambda: min(360, max(10, _int("ROLLOUT_UPGRADE_TIMEOUT_MINUTES", 60))))
+    # §23.3 backups: BACKUP_ENCRYPTION_KEY is the preferred name of BACKUP_PASSPHRASE
+    backup_encryption_key: str = field(default_factory=lambda: os.getenv("BACKUP_ENCRYPTION_KEY", ""))
+    backup_require_encryption: bool = field(default_factory=lambda: _bool("BACKUP_REQUIRE_ENCRYPTION", False))
+    backup_s3_keep_days: int = field(default_factory=lambda: max(0, _int("BACKUP_S3_KEEP_DAYS", 0)))
+    backup_verify_enabled: bool = field(default_factory=lambda: _bool("BACKUP_VERIFY_ENABLED", False))
+    backup_verify_weekday: int = field(default_factory=lambda: min(6, max(0, _int("BACKUP_VERIFY_WEEKDAY", 6))))
+    backup_verify_hour: int = field(default_factory=lambda: min(23, max(0, _int("BACKUP_VERIFY_HOUR", 4))))
+    backup_verify_database_url: str = field(
+        default_factory=lambda: os.getenv("BACKUP_VERIFY_DATABASE_URL", "").strip())
+    # §23.4 config history
+    config_history_enabled: bool = field(default_factory=lambda: _bool("CONFIG_HISTORY_ENABLED", True))
+    config_history_max_versions: int = field(
+        default_factory=lambda: min(1000, max(10, _int("CONFIG_HISTORY_MAX_VERSIONS", 100))))
+    config_history_days: int = field(default_factory=lambda: min(3650, max(7, _int("CONFIG_HISTORY_DAYS", 90))))
+    # §23.5 customer alert channels (SMS / Bale / Telegram customer bots); off until configured
+    sms_provider: str = field(default_factory=lambda: (os.getenv("SMS_PROVIDER") or "").strip().lower())
+    sms_api_key: str = field(default_factory=lambda: os.getenv("SMS_API_KEY", "").strip())
+    sms_sender: str = field(default_factory=lambda: os.getenv("SMS_SENDER", "").strip())
+    sms_api_url: str = field(default_factory=lambda: os.getenv("SMS_API_URL", "").strip().rstrip("/"))
+    sms_allow_international: bool = field(default_factory=lambda: _bool("SMS_ALLOW_INTERNATIONAL", False))
+    telegram_customer_bot_token: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_CUSTOMER_BOT_TOKEN", "").strip())
+    telegram_customer_bot_username: str = field(
+        default_factory=lambda: os.getenv("TELEGRAM_CUSTOMER_BOT_USERNAME", "").strip().lstrip("@"))
+    bale_bot_token: str = field(default_factory=lambda: os.getenv("BALE_BOT_TOKEN", "").strip())
+    bale_bot_username: str = field(default_factory=lambda: os.getenv("BALE_BOT_USERNAME", "").strip().lstrip("@"))
+    bale_api_url: str = field(
+        default_factory=lambda: (os.getenv("BALE_API_URL") or "https://tapi.bale.ai").rstrip("/"))
+    notify_dedup_minutes: int = field(default_factory=lambda: max(0, _int("NOTIFY_DEDUP_MINUTES", 30)))
+    notify_rate_sms_hour: int = field(default_factory=lambda: max(1, _int("NOTIFY_RATE_SMS_HOUR", 10)))
+    notify_rate_sms_day: int = field(default_factory=lambda: max(1, _int("NOTIFY_RATE_SMS_DAY", 30)))
+    notify_rate_msg_hour: int = field(default_factory=lambda: max(1, _int("NOTIFY_RATE_MSG_HOUR", 30)))
+    notify_rate_email_hour: int = field(default_factory=lambda: max(1, _int("NOTIFY_RATE_EMAIL_HOUR", 20)))
+    notify_brand: str = field(default_factory=lambda: (os.getenv("NOTIFY_BRAND") or "").strip())
+    # §23.6 provider import (ArvanCloud / Cloudflare)
+    import_enabled: bool = field(default_factory=lambda: _bool("IMPORT_ENABLED", True))
+    import_session_minutes: int = field(
+        default_factory=lambda: min(240, max(5, _int("IMPORT_SESSION_MINUTES", 30))))
+    arvan_api_url: str = field(
+        default_factory=lambda: (os.getenv("ARVAN_API_URL") or "https://napi.arvancloud.ir/cdn/4.0").rstrip("/"))
+    cloudflare_api_url: str = field(
+        default_factory=lambda: (os.getenv("CLOUDFLARE_API_URL")
+                                 or "https://api.cloudflare.com/client/v4").rstrip("/"))
+    # §23.7 RUM
+    rum_retention_days: int = field(default_factory=lambda: min(400, max(7, _int("RUM_RETENTION_DAYS", 30))))
+    # §23.9 operator-approved node provisioning
+    provisioning_enabled: bool = field(default_factory=lambda: _bool("PROVISIONING_ENABLED", False))
+    provisioner_token: str = field(default_factory=lambda: os.getenv("PROVISIONER_TOKEN", "").strip())
+    provision_target_pct: float = field(
+        default_factory=lambda: min(95.0, max(10.0, _float("PROVISION_TARGET_PCT", 60))))
+    provision_sizes: dict = field(default_factory=lambda: _sizes(os.getenv("PROVISION_SIZES", "")))
+    join_token_hours: int = field(default_factory=lambda: min(168, max(1, _int("JOIN_TOKEN_HOURS", 24))))
+    # §23.10 abuse desk (public endpoints off by default)
+    abuse_enabled: bool = field(default_factory=lambda: _bool("ABUSE_ENABLED", False))
+    abuse_pow_bits: int = field(default_factory=lambda: min(26, max(16, _int("ABUSE_POW_BITS", 20))))
+    abuse_rate_per_hour: int = field(default_factory=lambda: max(1, _int("ABUSE_RATE_PER_HOUR", 5)))
+    abuse_deadline_hours: int = field(default_factory=lambda: min(720, max(1, _int("ABUSE_DEADLINE_HOURS", 48))))
+    abuse_retention_days: int = field(default_factory=lambda: max(1, _int("ABUSE_RETENTION_DAYS", 365)))
+    # §23.11 SLO (operator-only data and alerts)
+    slo_enabled: bool = field(default_factory=lambda: _bool("SLO_ENABLED", True))
+    slo_availability: float = field(
+        default_factory=lambda: min(99.999, max(50.0, _float("SLO_AVAILABILITY", 99.9))))
+    slo_latency: float = field(default_factory=lambda: min(99.999, max(50.0, _float("SLO_LATENCY", 99.0))))
+    slo_errors: float = field(default_factory=lambda: min(99.999, max(50.0, _float("SLO_ERRORS", 99.5))))
+    slo_latency_ms: int = field(default_factory=lambda: max(1, _int("SLO_LATENCY_MS", 300)))
+    slo_overrides: dict = field(default_factory=lambda: _json_obj(os.getenv("SLO_OVERRIDES", "")))
+    slo_retention_days: int = field(default_factory=lambda: max(31, _int("SLO_RETENTION_DAYS", 400)))
+
+
+def _version_file() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in ("/app/VERSION", os.path.join(here, "..", "..", "VERSION"), os.path.join(here, "..", "VERSION")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                line = f.readline().strip()
+            if line:
+                return line
+        except OSError:
+            continue
+    return ""
+
+
+def _app_version() -> str:
+    """SPEC §23.1: PCDN_VERSION, else the first line of VERSION (/app or the repo root), else ""."""
+    return (os.getenv("PCDN_VERSION") or "").strip().removeprefix("v") or _version_file().removeprefix("v")
+
+
+def _json_obj(raw: str) -> dict:
+    import json
+
+    try:
+        v = json.loads(raw) if raw and raw.strip() else {}
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+DEFAULT_PROVISION_SIZES = {"small": 500, "medium": 1000, "large": 2500}
+
+
+def _sizes(raw: str) -> dict:
+    v = _json_obj(raw)
+    out = {str(k): int(n) for k, n in v.items()
+           if isinstance(n, (int, float)) and not isinstance(n, bool) and n > 0
+           and re.match(r"^[a-z0-9_-]{1,16}$", str(k))}
+    return out or dict(DEFAULT_PROVISION_SIZES)
+
 
 settings = Settings()

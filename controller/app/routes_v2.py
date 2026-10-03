@@ -94,33 +94,7 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
         raise HTTPException(403, str(e))
     except ValidationError as e:
         bad(e)
-    new_secrets = None
-    stale_tsig = None
-    if section == "logs":  # write-only secret_key: stored encrypted outside the section (SPEC §14.3.2)
-        value = logexport.apply_write(site, value)
-    elif section == "webhooks":  # ids + signing secrets assigned by the controller (SPEC §14.3.3)
-        value, new_secrets = webhooks.apply_write(site, value)
-    elif section == "image":  # write-only transform_secret (SPEC §16.6)
-        value = images.apply_write(site, value)
-    elif section == "dns_secondary":  # write-only TSIG secret, key name unique per site (SPEC §16.7)
-        try:
-            value, stale_tsig = dns_secondary.apply_write(db, site, value)
-        except dns_secondary.TsigConflict as e:
-            db.rollback()
-            raise HTTPException(409, str(e))
-    elif section == "l4":  # edge ports allocated / checked across the edge group (SPEC §16.4)
-        try:
-            value = l4.apply_write(db, site, value)
-        except l4.PortConflict as e:
-            db.rollback()
-            raise HTTPException(409, str(e))
-        except IntegrityError:
-            db.rollback()
-            raise HTTPException(409, "همین حالا پورتی که انتخاب شد به سرویس دیگری داده شد؛ دوباره تلاش کنید")
-    elif section == "waiting_room":  # SPEC §18.1: the site's wr_secret exists before edges need it
-        waiting_room.after_write(site, value)
-    elif section == "access":  # SPEC §18.2: the site's access_secret (encrypted, never returned)
-        access.after_write(site, value)
+    value, new_secrets, stale_tsig = apply_section_write(db, site, section, value)
     sections.store_section(site, section, value)
     try:
         db.commit()
@@ -163,6 +137,40 @@ def write_section_of(db: Session, site: Site, section: str, body: dict,
     return value
 
 
+def apply_section_write(db: Session, site: Site, section: str, value: dict) -> tuple[dict, dict | None, str | None]:
+    """The per-section write hooks after validation (write-only secrets, webhook ids, TSIG, l4 ports,
+    waiting room / access secrets): returns (value as stored, new webhook secrets, stale TSIG key).
+    Shared by the section PUT and the config-history restore / import (SPEC §23.4 / §23.6)."""
+    new_secrets = None
+    stale_tsig = None
+    if section == "logs":  # write-only secret_key: stored encrypted outside the section (SPEC §14.3.2)
+        value = logexport.apply_write(site, value)
+    elif section == "webhooks":  # ids + signing secrets assigned by the controller (SPEC §14.3.3)
+        value, new_secrets = webhooks.apply_write(site, value)
+    elif section == "image":  # write-only transform_secret (SPEC §16.6)
+        value = images.apply_write(site, value)
+    elif section == "dns_secondary":  # write-only TSIG secret, key name unique per site (SPEC §16.7)
+        try:
+            value, stale_tsig = dns_secondary.apply_write(db, site, value)
+        except dns_secondary.TsigConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
+    elif section == "l4":  # edge ports allocated / checked across the edge group (SPEC §16.4)
+        try:
+            value = l4.apply_write(db, site, value)
+        except l4.PortConflict as e:
+            db.rollback()
+            raise HTTPException(409, str(e))
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(409, "همین حالا پورتی که انتخاب شد به سرویس دیگری داده شد؛ دوباره تلاش کنید")
+    elif section == "waiting_room":  # SPEC §18.1: the site's wr_secret exists before edges need it
+        waiting_room.after_write(site, value)
+    elif section == "access":  # SPEC §18.2: the site's access_secret (encrypted, never returned)
+        access.after_write(site, value)
+    return value, new_secrets, stale_tsig
+
+
 @router.get("/sites/{domain}/config/{section}")
 def read_section(domain: str, section: str, response: Response, db: Session = Depends(get_db)):
     return read_section_of(get_site(db, domain), section, response)
@@ -198,6 +206,13 @@ def waf_learning_of(db: Session, site: Site) -> dict:
 def waf_learning_apply_of(db: Session, site: Site, ids: list[str]) -> dict:
     """Apply the chosen proposals (normal section validation, one commit); already applied ones
     are `unchanged` (idempotent). Unknown ids -> 422 and nothing is applied."""
+    from . import config_history
+
+    with config_history.source("waf_learning"):  # SPEC §23.4
+        return _waf_learning_apply(db, site, ids)
+
+
+def _waf_learning_apply(db: Session, site: Site, ids: list[str]) -> dict:
     try:
         return waf_learning.apply(db, site, ids)
     except waf_learning.UnknownProposals as e:
@@ -782,6 +797,8 @@ def overview(db: Session = Depends(get_db)):
         "capacity": tunnel_quality.capacity(db),
         # SPEC §22.3: names of the enabled edges whose own tunnel path fails the loopback probe
         "tunnel_degraded": [e.name for e in edges if e.enabled and e.tunnel_degraded],
+        # SPEC §23.10: abuse reports not closed / rejected
+        "abuse_open": _abuse_open(db),
         "tunnel_multi_origin_sites": multi_origin,
     }
 
@@ -848,8 +865,20 @@ def create_incident(body: IncidentIn, db: Session = Depends(get_db)):
     db.add(inc)
     db.flush()
     inc.updates.append(IncidentUpdate(status=body.status, body=body.body))
+    _incident_notify(db, inc, None)
     db.commit()
     return incident_dict(inc)
+
+
+def _incident_notify(db: Session, inc: Incident, previous: str | None) -> None:
+    """SPEC §23.5: incident.opened when an incident is created (not resolved), incident.resolved when
+    it becomes resolved (account-scoped customer notifications + webhooks)."""
+    from . import notify
+
+    if previous is None and inc.status != "resolved":
+        notify.on_incident(db, inc, opened=True)
+    elif previous is not None and previous != "resolved" and inc.status == "resolved":
+        notify.on_incident(db, inc, opened=False)
 
 
 @router.post("/incidents/{incident_id}/updates", status_code=201)
@@ -858,9 +887,11 @@ def add_incident_update(incident_id: int, body: IncidentUpdateIn, db: Session = 
 
     _check_status(body.status)
     inc = _get_incident(db, incident_id)
+    previous = inc.status
     inc.updates.append(IncidentUpdate(status=body.status, body=body.body))
     inc.status = body.status
     inc.updated_at = utcnow()
+    _incident_notify(db, inc, previous)
     db.commit()
     return incident_dict(inc)
 
@@ -877,11 +908,19 @@ def update_incident(incident_id: int, body: IncidentPatch, db: Session = Depends
         _check_status(data["status"])
     if not data:
         bad(ValidationError("هیچ تغییری ارسال نشده است"))
+    previous = inc.status
     for k, v in data.items():
         setattr(inc, k, v.strip() if k == "title" else v)
     inc.updated_at = utcnow()
+    _incident_notify(db, inc, previous)
     db.commit()
     return incident_dict(inc)
+
+
+def _abuse_open(db: Session) -> int:
+    from . import abuse
+
+    return abuse.open_count(db)
 
 
 def _since(value: str | None):

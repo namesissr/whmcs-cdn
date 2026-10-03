@@ -239,3 +239,33 @@ def test_no_third_party_imports():
     for f in ("loadtest.py", "lt_proto.py", "origin.py"):
         text = (LT_DIR / f).read_text()
         assert "import h2" not in text and "import aiohttp" not in text
+
+
+# ----------------------------------------------------------------- thresholds (SPEC §23.1 staging gate)
+
+def test_thresholds_pass_and_fail(tmp_path, origin):
+    out = tmp_path / "ok.json"
+    rc = loadtest.main([*map(str, ["http", *target(origin), "--path", "/bytes/512", "--concurrency", 2,
+                                   "--duration", 0.5, "--max-error-pct", 0.5, "--max-p99-ms", 5000]),
+                        "--quiet", "--out", str(out)])
+    rep = json.loads(out.read_text())
+    assert rc == 0 and rep["thresholds"]["pass"] is True and rep["thresholds"]["failures"] == []
+    # an impossible p99 bound -> exit 3 and the failure is recorded in the report
+    out = tmp_path / "slow.json"
+    rc = loadtest.main([*map(str, ["ws", *target(origin), "--connections", 2, "--duration", 0.5,
+                                   "--max-p99-ms", 0.0001]), "--quiet", "--out", str(out)])
+    rep = json.loads(out.read_text())
+    assert rc == loadtest.EXIT_THRESHOLD == 3
+    assert rep["thresholds"]["pass"] is False and rep["thresholds"]["failures"][0].startswith("p99_ms")
+
+
+def test_thresholds_error_pct_and_off_by_default():
+    rep = {"protocol": "http", "result": {"error_rate": 0.01, "latency_ms": {"request": {"p99": 100.0}}}}
+    th = loadtest.check_thresholds(rep, max_error_pct=0.5, max_p99_ms=1500)
+    assert th["error_pct"] == 1.0 and not th["pass"] and th["failures"] == ["error_pct 1.0 > 0.5"]
+    assert loadtest.check_thresholds(rep) is None
+    rep = {"protocol": "ws", "result": {"error_rate": 0.0, "latency_ms": {"rtt": {"p99": None}}}}
+    th = loadtest.check_thresholds(rep, max_p99_ms=10)
+    assert th["failures"] == ["p99_ms not measured"]
+    with pytest.raises(SystemExit):
+        loadtest.main(["http", "--target", "127.0.0.1:1", "--host", "lt.test", "--max-error-pct", "101"])

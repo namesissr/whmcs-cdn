@@ -240,6 +240,30 @@ python3 tools/loadtest/origin.py --port 8080            # پیش‌فرض 0.0.0.
 اتصال‌ها، Mbps و خطاها جمع می‌شوند و p50/p95/p99 از هیستوگرام خام (`raw`) همه‌ی اجراها دقیق محاسبه
 می‌شود. اجراها باید هم‌زمان شروع شوند و مدت یکسان داشته باشند.
 
+### آستانهٔ قبول/رد (دروازهٔ staging)
+
+سناریوهای ثابت (`http`، `ws`، `httpupgrade`، `grpc`، `h2`، `xhttp`) دو گزینهٔ اختیاری دارند که اجرا را به یک
+آزمون قبول/رد تبدیل می‌کنند (SPEC §23.1):
+
+| گزینه | معنا |
+|---|---|
+| `--max-error-pct PCT` | اگر نرخ خطا (همان `error_rate` گزارش، به درصد) از `PCT` بیشتر شود، رد |
+| `--max-p99-ms MS` | اگر p99 تأخیر (http: زمان کامل درخواست؛ تونل‌ها: رفت‌وبرگشت echo) از `MS` بیشتر شود یا اصلاً اندازه‌گیری نشود، رد |
+
+بدون این گزینه‌ها رفتار مثل قبل است (کد خروج ۰). با آن‌ها گزارش JSON بخش `thresholds`
+(`{"max_error_pct", "max_p99_ms", "error_pct", "p99_ms", "pass", "failures"}`) می‌گیرد و در صورت رد، کد خروج
+**۳** است. دروازهٔ انتشار (`tools/release/staging-verify.sh`، [RELEASE §۴](RELEASE.md#۴-دروازهٔ-staging-staging-verifysh))
+این‌ها را با پیش‌فرض‌های زیر روی یک نود staging اجرا می‌کند:
+
+```bash
+./pcdn-loadtest http --target 203.0.113.10:443 --host lt.staging.example.com --duration 120 \
+    --max-error-pct 0.5 --max-p99-ms 1500 --out http.json
+./pcdn-loadtest ws --target 203.0.113.10:443 --host lt.staging.example.com --duration 60 \
+    --max-error-pct 0.5 --out ws.json
+```
+
+(`ramp` آستانه‌های پله‌ای خودش را دارد: `--max-error-rate` به‌صورت کسر و `--max-p99-ms`.)
+
 ## ۶. خواندن نتایج
 
 خلاصه‌ی فارسی در پایان هر اجرا چاپ می‌شود؛ نمونه:

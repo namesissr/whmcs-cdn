@@ -7,6 +7,10 @@
 #
 # The one-command bootstrap downloads the edge bundle from the controller and runs the
 # installer with the flags you choose. It holds no secrets other than the token you paste.
+#
+# SPEC §23.9: a one-time JOIN token (jt_..., from a provisioning proposal or the admin's
+# "join token" action) works instead of the edge token: pass it as PCDN_JOIN_TOKEN="$TOKEN"
+# (install.sh exchanges it for the edge token). Add --version vX.Y.Z to install a pinned release.
 
 write_files:
   - path: /root/pcdn-install.sh

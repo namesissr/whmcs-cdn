@@ -247,6 +247,55 @@ def _collect(out: _Out) -> None:
         db.close()
 
 
+def _wave14(out: _Out) -> None:
+    """SPEC §23: build info, rollout state and the SLO gauges (operator-only, no customer identifier)."""
+    out.metric("pcdn_build_info", 1, "Controller platform version (label).", labels={"version": settings.app_version})
+    db = SessionLocal()
+    try:
+        try:
+            from . import rollout
+
+            r, counts = rollout.metrics(db)
+            if r is not None:
+                out.metric("pcdn_rollout_state", 1, "State of the latest node rollout.",
+                           labels={"rollout": r.id, "state": r.state})
+                for state in sorted(counts):
+                    out.metric("pcdn_rollout_edges", counts[state], "Edges of the latest rollout by state.",
+                               labels={"state": state})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: rollout block failed")
+            db.rollback()
+        if settings.slo_enabled:
+            try:
+                from . import slo
+
+                state = slo.evaluate(db)
+                for g in state["groups"]:
+                    for sli, v in g["slis"].items():
+                        labels = {"group": g["group"], "sli": sli}
+                        out.metric("pcdn_slo_objective", v["objective"] / 100.0, "SLO objective (ratio).",
+                                   labels=labels)
+                        if v["actual"] is not None:
+                            out.metric("pcdn_slo_ratio", v["actual"] / 100.0, "SLI good/total ratio.",
+                                       labels={**labels, "window": "month"})
+                        thirty = slo._sum(db, g["group"], "1h", utcnow() - timedelta(days=30), utcnow())
+                        bad, total = slo.bad_total(thirty, sli)
+                        if total:
+                            out.metric("pcdn_slo_ratio", round((total - bad) / total, 6), "SLI good/total ratio.",
+                                       labels={**labels, "window": "30d"})
+                        if v["budget_remaining_pct"] is not None:
+                            out.metric("pcdn_slo_error_budget_remaining", v["budget_remaining_pct"] / 100.0,
+                                       "Error budget left this month (ratio, may be negative).", labels=labels)
+                        for w, rate in v["burn"].items():
+                            out.metric("pcdn_slo_burn_rate", rate, "Error budget burn rate.",
+                                       labels={**labels, "window": w})
+            except Exception:  # noqa: BLE001
+                log.exception("metrics: slo block failed")
+                db.rollback()
+    finally:
+        db.close()
+
+
 @router.get("/metrics")
 def metrics(authorization: str | None = Header(default=None)):
     _check_token(authorization)
@@ -255,4 +304,8 @@ def metrics(authorization: str | None = Header(default=None)):
         _collect(out)
     except Exception:  # noqa: BLE001 - a scrape must never 500
         log.exception("metrics collection failed")
+    try:
+        _wave14(out)
+    except Exception:  # noqa: BLE001
+        log.exception("metrics collection (wave 14) failed")
     return PlainTextResponse(out.text(), media_type=CONTENT_TYPE)

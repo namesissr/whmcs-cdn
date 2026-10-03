@@ -118,10 +118,18 @@ def new_event_id() -> str:
 
 
 def emit(db: Session, site: Site, event: str, data: dict | None = None, now: datetime | None = None,
-         event_id: str | None = None) -> int:
+         event_id: str | None = None, notify_customers: bool = True) -> int:
     """Queue `event` for every matching hook of `site` (pending rows, caller's transaction). Never
     raises; returns the number of deliveries queued. `event_id` lets a caller that also records the
-    event elsewhere (site_events, SPEC §15.4) use the same id in the webhook body."""
+    event elsewhere (site_events, SPEC §15.4) use the same id in the webhook body. Every site event
+    also reaches the customer notification engine (SPEC §23.5, notify.py), hooks or not."""
+    if notify_customers:
+        try:
+            from . import notify
+
+            notify.on_webhook_event(db, site, event, data)
+        except Exception:  # noqa: BLE001 - never break the triggering request
+            log.exception("could not queue customer notification %s", event)
     try:
         hooks = active_hooks(site, event)
         if not hooks:

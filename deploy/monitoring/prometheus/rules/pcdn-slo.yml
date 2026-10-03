@@ -1,0 +1,52 @@
+# Pasargad CDN — SLO burn-rate alerts (SPEC §23.11), on the controller's /metrics:
+#   pcdn_slo_burn_rate{group,sli,window="5m"|"30m"|"1h"|"6h"}   burn = (bad/total) / (1 - objective)
+#   pcdn_slo_error_budget_remaining{group,sli}                    % of the month's budget left
+# Multi-window, multi-burn-rate (Google SRE workbook): fast = 14.4x over 1h AND 5m (2% of a 30-day
+# budget in one hour), slow = 6x over 6h AND 30m; an alert resolves when the short window drops below.
+#
+# PAGE FROM ONE SOURCE ONLY. The controller raises the same conditions itself (slo_burn_fast:*,
+# slo_burn_slow:*, slo_budget_exhausted:* through its Telegram / e-mail alerts). Use EITHER these rules
+# (Alertmanager pages; keep SLO_ENABLED=true — it produces these metrics — and do not use the controller's
+# alert channels as a pager) OR the controller alerts (then drop this file from prometheus/rules/ or route
+# alertname=~"PcdnSlo.+" to a null receiver) — never both, or every burn pages twice.
+# See deploy/monitoring/README.md.
+# Validate: promtool check rules prometheus/rules/pcdn-slo.yml && promtool test rules prometheus/tests/pcdn-slo.test.yml
+groups:
+  - name: pcdn-slo
+    rules:
+      - alert: PcdnSloBurnFast
+        expr: |
+          max without (window) (pcdn_slo_burn_rate{window="1h"}) >= 14.4
+            and max without (window) (pcdn_slo_burn_rate{window="5m"}) >= 14.4
+        for: 2m
+        labels:
+          severity: critical
+          source: prometheus
+        annotations:
+          summary: "بودجهٔ خطای {{ $labels.sli }} گروه {{ $labels.group }} سریع مصرف می‌شود"
+          description: "نرخ مصرف بودجه در ۱ ساعت و ۵ دقیقهٔ اخیر ≥ ۱۴٫۴ برابر است (اکنون {{ $value | printf \"%.1f\" }}). با این روند کل بودجهٔ ماه در کمتر از ۲ روز تمام می‌شود."
+          runbook: docs/MONITORING.md
+
+      - alert: PcdnSloBurnSlow
+        expr: |
+          max without (window) (pcdn_slo_burn_rate{window="6h"}) >= 6
+            and max without (window) (pcdn_slo_burn_rate{window="30m"}) >= 6
+        for: 15m
+        labels:
+          severity: warning
+          source: prometheus
+        annotations:
+          summary: "بودجهٔ خطای {{ $labels.sli }} گروه {{ $labels.group }} پیوسته مصرف می‌شود"
+          description: "نرخ مصرف بودجه در ۶ ساعت و ۳۰ دقیقهٔ اخیر ≥ ۶ برابر است (اکنون {{ $value | printf \"%.1f\" }})."
+          runbook: docs/MONITORING.md
+
+      - alert: PcdnSloBudgetExhausted
+        expr: pcdn_slo_error_budget_remaining <= 0
+        for: 10m
+        labels:
+          severity: warning
+          source: prometheus
+        annotations:
+          summary: "بودجهٔ خطای ماه برای {{ $labels.sli }} گروه {{ $labels.group }} تمام شده است"
+          description: "تا پایان ماه هر خطای بیشتر هدف SLO را می‌شکند؛ تغییرات پرخطر (انتشار نسخه) را به تعویق بیندازید."
+          runbook: docs/RELEASE.md

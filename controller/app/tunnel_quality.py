@@ -3,7 +3,7 @@ events + webhooks, and the edge-group capacity alert.
 
 Scope: quality, reliability and diagnostics only. Nothing here selects, ranks or recommends edge
 nodes or addresses; the per-edge breakdown is a diagnostic view of the site's own traffic by the
-edge *name* that served it (never an address).
+edge's customer-facing city label and public tag (SPEC §23.12; never an internal name or address).
 
 Data sources
 * `usage_hourly.details.tunnel.paths` — per (site, edge, hour) path-id counters sent by the edges
@@ -154,15 +154,21 @@ def quality(db: Session, site: Site, hours: int, now: datetime | None = None) ->
         out_paths.append({"id": pid, "path": None, "protocol": None, **path_metrics(per_path[pid]),
                           "removed": True})
 
-    names = dict(db.execute(select(Edge.id, Edge.name).where(Edge.id.in_(list(per_edge)))).all()) \
-        if per_edge else {}
+    # SPEC §23.12: customers never see an internal node name: `name` is the Persian display label
+    # («نود تهران ۱»; old clients render it unchanged), `label_en` the English one and `key` the node's
+    # public tag; never the edge id
+    from . import edge_labels
+
+    labels = edge_labels.labels(db) if per_edge else {}
+    tags = edge_labels.tags(db) if per_edge else {}
     out_edges = []
     for edge_id, c in per_edge.items():
         m = path_metrics(c)
-        out_edges.append({"name": names.get(edge_id, f"edge-{edge_id}"), "sessions": m["sessions"],
-                          "abnormal_pct": m["abnormal_pct"], "connect_ms_avg": m["connect_ms_avg"],
-                          "error_total": m["error_total"]})
-    out_edges.sort(key=lambda e: e["name"])
+        lab = labels.get(edge_id) or {"fa": "نود", "en": "Node"}
+        out_edges.append({"name": lab["fa"], "label_en": lab["en"], "key": tags.get(edge_id),
+                          "sessions": m["sessions"], "abnormal_pct": m["abnormal_pct"],
+                          "connect_ms_avg": m["connect_ms_avg"], "error_total": m["error_total"]})
+    out_edges.sort(key=lambda e: (e["name"], e["key"] or ""))
 
     series, t = [], start
     while t <= end:  # zero-filled, one point per hour, oldest first

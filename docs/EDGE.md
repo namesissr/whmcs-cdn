@@ -476,8 +476,8 @@ in agent.conf; 0 = never hot.
 
 **Speed test.** `/__pcdn/speed/{ping,down,up}` on every active site (CORS `*`, no-store, rate-limited
 per IP, counted as normal traffic). Downloads are served from `SPEED_FILE` (random data written once,
-10 MiB) via the flv module (`--with-http_flv_module`); `X-Pcdn-Node` is a hash of the node name, never
-an address.
+10 MiB) via the flv module (`--with-http_flv_module`); `X-Pcdn-Node` is the node's public tag (SPEC
+§23.12.2: `node.public_tag` from the controller, else a hash of the node name), never an address or name.
 
 New agent.conf keys (kept by `--upgrade`): `CAPACITY_MBPS` (0), `FAIR_SHARE_PCT` (25), `NODE_NAME`
 (hostname), `SPEED_FILE` (`speed.bin` next to the state file).
@@ -652,3 +652,124 @@ keys, WST parser + auto table, memory guard on a fake /proc, echo protocol, prob
 TCP checker, tuning with a fake /proc/sys, upstream resolve, tickets, dual cert / OCSP, HTTP/3 gate, session
 ends) and `edge/tests/test_tunnel_speed_e2e.py` (real nginx: WS + gRPC probe, 403 for non-loopback clients,
 drain refusal semantics, multi-origin failover with TCP health, ticket resumption).
+
+## Wave 14: release safety, operations and customer experience (SPEC §23)
+
+Hard constraint (SPEC §23): nothing here hides or rotates node addresses, evades filtering or picks nodes by
+reachability. RUM data is a performance report for the site owner only (no node dimension, never read by
+node selection); only internal node *names* / host names stop leaking to visitors.
+
+**Release (§23.1).** A bundle built from a tag carries `edge/RELEASE` (`vX.Y.Z`). `install.sh` copies it to
+`/etc/pcdn/release` (no file in the bundle → removed: release unknown) and keeps the verified tarball it was
+installed from (`PCDN_RELEASE_TARBALL`, set by `bootstrap.sh` and by the self-upgrade) as
+`RELEASES_DIR/<vX.Y.Z>.tar.gz` (dir 0700, files 0600, the 3 newest; the installed one is always the newest)
+for a rollback. `install.sh --release vX.Y.Z` refuses a bundle whose `edge/RELEASE` differs (or is missing).
+Every heartbeat carries `"release": "vX.Y.Z" | null` next to `bundle_version`.
+
+**Pinned bootstrap.** `bootstrap.sh --version vX.Y.Z` (or `--version=…`, validated with
+`^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$` before anything runs) downloads
+`/edge/bundle.tar.gz?version=vX.Y.Z` and `/edge/releases/vX.Y.Z.sha256`, verifies with `sha256sum -c` (mismatch →
+exit 1, nothing installed) and runs `install.sh --release vX.Y.Z`. Without `--version`, a pin advertised by
+`GET /edge/releases` for the node's group (`groups.<group>`, else `pinned`; group = `tunnel` for
+`--role tunnel`, else `general`; an `--upgrade` without `--role` uses `GROUP` from agent.conf) is installed the
+same way and printed. A controller without `/edge/releases` (404) → the live bundle as before; with
+`--version` → «این کنترلر نسخهٔ پین‌شده ارائه نمی‌کند» and exit 1. `--upgrade`, `--drain` and reading
+`CONTROLLER_URL` from `/etc/pcdn/agent.conf` work as before.
+
+**Join tokens (§23.9).** Instead of an edge token, a one-time join token (`jt_` + 40 hex) in `PCDN_JOIN_TOKEN`
+or `--join-token-file F` (bootstrap.sh and install.sh; never argv). Right before agent.conf is written,
+install.sh POSTs `{"join_token", "hostname"}` (body on stdin) to `/edge/v1/join` (https only unless
+`--insecure-http`) and stores the returned `token` in agent.conf (0600). 401 → «توکن پیوستن نامعتبر یا منقضی
+است» / "join token invalid or expired", exit 1; 404 (older controller) → exit 1 with a clear message. Cloud-init:
+`curl -fsSL --proto '=https' <controller>/edge/bootstrap.sh | PCDN_JOIN_TOKEN=<token> bash -s -- --controller
+<url> --role <role> --region <region> [--version <release>]`.
+
+**Self-upgrade (§23.2, `pcdn_agent/upgrade.py`).** `node.upgrade = {"id", "release", "sha256", "drain_minutes",
+"rollback", "timeout_s"}` is agent-side only (never rendered: no reload; kept across 304 polls in
+`state["ctl_upgrade"]`). For an `id` (+ release: a rollback may reuse the attempt id) not handled yet and a
+release other than the running one the agent:
+reuses `RELEASES_DIR/<release>.tar.gz` when its sha256 matches, else downloads
+`CONTROLLER_URL/edge/bundle.tar.gz?version=<release>` (≤ 50 MB, sha256 verified: mismatch → `failed`,
+`sha256_mismatch`); unpacks it (unsafe members refused) into a new 0700 directory under `UPGRADE_DIR`; records
+`state["upgrade"]` = `installing` under the state lock; then runs
+`systemd-run --unit=pcdn-upgrade-<id>[-rb] --collect --no-block -p Type=oneshot -p TimeoutStartSec=<timeout_s>
+… install.sh --upgrade --release <release> [--drain=<m>]` (a small bash wrapper writes the installer's exit
+code to `UPGRADE_DIR/<unit>.status`; an installer that predates `--release`, e.g. a rollback target, gets none;
+`drain_minutes` 0 = no drain). The installer survives the agent restart it causes; the existing drain flow
+drains first and the new agent undrains itself. The new agent (or the old one, once `/etc/pcdn/release`
+changed) reports `done`; a non-zero exit (status file, else `systemctl show` while the unit is loaded) →
+`failed` (`install_failed: exit N`; exit 3 = the drain's last-edge refusal → `last_edge`, install.sh exits 3
+instead of 1 only under the self-upgrade), `timeout_s` without the release change → `timeout`. Never two
+upgrades at once; a `node.upgrade` for the running release is `done` at once; a rollback is the same path.
+Heartbeat `"upgrade": {"id", "release", "state": "downloading"|"installing"|"done"|"failed", "error" (≤ 200,
+no secrets), "at", "rollback"}` (omitted when never upgraded; a transition triggers a heartbeat at once).
+`capabilities.self_upgrade` = `SELF_UPGRADE` (yes) and `systemd-run` present; `SELF_UPGRADE=no` → false and
+nothing is done (rollouts list the node as `manual`).
+
+**Public node tag (§23.12.2).** `node.public_tag` (8 hex, rendered) is the value of `$pcdn_node`: every
+proxied response's `X-Served-By` (previously `$hostname`, the OS host name) and the speed-test
+`X-Pcdn-Node`. Without it (old controller) the old name hash is used. Old agents keep `X-Served-By $hostname`
+until upgraded.
+
+**Live `oe` / `pe` (§23.5).** Every live (minute) item carries `"oe"`: 502 / 503 / 504 with a non-empty
+upstream status (the origin answered it or nginx recorded the failed connect / timeout), not from the cache,
+not the site's suspended page, not a security answer; and `"pe"`: the §14.3.1 platform errors of the minute.
+
+**RUM (§23.7).** Per-site config `rum: {"enabled", "sample", "inject": "auto"|"manual", "exclude", "spa"}` (old
+controllers send none; rendered only on active sites of nodes with njs).
+* `GET /__pcdn/rum.js` → `edge/pages/rum.js` (installed to `/usr/share/pcdn/pages/`; < 4 KB, no cookies /
+  storage / identifiers / user agent, no eval; `Cache-Control: public, max-age=3600`,
+  `application/javascript; charset=utf-8`, `nosniff`). It reads `data-s` (sample rate) and `data-spa="1"`
+  from its own tag, collects ttfb / fcp / lcp / cls (session windows) / inp (largest `event` duration with an
+  interactionId, threshold 40 ms) / dns / tcp / tls / dom / load, `nt`, `dev` (m ≤ 767 px, t ≤ 1024 px, d),
+  `cs` (Server-Timing `cdn-cache`) and the path, and sends one beacon per view on hidden / pagehide
+  (`sendBeacon`, fallback `fetch` keepalive, credentials omitted); with spa, one `nt: "soft"` beacon (inp /
+  cls) per further view.
+* `inject: "auto"`: the HTML-serving proxy locations (not static assets, `/__pcdn/`, tunnels, storage
+  origins, decoy/404 tunnel hosts) render `sub_filter '</head>' '$pcdn_rum_<sid></head>'; sub_filter_once on;`
+  with a per-site `map $uri $pcdn_rum_<sid>` (excluded prefixes → `""`), `proxy_set_header Accept-Encoding "";`
+  (sub_filter needs an uncompressed origin body; the edge still compresses towards clients — more origin
+  bandwidth, cached objects stored uncompressed) and `add_header Server-Timing $pcdn_rum_st;` (HTML only:
+  `cdn-cache;desc=$upstream_cache_status`). `inject: "manual"` renders only the two endpoints.
+* `POST /__pcdn/rum`: `limit_req zone=pcdn_rum` (2 r/s per address, burst 20, in memory; rejections logged
+  at info level), body ≤ 2 KB, `pcdn.rumIngest`: only POST with `text/plain` / `application/json` and an
+  `Origin` (else `Referer`) host equal to `$host`; `v == 1`; ms metrics clamped to 0..60000, cls 0..10, path
+  `^/[^\s?#]{0,199}$` else `/`; unknown `nt` / `dev` dropped, `cs` else `""`. The sanitized line
+  `{"t" (minute), "h", "cc", "asn", "rg", "p", "nt", "dev", "cs", …metrics}` goes to `RUM_LOG` via
+  `log_format pcdn_rum escape=none '$pcdn_rum_line'` — no address field exists; always answers 204. The
+  location has no access log (never billed, not in analytics / fair share / tunnel telemetry).
+* ASN / region: `$pcdn_asn` from `RUM_ASN_DB` (DB-IP "IP to ASN Lite", `pcdn-geoip-update --asn`, refreshed by
+  pcdn-geoip.service; absent → 0) and `$pcdn_region` from `RUM_REGION_DB` (city / subdivision mmdb, default
+  off → ""), both only with the geoip2 module; the client address is read only for these lookups.
+* The agent tails `RUM_LOG` (own offset, rotation like the L4 log) and aggregates per host-hour into the usage
+  item's `rum`: `{"n", "all": H, "by": {"cc" ≤ 30, "asn" ≤ 20, "rg" ≤ 31, "dev", "path" ≤ 50, "cs"}}`, `H =
+  {"n", "<metric>": [counts]}` with the fixed buckets (contract with the controller): ms metrics
+  `[50, 100, 200, 300, 500, 800, 1000, 1500, 1800, 2000, 2500, 3000, 4000, 5000, 8000, 12000, ∞]` (17 counts),
+  cls ×1000 `[10, 50, 100, 150, 250, 500, 1000, ∞]` (8 counts); an upper bound is inclusive. Top-N by `n`, the
+  rest summed into `"other"`; ≤ 32 KB per item (`path` dropped first, then `rg`). Unknown dimensions (no
+  country, ASN 0, empty region, no cache status) are left out of that breakdown. Capability `rum: true` (njs).
+  Old controllers drop the key.
+
+New agent.conf keys (kept by `--upgrade`):
+
+| key | default | meaning |
+|---|---|---|
+| `RUM_ASN_DB` | `/usr/share/pcdn/geo/asn.mmdb` | ASN database (used only if present) |
+| `RUM_REGION_DB` | `""` | city / subdivision database (off) |
+| `RUM_LOG` | `/var/log/nginx/pcdn-rum.log` | the RUM beacon log (logrotate as the access log) |
+| `UPGRADE_DIR` | `/var/lib/pcdn/upgrade` | unpacked bundle of a running self-upgrade (0700) + exit status |
+| `RELEASES_DIR` | `/var/lib/pcdn/releases` | kept release tarballs for rollback (3 newest) |
+| `SELF_UPGRADE` | yes | `no` → capability false, `node.upgrade` ignored |
+| `RELEASE_FILE` | `/etc/pcdn/release` | the installed release (written by install.sh) |
+
+Tests: `edge/tests/test_wave14.py` (public tag + fallback, X-Served-By never `$hostname`, non-rendered
+`node.upgrade`, the self-upgrade state machine with a fake controller and `systemd-run` / `systemctl` PATH shims:
+download + sha, cached tarball, idempotent release, failed unit / last edge / timeout / restart detection, the
+wrapper's exit status; heartbeat `release` / `upgrade` / capabilities; `oe` / `pe` rules; RUM buckets golden,
+aggregation / top-N / size cap / rotation; RUM rendering + `nginx -t`; `pcdn.rumIngest` and `rum.js` under node;
+install.sh release check / release files / join flow (fake curl) / last-edge exit; bootstrap.sh `--version` and
+release download with a fake curl) and `edge/tests/test_wave14_e2e.py` (real nginx: injection once on HTML,
+none on JSON / excluded paths, gzip to the client, the script endpoint, ingestion → RUM log without address →
+usage item, X-Served-By / X-Pcdn-Node = the tag). Staging: `tests/integration/test_wave14.py` (skips against
+pre-wave-14 controllers / agents).
+

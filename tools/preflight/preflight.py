@@ -5,7 +5,7 @@ Checks a live deployment from the operator's machine or the controller host and 
 (or JSON) of OK / WARN / FAIL / SKIP rows:
 
   controller   GET /healthz, GET /healthz/deep (status, warnings), database revision == head,
-               backup age, alert channels configured
+               backup age, backup verify (restore test) age, alert channels configured
   nodes        GET /api/v1/edges (admin key): every enabled node's heartbeat is fresh and its
                bundle_version equals GET /edge/version
   dns          ns1/ns2 (--ns) answer SOA for a sample zone authoritatively, and the serials match
@@ -173,6 +173,8 @@ def check_controller(http: Http, opts) -> tuple[list[Check], dict | None]:
         else:
             note = " (an earlier run failed; see the controller log)" if b.get("failing") else ""
             out.append(Check("backup age", OK, f"last success {age} h ago{note}", {"age_hours": age}))
+
+    out.append(backup_verify_check(b, opts))
 
     a = body.get("alerts")
     if a is not None:
@@ -538,6 +540,30 @@ def run(opts, key: str | None) -> list[Check]:
     return checks
 
 
+def backup_verify_check(b: dict | None, opts) -> Check:
+    """SPEC §23.3: age / result of the last restore test (`/healthz/deep` backup.verify_age_s, verify_ok).
+
+    WARN when older than --backup-verify-max-days (8) or never run, FAIL when the last verify failed,
+    SKIP when the controller does not report it (older than wave 14) or backups are disabled."""
+    name = "backup verify age"
+    if b is None or "verify_age_s" not in b:
+        return Check(name, SKIP, "not reported by this controller")
+    if not b.get("enabled"):
+        return Check(name, SKIP, "automatic backups are disabled")
+    age_s, ok = b.get("verify_age_s"), b.get("verify_ok")
+    data = {"verify_age_s": age_s, "verify_ok": ok, "offsite": b.get("offsite")}
+    if age_s is None:
+        return Check(name, WARN, "no restore test recorded (BACKUP_VERIFY_ENABLED / POST /api/v1/backups/verify)",
+                     data)
+    days = round(float(age_s) / 86400, 1)
+    if ok is False:
+        return Check(name, FAIL, f"the last restore test failed ({days} d ago); see the admin backups page", data)
+    if days > opts.backup_verify_max_days:
+        return Check(name, WARN, f"last restore test {days} d ago (> {opts.backup_verify_max_days} d)", data)
+    off = "" if b.get("offsite") is not False else " (backups are not off-site)"
+    return Check(name, OK, f"last restore test {days} d ago{off}", data)
+
+
 def exit_code(checks: list[Check], strict: bool) -> int:
     if any(c.status == FAIL for c in checks):
         return 2
@@ -577,6 +603,8 @@ def parse_args(argv):
     p.add_argument("--alert-test", action="store_true", help="send a real test alert (POST /api/v1/alerts/test)")
     p.add_argument("--heartbeat-max", type=int, default=180, metavar="S", help="max node heartbeat age (180)")
     p.add_argument("--backup-max-hours", type=float, default=26, metavar="H", help="max backup age (26)")
+    p.add_argument("--backup-verify-max-days", type=float, default=8, metavar="D",
+                   help="max age of the last restore test (8)")
     p.add_argument("--tls-warn-days", type=int, default=21)
     p.add_argument("--tls-fail-days", type=int, default=7)
     p.add_argument("--timeout", type=float, default=10, help="HTTP/TLS timeout in seconds (10)")

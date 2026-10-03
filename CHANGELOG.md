@@ -11,6 +11,87 @@ process is described in [docs/ROLLOUT.md](docs/ROLLOUT.md).
 
 ## [Unreleased]
 
+### Added — wave 14: release safety, operations and customer experience (SPEC §23), controller
+
+Migration `0023` (`edges.display_city|display_city_en|release|upgrade_state`, `sites.abuse_suspended`, tables
+`site_config_versions`/`site_config_values`, `backup_runs`, `pcdn_live_marker`, `notification_subscriptions`/
+`_targets`/`_link_codes`/`_outbox`, `import_sessions`, `rum_hourly`, `abuse_reports`/`abuse_events`,
+`slo_buckets`, `rollouts`/`rollout_edges`, `edge_join_tokens`, `provision_proposals`). Every new switch defaults
+to today's behaviour; node selection stays health / load / capacity driven (RUM / ISP data is never read by
+DNS, rollouts or provisioning — enforced by an import test).
+
+- **Versions and pinned edge releases** (§23.1): `PCDN_VERSION` / `VERSION` file in `/healthz`,
+  `/healthz/deep` (`version`, `environment` from `PCDN_ENVIRONMENT`) and `pcdn_build_info`; `EDGE_RELEASES_DIR`
+  + `EDGE_RELEASE`: `GET /edge/releases`, `GET /edge/releases/vX.Y.Z.sha256`, `bundle.tar.gz?version=&group=`
+  (streamed), `/edge/version` `release`; group pins advanced by completed rollouts; install one-liner
+  `--version`; edge dict `release`, `pinned_release`, `release_ok`, `upgrade`.
+- **Staged rollouts with automatic rollback** (§23.2): `GET /api/v1/releases`, `/api/v1/rollouts` (dry run,
+  rings: canary / ring % / rest, `manual` edges, `no_rollback_release`), start / pause / resume / abort /
+  rollback, per-edge skip / force / retry; `job_rollout` with per-pool parallelism, last-edge block, health gate
+  (heartbeat, config applied, probe, tunnel probe, platform error % vs baseline), auto rollback; `node.upgrade`
+  (non-rendered); alerts `rollout_blocked`, `rollout_failed`; metrics `pcdn_rollout_state`, `pcdn_rollout_edges`.
+  Env `ROLLOUT_*`.
+- **Off-site backups and weekly restore test** (§23.3): `BACKUP_ENCRYPTION_KEY` (alias, conflict and
+  equal-to-data-key refusal), `BACKUP_REQUIRE_ENCRYPTION`, S3 `HEAD` + `x-amz-meta-sha256` read-back,
+  `BACKUP_S3_KEEP_DAYS`, manifest `counts` / `app_version` / member sha256, `job_backup_verify`
+  (`BACKUP_VERIFY_*`, full SQLite / PostgreSQL scratch restore with live-marker guard, partial level), run
+  history, `GET /api/v1/backups`, `POST /api/v1/backups/run|verify`, `backup.scrub()`; alerts
+  `backup_not_offsite`, `backup_unencrypted_offsite`, `backup_verify_failed`, `backup_verify_partial`.
+- **Config history** (§23.4): automatic versions of every section write (before_flush capture, actor from
+  `X-PCDN-Actor` / capi key / scheduler job), redacted diffs, restore under the current plan (feature drops,
+  list truncation, logs / webhook secret rules, 10/hour), admin + capi endpoints, retention
+  `CONFIG_HISTORY_*`.
+- **Customer alert channels** (§23.5): subscriptions per WHMCS account, SMS (Kavenegar / SMS.ir / Melipayamak),
+  Bale and Telegram customer bots (link codes, `/stop`), e-mail outbox for the WHMCS cron, dedup, rate limits
+  with digests, Tehran quiet hours, retries and permanent-failure disabling, encrypted targets; new events
+  `origin.down` / `origin.up` (from live `oe`), `ssl.expiring`, `incident.opened` / `incident.resolved`;
+  plan features `alert_sms`, `alert_messengers`, `max_alert_subscriptions`.
+- **Migration from ArvanCloud and Cloudflare** (§23.6): import preview / apply / delete (admin + capi), the
+  provider key used only inside the request (never stored, logged or echoed), encrypted short-lived sessions,
+  fixture-tested mappers for DNS, caching, HTTPS, firewall, page rules, DDoS and rate limits.
+- **RUM** (§23.7): section `rum` (plan feature `rum`), usage `rum` histograms merged into `rum_hourly`, p75 /
+  good / poor / breakdowns by country / ISP / region / device / path, CDN impact, `GET …/rum` (+ capi).
+- **Diagnostics report** (§23.8): `GET …/diagnostics` (+ capi) with secrets, origins, tunnel paths, node names
+  and addresses redacted; admin audience `internal` block.
+- **Provisioning and join tokens** (§23.9): capacity-sized proposals, two approvals, provisioner API (bearer
+  `PROVISIONER_TOKEN`), one-time join tokens (`POST /edge/v1/join`, `POST /api/v1/edges/{id}/join-token`).
+- **Abuse desk** (§23.10): public intake with proof of work (`ABUSE_ENABLED`), admin queue, owner notice via
+  the e-mail outbox, abuse suspension independent of billing (`abuse_suspended`), overdue alerts, retention.
+- **SLO dashboard** (§23.11): availability / latency / error SLIs per edge group, `GET /api/v1/slo`, burn-rate
+  alerts and `pcdn_slo_*` metrics (`SLO_*`).
+- **Customer-visible node naming** (§23.12): `display_city` labels («نود تهران ۱» / "Tehran node 1"), keyed
+  public tag (`node.public_tag`, `GET /api/v1/edges?tag=`), tunnel quality shows labels instead of internal
+  names; `edge_ips` sorted and unlabeled.
+
+### Added — wave 14, edge
+
+- Self-upgrade from `node.upgrade` (systemd-run, sha256-verified bundle, rollback cache of the last 3 releases);
+  `bootstrap.sh --version` pinned install with sha256 check, following the group pin of `/edge/releases`;
+  one-time join tokens (`--join-token-file` / `PCDN_JOIN_TOKEN`); `/etc/pcdn/release`.
+- `X-Served-By` now carries the node's public tag instead of the host name.
+- RUM beacon (`/__pcdn/rum.js`, `/__pcdn/rum`), auto / manual injection, privacy-preserving ingestion (no IP),
+  aggregated into usage; live `oe` / `pe` error counters; `pcdn-geoip-update --asn`.
+
+### Added — wave 14, release and ops tooling
+
+- `VERSION` file and `tools/release/*` (prepare.sh, changelog-section.sh, build-edge-bundle.sh,
+  fetch-edge-release.sh, staging-verify.sh, security-check.sh, check-meta.sh);
+  `.github/workflows/release-platform.yml` (on a `vX.Y.Z` tag: CI again, deterministic
+  `pcdn-edge-vX.Y.Z.tar.gz` + `.sha256`, a DRAFT GitHub release — merge / tag / publish stay owner decisions);
+  CI jobs `release-meta`, provisioning, status page.
+- `terraform/` (module `pcdn-edge-node`, `providers/hcloud` example, `providers/fake`) and
+  `tools/provision/pcdn-provision` (approved jobs only, one-time join tokens, masked tokens, never destroys).
+- CLI `pcdn config history|diff|restore`; `status/abuse.html` public abuse report page with in-browser proof
+  of work; Prometheus SLO burn-rate rules `pcdn-slo.yml` + promtool tests + Grafana dashboard `pcdn-slo`;
+  loadtest `--max-error-pct` / `--max-p99-ms` (exit 3); preflight `backup verify age`; staging stack sets
+  `PCDN_ENVIRONMENT=staging` and `PCDN_VERSION`; docs `RELEASE.md` (new), ROLLOUT / LOADTEST / STAGING /
+  TERRAFORM / CLI updated.
+
+### Changed — wave 14
+
+- Docs: API, OPERATIONS (§۱۰), MONITORING, SECURITY (§۱۲), UPGRADE («۱۲) موج ۱۴ — انتشار ایمن، عملیات و
+  تجربهٔ مشتری»), DISASTER_RECOVERY (weekly restore test), NODES (§۱۴); `.env.example` wave 14 block.
+
 ### Added — wave 13: tunnel speed and stability (SPEC §22), controller
 
 Migration `0022` (edges drain / probe / reload / tuning / `http3_enabled` / `dns_weight_level` columns,

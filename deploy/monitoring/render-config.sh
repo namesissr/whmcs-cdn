@@ -155,6 +155,8 @@ inhibit_rules:
   # controller unreachable: every alert derived from its /metrics is noise
   - source_matchers: ['alertname=~"PcdnControllerDown|PcdnControllerScrapeFailing"']
     target_matchers: ['source="metrics"']
+  - source_matchers: ['alertname=~"PcdnControllerDown|PcdnControllerScrapeFailing"']
+    target_matchers: ['source="prometheus"', 'alertname=~"PcdnSlo.+"']
   # all edges down: the single-edge / degraded alerts add nothing
   - source_matchers: ['alertname="PcdnEdgesAllOffline"']
     target_matchers: ['alertname=~"PcdnEdgesOffline|PcdnEdgeOffline|PcdnEdgesProbeFailing"']

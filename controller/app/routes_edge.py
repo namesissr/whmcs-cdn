@@ -106,6 +106,9 @@ class Capabilities(BaseModel):
     tunnel_probe: bool = False
     tunnel_multi_origin: bool = False
     upstream_resolve: bool = False
+    # SPEC §23 (wave 14): the agent upgrades itself from node.upgrade (§23.2); RUM beacons (§23.7)
+    self_upgrade: bool = False
+    rum: bool = False
 
     @field_validator("l4_port_range", mode="before")
     @classmethod
@@ -219,6 +222,26 @@ class Tuning(BaseModel):
         return list(v)[:20] if isinstance(v, list) else []
 
 
+class UpgradeReport(BaseModel):
+    """Heartbeat `upgrade` (SPEC §23.2)."""
+    id: str = Field(max_length=64)
+    release: str = Field(max_length=40)
+    state: Literal["downloading", "installing", "done", "failed"]
+    error: str | None = None
+    at: datetime | None = None
+    rollback: bool = False
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def _error(cls, v):
+        from .edge_state import scrub
+
+        return scrub(v, 200) if isinstance(v, str) else None
+
+
+RELEASE_RE = re.compile(r"^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
+
+
 def _ignore_malformed(name: str):
     """A malformed wave-13 heartbeat object is ignored (None), never a 422: a heartbeat must not
     fail on an informational field."""
@@ -277,6 +300,16 @@ class Heartbeat(BaseModel):
     _probe = field_validator("tunnel_probe", mode="wrap")(classmethod(_ignore_malformed("tunnel_probe")))
     _reloads = field_validator("reloads", mode="wrap")(classmethod(_ignore_malformed("reloads")))
     _tuning = field_validator("tuning", mode="wrap")(classmethod(_ignore_malformed("tuning")))
+
+    # wave 14 (SPEC §23.1 / §23.2), older agents omit them; malformed values are ignored
+    release: str | None = None
+    upgrade: UpgradeReport | None = None
+    _upgrade = field_validator("upgrade", mode="wrap")(classmethod(_ignore_malformed("upgrade")))
+
+    @field_validator("release", mode="before")
+    @classmethod
+    def _release(cls, v):
+        return v if isinstance(v, str) and RELEASE_RE.match(v) else None
 
     @field_validator("capabilities", mode="wrap")
     @classmethod
@@ -344,6 +377,11 @@ def heartbeat(body: Heartbeat, request: Request, edge: Edge = Depends(require_ed
         edge_state.record_reloads(edge, body.reloads.model_dump(mode="json"))
     if body.tuning is not None:
         edge_state.record_tuning(edge, body.tuning.model_dump(mode="json"))
+    # SPEC §23.1 / §23.2: the platform release the node runs and its latest self-upgrade report
+    if "release" in body.model_fields_set:
+        edge.release = body.release
+    if body.upgrade is not None:
+        edge.upgrade_state = json.dumps(body.upgrade.model_dump(mode="json"), sort_keys=True)
     db.commit()
     return {"ok": True}
 
@@ -625,6 +663,15 @@ class UsageItem(BaseModel):
     # [{t, app, email_hash, ok}] (malformed events are dropped, never a 422)
     access: access_mod.AccessUsage | None = None
     access_events: list[access_mod.AccessEvent] = []
+    # SPEC §23.7 (optional): RUM histograms of this host-hour (malformed -> ignored, never a 422)
+    rum: dict | None = None
+
+    @field_validator("rum", mode="before")
+    @classmethod
+    def _rum(cls, v):
+        from . import rum as rum_mod
+
+        return rum_mod.clean(v) if v is not None else None
 
     @field_validator("access_events", mode="before")
     @classmethod
@@ -662,6 +709,10 @@ class LiveItem(BaseModel):
     # controller's origin-down detection reads them; older agents omit them (0).
     tunnel_attempts: int = Field(default=0, ge=0, le=BIG)
     tunnel_errors: int = Field(default=0, ge=0, le=BIG)
+    # SPEC §23.5 (wave 14, optional): origin-attributed 5xx (`oe`) and platform errors (`pe`) of this
+    # minute; stored in analytics_minute.details (origin.down/up, SLO errors). Older agents omit them.
+    oe: int | None = Field(default=None, ge=0, le=BIG)
+    pe: int | None = Field(default=None, ge=0, le=BIG)
 
 
 class EventIn(BaseModel):
@@ -827,6 +878,7 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
     # security events per site in this batch (attack.detected webhook, SPEC §14.3.3)
     security: dict[int, dict[str, int]] = {}
     learning: dict[int, dict] = {}  # site id -> waf.learning (only looked up for items with waf_learn)
+    rum_items: list[tuple[int, datetime, dict]] = []
     for it in body.items:
         sid = _site_for_host(it.host, domains)
         if sid is None:
@@ -846,6 +898,9 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
         a["r"] += it.requests
         a["h"] += it.cache_hits
         item = it.model_dump()
+        rum_item = item.pop("rum", None)
+        if rum_item:  # SPEC §23.7: merged into rum_hourly below (sites whose plan has `rum`)
+            rum_items.append((sid, hour, rum_item))
         if item.get("waf_learn") is not None:
             if sid not in learning:
                 site = db.get(Site, sid)
@@ -873,6 +928,16 @@ def usage(body: UsageIn, edge: Edge = Depends(require_edge), db: Session = Depen
             except ValueError:
                 current = {}
             row.details = json.dumps(_merge_details(current, a["d"]))
+    if rum_items:
+        from . import rum as rum_mod
+
+        accepts: dict[int, bool] = {}
+        for sid, hour, r in sorted(rum_items, key=lambda x: (x[0], x[1])):
+            if sid not in accepts:
+                site = db.get(Site, sid)
+                accepts[sid] = site is not None and rum_mod.site_accepts(site)
+            if accepts[sid]:
+                rum_mod.ingest(db, sid, hour, r)
     accepted_events = 0
     event_counts: dict[int, int] = {}
     for ev in body.events:
@@ -1089,3 +1154,29 @@ def access_otp(body: AccessOtpIn, request: Request, edge: Edge = Depends(require
     # (truncating answered exactly WINDOW_SECONDS during the last second of a window)
     expires_in = math.ceil((window + 2) * access_mod.WINDOW_SECONDS - unix)
     return {"ok": True, "expires_in": expires_in}
+
+
+# ------------------------------------------------------------------ join (SPEC §23.9)
+
+class JoinIn(BaseModel):
+    join_token: str = Field(max_length=64)
+    hostname: str | None = Field(default=None, max_length=253)
+
+
+@router.post("/join")
+def join(body: JoinIn, request: Request, db: Session = Depends(get_db)):
+    """A node joins with its one-time join token (no other auth): a fresh edge token is minted (stored
+    hashed) and the join token is spent. 401 for unknown / used / expired tokens; ≤ 10 attempts per
+    minute per source address (429). The node's address is learned from its first heartbeat."""
+    from fastapi import HTTPException
+
+    from . import provisioning
+    from .audit import record_audit
+
+    ip = request.client.host if request.client else "?"
+    if not provisioning.join_rate(ip):
+        raise HTTPException(429, "too many join attempts")
+    edge, token = provisioning.join(db, body.join_token)
+    record_audit(db, actor="edge", actor_kind="system", action="edge.join", target=edge.name,
+                 detail={"name": edge.name}, ip=ip)
+    return {"edge_id": edge.id, "name": edge.name, "token": token}

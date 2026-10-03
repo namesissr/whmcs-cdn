@@ -19,6 +19,7 @@ PowerDNS، دو نود Edge، یک سرور اصلی نمونه و در صورت
 - [اجرای آزمون‌ها از روی میزبان](#اجرای-آزمونها-از-روی-میزبان)
 - [پروفایل‌های اختیاری: Storage و L4](#پروفایلهای-اختیاری-storage-و-l4)
 - [CI](#ci)
+- [دروازهٔ انتشار (staging gate)](#دروازهٔ-انتشار-staging-gate)
 - [عیب‌یابی](#عیبیابی)
 - [محدودیت‌ها و تفاوت با محیط واقعی](#محدودیتها-و-تفاوت-با-محیط-واقعی)
 
@@ -213,6 +214,30 @@ STAGING_STORAGE=1 deploy/staging/staging.sh down
 job `integration` در `.github/workflows/ci.yml` (ubuntu-24.04، سقف ۲۰ دقیقه، زمان معمول کمتر از ۱۵ دقیقه):
 `staging.sh config` ← `staging.sh up` (build و `--wait`) ← `staging.sh test` ← در صورت شکست لاگ‌ها چاپ و به‌عنوان
 artifact (`staging-logs`) بارگذاری می‌شوند ← در هر حال `staging.sh down`. پروفایل storage در CI اجرا نمی‌شود.
+
+## دروازهٔ انتشار (staging gate)
+
+پیش از هر انتشار سکو، head همان PR انتشار روی staging با `tools/release/staging-verify.sh` سنجیده می‌شود
+(SPEC §23.1، [RELEASE §۴](RELEASE.md#۴-دروازهٔ-staging-staging-verifysh)): نسخهٔ کنترلر و نودها، preflight
+سخت‌گیر، مهاجرت‌ها در head، همین `staging.sh test`، آزمون بار با آستانه، پشتیبان + آزمون بازیابی کامل،
+پیش‌نمایش rollout و بازبینی امنیتی. شواهد در `release-evidence/vX.Y.Z/` (`report.md`، `report.json`، `raw/`).
+
+- کنترلر این پشته `PCDN_ENVIRONMENT=staging` و `PCDN_VERSION` (از فایل `VERSION`، با `staging.sh` صادر
+  می‌شود) دارد؛ دروازه هر کنترلری را که `production` گزارش کند یا در `PCDN_PROD_CONTROLLERS` باشد **رد**
+  می‌کند (کد ۲، بدون گزینهٔ دور زدن).
+- تنظیمات دروازه در `deploy/staging/staging-gate.env` (از روی `staging-gate.env.example`، git-ignored،
+  `chmod 600`): `PCDN_CONTROLLER_URL`، `PCDN_ADMIN_KEY`، `STAGING_EDGE_TARGET`، `STAGING_LOADTEST_HOST`،
+  `STAGING_NS`، `PCDN_PROD_CONTROLLERS`.
+- این پشتهٔ Docker پشتیبان‌گیری را خاموش دارد و پورت منتشر نمی‌کند؛ برای دروازهٔ کامل از یک staging شبیه
+  تولید (کنترلر با `BACKUP_ENABLED`، `BACKUP_VERIFY_DATABASE_URL` و نودهای واقعی) استفاده کنید، یا گام‌های
+  نامربوط را با `--skip-backup` / `--skip-loadtest` رد کنید (نتیجه PARTIAL، کد ۳).
+
+نمونه روی همین پشته (از ماشینی که به شبکهٔ پشته دسترسی دارد):
+
+```bash
+tools/release/staging-verify.sh --env-file deploy/staging/staging-gate.env \
+    --controller http://11.200.0.10:8000 --ns 11.200.0.53 --skip-loadtest --skip-backup
+```
 
 ## عیب‌یابی
 

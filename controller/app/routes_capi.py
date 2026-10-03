@@ -30,7 +30,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import sections, tunnel_quality
+from fastapi.concurrency import run_in_threadpool
+
+from . import routes_cx, sections, tunnel_quality
 from .audit import record_audit
 from .auth import hash_token
 from .config import settings
@@ -125,6 +127,10 @@ def resolve_key(credentials: HTTPAuthorizationCredentials | None = Depends(beare
     _rate_limit(key.id)
     key.last_used_at = utcnow()
     db.commit()
+    # SPEC §23.4: config versions written through this key are attributed to it
+    from . import config_history
+
+    config_history.update_actor(kind="capi", actor=f"key:{key.id}:{key.name or ''}"[:120], source="capi")
     return key
 
 
@@ -132,7 +138,7 @@ def check_scope(key: ApiKey, scope: str, write: bool = False) -> ApiKey:
     """403 unless the key carries `scope`; for a write also 403 while the site is suspended (M2)."""
     if scope not in key.scope_list:
         raise HTTPException(403, f"این کلید دسترسی «{scope}» را ندارد")
-    if write and key.site is not None and key.site.suspended:
+    if write and key.site is not None and (key.site.suspended or key.site.abuse_suspended):
         raise HTTPException(403, "سرویس معلق است؛ تا رفع تعلیق فقط خواندن از طریق API مجاز است")
     return key
 
@@ -352,6 +358,94 @@ def delete_record(record_id: int, request: Request, key: ApiKey = Depends(requir
     result = delete_record_of(db, _site(_rate_limit_config(key)), record_id)
     _audit(db, request, key, "record.delete", {"record_id": record_id})
     return result
+
+
+# ------------------------------------------------------------------ wave 14 (SPEC §23)
+# defined before /config/{section} so "history" is never taken for a section name
+
+def _has(key: ApiKey, scope: str) -> bool:
+    return scope in key.scope_list
+
+
+@router.get("/config/history")
+def config_history(limit: int = 50, before: int | None = None, key: ApiKey = Depends(require_scope("config")),
+                   db: Session = Depends(get_db)):
+    return routes_cx.history_of(db, _site(key), limit, before)
+
+
+@router.get("/config/history/{version}")
+def config_history_version(version: int, key: ApiKey = Depends(require_scope("config")),
+                           db: Session = Depends(get_db)):
+    return routes_cx.version_of(db, _site(key), version, functions=_has(key, "functions"))
+
+
+@router.get("/config/history/{version}/diff")
+def config_history_diff(version: int, against: str = "current", section: str | None = None,
+                        key: ApiKey = Depends(require_scope("config")), db: Session = Depends(get_db)):
+    return routes_cx.diff_of(db, _site(key), version, against, section, functions=_has(key, "functions"))
+
+
+@router.post("/config/history/{version}/restore")
+def config_history_restore(version: int, request: Request, body: dict | None = None,
+                           key: ApiKey = Depends(require_scope("config", write=True)), db: Session = Depends(get_db)):
+    result = routes_cx.restore_of(db, _site(_rate_limit_config(key)), version, body or {},
+                                  functions=_has(key, "functions"))
+    if not (body or {}).get("dry_run"):
+        _audit(db, request, key, "config.restore", {"section": result["applied"], "record_id": version})
+    return result
+
+
+def _import_key(key: ApiKey) -> ApiKey:
+    check_scope(key, "dns", write=True)
+    return check_scope(key, "config", write=True)
+
+
+@router.post("/import/preview")
+async def import_preview(request: Request, key: ApiKey = Depends(resolve_key)):
+    _import_key(key)
+    body = await routes_cx._json_body(request)
+    return await run_in_threadpool(routes_cx.preview_of, key.site_id, body)
+
+
+@router.post("/import/apply")
+async def import_apply(request: Request, key: ApiKey = Depends(resolve_key), db: Session = Depends(get_db)):
+    _import_key(key)
+    body = await routes_cx._json_body(request)
+    site = db.get(Site, key.site_id)
+    result = await run_in_threadpool(routes_cx.apply_of, db, site, body)
+    await run_in_threadpool(_audit, db, request, key, "import.apply",
+                            {"mode": result["provider"], "count": result["records"]["imported"],
+                             "section": result["sections"]["applied"]})
+    return result
+
+
+@router.delete("/import/{session_id}", status_code=204)
+def import_delete(session_id: str, key: ApiKey = Depends(resolve_key), db: Session = Depends(get_db)):
+    _import_key(key)
+    from . import importer
+
+    importer.drop(db, db.get(Site, key.site_id), session_id)
+    return Response(status_code=204)
+
+
+@router.get("/rum")
+def rum_report(hours: int = 24, by: str | None = None, key: ApiKey = Depends(require_scope("stats")),
+               db: Session = Depends(get_db)):
+    return routes_cx.rum_of(db, _site(key), hours, by)
+
+
+@router.get("/diagnostics")
+def diagnostics_report(request: Request, key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    report = routes_cx.diagnostics_of(db, _site(key), "customer")
+    _audit(db, request, key, "diagnostics.generate", {"items": report["report_id"]})
+    return report
+
+
+@router.get("/alerts")
+def alerts_of_site(key: ApiKey = Depends(require_scope("stats")), db: Session = Depends(get_db)):
+    from . import notify
+
+    return notify.capi_alerts(db, _site(key))
 
 
 @router.get("/config/{section}")

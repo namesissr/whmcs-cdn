@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # release-platform.yml runs every job of this workflow before it builds a platform release (SPEC §23.1)
+  workflow_call:
 
 jobs:
   controller:
@@ -190,3 +192,65 @@ jobs:
       - run: docker compose -f deploy/monitoring/docker-compose.yml --env-file deploy/monitoring/.env.example config -q
       - run: docker compose -f deploy/status/docker-compose.yml --env-file deploy/status/.env.example config -q
       - run: pip install -r docs-site/requirements.txt && mkdocs build --strict
+
+  # release metadata (SPEC §23.1): VERSION is SemVer, CHANGELOG has [Unreleased], the edge release bundle
+  # is deterministic, tools/release/*.sh pass bash -n + shellcheck; release tooling tests (prepare /
+  # changelog section / bundle / fetch / staging gate against a fake controller / security-check scanners)
+  release-meta:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: shellcheck available
+        run: shellcheck --version || (sudo apt-get update -q && sudo apt-get install -y -q shellcheck)
+      - run: tools/release/check-meta.sh
+      - name: Release tooling tests
+        run: |
+          pip install pytest pyflakes
+          python3 -m pyflakes tools/release tools/provision
+          git config --global user.email ci@example.invalid && git config --global user.name ci
+          python3 -m pytest -q tools/release/tests
+
+  # node provisioning (SPEC §23.9): terraform/ fmt + validate (fake + hcloud example, no cloud credentials)
+  # and pcdn-provision against a fake controller with the real Terraform CLI and the fake provider module
+  provisioning:
+    runs-on: ubuntu-24.04
+    env:
+      PCDN_REQUIRE_TERRAFORM: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff terraform
+      - name: terraform validate
+        run: |
+          for d in terraform/modules/pcdn-edge-node terraform/providers/fake terraform/providers/hcloud; do
+            echo "== $d"
+            terraform -chdir="$d" init -backend=false -input=false -no-color
+            terraform -chdir="$d" validate -no-color
+          done
+      - name: Provisioner tests
+        run: |
+          pip install pytest pyflakes
+          python3 -m pyflakes tools/provision
+          python3 -m pytest -q tools/provision/tests
+
+  # public status page: abuse form PoW solver / helpers (SPEC §23.10) under node
+  status-page:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --check status/status.js && node --check status/abuse.js
+      - run: node --test status/tests/*.test.js

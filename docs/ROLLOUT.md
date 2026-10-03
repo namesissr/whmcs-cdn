@@ -94,6 +94,11 @@ python3 tools/preflight/preflight.py --controller https://cdn-api.example.com --
 
 ## ۳. مرحلهٔ ۱: staging
 
+> **از موج ۱۴:** همهٔ گام‌های زیر به‌اضافهٔ آزمون بار با آستانه، پشتیبان + آزمون بازیابی، پیش‌نمایش rollout و
+> بازبینی امنیتی با یک فرمان اجرا و مستند می‌شوند: `tools/release/staging-verify.sh` (دروازهٔ staging،
+> [RELEASE §۴](RELEASE.md#۴-دروازهٔ-staging-staging-verifysh)). گام‌های دستی زیر برای فهم و عیب‌یابی هر بخش
+> باقی مانده‌اند؛ انتشار فقط با گزارش PASS آن دروازه و تأیید مالک مخزن.
+
 1. پشتهٔ کامل را بالا بیاورید و آزمون‌های یکپارچه را اجرا کنید ([STAGING.md](STAGING.md#شروع-سریع)):
    ```bash
    deploy/staging/staging.sh up && deploy/staging/staging.sh test
@@ -116,6 +121,16 @@ python3 tools/preflight/preflight.py --controller https://cdn-api.example.com --
 
 ## ۴. مرحلهٔ ۲: canary (یک نود + مشتریان داخلی، یک هفته)
 
+> **انتشار خودکار نودها (موج ۱۴، SPEC §23.2):** وقتی کنترلر `EDGE_RELEASES_DIR` دارد و نودها
+> `capabilities.self_upgrade` گزارش می‌کنند، گام ۳ این بخش و گام ۱ بخش ۵ با یک **rollout** انجام می‌شوند:
+> صفحهٔ مدیر «انتشار نسخه» (یا `POST /api/v1/rollouts` با `{"release": "vX.Y.Z"}`) حلقهٔ ۰ = یک canary در هر
+> گروه، حلقهٔ ۱ = ۲۵٪، حلقهٔ ۲ = بقیه؛ هر نود پیش از ارتقا تخلیه (drain) می‌شود، در دورهٔ پایش (`soak_minutes`)
+> با سلامت خودش (heartbeat، پروب کنترلر، پروب داخلی تونل، نرخ خطای سکو) سنجیده می‌شود و در صورت شکست، همهٔ
+> نودهای ارتقایافتهٔ همین rollout **خودکار بازگردانده** می‌شوند. آخرین نود سالم یک گروه/منطقه هرگز بی‌صدا ارتقا
+> نمی‌یابد. پیش از شروع، «پیش‌نمایش» (dry run) را ببینید. جزئیات: [OPERATIONS.md](OPERATIONS.md)؛
+> بسته‌ها: [RELEASE §۷](RELEASE.md#۷-workflow-انتشار-و-بستهٔ-لبهٔ-پینشده). نودهای بدون این قابلیت (`manual`) را
+> مثل گذشته دستی ارتقا دهید.
+
 1. **پشتیبان** کنترلر و WHMCS ([UPGRADE §۰](UPGRADE.md#۰-پیش-از-شروع--پشتیبان-بگیرید))؛ preflight پیش از
    شروع را ذخیره کنید تا مبنای مقایسه باشد.
 2. **کنترلر** را طبق [UPGRADE §۱](UPGRADE.md) ارتقا دهید (در HA اول standby، سپس primary). بلافاصله:
@@ -135,6 +150,9 @@ python3 tools/preflight/preflight.py --controller https://cdn-api.example.com --
    بقیه، و بازخورد مشتریان داخلی. یک بار در هفته `--alert-test`.
 
 ## ۵. مرحلهٔ ۳: همهٔ نودها و مشتریان
+
+> با rollout خودکار، دسته‌بندی ۲۵٪ و صبر میان دسته‌ها (گام ۱ زیر) را خود rollout انجام می‌دهد؛ این مرحله
+> یعنی ادامهٔ همان rollout پس از هفتهٔ canary (یا rollout تازه برای گروه‌های باقی‌مانده) و سپس گام‌های ۲ تا ۴.
 
 1. اگر همهٔ [معیارهای go](#۶-معیارهای-ادامه--توقف-go--no-go) برقرارند، بقیهٔ نودها را **دسته‌ای** ارتقا دهید:
    هر بار حداکثر ۲۵٪ نودهای هر گروه، و پیش از دستهٔ بعد ۳۰ دقیقه صبر و preflight (همهٔ نودهای ارتقایافته OK).
@@ -234,6 +252,10 @@ python3 tools/preflight/preflight.py --controller https://cdn-api.example.com --
 
 ## ۹. نسخه‌گذاری و انتشار
 
+> **جریان کامل انتشار** (فایل `VERSION`، `tools/release/prepare.sh`، دروازهٔ staging، بازبینی امنیتی، Release
+> پیش‌نویس با بستهٔ لبهٔ پین‌شده) اکنون در [RELEASE.md](RELEASE.md) است. ادغام در `main`، برچسب `vX.Y.Z` و
+> انتشار Release فقط با **تأیید صریح مالک مخزن** انجام می‌شوند. قواعد زیر همچنان معتبرند.
+
 - **SemVer:** `MAJOR` برای تغییر ناسازگار API مشتری/قرارداد لبه یا نیاز به اقدام دستی اپراتور، `MINOR` برای
   امکان تازهٔ سازگار (معمولاً هر موج)، `PATCH` برای رفع اشکال. نسخهٔ سکو (کنترلر + بستهٔ لبه + ماژول‌های WHMCS +
   کیت استقرار) یکی است: `vX.Y.Z`.
@@ -242,13 +264,16 @@ python3 tools/preflight/preflight.py --controller https://cdn-api.example.com --
 - **CHANGELOG:** هر PR تغییر کاربرپسند خود را زیر `## [Unreleased]` در [CHANGELOG.md](../CHANGELOG.md) با
   دسته‌های Keep a Changelog (`Added`، `Changed`، `Security`، `Fixed`، `Removed`، `Deprecated`) می‌نویسد.
 - **انتشار:**
-  1. `Unreleased` را به `## [X.Y.Z] - YYYY-MM-DD` تبدیل و پیوندهای مقایسه را پایین فایل به‌روز کنید (یک PR).
+  1. `tools/release/prepare.sh X.Y.Z` بخش `Unreleased` را به `## [X.Y.Z] - YYYY-MM-DD` تبدیل، پیوندهای مقایسه و
+     `VERSION` را به‌روز و فرمان‌های PR را چاپ می‌کند (یک PR؛ [RELEASE §۳](RELEASE.md#۳-آمادهسازی-preparesh)).
   2. پس از ادغام، روی همان commit در `main`:
      ```bash
      git tag -a vX.Y.Z -m "Pasargad CDN vX.Y.Z" && git push origin vX.Y.Z
      ```
      برای نسخهٔ نامزد پیش از canary: `vX.Y.Z-rc.N`.
-  3. در GitHub یک Release با متن بخش همان نسخه از CHANGELOG و خروجی `--json` preflight نهایی بسازید.
+  3. `release-platform.yml` یک Release **پیش‌نویس** با متن بخش همان نسخه از CHANGELOG و بستهٔ
+     `pcdn-edge-vX.Y.Z.tar.gz` (+ `.sha256`) می‌سازد؛ گزارش staging و خروجی `--json` preflight نهایی را
+     پیوست کنید و مالک آن را منتشر می‌کند.
 - **CLI و Terraform provider** برچسب‌های جدای خود را دارند و انتشارشان خودکار است
   (`.github/workflows/release.yml` + GoReleaser، امضای GPG): `git tag cli/vA.B.C` و `git tag provider/vA.B.C`
   ([CLI.md](CLI.md)، [TERRAFORM.md](TERRAFORM.md)). اگر تغییری در API مشتری داده‌اید که CLI/provider به آن نیاز

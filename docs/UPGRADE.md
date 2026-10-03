@@ -439,3 +439,37 @@ curl -fsSL https://<دامنه-کنترلر>/edge/bootstrap.sh | sudo bash -s --
 **بازگشت:** کنترلر قدیمی با نود جدید کار می‌کند (فیلدهای تازه‌ی heartbeat و مصرف نادیده گرفته می‌شوند).
 برای برگرداندن پایگاه‌داده (پس از پشتیبان‌گیری): `python -m app.manage downgrade 0021 --yes` (ستون‌ها و جدول
 تازه حذف می‌شوند).
+
+## ۱۲) موج ۱۴ — انتشار ایمن، عملیات و تجربهٔ مشتری
+
+**کنترلر:** مهاجرت `0023` (`0023_release_ops_cx.py`) هنگام راه‌اندازی خودکار اجرا می‌شود و idempotent است:
+ستون‌های `edges.display_city`، `display_city_en`، `release`، `upgrade_state` و `sites.abuse_suspended` (پیش‌فرض
+false) و جدول‌های تاریخچهٔ تنظیمات، اجرای پشتیبان، اعلان‌ها، جلسه‌های واردکردن، RUM، تخلف، SLO، rollout، توکن
+پیوستن و پیشنهاد نود؛ و جدول یک‌ردیفی `pcdn_live_marker` (فقط در پایگاه زنده؛ آن را در پایگاه آزمایشی نسازید).
+
+**کلیدهای تازه** (همه رفتار قبلی را نگه می‌دارند؛ فهرست در `.env.example`): `PCDN_VERSION`، `PCDN_ENVIRONMENT`،
+`EDGE_RELEASES_DIR`، `EDGE_RELEASE`، `ROLLOUT_*`، `BACKUP_ENCRYPTION_KEY`، `BACKUP_REQUIRE_ENCRYPTION`،
+`BACKUP_S3_KEEP_DAYS`، `BACKUP_VERIFY_*`، `CONFIG_HISTORY_*`، `SMS_*`، `TELEGRAM_CUSTOMER_BOT_*`، `BALE_*`،
+`NOTIFY_*`، `IMPORT_*`، `ARVAN_API_URL`، `CLOUDFLARE_API_URL`، `RUM_RETENTION_DAYS`، `PROVISIONING_ENABLED`،
+`PROVISIONER_TOKEN`، `PROVISION_*`، `JOIN_TOKEN_HOURS`، `ABUSE_*`، `SLO_*`. فقط `CONFIG_HISTORY_ENABLED` و
+`SLO_ENABLED` به‌صورت پیش‌فرض روشن‌اند (فقط ثبت داده و هشدار به اپراتور).
+
+**قابلیت‌های پلن:** `rum`، `alert_sms`، `alert_messengers` (پیش‌فرض false) و `max_alert_subscriptions` (۲۰).
+
+**تغییرهای قابل مشاهده:**
+- پاسخ `/tunnel/quality` به‌جای نام داخلی نود، برچسب شهر («نود تهران ۱») و `label_en` و `key` می‌دهد؛ برای هر نود
+  `display_city` را تنظیم کنید (docs/NODES.md §۱۴).
+- `edge_ips` سایت حالا مرتب عددی (IPv4 سپس IPv6) و بی‌تکرار است؛ همان آدرس‌ها.
+- وبهوک‌های `site.suspended` / `site.unsuspended` فیلد `reason` دارند؛ رویدادهای تازه: `origin.down`، `origin.up`،
+  `ssl.expiring`، `incident.opened`، `incident.resolved`.
+- `backup_not_offsite` (اطلاع) وقتی `BACKUP_ENABLED` بدون `BACKUP_S3_*` است باز می‌ماند.
+
+**نودها — همه را ارتقا دهید:** تا وقتی نودی ارتقا نیافته، سرآیند `X-Served-By` آن هنوز نام میزبان سیستم‌عامل
+است؛ نودهای ارتقایافته برچسب عمومی (`node.public_tag`) را می‌فرستند. برای ارتقای مرحله‌ای از این پس از صفحهٔ
+«انتشار نسخه» (rollout) استفاده کنید؛ نودهای بدون `self_upgrade` به‌صورت `manual` فهرست می‌شوند و باید دستی
+(`install.sh --upgrade --drain`) ارتقا یابند. اسکریپت‌هایی که از `X-Served-By` نام میزبان می‌خواندند باید با
+`GET /api/v1/edges?tag=` نود را پیدا کنند.
+
+**بازگشت:** کنترلر قدیمی با نود جدید کار می‌کند (کلیدهای `release`، `upgrade`، `rum`، `oe`، `pe` نادیده گرفته
+می‌شوند). برگرداندن پایگاه‌داده (پس از پشتیبان‌گیری): `python -m app.manage downgrade 0022 --yes` (جدول‌ها و
+ستون‌های تازه حذف می‌شوند).

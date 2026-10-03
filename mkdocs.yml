@@ -87,6 +87,7 @@ nav:
       - معماری: ARCHITECTURE.md
       - به‌روزرسانی: UPGRADE.md
       - استقرار تدریجی (Rollout): ROLLOUT.md
+      - انتشار نسخه (Release): RELEASE.md
   - عملیات:
       - راهنمای عملیات: OPERATIONS.md
       - پایش و هشدار: MONITORING.md

@@ -6,7 +6,7 @@ import signal
 import time
 from datetime import datetime, timezone
 
-from .capabilities import guard_installed, image_capabilities, l4_ready, nginx_capabilities
+from .capabilities import guard_installed, image_capabilities, l4_ready, nginx_capabilities, self_upgrade_capable
 from .common import VIRTUAL_IFACES, _int, default_iface
 from .functions import functions_ready
 from .render.stream import l4_port_range
@@ -34,7 +34,10 @@ def heartbeat_capabilities(cfg: dict) -> dict:
             # SPEC §22 (wave 13): node drain flag, synthetic tunnel probe, multi-origin tunnel paths and
             # re-resolved keepalive upstreams for host-name origins (nginx >= 1.27.3)
             "drain": True, "tunnel_probe": True, "tunnel_multi_origin": True,
-            "upstream_resolve": bool(c.get("upstream_resolve"))}
+            "upstream_resolve": bool(c.get("upstream_resolve")),
+            # SPEC §23 (wave 14): node.upgrade handled (SELF_UPGRADE=no / no systemd-run -> false: rollouts
+            # treat the node as manual); RUM beacons served and aggregated (needs njs for the ingestion)
+            "self_upgrade": self_upgrade_capable(cfg), "rum": "njs" in c["modules"]}
 
 
 def net_bytes(iface: str | None, dev_path: str = "/proc/net/dev") -> tuple[int, int] | None:

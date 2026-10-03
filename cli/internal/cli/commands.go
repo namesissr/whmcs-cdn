@@ -370,11 +370,21 @@ func (a *app) recordsDelete(ctx context.Context, args []string) error {
 const configUsage = `Usage:
   pcdn config get <section>             print the section as JSON
   pcdn config set <section> [file|-]    replace the section with a JSON object from file (or stdin)
+  pcdn config history [--limit N] [--before V]
+                                        settings history: who changed which sections when (scope config)
+  pcdn config diff <version> [--against current|V] [--section S]
+                                        what changed between <version> and the current config (or V)
+  pcdn config restore <version> [--section S ...] [--dry-run]
+                                        restore sections of an older version (all that differ by default);
+                                        --dry-run shows what would be applied / dropped without writing
 
 The section document is always JSON (independent of --output), so
   pcdn config get waf > waf.json && $EDITOR waf.json && pcdn config set waf waf.json
 round-trips. Non-blocking warnings of the controller are printed to stderr. For the webhooks
 section the reply may contain new signing secrets: they are shown only once.
+
+History values are redacted by the controller (secrets, auth headers): a restore never changes stored
+secrets, and sections the current plan does not allow are dropped (listed in the reply).
 `
 
 var sectionRe = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
@@ -383,7 +393,7 @@ func (a *app) cmdConfig(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprint(a.stderr, configUsage)
 		if len(args) == 0 {
-			return usagef("config needs a sub-command: get or set")
+			return usagef("config needs a sub-command: get, set, history, diff or restore")
 		}
 		return flag.ErrHelp
 	}
@@ -442,8 +452,106 @@ func (a *app) cmdConfig(ctx context.Context, args []string) error {
 			fmt.Fprintf(a.stderr, "Section %q updated.\n", pos[0])
 		}
 		return a.printJSON(res.Body)
+	case "history":
+		return a.configHistory(ctx, rest)
+	case "diff":
+		return a.configDiff(ctx, rest)
+	case "restore":
+		return a.configRestore(ctx, rest)
 	}
-	return usagef("unknown config sub-command %q (get, set)", sub)
+	return usagef("unknown config sub-command %q (get, set, history, diff, restore)", sub)
+}
+
+// configVersion parses a history version number (1..999999999).
+func configVersion(s string) (int64, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 1 || n > 999999999 {
+		return 0, usagef("invalid version %q (a positive number from 'pcdn config history')", s)
+	}
+	return n, nil
+}
+
+func (a *app) configHistory(ctx context.Context, args []string) error {
+	fs := a.flagSet("config history", configUsage)
+	limit := fs.Int("limit", 50, "versions to show (1..200)")
+	before := fs.Int64("before", 0, "only versions older than this one (paging)")
+	if _, err := parseExact(fs, args, 0, "config history"); err != nil {
+		return err
+	}
+	if *limit < 1 || *limit > 200 {
+		return usagef("--limit must be between 1 and 200")
+	}
+	if *before < 0 || *before > 999999999 {
+		return usagef("--before must be a version number")
+	}
+	return a.fetchAndRender(func(c *client.Client) (json.RawMessage, error) {
+		return c.ConfigHistory(ctx, *limit, *before)
+	}, renderHistory)
+}
+
+func (a *app) configDiff(ctx context.Context, args []string) error {
+	fs := a.flagSet("config diff", configUsage)
+	against := fs.String("against", "current", "compare with: current or a version number")
+	section := fs.String("section", "", "only this section")
+	pos, err := parseExact(fs, args, 1, "config diff")
+	if err != nil {
+		return err
+	}
+	v, err := configVersion(pos[0])
+	if err != nil {
+		return err
+	}
+	if *against != "current" {
+		if _, err := configVersion(*against); err != nil {
+			return usagef("--against must be current or a version number")
+		}
+	}
+	if *section != "" && !sectionRe.MatchString(*section) {
+		return usagef("invalid section name %q", *section)
+	}
+	return a.fetchAndRender(func(c *client.Client) (json.RawMessage, error) {
+		return c.ConfigDiff(ctx, v, *against, *section)
+	}, renderDiff)
+}
+
+func (a *app) configRestore(ctx context.Context, args []string) error {
+	fs := a.flagSet("config restore", configUsage)
+	var sections stringList
+	fs.Var(&sections, "section", "section to restore (repeatable; default: every section that differs)")
+	dry := fs.Bool("dry-run", false, "show what would be restored / dropped without writing")
+	pos, err := parseExact(fs, args, 1, "config restore")
+	if err != nil {
+		return err
+	}
+	v, err := configVersion(pos[0])
+	if err != nil {
+		return err
+	}
+	in := client.RestoreInput{DryRun: *dry}
+	for _, s := range sections {
+		for _, part := range strings.Split(s, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if !sectionRe.MatchString(part) {
+				return usagef("invalid section name %q", part)
+			}
+			in.Sections = append(in.Sections, part)
+		}
+	}
+	c, err := a.client()
+	if err != nil {
+		return err
+	}
+	raw, err := c.ConfigRestore(ctx, v, in)
+	if err != nil {
+		return err
+	}
+	if a.jsonOut() {
+		return a.printJSON(raw)
+	}
+	return renderRestore(a.stdout, raw, *dry)
 }
 
 // readJSONObject reads src ("-" = stdin) and requires one JSON object.

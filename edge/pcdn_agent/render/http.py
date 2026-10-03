@@ -5,10 +5,11 @@ server, the mTLS resizer upstreams, the verified-crawler ranges (bots.conf), and
 import base64
 import binascii
 import hashlib
+import os
 import re
 import socket
 
-from ..capabilities import geoip_present, image_capabilities, module_blocks, nginx_capabilities
+from ..capabilities import geoip_present, has_module, image_capabilities, module_blocks, nginx_capabilities
 from ..common import SAFE_FSPATH, SAFE_RESOLVER, SAFE_SIZE, _int, _v6
 from ..settings import asset, log
 from ..validation.origin import internal_src
@@ -46,7 +47,19 @@ def norm_node(config: dict, cfg: dict) -> dict:
             "fair_share_pct": _int(n.get("fair_share_pct", cfg.get("FAIR_SHARE_PCT")), 25, 1, 100),
             "name": name[:253],
             # SPEC §22.9 per-node HTTP/3 switch (absent = on where the nginx build has HTTP/3)
-            "http3": n.get("http3") is not False}
+            "http3": n.get("http3") is not False,
+            # SPEC §23.12.2 public node tag (8 hex, keyed HMAC on the controller; "" = old controller)
+            "public_tag": public_tag(n)}
+
+
+_PUBLIC_TAG = re.compile(r"^[0-9a-f]{8}$")
+
+
+def public_tag(n: dict) -> str:
+    """node.public_tag of the config when it is exactly 8 lower-case hex characters, else "" (an old
+    controller sends none: the agent then falls back to node_tag(name))."""
+    v = n.get("public_tag") if isinstance(n, dict) else None
+    return v if isinstance(v, str) and _PUBLIC_TAG.match(v) else ""
 
 
 # ----------------------------------------------------------------- TLS session tickets (SPEC §22.8)
@@ -91,10 +104,32 @@ def tickets_conf(cfg: dict, n: int) -> str:
 
 
 def node_tag(name: str) -> str:
-    """Speed-test X-Pcdn-Node value (SPEC §15.6): 8 hex chars of a hash of the node NAME. It tells a
-    customer whether two measurements hit the same node; it is never an address and cannot be used
-    to pick or reach a node."""
+    """Fallback X-Pcdn-Node / X-Served-By value (SPEC §15.6, §23.12.2) for a controller that sends no
+    node.public_tag: 8 hex chars of a hash of the node NAME. It tells a customer whether two
+    measurements hit the same node; it is never an address and cannot be used to pick or reach a node."""
     return hashlib.sha256(("pcdn-node|" + name).encode()).hexdigest()[:8]
+
+
+def served_tag(node: dict) -> str:
+    """The value of X-Served-By and of the speed-test X-Pcdn-Node ($pcdn_node, SPEC §23.12.2): the
+    controller's public tag, else the name hash (old controller). Never the host name."""
+    return node.get("public_tag") or node_tag(node.get("name") or "")
+
+
+def rum_geo_conf(cfg: dict) -> str:
+    """SPEC §23.7: $pcdn_asn / $pcdn_region for the RUM ingestion (read only there, at ingestion; the
+    client address itself is never logged). Each comes from its optional mmdb when the geoip2 module and
+    the file exist, else a constant (asn "0", region "")."""
+    out = []
+    geo2 = has_module(cfg, "geoip2")
+    for key, var, path, default in (("RUM_ASN_DB", "$pcdn_asn", "autonomous_system_number", "0"),
+                                    ("RUM_REGION_DB", "$pcdn_region", "subdivisions 0 names en", "")):
+        db = cfg.get(key) or ""
+        if geo2 and SAFE_FSPATH.match(db) and os.path.isfile(db):
+            out.append(f"geoip2 {db} {{\n    auto_reload 60m;\n    {var} {path};\n}}")
+        else:
+            out.append(f"map $host {var} {{\n    default \"{default}\";\n}}")
+    return "\n".join(out)
 
 
 def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bots: bool = False,
@@ -157,7 +192,8 @@ def render_http(cfg: dict, hc_interval: int = 2, shield: dict | None = None, bot
         "EARLY_HINTS": eh_conf,
         "LISTEN_H2": "" if caps["http2_directive"] else " http2",
         "HTTPS_DEFAULT_EXTRA": "\n".join(extra),
-        "NODE_TAG": node_tag((node or norm_node({}, cfg))["name"]),
+        "NODE_TAG": served_tag(node or norm_node({}, cfg)),
+        "RUM_GEO": rum_geo_conf(cfg),
         "RESIZER": render_resizer(cfg),
         "PROBE": probe,
         "SSL_TICKETS": tickets_conf(cfg, tickets),

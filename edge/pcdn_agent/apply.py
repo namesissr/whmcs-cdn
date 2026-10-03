@@ -118,6 +118,8 @@ def render_rev(cfg: dict) -> str:
         except OSError:
             pass
     h.update(str(os.path.isfile(cfg.get("GEOIP_DB") or "")).encode())
+    # SPEC §23.7: the optional RUM ASN / region databases appearing change the http.conf geo lookups
+    h.update(str([os.path.isfile(cfg.get(k) or "") for k in ("RUM_ASN_DB", "RUM_REGION_DB")]).encode())
     h.update(json.dumps({k: cfg.get(k) for k in sorted(DEFAULTS) if k not in ("CONTROLLER_URL", "EDGE_TOKEN")}).encode())
     # an nginx swap (install.sh --http3) changes what can be rendered (SPEC §14.1)
     h.update(json.dumps(nginx_capabilities(cfg), sort_keys=True).encode())

@@ -37,7 +37,8 @@ def deep_health() -> tuple[dict, int]:
 
     warnings: list[str] = []
     degraded = False
-    body: dict = {"instance": instance_id()}
+    # SPEC §23.1: platform version and environment label (PCDN_VERSION / PCDN_ENVIRONMENT)
+    body: dict = {"instance": instance_id(), "version": settings.app_version, "environment": settings.environment}
 
     # database ---------------------------------------------------------------
     db = SessionLocal()
@@ -45,6 +46,7 @@ def deep_health() -> tuple[dict, int]:
         db.execute(text("SELECT 1"))
         state = {r.key: r.value for r in db.query(State).filter(State.key.in_([
             "scheduler:last_run", "scheduler:leader", "backup:last_success_at", "backup:last_failure_at",
+            "backup:verify_at", "backup:verify_ok",
         ]))}
         rev = migrate.current_revision(engine)
         head = migrate.head_revision()
@@ -124,7 +126,12 @@ def deep_health() -> tuple[dict, int]:
     b_age = _age_seconds(state.get("backup:last_success_at"))
     body["backup"] = {"enabled": settings.backup_enabled,
                       "last_success_age_hours": round(b_age / 3600, 1) if b_age is not None else None,
-                      "failing": bool(state.get("backup:last_failure_at"))}
+                      "failing": bool(state.get("backup:last_failure_at")),
+                      # SPEC §23.3: the weekly restore test and whether backups leave the server
+                      "verify_age_s": _age_seconds(state.get("backup:verify_at")),
+                      "verify_ok": (state.get("backup:verify_ok") == "1") if state.get("backup:verify_ok") else None,
+                      "offsite": bool(settings.backup_s3_endpoint and settings.backup_s3_bucket
+                                      and settings.backup_s3_access_key and settings.backup_s3_secret_key)}
     if settings.backup_enabled and (b_age is None or b_age > 26 * 3600):
         warnings.append("no successful backup in the last 26 hours")
 
