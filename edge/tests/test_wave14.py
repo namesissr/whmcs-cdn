@@ -833,6 +833,19 @@ def test_install_release_files_block(tmp_path):
     assert p.returncode == 0 and not rel_file.exists() and len(list(rdir.iterdir())) == 3
 
 
+
+def test_install_release_files_block_fresh_node(tmp_path):
+    """A fresh install has no agent.conf: the block must not die under `set -euo pipefail` (sed exits 2 on a
+    missing file; CI staging regression) and falls back to the default releases dir."""
+    block = _block("install.sh", "# >>> pcdn release files", "# <<< pcdn release files")
+    missing = tmp_path / "no-such/agent.conf"
+    block = block.replace("/etc/pcdn/agent.conf", str(missing))
+    rel_file = tmp_path / "release"
+    p = _run(f'BUNDLE_RELEASE=""; RELEASE_FILE="{rel_file}"; unset RELEASES_DIR\n' + block
+             + '\necho "RD=$RELEASES_DIR"')
+    assert p.returncode == 0, p.stderr
+    assert "RD=/var/lib/pcdn/releases" in p.stdout
+
 class FakeCurl:
     """A curl shim answering from a directory: <name>.code / <name>.body per URL key; records the stdin
     body and the argv of every call."""

@@ -421,8 +421,9 @@ install -m 644 "$HERE/systemd/pcdn-imaged.service" /etc/systemd/system/pcdn-imag
 # /etc/pcdn/release = the bundle's release (the agent reports it; no RELEASE -> removed = unknown) and the
 # verified tarball this bundle came from kept for a rollback: RELEASES_DIR/<release>.tar.gz, 0600, 3 newest
 RELEASE_FILE="${RELEASE_FILE:-/etc/pcdn/release}"
-if [ -z "${RELEASES_DIR:-}" ]; then
-  RELEASES_DIR="$(sed -n 's/^RELEASES_DIR=//p' /etc/pcdn/agent.conf 2>/dev/null | tail -1 | tr -d "\"' \r")"
+# a fresh install has no agent.conf yet: sed would exit 2 and, under pipefail, end install.sh
+if [ -z "${RELEASES_DIR:-}" ] && [ -r /etc/pcdn/agent.conf ]; then
+  RELEASES_DIR="$(sed -n 's/^RELEASES_DIR=//p' /etc/pcdn/agent.conf | tail -1 | tr -d "\"' \r")"
 fi
 RELEASES_DIR="${RELEASES_DIR:-/var/lib/pcdn/releases}"
 if [ -n "$BUNDLE_RELEASE" ]; then
