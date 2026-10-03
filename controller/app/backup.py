@@ -378,7 +378,7 @@ def dump_controller_db(out_dir: str, url: str | None = None) -> str:
     kind = _db_kind(url)
     if kind == "postgresql":
         path = os.path.join(out_dir, "controller.pgdump")
-        _run(["pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", path], _pg_env(url))
+        _pg_dump_with_counts(url, path)
         return path
     if kind == "sqlite":
         src = make_url(url).database
@@ -388,6 +388,43 @@ def dump_controller_db(out_dir: str, url: str | None = None) -> str:
         sqlite_copy(src, path)
         return path
     raise BackupError(f"unsupported database {kind}")
+
+
+# row counts of the PostgreSQL dumps written by this process, by dump path (read by _dump_counts)
+_PG_COUNTS: dict[str, dict] = {}
+
+
+def _pg_dump_with_counts(url: str, path: str) -> None:
+    """pg_dump of `url` and the row counts of COUNT_TABLES taken in the SAME snapshot (SPEC §23.3): a
+    REPEATABLE READ transaction exports its snapshot, counts the rows and keeps the snapshot open while
+    `pg_dump --snapshot` dumps exactly that state, so the restore test can compare counts exactly even
+    while the controller keeps writing (audit log, usage). Without the snapshot (e.g. a standby that
+    cannot export one) the dump runs as before and the counts are taken right after it."""
+    from sqlalchemy import create_engine, inspect, text
+
+    cmd = ["pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", path]
+    eng = create_engine(url)
+    try:
+        names = set(inspect(eng).get_table_names())
+        tables = [t for t in COUNT_TABLES if t in names]
+        with eng.connect().execution_options(isolation_level="REPEATABLE READ") as c:
+            try:
+                snap = c.execute(text("SELECT pg_export_snapshot()")).scalar()
+            except Exception:  # noqa: BLE001 - e.g. a hot standby: dump first, count after
+                c.rollback()
+                snap = None
+            if snap:
+                _PG_COUNTS[path] = {t: int(c.execute(text(f'SELECT count(*) FROM "{t}"')).scalar() or 0)
+                                    for t in tables}
+                _run(cmd + [f"--snapshot={snap}"], _pg_env(url))
+                c.rollback()
+                return
+        _run(cmd, _pg_env(url))
+        with eng.connect() as c:
+            _PG_COUNTS[path] = {t: int(c.execute(text(f'SELECT count(*) FROM "{t}"')).scalar() or 0)
+                                for t in tables}
+    finally:
+        eng.dispose()
 
 
 def backup_name(now: dt.datetime | None = None, encrypted: bool = False) -> str:
@@ -683,19 +720,12 @@ def _sqlite_counts(path: str) -> dict:
 
 
 def _dump_counts(db_file: str, kind: str) -> dict:
-    """Row counts of the dump: exact for SQLite (counted in the copy); for PostgreSQL counted on the
-    live database right after the dump (the restore test compares these with the restored rows)."""
+    """Row counts of the dump: for SQLite counted in the copy itself; for PostgreSQL the counts taken in
+    the dump's own snapshot (_pg_dump_with_counts). Never the counts of another database."""
     try:
         if kind == "sqlite":
             return _sqlite_counts(db_file)
-        from sqlalchemy import inspect, text
-
-        from .db import engine
-
-        names = set(inspect(engine).get_table_names())
-        with engine.connect() as c:
-            return {t: int(c.execute(text(f'SELECT count(*) FROM "{t}"')).scalar() or 0)
-                    for t in COUNT_TABLES if t in names}
+        return dict(_PG_COUNTS.pop(db_file, {}))
     except Exception as e:  # noqa: BLE001 - counts are informational at backup time
         log.warning("backup: row counts unavailable (%s)", type(e).__name__)
         return {}
@@ -786,7 +816,12 @@ def _check_restored(engine, manifest: dict, checks: dict) -> None:
     names = set(inspect(engine).get_table_names())
     with engine.connect() as c:
         got = {t: int(c.execute(text(f'SELECT count(*) FROM "{t}"')).scalar() or 0) for t in want if t in names}
-        checks["counts"] = bool(want) and got == {t: int(v) for t, v in want.items()}
+        expected = {t: int(v) for t, v in want.items()}
+        checks["counts"] = bool(want) and got == expected
+        # name every table whose restored row count differs from the manifest (or is missing)
+        for t in sorted(expected):
+            if got.get(t) != expected[t]:
+                checks[f"counts:{t}"] = False
         secret = c.execute(text("SELECT secret FROM sites ORDER BY id LIMIT 1")).scalar() if "sites" in names else None
     try:
         if secret is not None:

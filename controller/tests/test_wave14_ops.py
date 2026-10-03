@@ -545,6 +545,14 @@ def test_manifest_counts_and_full_sqlite_verify(client, benv, monkeypatch):
     assert out["ok"] and out["level"] == "full" and out["location"] == "local", out
     assert {"download", "decrypt", "members", "revision", "counts", "decrypt_secret"} <= set(out["checks"])
     assert out["name"] == res["name"]
+    # counts that do not match the dump fail and name the table
+    checks = {}
+    work = benv / "w"
+    work.mkdir()
+    out_dir, manifest = backup.open_archive(res["path"], "pass-phrase-1", str(work))
+    manifest["counts"]["sites"] += 1
+    backup._verify_sqlite(os.path.join(out_dir, "controller.sqlite3"), manifest, checks, str(work))
+    assert checks["counts"] is False and checks["counts:sites"] is False
     # a wrong key fails without leaking it
     monkeypatch.setattr(settings, "backup_encryption_key", "other-key")
     bad = backup.verify_backup(s3=None)
@@ -576,9 +584,15 @@ def test_pg_full_verify_and_marker_refusal(pg_url, tmp_path, monkeypatch):
     try:
         dump = backup.dump_controller_db(str(tmp_path), pg_url)
         manifest = {"alembic_revision": migrate.head_revision(), "counts": backup._dump_counts(dump, "postgresql")}
+        assert manifest["counts"].get("edges") == 0 and "sites" in manifest["counts"]
         checks = {}
         backup._verify_pg_full(dump, manifest, checks, scratch)
-        assert checks["revision"] and checks["counts"], checks
+        assert checks["revision"] and checks["counts"] and all(checks.values()), checks
+        # a manifest that does not match the dump fails and names the table
+        bad = {**manifest, "counts": {**manifest["counts"], "sites": manifest["counts"]["sites"] + 1}}
+        checks = {}
+        backup._verify_pg_full(dump, bad, checks, scratch)
+        assert checks["counts"] is False and checks["counts:sites"] is False, checks
         eng = create_engine(scratch)
         with eng.begin() as c:
             c.execute(text("CREATE TABLE pcdn_live_marker (id integer)"))
