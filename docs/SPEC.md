@@ -2249,3 +2249,1175 @@ undrain restores it.
   `PROBE_BYTES`, `PROBE_ECHO_PORT`, `PROBE_H2C_PORT`, `ORIGIN_TCP_HEALTH`, `TUNE_PROFILE`, `PROC_SYS`.
 - Ownership: A = `controller/**` + API/NODES/OPERATIONS/MONITORING/SECURITY/UPGRADE docs + CHANGELOG;
   B = `edge/**` + `tests/integration/**` + `docs/EDGE.md`; C = `whmcs/**` + `docs/WHMCS.md`.
+
+
+## 23. Wave 14: release safety, operations and customer experience
+
+**Hard constraint (applies to every item below, like §15 / §22).** Nothing in this wave may have as its
+purpose or main effect evading filtering/blocking, hiding or rotating node IP addresses, reducing a
+detection/filter rate, or choosing/recommending nodes by "what is not blocked". Node selection stays
+health/load/capacity driven exactly as in §7.4 / §12 / §22.10. In particular:
+- **RUM** (§23.7) country / region / ISP data is shown to the site owner as a performance report only. It
+  is never read by `dnsbuild`, the scheduler's DNS jobs, rollouts, provisioning or any node-selection code
+  (enforced by an import test, §23.7), never compared across nodes and never used to find out where a node
+  is reachable from. The beacon carries no node identity.
+- **Provisioning proposals** (§23.9) are sized from capacity (p95 vs `capacity_mbps`) only — never from
+  reachability, blocking or ISP data — and every new node gets ordinary, stable addresses.
+- **Rollouts** (§23.2) gate on the node's own health (heartbeat, controller probe, internal tunnel probe,
+  platform error rate) — never on reachability from user networks.
+- **Customers never see node IP addresses or internal node names** in any page, API answer, e-mail, SMS,
+  bot message, diagnostics report or response header (§23.12; the one documented exception is the
+  unlabeled origin allow-list `edge_ips`, §23.12.4, which the operator can switch off).
+Reviewers reject any PR that crosses this line.
+
+Scope: make releases repeatable and reversible (versions, staging gate, staged node rollout with automatic
+rollback), make the control plane recoverable (off-site backups with a weekly restore test), and give
+customers history, alerts, migration, RUM, a support report and an abuse desk, plus an operator SLO view
+and capacity-driven provisioning. Everything stays testable without real external services: controller
+tests on SQLite (PostgreSQL where CI has it) with `httpx.MockTransport` fakes for S3, SMS, Bale, Telegram,
+ArvanCloud and Cloudflare; edge unit tests with fake files / real nginx where CI has it; WHMCS `php -l` +
+harness; tools with local fakes; Terraform only `fmt`/`validate` + a fake provider (no real cloud).
+
+**Merging is not part of the implementation.** Agents open PRs only. Merging a wave PR to `main`, creating
+a `vX.Y.Z` tag and publishing a GitHub release are owner decisions that need the owner's explicit
+confirmation; the tooling below only prepares and verifies (it prints the commands, it never pushes,
+merges or tags by itself).
+
+**Alembic:** one new revision **`0023`** (`0023_release_ops_cx.py`, `down_revision = "0022"`), idempotent like
+0021/0022 (inspect existing tables/columns first; `_KW` with `sqlite_autoincrement` for `sites` batch
+operations). Contents in §23.13.
+
+### 23.0 Audit summary (what exists today)
+| # | item | exists (file refs) | main gap |
+|---|---|---|---|
+| 1 | release process | Keep-a-Changelog `CHANGELOG.md` (`[Unreleased]` + planned `[2.0.0] - Unreleased`), SemVer rules in `docs/ROLLOUT.md` §۹, `tools/preflight/preflight.py` (live checks), `tools/loadtest` (`pcdn-loadtest http|ws|grpc|xhttp|ramp|merge`), `tools/drill/dr-drill.sh`, `deploy/staging` + `tests/integration`, CI `.github/workflows/ci.yml` (controller, edge, whmcs, terraform, cli, integration, ops-tooling), `release.yml` only for `cli/v*` / `provider/v*` tags; edge bundle served by the controller from `EDGE_BUNDLE_DIR` (`controller/app/bundle.py`, `routes_bundle.py`), its version = 16-hex content hash; agent reports `bundle_version` (`edge/pcdn_agent/agent.py:87`, `routes_edge.py:239`), admin flags «به‌روزرسانی موجود است» (`Pages.php:475`) | no `VERSION` file, **no tags at all** (`git tag` is empty), no platform release workflow, no staging gate script, no security checklist, no versioned/pinned edge bundles (`bootstrap.sh` always installs the controller's live tree), node release unknown |
+| 2 | staged rollout | manual canary process in `docs/ROLLOUT.md` §۴–۵; drain flow §22.1 (`POST /edge/v1/drain`, `pcdn-agent drain`, `install.sh --upgrade --drain`, auto-undrain after an upgrade drain); `edge_events` `upgrade` row on bundle change (`routes_edge.py:316`) | no orchestration, no upgrade intent, no self-upgrade, no health gates, no rollback |
+| 3 | backups | `controller/app/backup.py` (pg_dump / SQLite copy + PowerDNS DB + acme home, AES-256-GCM chunks with scrypt from `BACKUP_PASSPHRASE`, SigV4 S3 upload `BACKUP_S3_*`, local/remote rotation), `job_backup` daily at `BACKUP_HOUR` (`scheduler.py:335`) + alert `backup_failed`, `manage backup|backups|backup-verify|restore`, `/healthz/deep` backup age, preflight `backup age`, monthly `dr-drill.sh` | `backup-verify` is manual and, for PostgreSQL, only checks decrypt + manifest (no real restore); no scheduled restore test; no off-site check (upload not read back); plaintext upload to S3 allowed silently; no admin status page; no run history |
+| 4 | config history | sections stored as one JSON (`sites.config`, `sections.store_section` called from `routes_v2.py:124`, `routes_admin.py:556`, `l4.py:87`, `waf_learning.py:661/689`, `transfer.py:81/95`); audit log records `config.update {section}` only (`routes_v2.config_audit`); secrets already live outside sections (`site_secrets`, `sections.redact/storable`) | no versions, no diff, no restore |
+| 5 | customer alerts | webhooks section (`sections.WEBHOOK_EVENTS`: purge.completed, ssl.issued/failed, quota.warning/exceeded, site.suspended/unsuspended, attack.detected, tunnel.origin_down/up), `site_events` + WHMCS cron e-mail for tunnel origin events (`TunnelAlerts.php`, §15.4); operator-only Telegram/SMTP alerts (`alerts.py`, `TELEGRAM_*`, `SMTP_*`) | no subscriptions, no SMS / Bale / customer Telegram, no web-origin-down or SSL-expiring event, no quiet hours / opt-out / per-plan channels |
+| 6 | Arvan migration | BIND zone import `POST /api/v1/sites/{d}/records/import` (`routes_v2.py:466`, dnspython) | no provider API import, no settings mapping, no preview |
+| 7 | RUM | nothing (no beacon, no web vitals); edge has country GeoIP only (`render/http.py:116`, DB-IP country lite) | everything |
+| 8 | diagnostics report | pieces exist: ns status (`ns_found`), SSL status, `section_warnings`, tunnel quality/drops (§15/§22), events; admin «تشخیص» page (`Pages.php:3592`) is platform-wide | no per-site report, no ticket integration (no `OpenTicket` use anywhere) |
+| 9 | provisioning | capacity alert `capacity:{group}` (`tunnel_quality.check_capacity`, daily), `POST /api/v1/edges` + `/edges/batch` return a long-lived edge token + install one-liner, `edge/cloud-init.yaml.example`; `terraform-provider-pcdn/` manages **customer** resources only — there is **no `terraform/` directory and no node-provisioning Terraform** | no proposal, no approval flow, no runner, tokens in cloud-init are long-lived |
+| 10 | abuse desk | nothing | everything |
+| 11 | SLO | per-edge hourly uptime (`edge_uptime`, `uptime.py`), controller probe (`job_probe`, `Edge.probe_*`, latest only), per-site SLA report (`sla.py`, `GET /sites/{d}/sla`), Prometheus rules (`deploy/monitoring/prometheus/rules/pcdn-alerts.yml`) | no group SLI history, no objectives, no error budget, no burn alerts |
+| 12 | node naming | — | customer-visible internal identity: (a) `GET …/tunnel/quality` `edges[].name` = internal `Edge.name` (`tunnel_quality.py:157-165`), rendered in the WHMCS client app per-node table (`tunnelq.js:284-298`); (b) **every proxied response carries `X-Served-By: $hostname`** = the node's OS host name (`edge/pcdn_agent/render/site.py:624`); (c) speed-test `X-Pcdn-Node` = unkeyed sha256 of the node name (`render/http.py:94`, `pcdn-base.conf:168`) — brute-forceable for short names like `edge-1`; (d) site dict `edge_ips` (`services.py:351`, `tutorials.js` origin allow-list); clean today: status page, tunnel drops `maintenance`, security events, log export, webhook payloads, SLA, `/capi/v1/site` |
+
+Note on the version number: `CHANGELOG.md` and `docs/ROLLOUT.md` already fix the platform version line at
+**2.x** (`[2.0.0]` planned, never tagged). This wave keeps that line: `VERSION` starts at `2.0.0` (what is
+documented as unreleased today) and the wave-13 + wave-14 changes become `2.1.0`. A tag such as `v1.13.0`
+would go backwards against the documented plan; the tooling validates any SemVer the owner chooses.
+
+### 23.1 Release process: versions, staging gate, security review, pinned edge releases
+**VERSION (D).** New root file `VERSION`: one line, SemVer without `v` (`2.0.0`; pre-releases `2.1.0-rc.1`).
+The platform tag is `v$(cat VERSION)`. Every component reports it:
+- controller: `settings.app_version` = env `PCDN_VERSION` if set, else the first line of `VERSION` found at
+  `/app/VERSION` or `<repo>/VERSION` (relative to `controller/app/..`), else `""`. `GET /healthz` and
+  `/healthz/deep` gain `"version": str`; `/metrics` gains `pcdn_build_info{version} 1` (A). D's release
+  tooling passes `PCDN_VERSION` (compose `.env` example / docs) — `controller/Dockerfile` copies `VERSION`
+  only if A decides to (A owns it; the env path is enough).
+- edge bundles built from a tag contain `edge/RELEASE` (one line `vX.Y.Z`). install.sh (B) copies it to
+  `/etc/pcdn/release` (absent in the bundle → the file is removed, release unknown). The agent reports
+  `"release": "vX.Y.Z" | null` in every heartbeat (B) next to `bundle_version`.
+- WHMCS addon config `version` (`1.6.0`) stays the addon's own version; the addon shows the controller
+  version from `/healthz` on its dashboard (C).
+
+**CHANGELOG sections per release (D tooling, every agent writes entries).** Rules unchanged
+(`[Unreleased]` + Keep-a-Changelog categories). `tools/release/prepare.sh X.Y.Z[-rc.N]` (D):
+1. refuses unless the working tree is clean, `X.Y.Z` is valid SemVer and greater than `VERSION`
+   (pre-release ordering per SemVer §11), and `[Unreleased]` is non-empty;
+2. rewrites `## [Unreleased]` → `## [X.Y.Z] - <UTC date>` with a fresh empty `## [Unreleased]` above it,
+   merges an existing `## [X.Y.Z] - Unreleased` heading (today's `[2.0.0]`) instead of duplicating it,
+   updates the compare links at the bottom, writes `VERSION`;
+3. prints (never runs) the next commands: `git commit`, PR creation, and after the owner's merge:
+   `git tag -a vX.Y.Z -m "Pasargad CDN vX.Y.Z" <merge commit>` / `git push origin vX.Y.Z`.
+`tools/release/changelog-section.sh X.Y.Z` prints that section (used by the release workflow).
+
+**Staging verification checklist script (D).** `tools/release/staging-verify.sh --env-file <staging.env>
+--controller <url> [--ns …] [--edge-target IP:port] [--skip-loadtest] [--out DIR]` runs, in order, and
+writes `DIR/vX.Y.Z/` (`report.md`, `report.json`, raw outputs; default `release-evidence/`, git-ignored):
+| step | how | pass when |
+|---|---|---|
+| version | `GET /healthz` `version` and every node's `release` from `GET /api/v1/edges` | controller = `VERSION`; nodes = `v$VERSION` (or listed as pending rollout) |
+| preflight | `tools/preflight/preflight.py --strict --json` | no FAIL, no WARN |
+| migrations | `/healthz/deep` `database.revision` | = head of the checked-out code (`ls controller/migrations/versions`) |
+| integration | `deploy/staging/staging.sh test` (existing E2E) | exit 0 |
+| load test | `pcdn-loadtest http --duration 120 --out …` and `ws` (60 s) against `--edge-target`; thresholds `--max-error-pct 0.5`, `--max-p99-ms 1500` (http) | under thresholds (documented defaults, overridable) |
+| backup | `POST /api/v1/backups/run` then `POST /api/v1/backups/verify` (§23.3), poll `GET /api/v1/backups` | both `ok`, verify `level = "full"` |
+| rollout dry-run | `POST /api/v1/rollouts` `{"release": "vX.Y.Z", "dry_run": true}` (§23.2) | 200, no `blocked` edge |
+| security checklist | `tools/release/security-check.sh` (below) | exit 0 and the manual sign-off file exists |
+Exit 0 only when every step passes; `--skip-*` steps are reported `SKIP` and make the result `PARTIAL`
+(exit 3). The script never touches production: it refuses (exit 2, no override flag) a controller URL listed
+in `PCDN_PROD_CONTROLLERS` (env, comma list) or whose `/healthz/deep` reports `"environment":
+"production"` (A adds `environment` from env `PCDN_ENVIRONMENT`, default `""`).
+
+**Security review checklist (D).** `tools/release/security-check.sh` (automated part, exit 1 on any
+failure): secret scan of the diff since the previous tag (`gitleaks detect` when installed, else a built-in
+regex set: private keys, `edge_[0-9a-f]{32,}`, `pcdn_[0-9a-f]{40}`, AWS-style keys, bot tokens
+`\d{6,}:[A-Za-z0-9_-]{30,}`, `Apikey [A-Za-z0-9-]{20,}`), no `.env`/`*.pem`/`agent.conf` tracked,
+`pip-audit -r controller/requirements.txt` and `govulncheck ./...` (cli) when installed (else `SKIP`),
+`bandit -q -r controller/app -lll` when installed, the "no WHMCS in customer-facing strings" check (C's
+harness test is run), and the hard-constraint grep (no `rum`/`isp` import in `controller/app/dnsbuild.py`,
+§23.7). The manual part is a checklist in `docs/RELEASE.md` (authz on every new endpoint, secrets never
+logged, new env defaults preserve behaviour, migration downgrade tested, hard constraint) signed by the
+reviewer into `release-evidence/vX.Y.Z/security-signoff.md` (template printed by the script).
+
+**Platform release workflow (D, new `.github/workflows/release-platform.yml`).** Trigger: tags `v*`
+(the existing `release.yml` keeps `cli/v*` / `provider/v*`; `v*` does not match those). Steps: tag must
+equal `v$(cat VERSION)` (else fail); run the same test jobs as CI (reuse via `workflow_call` of `ci.yml`
+or duplicated commands — never fewer checks); `tools/release/build-edge-bundle.sh vX.Y.Z` → 
+`dist/pcdn-edge-vX.Y.Z.tar.gz` (same layout and exclusions as `controller/app/bundle.py`: top directory
+`edge/`, excludes `__pycache__`, `tests`, `*.pyc`, `agent.conf`; deterministic: sorted entries, mtime =
+tag commit time, uid/gid 0, `gzip -n`) + `edge/RELEASE` + `dist/pcdn-edge-vX.Y.Z.tar.gz.sha256`
+(`sha256sum` format); create a **draft** GitHub release (title `Pasargad CDN vX.Y.Z`, body = the CHANGELOG
+section, assets = bundle + sha256). The owner publishes the draft. CI (`ci.yml`, additions only) gains a
+job `release-meta`: `VERSION` is valid SemVer, `CHANGELOG.md` has `## [Unreleased]`, `build-edge-bundle.sh`
+is deterministic (build twice, identical sha256), `bash -n` + shellcheck of `tools/release/*.sh`.
+
+**Pinned edge releases (A + B + D).**
+- Controller env `EDGE_RELEASES_DIR` (default empty = feature off, today's behaviour): a directory of
+  `pcdn-edge-vX.Y.Z.tar.gz` + `.sha256` files, filled by the operator with
+  `tools/release/fetch-edge-release.sh vX.Y.Z --dir <EDGE_RELEASES_DIR>` (D; downloads the release assets
+  with `curl`, verifies the sha256, refuses an existing different file) or
+  `tools/release/build-edge-bundle.sh vX.Y.Z --from-tag` (from a local checkout of the tag via
+  `git archive`).
+- Controller env `EDGE_RELEASE` (default empty): the pinned release for new installs, e.g. `v2.1.0`. Must
+  exist in `EDGE_RELEASES_DIR` (else logged once at startup and ignored → live bundle). Per edge group the
+  pin can be advanced by a completed rollout (state key `edge_release:group:<group>`, §23.2); effective pin
+  of a group = that state value, else `EDGE_RELEASE`, else none.
+- Public bundle routes (A, `routes_bundle.py`, still unauthenticated, still secret-free):
+  - `GET /edge/releases` → `{"pinned": "v2.1.0"|null, "groups": {"general": "v2.1.0"|null, "tunnel": …},
+    "releases": [{"version": "v2.1.0", "sha256": "<64 hex>", "size": int}]}` (sorted by SemVer desc;
+    404 when `EDGE_RELEASES_DIR` is unset — old behaviour).
+  - `GET /edge/bundle.tar.gz?version=vX.Y.Z` → that file (`^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`, else 422;
+    unknown → 404). Without `version`: the effective pin of `?group=` (default `general`) when one exists,
+    else the live bundle (unchanged).
+  - `GET /edge/releases/vX.Y.Z.sha256` → `text/plain` `"<hex>  pcdn-edge-vX.Y.Z.tar.gz\n"`.
+  - `GET /edge/version` → `{"version": <live hash>, "release": <effective pin of general>|null}`.
+  - Files are served with `FileResponse` (no full read into memory); path traversal impossible (name built
+    from the validated version only).
+- `bootstrap.sh` (B) gains `--version vX.Y.Z` (and `--version=…`; validated with the same regex) (the
+  edge group is derived from `--role`): downloads `bundle.tar.gz?version=…`, downloads the
+  `.sha256`, verifies with `sha256sum -c` (mismatch → abort, exit 1, nothing installed), records
+  `/etc/pcdn/bundle.version` as today and passes `--release vX.Y.Z` to install.sh (which also checks it
+  against `edge/RELEASE`). Without `--version` but with a pin advertised by `/edge/releases` for the role's
+  group, bootstrap installs the pinned release (same verification) and prints it; old controllers (404) →
+  today's behaviour. install.sh keeps the installed tarball as `/var/lib/pcdn/releases/<vX.Y.Z>.tar.gz`
+  (0600, last 3 kept) for rollback (§23.2).
+- `install_command` (A, `bundle.install_command`) adds `--version <pin>` when a pin exists for the edge's
+  group.
+- **Admin (C)**: Nodes page column «نسخه» = `release` (or the short `bundle_version` when release is null)
+  with a badge «≠ نسخهٔ پین‌شده (vX)» when an effective pin exists and differs; header line «نسخهٔ پین‌شده:
+  general vX · tunnel vY · کنترلر vZ». English: "Release", "differs from pinned (vX)", "Pinned release".
+- `edge_to_dict` (A) gains `"release": str|null`, `"pinned_release": str|null` (effective pin of its
+  group), `"release_ok": bool|null` (null when no pin).
+
+**Tests**: D — prepare.sh on a fixture CHANGELOG (merge of `[2.0.0] - Unreleased`, compare links, refusal
+cases), deterministic bundle, staging-verify against a fake controller (python `http.server` fixture) incl.
+the prod-refusal, security-check regexes on fixtures. A — `/edge/releases` listing, version regex, 404 off,
+pin resolution (env vs group state vs missing file), `FileResponse`, `edge_to_dict` fields, `healthz`
+version. B — bootstrap `--version` parsing (+ sha mismatch abort with a fake curl), install.sh RELEASE copy
+and release cache rotation (testable blocks like §22.1), heartbeat `release`. C — badge rendering.
+
+### 23.2 Staged node rollout with automatic rollback
+**Model (A).** One rollout at a time (409 `{"detail": "rollout_active"}` otherwise).
+- `rollouts`: `id`, `release` (target tag), `groups` (JSON list or null = all), `state`
+  (`planned` → `running` ⇄ `paused` → `completed` | `aborted` | `rolling_back` → `rolled_back` | `failed`),
+  `ring` (current 0..2), `soak_minutes`, `ring_percent` (default 25), `auto_rollback` (bool), `reason`
+  (≤ 200, last pause/fail reason), `created_by`, `created_at`, `started_at`, `finished_at`.
+- `rollout_edges`: `rollout_id`, `edge_id`, `ring` (0 canary, 1 = 25 %, 2 = rest), `from_release`,
+  `state` (`pending` | `upgrading` | `soaking` | `healthy` | `failed` | `rolling_back` | `rolled_back` |
+  `skipped` | `blocked` | `manual`), `started_at`, `soak_until`, `finished_at`, `error` (≤ 500), `attempts`,
+  `force_no_drain` (bool), `baseline_err_pct` (float|null).
+**Rings (per edge group, computed at creation, stable):** in-scope edges = enabled edges of the chosen
+groups whose `release` ≠ target. Ring 0 = one canary per group: the online, non-shield, non-draining edge
+with the most siblings in its group+region pool (ties: lowest id). Ring 1 = `ceil(ring_percent % × n)` of
+the remaining edges of the group, spread round-robin over its region pools (lowest ids first). Ring 2 = the
+rest. Edges without `capabilities.self_upgrade` → `manual` (listed, never touched, do not block progress;
+the admin upgrades them by hand). Edges whose `from_release` is null or not present in
+`EDGE_RELEASES_DIR` → creation refused 422 `{"detail": "no_rollback_release", "edges": [names]}` unless
+`allow_no_rollback: true` (then those edges cannot be rolled back automatically; documented).
+**Progress (leader job `job_rollout`, every scheduler tick):**
+1. In the current ring, start `pending` edges while, per group+region pool, at most `ROLLOUT_PARALLEL`
+   (env, default 1, 1..10) edges are `upgrading`/`soaking` AND starting one would still leave ≥ 1 online,
+   enabled, non-shed, non-draining, non-upgrading edge in that pool. Otherwise the edge waits; if it is the
+   **only** edge of its pool (no sibling could ever take over) it becomes `blocked` with reason
+   `last_edge` and the rollout pauses (`reason = "last_edge:<edge name>"`, alert
+   `rollout_blocked:<id>` warning). The admin then chooses **skip** or **force** (`force_no_drain = true`:
+   upgrade with `drain_minutes = 0`, the pool goes briefly without a serving node — the dialog says so).
+   The rollout never upgrades the last healthy node of a pool silently.
+2. Starting an edge = set `state = upgrading`, `started_at`, record `baseline_err_pct` (the edge's platform
+   error % over the previous 24 h from `usage_hourly`), and expose `node.upgrade` in that edge's config
+   (below). The agent drains (§22.1 `--drain`), upgrades and undrains itself.
+3. `upgrading` → `soaking` when the edge heartbeats `release == target` and `upgrade.state == "done"`;
+   `soak_until = now + soak_minutes`. `upgrading` → `failed` when `upgrade.state == "failed"` or no
+   success within `ROLLOUT_UPGRADE_TIMEOUT_MINUTES` (default 60, 10..360).
+4. **Health gate** during soak (every tick, all must hold; any violation → `failed` with the reason):
+   heartbeat age ≤ `EDGE_OFFLINE_SECONDS`; no `last_error` and `applied_version` equals the edge's current
+   config version within 10 min of the upgrade; controller probe (§8.1) `probe_fail < PROBE_FAIL_CHECKS`;
+   not `tunnel_degraded` (§22.3; only when the edge reports `capabilities.tunnel_probe`); platform error %
+   since `started_at` ≤ `max(ROLLOUT_MAX_ERROR_PCT (default 1.0), 2 × baseline_err_pct)` — evaluated only
+   once ≥ 200 requests were served since the upgrade (else not a failure). `soaking` → `healthy` at
+   `soak_until`.
+5. When every non-`manual`/`skipped` edge of the ring is `healthy`, `ring += 1`; after ring 2 → `completed`,
+   `finished_at`, and for every group fully on the target the state key `edge_release:group:<group>` =
+   target (advances the effective pin, §23.1). Audit `rollout.complete`.
+6. **Automatic rollback**: any `failed` edge with `auto_rollback = true` (default from
+   `ROLLOUT_AUTO_ROLLBACK`, default true) → rollout `rolling_back`: every edge of this rollout in
+   `upgrading`/`soaking`/`healthy`/`failed` gets `state = rolling_back` and `node.upgrade` with
+   `release = from_release` (`rollback: true`), at most `ROLLOUT_PARALLEL` per pool at a time (same
+   last-edge rule; a blocked rollback pauses and alerts critical). Done when each reports
+   `release == from_release` → `rolled_back`; rollout `rolled_back` when all are. Alert
+   `rollout_failed:<id>` (critical) with the failing edge + reason; resolved by `rolled_back` or by the
+   admin. With `auto_rollback = false` the rollout just pauses on a failure.
+**Edge config (A emits, B consumes):** `node.upgrade = {"id": "<rollout id>-<attempt>", "release":
+"v2.1.0", "sha256": "<hex>", "drain_minutes": 15 (0..120; 0 = no drain), "rollback": false,
+"timeout_s": 3600}` or absent/null. A **non-rendered key** (§22.2 list gains `node.upgrade`; no reload).
+`drain_minutes` = `ROLLOUT_DRAIN_MINUTES` (env, default 15) unless `force_no_drain`.
+**Agent (B, `pcdn_agent/upgrade.py`, capability `capabilities.self_upgrade: true`):**
+- On a `node.upgrade` whose `id` differs from `state["upgrade"]["id"]` and whose `release` ≠ the running
+  release: (1) obtain the tarball — `/var/lib/pcdn/releases/<release>.tar.gz` when its sha256 matches, else
+  download `CONTROLLER_URL/edge/bundle.tar.gz?version=<release>` (same TLS rules as the agent's controller
+  calls, max 50 MB) and verify `sha256` (mismatch → `failed`, error `sha256_mismatch`); (2) extract to a new
+  `0700` temp dir under `/var/lib/pcdn/upgrade/`; (3) write `state["upgrade"] = {"id", "release",
+  "state": "installing", "at", "rollback"}` under the state lock; (4) start
+  `systemd-run --unit=pcdn-upgrade-<id-sanitised> --collect --property=TimeoutStartSec=<timeout_s>
+  /bin/bash <dir>/edge/install.sh --upgrade --release <release> [--drain=<m>]` so the installer survives the
+  agent restart it causes; (5) the new agent, on start, sees `state["upgrade"]` with its own release ==
+  `release` → `state = "done"`; when the unit ended with a non-zero status (`systemctl show <unit>
+  -p Result -p ExecMainStatus`) or `timeout_s` passed without the release change → `failed` with
+  `error` (≤ 200 chars, no secrets). Exit code 3 of the drain (last edge) → `failed` with `last_edge`.
+- Never two upgrades at once; a `node.upgrade` for the release already running → reported `done`
+  immediately (idempotent). Rollback is the same path with the older release.
+- Heartbeat `"upgrade": {"id": str, "release": str, "state": "downloading"|"installing"|"done"|"failed",
+  "error": str|null, "at": iso, "rollback": bool}` (omitted when never upgraded).
+**Admin API (A):**
+- `GET /api/v1/releases` → `{"releases": [{"version", "sha256", "size", "nodes": int}], "pinned": …,
+  "groups": {…}, "controller": "<app_version>", "nodes": {"<release or null>": int}}`.
+- `POST /api/v1/rollouts` `{"release": "v2.1.0", "groups": ["general"]|null, "soak_minutes": 30
+  (5..1440, default `ROLLOUT_SOAK_MINUTES`=30), "ring_percent": 25 (1..90), "auto_rollback": true,
+  "allow_no_rollback": false, "dry_run": false}` → `201 <rollout>` (or `200` with `"dry_run": true` and
+  nothing stored). 404 unknown release; 409 `rollout_active`; 422 `no_rollback_release`. Audit
+  `rollout.create`.
+- `GET /api/v1/rollouts?limit=20`, `GET /api/v1/rollouts/{id}` → `{"id", "release", "state", "ring",
+  "soak_minutes", "ring_percent", "auto_rollback", "reason", "created_at", "started_at", "finished_at",
+  "rings": [{"ring": 0, "edges": [{"id", "name", "group", "region", "state", "from_release",
+  "started_at", "soak_until", "error", "gate": {"heartbeat": bool, "probe": bool, "tunnel_probe":
+  bool|null, "error_pct": float|null, "limit_pct": float}}]}]}`.
+- `POST /api/v1/rollouts/{id}/start|pause|resume|abort|rollback` (`abort` = stop starting new edges,
+  leave upgraded edges as they are; `rollback` = manual rollback of everything upgraded by this rollout)
+  and `POST /api/v1/rollouts/{id}/edges/{edge_id}/skip|force|retry` → the rollout. 409 on an invalid
+  transition (`{"detail": "invalid_state", "state": …}`). Every action audited (`rollout.<action>`).
+- `edge_events` kinds gain `rollout_start`, `rollout_done`, `rollback` (String(16) still fits).
+- `/metrics`: `pcdn_rollout_state{rollout,state} 1`, `pcdn_rollout_edges{state}`.
+**WHMCS admin (C)**: page «انتشار نسخه» (Releases): list of releases with node counts, pinned per group,
+«شروع انتشار…» dialog (release, groups, soak, ring %, auto-rollback, «پیش‌نمایش» = dry run showing the
+rings), live rollout view (rings → edges with state badges «در انتظار / در حال ارتقا / در دورهٔ پایش / سالم /
+ناموفق / بازگردانده شد / مسدود: آخرین نود»), gate details, buttons «توقف موقت» «ادامه» «لغو» «بازگردانی
+همه» and per edge «رد کردن» «ارتقا بدون تخلیه» (confirmation text: «این آخرین نود این گروه/منطقه است؛
+در طول ارتقا این مجموعه نود فعالی ندارد») «تلاش دوباره». English via the addon's existing language
+handling: "Releases", "Start rollout…", "Preview", "Pause", "Resume", "Abort", "Roll back all", "Skip",
+"Upgrade without drain", "Retry".
+**Tests**: A — ring computation (canary choice, 25 % rounding, region spread, manual edges), last-edge
+block + skip/force, parallel limit, upgrade timeout, each gate (heartbeat, probe, tunnel probe only with
+capability, error % with the 200-request floor and the 2× baseline), auto-rollback ordering + blocked
+rollback alert, pin advance on completion, state transitions 409, config `node.upgrade` shape and that it
+does not change rendered config (shape test against B's non-rendered list), dry run stores nothing.
+B — upgrade.py with a fake controller + fake `systemd-run`/`systemctl` (PATH shims): cached tarball reuse,
+sha mismatch, idempotent same release, failed unit → `failed`, timeout, restart detection → `done`,
+`node.upgrade` digest invariance. Integration (B, when compose is available): two staging edges, rollout
+to a locally built release, kill the canary's nginx during soak → automatic rollback.
+
+### 23.3 Automatic encrypted off-site backups and weekly restore test
+Keep `backup.py` (format v1, AES-256-GCM, SigV4) and add (A):
+- **Key**: env `BACKUP_ENCRYPTION_KEY` is accepted as the preferred name of the backup passphrase
+  (`BACKUP_PASSPHRASE` still works; when both are set they must be equal, else startup logs an error and
+  backups fail with `backup_key_conflict`). It must be different from `DATA_ENCRYPTION_KEY` (equal → refused,
+  alert): losing one must not expose the other.
+- **Off-site**: when `BACKUP_ENABLED` and no `BACKUP_S3_*` target → info alert `backup_not_offsite` (once,
+  until configured). An upload without encryption key → warning alert `backup_unencrypted_offsite` and,
+  only if `BACKUP_REQUIRE_ENCRYPTION=true` (default **false** = today's behaviour), the upload is refused.
+  After every upload the object is read back with `HEAD` (size) and its `x-amz-meta-sha256` (set on PUT)
+  compared with the local sha256; mismatch → backup `ok=false`, `error = "offsite_verify_failed"`.
+- **Retention**: `BACKUP_S3_KEEP_DAYS` (default 0 = off): remote archives older than N days are deleted in
+  addition to `BACKUP_S3_KEEP` (the newest archive is never deleted).
+- **Manifest** gains `counts` (`sites`, `records`, `edges`, `api_keys`, `site_config_versions`,
+  `audit_log`), `app_version`, `alembic_revision` (exists), `sha256` of each member.
+- **Weekly restore test** `job_backup_verify` (leader): env `BACKUP_VERIFY_ENABLED` (default false),
+  `BACKUP_VERIFY_WEEKDAY` (0 = Monday … 6, default 6), `BACKUP_VERIFY_HOUR` (UTC, default 4),
+  `BACKUP_VERIFY_DATABASE_URL` (scratch database, default empty). Steps: pick the newest **remote**
+  archive (local when no S3), download to a temp dir, decrypt, check member sha256s, then:
+  - PostgreSQL dump + `BACKUP_VERIFY_DATABASE_URL` set → **full**: refuse when the scratch URL points to the
+    same host+port+database as `DATABASE_URL`, or when the scratch DB contains a table `pcdn_live_marker`
+    (A creates this marker table in the live DB in 0023, never in a restore target: `pg_restore` of the dump
+    would bring it along, so the job drops it right after restore and refuses only if it existed **before**);
+    `DROP SCHEMA public CASCADE; CREATE SCHEMA public` in the scratch DB, `pg_restore --no-owner
+    --no-privileges`, then: `alembic_version` = manifest revision and ≤ code head (an older revision is
+    migrated with `migrate.upgrade` inside the scratch DB to prove upgradeability), row counts equal the
+    manifest `counts`, one encrypted value (`sites.secret` of the lowest site id) decrypts with the
+    current `DATA_ENCRYPTION_KEY`, and the scratch schema is dropped again.
+  - SQLite dump → **full** into a temp file (same checks).
+  - PostgreSQL without a scratch URL → **partial**: `pg_restore --list` parses, manifest at head,
+    counts present (today's level).
+  - PowerDNS DB: `PRAGMA integrity_check` = ok and `domains` count > 0 when the manifest says so.
+  - acme home present when it was in the manifest.
+  Failure → alert `backup_verify_failed` (critical, resolved by the next success); `level=partial` for 2
+  consecutive weeks → info alert `backup_verify_partial`.
+- **Run history**: table `backup_runs` (§23.13) for `backup` and `verify` runs (keep 200 rows).
+- **Admin API**: `GET /api/v1/backups` → `{"enabled", "encrypted": bool, "offsite": bool, "schedule":
+  {"backup_hour", "verify": {"enabled", "weekday", "hour", "scratch_db": bool}}, "last_backup": <run>|null,
+  "last_verify": <run>|null, "runs": [<run> ×≤30], "remote": {"count", "newest", "oldest", "bytes"}|null}`
+  where `<run> = {"id", "kind": "backup"|"verify", "started_at", "finished_at", "ok": bool, "name",
+  "size", "location": "local"|"s3"|"both", "level": "full"|"partial"|null, "checks": {name: bool},
+  "error": str|null}`; `POST /api/v1/backups/run` and `POST /api/v1/backups/verify` → `202
+  {"queued": true}` (a state flag the leader picks up within one tick; 409 when one is already queued or
+  running). Audit `backup.run`, `backup.verify`.
+- **Secrets never logged**: every error string stored or alerted passes `backup.scrub()` which removes the
+  values of `BACKUP_ENCRYPTION_KEY`/`BACKUP_PASSPHRASE`, `BACKUP_S3_SECRET_KEY`, `BACKUP_S3_ACCESS_KEY`,
+  `DATA_ENCRYPTION_KEY`, any `user:pass@` in URLs and `Authorization`/`X-Amz-Signature` values; libpq
+  passwords go through `PGPASSWORD` env (already) never argv. Tests assert absence in logs/runs/alerts.
+- `/healthz/deep` `backup` gains `verify_age_s`, `verify_ok`, `offsite`; preflight (D) gains `backup
+  verify age` (WARN > 8 days, FAIL when the last verify failed).
+- **WHMCS admin (C)**: page «پشتیبان‌گیری»: status cards (رمزنگاری، خارج از سرور، آخرین پشتیبان، آخرین آزمون
+  بازیابی با سطح «کامل/جزئی»)، run table with checks, buttons «پشتیبان‌گیری اکنون» «آزمون بازیابی اکنون».
+- **Tests** (A): key alias/conflict/equal-to-data-key refusal, require-encryption, HEAD+sha verify with a
+  fake S3 (`httpx.MockTransport`), keep-days pruning (newest kept), verify on SQLite full path, PG full path
+  where CI has PostgreSQL (create a second database as scratch), refusal on same URL / pre-existing marker,
+  partial level, alerts, scrub, run history cap, API shapes, 409 queueing.
+
+### 23.4 Site config history with diff and one-click restore
+**Storage (A).** Tables `site_config_versions` (header) and `site_config_values` (one row per changed
+section per version) — §23.13. A version stores only the sections that changed (by sha256 of the canonical
+JSON of the stored value); the config of version N = for each section the newest value with version ≤ N
+(or the section default when none).
+**Capture.** A SQLAlchemy `before_flush` listener (`config_history.py`) on `Site` objects whose `config`
+attribute changed compares the old and new stored JSON per section and appends one version when at least
+one section's canonical hash changed — so every writer (`routes_v2`, `routes_admin` legacy PATCH, `l4.py`,
+`waf_learning.py`, `transfer.py`, imports §23.6, restores) is covered without touching each call site.
+The actor comes from a `contextvars.ContextVar` set by: the admin router dependency (`actor_kind = "admin"`,
+`actor = "admin"`, `on_behalf_of` from the validated `X-PCDN-Actor` header, §20.3 — WHMCS sends
+`client:<id>` for an owner and `share:<id>:<role>` for a collaborator; C adds `client:<id>` where it does not
+send it yet), the capi dependency (`capi`, `key:<id>:<name>`), the scheduler (`system`, `job:<name>`);
+unknown → `system`. `source` ∈ `api` | `capi` | `admin` | `restore` | `import` | `waf_learning` |
+`transfer` | `system`, set by the same context (restore/import set it explicitly).
+**Size and secrets.** Stored values are the `storable()` form — they never contain write-only secrets
+(those live in `site_secrets`). The `functions` section is stored only when its JSON is ≤ 1 MiB; larger →
+the row stores `{"_omitted": true, "sha256": …, "ids": [...]}` and that section is not restorable from
+this version (reported). **Retention**: keep a version while it is among the newest
+`CONFIG_HISTORY_MAX_VERSIONS` (env, default 100, 10..1000) of the site **and** younger than
+`CONFIG_HISTORY_DAYS` (default 90, 7..3650); the newest version is always kept; pruning (daily, in
+`job_cleanup`) keeps the values needed to reconstruct the oldest retained version (they are re-attached to
+it). `CONFIG_HISTORY_ENABLED` (default true; false = no capture, endpoints answer 404).
+**Diff.** `config_history.diff(a, b)` per section → list of ops `{"op": "add"|"remove"|"replace", "path":
+"/rules/<id or index>/action", "old": …, "new": …}` (JSON pointer; list items that carry an `id` are
+matched by id — path uses `[id=xyz]` segment, e.g. `/rules/[id=r1]/action` — others by index).
+**Redaction in diffs and version views** (`config_history.redact_value`): values of any key matching
+`(?i)secret|password|passwd|token|api_?key|private|signature|cookie|authorization` and header-rule values
+whose header name is one of `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`,
+`x-auth-token` (sections `headers`, `transform`) are replaced by `"[redacted]"` (`old`/`new` both; an op
+whose only change is in a redacted value says `"redacted": true`). `logs.access_key` shows the first 4
+characters + `…`. Function code is never in a diff (only `{"code_sha256": old→new}`).
+**API (A)** — admin (site owner/collaborator via WHMCS) and capi (scope `config`; `functions` section
+additionally needs scope `functions`):
+- `GET /api/v1/sites/{d}/config/history?limit=50&before=<version>` (limit 1..200) and
+  `GET /capi/v1/config/history` → `{"versions": [{"version": 14, "at": iso, "actor": {"kind":
+  "client"|"collaborator"|"support"|"api_key"|"system", "label": str|null, "id": str|null}, "source":
+  "api", "sections": ["cache", "waf"], "restored_from": int|null, "restorable": true}], "current": 14,
+  "retention": {"max_versions": 100, "days": 90}}`. Actor mapping: admin without `on_behalf_of` →
+  `support` (label null — the internal admin label is never shown); `client:<id>` → `client` (id);
+  `share:<id>:<role>` → `collaborator` (id; WHMCS shows the member name); capi → `api_key` with the key
+  name; scheduler → `system` with label `waf_learning`|`transfer`|….
+- `GET …/config/history/{version}` → `{"version", "at", "actor", "source", "sections": […],
+  "config": {<section>: <redacted value>}}` (all sections as of that version; `functions` code omitted).
+- `GET …/config/history/{version}/diff?against=current|<version>&section=<name>` →
+  `{"from": 9, "to": 14|"current", "sections": {"cache": [ops…]}, "redacted": bool}`; unknown version
+  404; `section` optional.
+- `POST …/config/history/{version}/restore` `{"sections": ["cache","waf"] | null (= every section that
+  differs), "dry_run": false}` → `{"version": 15|null (dry run), "restored_from": 9, "applied": ["cache"],
+  "unchanged": ["waf"], "dropped": [{"section": "tunnel", "reason": "feature_missing", "feature":
+  "tunnel"} | {"section": "firewall", "reason": "limit", "feature": "max_firewall_rules", "kept": 20,
+  "removed": 5} | {"section": "pools", "reason": "invalid", "detail": "<msg>"} | {"section":
+  "functions", "reason": "not_restorable"}], "warnings": [str]}`. Each section is re-validated with
+  `validate_section` against the **current** plan: a feature gate → the section is dropped (warning
+  «این بخش به قابلیتی نیاز دارد که در پلن فعلی نیست»); a list limit (`max_*`) → the list is truncated to the
+  plan's maximum keeping the first items (warning); any other validation error → dropped with the
+  message. Secrets: `site_secrets` are never changed by a restore; a restored `logs.enabled = true` without
+  a stored secret is restored with `enabled = false` (warning); restored webhook items whose id has no
+  stored signing secret get a new one (warning «کلید امضای وبهوک … از نو ساخته شد؛ آن را در صفحهٔ وبهوک
+  بچرخانید و دوباره بردارید»). The restore writes through the normal path (`write_section_of` semantics:
+  DNS/edge config side effects, SSRF/origin checks) in one transaction → one new version with
+  `source = "restore"`, `restored_from = 9`. Rate limit: 10 restores/hour/site (429). Audit
+  `config.restore {section(s), version}`. While the site is suspended, capi restore answers 403 like other
+  capi writes.
+**WHMCS client (C)** new page «تاریخچهٔ تنظیمات» / "Settings history" (`assets/history.js`): timeline
+(who/when/what: «شما»، «همکار: نام»، «پشتیبانی»، «کلید API: نام»، «سیستم»), per-version «مشاهدهٔ تغییرات»
+(side-by-side or inline diff of the ops, redacted values shown as «[پنهان]»), «بازگردانی این نسخه…» dialog
+with section checkboxes + dry-run preview of `dropped`/`warnings`, then confirm. Collaborators with view
+role see history and diffs; restore needs the edit role (WHMCS enforces like other writes).
+`ClientApi::ROUTES`: GET `config/history`, `config/history/[0-9]{1,9}`, `config/history/[0-9]{1,9}/diff`,
+POST `config/history/[0-9]{1,9}/restore`; QUERY `limit`, `before`, `against` (`/^(current|[0-9]{1,9})$/`),
+`section` (SECTIONS regex).
+**CLI (D)**: `pcdn config history [--limit N]`, `pcdn config diff <version> [--against current|V]
+[--section S]`, `pcdn config restore <version> [--section S…] [--dry-run]` (capi).
+**Tests**: A — capture from every writer path (incl. waf_learning/transfer/l4 and a scheduler job), no
+version on a no-op write, actor mapping, functions size cap, retention (count × age, base re-attachment,
+newest kept), diff by id/index, redaction (keys + header values + access_key), restore: plan gate drop,
+limit truncation, invalid drop, logs secret rule, webhook secret regeneration, new version with
+`restored_from`, dry run writes nothing, capi scopes, rate limit, migration. C — page states, dialog flow,
+i18n. D — CLI against a fake server.
+
+### 23.5 Customer alert channels
+**Decision: the controller is the single notification engine; WHMCS delivers e-mail.** The controller
+already owns the events, has crypto at rest (`DATA_ENCRYPTION_KEY`), an outbound proxy setup, the leader
+scheduler (minute latency, retries) and the operator Telegram code; WHMCS owns the customer's e-mail
+address and e-mail templates. So: events → controller resolves subscriptions, dedup, rate limits, quiet
+hours, plan → one `notification_outbox` row per (delivery, channel, target); the controller sends SMS,
+Bale and Telegram itself; e-mail rows are pulled and sent by the WHMCS addon cron (like §15.4). Webhooks
+(section `webhooks`) are unchanged and remain a separate, per-site channel.
+**Events (A)** — catalog `notify.EVENTS` (also added to `sections.WEBHOOK_EVENTS` where marked ✚):
+| event | source | default severity |
+|---|---|---|
+| `origin.down` ✚ / `origin.up` ✚ | new: web origin health from `analytics_minute` — a 5-min window with ≥ 20 requests and origin-attributed 5xx (`oe`, §23.5 edge) ≥ 50 % of requests, 2 consecutive windows → down; < 10 % for 2 windows → up (`site_events` rows, like tunnel) | critical / info |
+| `tunnel.origin_down` / `tunnel.origin_up` | existing §15.4 | critical / info |
+| `quota.warning` (80 %) / `quota.exceeded` (100 %) | existing | warning / critical |
+| `ssl.expiring` ✚ | new daily check: active certificate expiring in ≤ 14 / 7 / 3 / 1 days (once per threshold per certificate) — ACME renewals normally prevent it; custom certificates are the main case | warning |
+| `ssl.failed` | existing | critical |
+| `attack.detected` | existing (covers the DDoS auto-mode trigger: security events over threshold) | warning |
+| `site.suspended` / `site.unsuspended` | existing | info |
+| `incident.opened` ✚ / `incident.resolved` ✚ | platform incidents (§8.3, operator-written status-page incidents; they have no component field, so they are account-scoped: one message per subscribed account, not per site; `maintenance` severity → info) | warning / info |
+| `abuse.notice` | §23.10, owner only, e-mail, **not** subscribable and no opt-out (legal notice) | critical |
+A per-node "tunnel degraded" event is **not** offered: it would reveal per-node state; platform-wide
+problems are covered by `incident.*`.
+**Subscriptions (A).** Owned by an *account* = WHMCS client id (`sites.client_id`, or `reseller_client_id`
+for reseller-owned sites). `notification_subscriptions`: `id`, `client_id` (index), `site_id` (nullable =
+every site of the account), `events` (JSON list), `channels` (JSON list ⊆ `email`,`sms`,`bale`,`telegram`),
+`lang` (`fa`|`en`), `quiet_start`/`quiet_end` (`HH:MM` Asia/Tehran or null), `quiet_bypass_critical` (bool,
+default true), `enabled`, `created_at`, `updated_at`. ≤ `max_alert_subscriptions` (plan feature of any
+site of the account; account limit = the maximum over its sites, default 20). Collaborators (§20) do not
+get their own subscriptions in this wave.
+**Targets (A).** `notification_targets`: `id`, `client_id`, `channel` (`sms`|`bale`|`telegram`), `value`
+(encrypted with `crypto.encrypt`: E.164 phone or chat id), `value_hash` (HMAC-SHA256 with a key derived from
+`DATA_ENCRYPTION_KEY`, for uniqueness/lookup), `masked` (e.g. `+98912•••4567`, `chat •••789`),
+`verified_at`, `created_at`, `disabled_at`, `fail_count`. E-mail targets are not stored (WHMCS knows the
+address). Phones: SMS verification by a 6-digit code (`notification_link_codes`, hashed, 10 min, 5 tries,
+≤ 3 codes/hour/account and ≤ 5/day per phone hash) before the target is usable — nobody can make the
+platform SMS a third party repeatedly. Bale/Telegram: the customer requests a link code
+(`notification_link_codes`, 8 chars `[A-Z2-9]`, 15 min, single use) and sends `/start <code>` to the
+operator's bot (deep links `https://t.me/<TELEGRAM_CUSTOMER_BOT_USERNAME>?start=<code>`,
+`https://ble.ir/<BALE_CUSTOMER_BOT_USERNAME>?start=<code>`); leader job `job_bots` polls `getUpdates`
+(every 30 s, `timeout=0`, offset in `state`) on each configured customer bot, binds the chat id, answers
+«اتصال برقرار شد» / "Linked"; `/stop` in the chat disables every target with that chat id (opt-out) and
+answers accordingly. Bots never answer anything else (no node or account data). The customer bots are
+**separate** from the operator alert bot (`TELEGRAM_BOT_TOKEN` remains operator-only).
+**Delivery rules (A, `notify.py`):**
+- **Plan per channel**: SMS needs plan feature `alert_sms` (default false), Bale/Telegram need
+  `alert_messengers` (default false) — evaluated on the event's site (account-scoped `incident.*` events: allowed
+  when any site of the account has the feature). E-mail is always allowed. A channel not configured by the operator (no
+  provider key / bot token) is unavailable and hidden.
+- **Dedup**: key `(client_id, site_id, event, dedup_key)` (dedup_key = e.g. path id, certificate serial +
+  threshold, incident id) suppressed for `NOTIFY_DEDUP_MINUTES` (default 30); a recovery event (`*.up`,
+  `*.resolved`, `site.unsuspended`) is only sent on channels where the matching down/open was sent.
+- **Rate limits** per account and channel: SMS 10/hour and 30/day, Bale/Telegram 30/hour, e-mail 20/hour
+  (env `NOTIFY_RATE_SMS_HOUR`, `NOTIFY_RATE_SMS_DAY`, `NOTIFY_RATE_MSG_HOUR`, `NOTIFY_RATE_EMAIL_HOUR`).
+  Over limit → one digest notice per hour per channel («N هشدار دیگر در پنل») instead of each message.
+- **Quiet hours**: inside the window non-critical messages are deferred to the window end (one digest);
+  critical ones are sent when `quiet_bypass_critical`. E-mail is never deferred.
+- **Retries**: SMS/bot sends retry 3× (1, 5, 15 min); 4xx from the provider (bad number, bot blocked:
+  Telegram 403) → target `fail_count += 1`, disabled after 3 consecutive permanent failures (shown in UI).
+- **Templates** (A, `notify_templates.py`, fa + en, plain text, ≤ 300 chars for SMS (the provider splits),
+  no node names/IPs, no "WHMCS"): e.g. `origin.down` fa «پاسارگاد CDN: سرور اصلی {domain} پاسخ نمی‌دهد
+  (از {time}). جزئیات در پنل.» / en "Pasargad CDN: the origin server of {domain} is not responding (since
+  {time}). Details in your panel."; `quota.warning` «۸۰٪ ترافیک ماهانهٔ {domain} مصرف شد.»; `ssl.expiring`
+  «گواهی SSL {domain} تا {days} روز دیگر منقضی می‌شود.»; brand text from env `NOTIFY_BRAND` (default
+  `پاسارگاد CDN` / `Pasargad CDN`).
+**Providers (A, `notify_providers.py`, all HTTP via `httpx` with the existing proxy rules, timeouts 10 s,
+mocked in tests; endpoints are assumptions to verify on staging):**
+- SMS `SMS_PROVIDER` = `""` (off, default) | `kavenegar` | `smsir` | `melipayamak`; `SMS_API_KEY`,
+  `SMS_SENDER` (line number), `SMS_API_URL` (override). Kavenegar: `POST
+  https://api.kavenegar.com/v1/{key}/sms/send.json` form `receptor`, `sender`, `message` (the key is in the
+  URL path → URLs of SMS requests are **never** logged; errors carry only the provider status). SMS.ir:
+  `POST https://api.sms.ir/v1/send/bulk` header `X-API-KEY`, JSON `{"lineNumber", "messageText",
+  "mobiles": [..]}`. Melipayamak: `POST https://console.melipayamak.com/api/send/simple/{key}` JSON
+  `{"from", "to", "text"}`. Pluggable: a provider is a class with `send(phone, text) -> (ok, permanent,
+  provider_id)`; adding one = one class + one enum value.
+- Telegram customer bot `TELEGRAM_CUSTOMER_BOT_TOKEN`, `TELEGRAM_CUSTOMER_BOT_USERNAME`, API base
+  `TELEGRAM_API_URL` (existing, shared). Bale `BALE_BOT_TOKEN`, `BALE_BOT_USERNAME`, `BALE_API_URL` (default
+  `https://tapi.bale.ai`; Telegram-compatible `/bot<token>/sendMessage` and `/getUpdates`).
+- Tokens/keys only in env; never stored in the DB, never in logs, audit, `/metrics`, error texts or admin
+  API answers (`GET /api/v1/notifications/status` reports only `{"sms": {"provider": "kavenegar",
+  "configured": true}, "bale": {"configured": bool, "username": str}, …}`).
+**API (A).** WHMCS calls these with the admin key on behalf of the logged-in client (WHMCS checks the
+client id is the session's own; the controller additionally requires that the client owns ≥ 1 site, else
+404):
+- `GET /api/v1/accounts/{client_id}/alerts` → `{"channels": {"email": {"available": true},
+  "sms": {"available": bool, "plan": bool}, "bale": {…, "username": str|null}, "telegram": {…}},
+  "events": [{"event": "origin.down", "severity": "critical", "site_scoped": true}], "subscriptions":
+  [<sub>], "targets": [{"id", "channel", "masked", "verified": bool, "disabled": bool}], "limits":
+  {"max_subscriptions": 20}}` where `<sub> = {"id", "site": "example.com"|null, "events", "channels",
+  "lang", "quiet_hours": {"start": "23:00", "end": "07:00", "bypass_critical": true}|null, "enabled"}`.
+- `PUT /api/v1/accounts/{client_id}/alerts/subscriptions` `{"items": [<sub> without id or with id]}` →
+  full replace, validated (sites must belong to the account; channels must be available for every site in
+  scope, else 403 `{"detail": "channel_not_in_plan", "channel": "sms"}`); 200 → same as GET.
+- `POST /api/v1/accounts/{client_id}/alerts/targets/sms` `{"phone": "+989121234567"}` (E.164, Iranian
+  mobiles `^\+989\d{9}$` unless `SMS_ALLOW_INTERNATIONAL=true`) → `202 {"target_id", "expires_at"}` (code
+  sent); `POST …/targets/{id}/verify` `{"code": "123456"}` → `{"verified": true}` / 422; 429 on limits.
+- `POST /api/v1/accounts/{client_id}/alerts/targets/{bale|telegram}/link` → `{"code", "deep_link",
+  "expires_at"}`; `GET …/targets/link/{code}` → `{"linked": bool, "target_id"|null}` (polling while the
+  dialog is open).
+- `DELETE /api/v1/accounts/{client_id}/alerts/targets/{id}` (also used for opt-out).
+- `POST /api/v1/accounts/{client_id}/alerts/test` `{"channel": "sms"|"bale"|"telegram"|"email",
+  "target_id"?}` → `202` (≤ 3/hour/account).
+- E-mail outbox (WHMCS cron): `GET /api/v1/notifications/outbox?channel=email&after=<id>&limit=200` →
+  `{"items": [{"id", "client_id", "service_id": "<sites.external_id>"|null, "site": "example.com"|null,
+  "event", "severity", "lang", "subject", "text", "vars": {…}, "created_at"}], "next": <id>|null}`;
+  `POST /api/v1/notifications/outbox/ack` `{"results": {"<id>": "sent"|"failed"|"skipped"}}` (unacked e-mail
+  rows are re-offered after 30 min, expire after 48 h). `abuse.notice` rows (§23.10) use the same outbox.
+- capi (scope `stats`): `GET /capi/v1/alerts` → the subscriptions that include this site (read-only).
+- Audit: `alerts.update`, `alerts.target.add|verify|delete`, `alerts.test` (target masked only).
+**Edge (B)**: live items gain `"oe": int` (origin-attributed 5xx: status 502/503/504 with a non-empty
+upstream status or a failed upstream connect, i.e. not `platform_error`) and `"pe": int` (the §14.3.1
+platform errors) per minute; old controllers ignore unknown keys. A stores them in
+`analytics_minute.details` (`oe`, `pe`).
+**WHMCS (C)**:
+- Client app page «هشدارها» / "Alerts" (`assets/alerts.js`, account-level, reachable from every service):
+  channel cards (ایمیل؛ پیامک: شماره + تأیید کد؛ بله و تلگرام: «اتصال» opens the deep link + code and polls),
+  subscription editor (همهٔ سرویس‌ها / یک سرویس، رویدادها با توضیح، کانال‌ها، زبان، ساعات سکوت «از … تا …»
+  + «هشدارهای بحرانی در ساعات سکوت هم ارسال شوند»)، «ارسال پیام آزمایشی»، opt-out per target. Channels not in
+  the plan show «در پلن شما فعال نیست» with the upgrade link. No text contains "WHMCS".
+- Addon cron (`AlertMail.php`, AfterCronJob, same fail-safe pattern as `TunnelAlerts`): pull e-mail outbox,
+  send with `SendEmail` using new e-mail templates created/updated on activate/upgrade: «Pasargad CDN Alert»
+  (generic: subject/text from the item, fa and en versions) and «Pasargad CDN Abuse Notice» (§23.10);
+  ack results. `TunnelAlerts` keeps sending its own tunnel e-mails; the controller never puts
+  `tunnel.origin_*` into the e-mail outbox (no duplicates).
+- Admin: product/feature editor gains `alert_sms` «هشدار پیامکی», `alert_messengers` «هشدار در بله/تلگرام»,
+  `max_alert_subscriptions`; settings page shows `GET /api/v1/notifications/status`.
+**Tests**: A — event catalog, origin.down/up windows from `oe`, ssl.expiring thresholds once each,
+incident mapping, subscription validation/plan 403, account ownership 404, phone regex, OTP limits and
+tries, link code single use + expiry, `getUpdates` binding and `/stop` with a mocked bot API, dedup,
+recovery-only-after-down, per-channel rate limits + digest, quiet hours (Asia/Tehran, window crossing
+midnight, bypass), retries and permanent-failure disabling, each SMS provider request shape (MockTransport;
+the key never appears in captured logs), outbox paging/ack/re-offer/expiry, encryption at rest of targets.
+B — `oe`/`pe` counting rules on synthetic log lines. C — page states, link polling, cron delivery + ack with
+harness stubs, no "WHMCS" in customer strings.
+
+### 23.6 Migration from ArvanCloud (and Cloudflare DNS)
+**Key handling (A, the core rule).** The customer's provider API key is used only inside the preview
+request: it is held in a local variable, sent to the provider over HTTPS, and dropped when the request
+ends. It is **never** stored (DB, state, files, cache), logged, audited, put into an exception message,
+returned, or forwarded to WHMCS logs (C: `ApiClient::redact` gains `api_key`; the body is sent only to the
+controller). FastAPI validation errors for these endpoints are replaced by a generic 422 that never echoes
+the input. What *is* kept: the provider data fetched with it (records/settings), encrypted with
+`crypto.encrypt` in `import_sessions.data` for `IMPORT_SESSION_MINUTES` (default 30), deleted on apply,
+expiry or `DELETE`. Without `DATA_ENCRYPTION_KEY` the preview still works but the session is kept in
+process memory only (single-instance) — documented.
+**Endpoints (A)** (admin for the WHMCS client app; capi with scopes `dns` + `config`):
+- `POST /api/v1/sites/{d}/import/preview` and `POST /capi/v1/import/preview` `{"provider": "arvan" |
+  "cloudflare", "api_key": "<≤ 512 chars>", "zone": "<domain, default the site's domain>"}` →
+  `{"session_id": "imp_<16 hex>", "expires_at", "provider", "zone", "report": {"records": {"total": n,
+  "importable": n, "items": [{"name", "type", "content", "ttl", "proxied": bool, "priority": int|null,
+  "status": "ok"|"duplicate"|"conflict"|"unsupported"|"limit"|"invalid", "reason": str|null}]},
+  "sections": {"<section>": {"status": "maps"|"partial"|"none", "value": {<proposed full section>}|null,
+  "notes": [str]}}, "unmapped": [{"what": str, "reason": str}]}}`. Errors: provider 401/403 → 422
+  `{"detail": "provider_auth"}`; zone not found → 404 `{"detail": "provider_zone_not_found"}`; timeout /
+  5xx → 502 `{"detail": "provider_unreachable"}`. Rate limit 10 previews/hour/site (429). Total fetch budget
+  60 s, ≤ 10 000 records, ≤ 5 MB of provider JSON.
+- `POST …/import/apply` `{"session_id", "records": true, "replace_records": false, "record_names": [..]|null
+  (subset), "sections": ["cache", "ssl", "firewall", "redirects", "ddos"]}` → `{"records": {"imported": n,
+  "skipped": [{"line"|"name", "reason"}]}, "sections": {"applied": [..], "dropped": [{"section",
+  "reason", …}]}, "config_version": int|null, "dns_error": str|null}`. Records go through the same
+  `_record_from` validation, max_records and duplicate rules as the BIND import; sections through
+  `validate_section` (plan gates/limits: dropped or truncated with a warning, like §23.4 restore). One
+  transaction, one config-history version (`source = "import"`). Audit `import.apply {provider, count,
+  section(s)}` (never the key).
+- `DELETE …/import/{session_id}` → 204.
+**Mapping (A, `importers/arvan.py`, `importers/cloudflare.py`; pure functions from provider JSON to
+`(records, sections, unmapped)` so tests run on fixtures):**
+| ArvanCloud | ours | status |
+|---|---|---|
+| DNS A/AAAA (`value` list of `{ip, port?, weight?, country?}`), CNAME, ANAME, MX, TXT, NS (non-apex), SRV, CAA, PTR | one record per value; ANAME → `ALIAS`; `cloud: true` → `proxied: true` (A/AAAA/CNAME/ALIAS only); TTL clamped 60..86400; apex NS/SOA skipped | maps; weights / per-country values / `ip_filter_mode` / `upstream_https` → noted as unmapped (weighted records §16.7 only when every value has a weight: `partial`) |
+| caching: `cache_status` (off / uri / query_string / advance), `cache_page_200`, `cache_browser`, `cache_developer_mode`, `cache_ignore_sc` | `cache.enabled`, `edge_ttl`, `browser_ttl`, `dev_mode`, `ignore_query` (`cache_status = uri` → true; `query_string` → false) | maps / partial |
+| HTTPS: `https_redirect`, HSTS (`hsts_status`, `hsts_max_age`, `hsts_subdomain`, `hsts_preload`) | `ssl.force_https`, `ssl.hsts.*` (preload rule of §2 still enforced) | maps |
+| firewall rules with simple filters (`ip.src in {…}`, `ip.geoip.country in {…}`, `http.request.uri.path` starts/equals) and actions allow/deny/challenge | `firewall.rules` conditions `ip`/`country`/`path`, actions `allow`/`block`/`challenge` | partial (other expressions unmapped, listed one by one) |
+| page rules with forwarding URL / redirect | `redirects.rules` (301/302) | partial |
+| DDoS protection mode (off / cookie / js / captcha) | `ddos.mode` `off`/`js`/`js`/`captcha` | maps |
+| rate-limit rules (simple path + rps) | `ratelimit.rules` | partial |
+| load balancers, WAF managed rules, Arvan apps, custom pages, TLS certificates/keys, log forwarders | — | none (listed in `unmapped`; certificates are never imported: issue ACME or upload custom) |
+**Arvan API assumptions (verify on staging with a test account; one module, fixture-tested):** base
+`https://napi.arvancloud.ir/cdn/4.0`, header `Authorization: Apikey <key>` (accept a pasted value that
+already starts with `Apikey `), `GET /domains/{domain}` (key + zone check), `GET
+/domains/{domain}/dns-records?page=N&per_page=100` (follow `meta.last_page`), `GET /domains/{domain}/caching`,
+`GET /domains/{domain}/https` (or `/ssl`), `GET /domains/{domain}/firewall/rules`, `GET
+/domains/{domain}/page-rules`, `GET /domains/{domain}/ddos`, `GET /domains/{domain}/rate-limit/rules`. A 404
+on an optional settings endpoint = that part `none` with note «در این نسخهٔ API در دسترس نبود», never a
+failure. Env `ARVAN_API_URL` (override), `IMPORT_ENABLED` (default true).
+**Cloudflare (cheap, DNS + 4 settings):** `https://api.cloudflare.com/client/v4` (`CLOUDFLARE_API_URL`),
+`Authorization: Bearer <token>` (a read-only API token: Zone.Zone Read + Zone.DNS Read), `GET
+/zones?name=<zone>`, `GET /zones/{id}/dns_records?per_page=100&page=N`, `GET /zones/{id}/settings` →
+`always_use_https`, `browser_cache_ttl`, `development_mode`, `security_level` (`under_attack` → `ddos.mode =
+js`); `proxied` → `proxied`. Everything else `unmapped`.
+**WHMCS client (C)**: wizard «انتقال از ابر آروان» / "Move from ArvanCloud" on the DNS page and in the
+onboarding wizard (and «انتقال از Cloudflare»): step 1 paste key (password field, explains «کلید فقط برای همین
+انتقال استفاده می‌شود و ذخیره نمی‌شود»; links to «ساخت کلید فقط‌خواندنی در پنل آروان»), step 2 preview table
+(records with status badges, sections «قابل انتقال / بخشی / غیرقابل انتقال» with notes, unmapped list), step 3
+choose (records subset, replace?, sections), apply, result. `ClientApi::ROUTES` POST `import/preview`,
+`import/apply`, DELETE `import/imp_[0-9a-f]{16}`; the PHP proxy never logs the preview body.
+**Tests**: A — mappers on fixture JSON (every row of the table, unmapped list), pagination, auth/404/timeout
+mapping with MockTransport, key absent from logs/audit/DB/exception text/422 bodies (assert on captured
+log records and DB dump), session encryption + expiry + delete, apply plan limits, duplicate handling,
+one config version, capi scopes, rate limit. C — wizard states, redaction in `ApiClient` logs.
+
+### 23.7 RUM (real user monitoring)
+**Principles.** Optional per site (plan feature **`rum`**, default false; section `rum` default off).
+Privacy: no cookies, no local/session storage, no identifiers, no user agent string, no query string or
+fragment, no IP address stored anywhere (the edge reads the client IP only to look up country / ASN at
+ingestion and never writes it to the RUM log). CSP-friendly: same-origin external script and same-origin
+beacon (`script-src 'self'`, `connect-src 'self'` suffice), no inline script, no `eval`.
+**Hard constraint, enforced:** RUM aggregates are read only by `rum.py` report code and the client API. A
+controller test asserts that `dnsbuild`, `scheduler` DNS jobs (`job_edges`, `job_probe`), `services`
+shed/weight code, rollouts and provisioning do not import `rum` (AST import check), and the edge RUM
+aggregates carry no node dimension.
+**Section `rum` (A, gated by `rum`):** `{"enabled": false, "sample_rate": 0.1 (0.01..1.0), "inject":
+"auto"|"manual" (default "auto"), "exclude_paths": [≤ 20 path prefixes, `/`-prefixed, ≤ 200 chars],
+"spa": false}`. Disabled shape always writable (§2 rule).
+**Edge config (A emits, B consumes):** per site `rum: {"enabled": true, "sample": 0.1, "inject": "auto",
+"exclude": ["/admin"], "spa": false}` or absent (old agents ignore it).
+**Script (B, `edge/pages/rum.js`, ≤ 4 KB minified, served at `GET /__pcdn/rum.js` on every site with
+`rum.enabled`, `Cache-Control: public, max-age=3600`, `Content-Type: application/javascript;
+charset=utf-8`, `X-Content-Type-Options: nosniff`):** reads `data-s` (sample rate) from its own
+`<script>` tag (`document.currentScript`), decides `Math.random() < s` once per page view; collects with
+`PerformanceObserver` (`buffered: true`): `ttfb` (navigation `responseStart − activationStart|0`), `fcp`,
+`lcp` (last `largest-contentful-paint` before first input/hidden), `cls` (session-window max, standard
+algorithm), `inp` (largest `event` entry duration with an `interactionId`, durationThreshold 40 — a
+documented approximation of INP), navigation timing `dns`, `tcp`, `tls`, `dom` (domInteractive), `load`;
+`nt` (`navigate`|`reload`|`back_forward`|`prerender`), `dev` (`m` if `matchMedia('(max-width: 767px)')`,
+`t` up to 1024 px, else `d`), `cs` (cache status from the navigation entry's `serverTiming` entry
+`cdn-cache` desc: `HIT`|`MISS`|`BYPASS`|`EXPIRED`|`STALE`|``), `p` = `location.pathname` truncated to 200
+chars. With `spa: true` soft navigations (`history.pushState`/`popstate`) send one beacon each with `nt =
+"soft"` (only `inp`, `cls` for that view). Sends once on `visibilitychange → hidden` / `pagehide` with
+`navigator.sendBeacon('/__pcdn/rum', JSON)` (fallback `fetch(…, {keepalive: true, credentials:
+'omit'})`). Body: `{"v": 1, "p": "/products", "nt": "navigate", "dev": "m", "cs": "HIT", "ttfb": 312,
+"fcp": 900, "lcp": 1800, "cls": 0.04, "inp": 120, "dns": 0, "tcp": 20, "tls": 30, "dom": 1200, "load":
+2100}` (missing metrics omitted).
+**Injection (B):** `inject = "auto"`: in the site's HTML-serving locations `sub_filter '</head>' '<script
+src="/__pcdn/rum.js" data-s="0.1" defer></script></head>'; sub_filter_once on; sub_filter_types
+text/html;` — the replacement is a per-site variable so excluded paths need no extra locations:
+`map $uri $pcdn_rum_<sid> { default '<script src="/__pcdn/rum.js" data-s="0.1" defer></script>';
+~^/admin ''; }` and `sub_filter '</head>' '$pcdn_rum_<sid></head>';` (an excluded path replaces `</head>`
+by itself). Never in tunnel, storage-bucket or `/__pcdn/` locations. `sub_filter` needs an uncompressed
+upstream body, so a RUM-auto site renders `proxy_set_header Accept-Encoding "";` (the edge still compresses
+towards clients; documented trade-off: more origin bandwidth, cached objects stored uncompressed). The
+response gets `Server-Timing: cdn-cache;desc=$upstream_cache_status` (HTML only via `map
+$sent_http_content_type`). `inject = "manual"`: nothing is rewritten; the customer adds the tag (shown in
+the client app, with their own CSP nonce if they use one); the `/__pcdn/rum` and `/__pcdn/rum.js`
+locations exist either way.
+**Ingestion (B):** `location = /__pcdn/rum { limit_req zone=pcdn_rum burst=20 nodelay;
+client_max_body_size 2k; client_body_buffer_size 2k; js_content pcdn.rumIngest; }` (`limit_req_zone
+$binary_remote_addr zone=pcdn_rum:10m rate=2r/s;` in the base config). Only `POST` with
+`Content-Type` `text/plain` or `application/json` (sendBeacon) and `Origin`/`Referer` host = `$host`
+(else 204 and dropped); njs parses, validates (`v == 1`, numbers clamped: ms 0..60000, cls 0..10, path
+`^/[^\s?#]{0,199}$` else `/`), sets `js_var $pcdn_rum_line` to a sanitized JSON line
+`{"t": "<iso minute>", "h": "$host", "cc": "$pcdn_country", "asn": $pcdn_asn|0, "rg": "$pcdn_region",
+…metrics…}` and returns 204 (`Cache-Control: no-store`). `access_log /var/log/nginx/pcdn-rum.log pcdn_rum
+if=$pcdn_rum_line;` with `log_format pcdn_rum escape=none '$pcdn_rum_line';` — no IP field exists in that
+format. The location is excluded from site usage/billing counters, fair share and §15.1 telemetry
+(`access_log` of the main format off there). ASN: optional DB-IP "IP to ASN Lite" mmdb
+(`pcdn-geoip-update.sh --asn`, agent.conf `RUM_ASN_DB`, default `/usr/share/pcdn/geo/asn.mmdb`; absent →
+`$pcdn_asn = 0`); region: optional city/subdivision mmdb `RUM_REGION_DB` (default empty → `rg = ""`). The
+agent tails `pcdn-rum.log` (same offset/rotation handling as the access log) and aggregates per host-hour.
+**Usage item (B emits, A consumes):** `"rum": {"n": 120, "all": <H>, "by": {"cc": {"IR": <H>, …≤ 30},
+"asn": {"197207": <H>, …≤ 20}, "rg": {"Tehran": <H>, …≤ 31}, "dev": {"m": <H>, "t": <H>, "d": <H>},
+"path": {"/": <H>, …≤ 50}, "cs": {"HIT": <H>, "MISS": <H>, …}}}` where `<H> = {"n": int, "<metric>":
+[counts per bucket]}` with fixed buckets (the contract, A and B share them, pinned by golden tests):
+ms metrics (`ttfb`, `fcp`, `lcp`, `inp`, `dns`, `tcp`, `tls`, `dom`, `load`) upper bounds
+`[50, 100, 200, 300, 500, 800, 1000, 1500, 1800, 2000, 2500, 3000, 4000, 5000, 8000, 12000, ∞]` (17
+counts), `cls` (×1000) `[10, 50, 100, 150, 250, 500, 1000, ∞]` (8 counts). Top-N by `n`, the rest summed
+into key `"other"`. Size cap 32 KB per item (drop `path` first, then `rg`). Old controllers drop `rum`
+(`routes_edge.UsageItem` / `LiveItem` / `Heartbeat` use pydantic's default `extra = "ignore"`, so unknown
+keys never cause a 422). Capability `capabilities.rum: true`.
+**Controller (A):** `UsageItem.rum` (malformed → ignored), merged into `rum_hourly` (site, hour, dim, key)
+— `dim` ∈ `all`, `cc`, `asn`, `rg`, `dev`, `path`, `cs`; histograms added bucket-wise. Retention
+`RUM_RETENTION_DAYS` (default 30, 7..400). ISP labels: `controller/app/data/isp_names.json` (ASN →
+`{"fa": "همراه اول", "en": "MCI"}` for the main Iranian access networks, e.g. 197207 MCI, 44244 Irancell,
+58224 TCI, 31549 Shatel, 16322 Pars Online, 43754 Asiatech, 57218 RighTel, 12880 ITC; others →
+`"AS<n>"`). Country names via the existing fa/en country tables.
+- `GET /api/v1/sites/{d}/rum?hours=24|168|720&by=country|isp|region|device|path` and `GET /capi/v1/rum`
+  (scope stats) → `{"enabled": bool, "sample_rate": 0.1, "hours": 24, "n": 1234, "metrics": {"lcp":
+  {"p75": 2100, "good_pct": 71.2, "poor_pct": 8.1, "hist": [..17]}, "inp": {…}, "cls": {"p75": 0.04,
+  …}, "ttfb": {…}, "fcp": {…}}, "thresholds": {"lcp": [2500, 4000], "inp": [200, 500], "cls": [0.1, 0.25],
+  "ttfb": [800, 1800], "fcp": [1800, 3000]}, "by": [{"key": "IR", "label": "ایران", "label_en": "Iran",
+  "n": 900, "p75": {"lcp": 2000, "inp": 110, "cls": 0.03, "ttfb": 300}}], "series": [{"t": iso, "n": 40,
+  "lcp_p75": 2100, "inp_p75": 120, "cls_p75": 0.04, "ttfb_p75": 310}], "cdn_impact": {"hit": {"n": 700,
+  "ttfb_p75": 180, "lcp_p75": 1600}, "miss": {"n": 200, "ttfb_p75": 900, "lcp_p75": 2900},
+  "ttfb_gain_pct": 80.0, "lcp_gain_pct": 44.8, "hit_ratio_pct": 77.8} | null, "has_data": bool}`. p75 from
+  the merged histogram (linear interpolation inside the bucket, documented). `cdn_impact` null when either
+  side has < 30 samples. 404 when the plan has no `rum`.
+**WHMCS client (C)** page «تجربهٔ کاربران واقعی» / "Real user monitoring" (`assets/rum.js`): on/off,
+sample rate, auto/manual (manual shows the `<script>` tag to copy and the CSP lines `script-src 'self';
+connect-src 'self'`), exclude paths; KPI cards for LCP / INP / CLS / TTFB / FCP with good/needs
+improvement/poor colours (Google thresholds), hourly series chart, breakdown tables by country, ISP
+(«اپراتور اینترنت»), region, device, page; «اثر CDN» card comparing cache HIT vs MISS (TTFB/LCP gain);
+privacy note «بدون کوکی و بدون ذخیرهٔ IP». Hidden when 404.
+**Tests**: B — script unit tests under node (`node --test`, fake PerformanceObserver), njs validation/
+clamping/origin check, rendered locations + `nginx -t`, auto injection e2e with real nginx (HTML gets the
+tag once; JSON does not), RUM log has no IP, aggregator top-N/other/size cap, buckets golden. A — merge,
+p75 interpolation, thresholds, impact null rule, retention, ISP labels, plan 404, capi scope, import-isolation
+test. C — page render with/without data, manual snippet.
+
+### 23.8 Support diagnostics report
+**Controller (A, `diagnostics.py`):** `GET /api/v1/sites/{d}/diagnostics?audience=customer|admin`
+(default customer) and `GET /capi/v1/diagnostics` (scope stats, always customer) →
+```json
+{"report_id": "dg_<12 hex>", "generated_at": "<iso>", "audience": "customer",
+ "site": {"domain": "example.com", "status": "active", "created_at": iso, "plan": {"bandwidth_limit_gb": 500,
+          "features": {"waf": true, "tunnel": false, …}}},
+ "dns": {"ns_verified": true, "ns_expected": ["ns1…", "ns2…"], "ns_found": [...], "ns_checked_at": iso,
+         "dnssec": false, "records": 14, "proxied": 6, "secondary": false},
+ "ssl": {"status": "active", "source": "letsencrypt", "expires_at": iso, "days_left": 61,
+         "key_type": "ecdsa-p256", "error": null},
+ "config": {"cache": {"enabled": true, "dev_mode": false, "edge_ttl": 3600},
+            "firewall": {"rules": 5}, "ratelimit": {"rules": 1}, "waf": {"mode": "block", "learning": "off"},
+            "ddos": {"mode": "auto"}, "tunnel": {"paths": 2, "protocols": ["grpc", "ws"]},
+            "pools": {"pools": 1}, "redirects": {"rules": 12}, "functions": {"items": 0}, …},
+ "warnings": ["<section_warnings text>", …],
+ "recent": {"security_events_24h": 120, "top_rules": [{"rule": "waf:942100", "count": 40}],
+            "status_24h": {"2xx": 1, "3xx": 1, "4xx": 1, "5xx": 1}, "origin_errors_24h": 3,
+            "platform_errors_24h": 0, "events": [{"t": iso, "type": "ssl.issued"}]},
+ "tunnel": {"sessions_24h": 1200, "abnormal_pct": 1.2, "connect_ms_avg": 85, "origin": "up",
+            "top_drop_reason": "idle_timeout", "nodes": [{"label": "نود تهران ۱", "label_en": "Tehran node 1",
+            "sessions": 600, "abnormal_pct": 1.0}]} | null,
+ "usage": {"month_bytes": 1, "limit_gb": 500, "pct": 12.5, "over_quota": false},
+ "history": [{"version": 14, "at": iso, "actor": {"kind": "client"}, "sections": ["cache"]}],
+ "incidents": [{"title": "…", "status": "resolved", "at": iso}]}
+```
+- Never included: secrets (sections are summarized as counts/modes only — no header values, no tunnel path
+  strings (they can be secret paths: only count + protocols), no origin addresses, no webhook URLs, no API
+  keys), node IPs, internal node names (customer audience uses §23.12 labels), other sites. ≤ 64 KB.
+- `audience=admin` (admin API only; the client app never sends it — C's whitelist forbids the query) adds
+  `"internal": {"edges_serving": [{"name", "group", "region", "online", "release"}], "site_id",
+  "external_id"}`.
+- Audit `diagnostics.generate` (report id only). Rate limit 20/hour/site (429).
+**WHMCS client (C)**: button «ارسال گزارش عیب‌یابی به پشتیبانی» / "Send a diagnostics report to support" on
+the overview and the tunnel quality page: (1) fetch the report, keep it server-side in the PHP session
+(`$_SESSION['pcdn_diag'][report_id]`, 30 min, ≤ 3 per session) so what is sent is exactly what was shown;
+(2) show a readable preview (sections as above, fa/en) + optional customer note (≤ 2000 chars) + choice
+«تیکت جدید» (department from addon setting `support_department`, subject «گزارش عیب‌یابی {domain}») or
+«افزودن به تیکت باز» (the client's own open tickets, `GetTickets` filtered by `clientid` + status);
+(3) on confirm: `localAPI('OpenTicket', {clientid, deptid, subject, message, priority: 'Medium',
+markdown: true, serviceid})` or `localAPI('AddTicketReply', {ticketid, clientid, message, markdown:
+true})` — the message is the rendered Markdown report + note; the JSON is attached as
+`pcdn-diagnostics-<report_id>.json` via the `attachments` parameter when the WHMCS version supports it
+(else appended in a fenced block). The ticket belongs to the client; the server checks ticket ownership
+before `AddTicketReply`. Customer text never says "WHMCS". Admin addon: site page «گزارش عیب‌یابی» shows the
+admin audience report with «کپی» / «دانلود JSON».
+**Tests**: A — shape, redaction (fixture site with secret header values, tunnel secret paths, webhook URLs:
+none appear), labels instead of names, admin-only `internal`, capi scope, size cap, rate limit. C — session
+binding (a tampered report id is refused), OpenTicket/AddTicketReply calls with harness stubs, ownership
+check, i18n.
+
+### 23.9 Capacity-driven node provisioning (operator-approved)
+**Flow:** capacity alert opens (`check_capacity`, §15.5) → the controller writes a **proposal** → the admin
+reviews and approves → an operator-run **provisioner** (`tools/provision`, D) fetches the approved job,
+runs `terraform plan` and uploads the plan summary (dry run) → the admin approves the apply → the
+provisioner runs `terraform apply` → each VM boots with a **one-time join token** → the edge joins → done.
+Nothing is ever created without two explicit admin approvals; the controller never holds cloud
+credentials (they live only in the provisioner's environment).
+**Controller (A):**
+- Env `PROVISIONING_ENABLED` (default false: no proposals, endpoints 404), `PROVISIONER_TOKEN` (≥ 32
+  chars; the provisioner's bearer token, compared in constant time; empty → provisioner endpoints 401),
+  `PROVISION_TARGET_PCT` (default 60: proposal sizing target utilisation), `PROVISION_SIZES` (JSON map of
+  size names to capacity, default `{"small": 500, "medium": 1000, "large": 2500}` Mbps — the provisioner
+  maps names to provider server types).
+- On `capacity:{group}` opening (and daily while open) and when no proposal of that group is in a
+  non-final state: `provision_proposals` row with `group`, `region` (the group's region with the highest
+  share of the group's 72 h traffic; admin can change), `size` (the smallest size ≥ median known capacity of
+  the group, else `medium`), `count = max(1, ceil((p95 / (PROVISION_TARGET_PCT/100) − capacity) /
+  size_capacity))`, `reason` (the capacity report line), `state = "proposed"`. Sizing uses capacity only
+  (hard constraint).
+- States: `proposed` → `approved` (admin) → `planning` (provisioner fetched) → `planned` (plan uploaded) →
+  `apply_approved` (admin) → `applying` → `applied` → `joined` (all edges joined) | `failed` | `rejected` |
+  `expired` (proposed/planned untouched 7 days).
+- Approve creates `count` Edge rows (`enabled = true`, `ipv4 = "0.0.0.0"` placeholder exactly like
+  `/edges/batch`, names `<group>-<region>-p<proposal id>-<n>`, `capacity_mbps` = size capacity, group,
+  region) and, per edge, a **join token** (`edge_join_tokens`: `jt_` + 40 hex, sha256 stored, `expires_at
+  = now + JOIN_TOKEN_HOURS` (default 24, 1..168), single use). The plaintext join tokens are kept
+  encrypted (`crypto.encrypt`) on the proposal only until the provisioner fetches the job once, then
+  wiped. Without `DATA_ENCRYPTION_KEY` approval is refused (422 `encryption_required`).
+- **Join** (edge API, unauthenticated except the join token): `POST /edge/v1/join` `{"join_token":
+  "jt_…", "hostname": str?}` → `200 {"edge_id", "name", "token": "edge_…"}` — mints a fresh edge token
+  (stored hashed, replaces the placeholder hash), marks the join token used. 401 for unknown/used/expired
+  (constant time; ≤ 10 attempts/min per source IP → 429). The node's IP is learned from its first
+  heartbeat like batch edges. Audit `edge.join`.
+- Admin can also mint a join token for any not-yet-heartbeated edge: `POST /api/v1/edges/{id}/join-token`
+  → `{"join_token", "expires_at", "install": "<one-liner with --join-token via env>"}`.
+- Admin API: `GET /api/v1/provisioning/proposals` / `{id}` → `{"id", "group", "region", "size",
+  "count", "reason", "state", "plan": {"summary": str (≤ 64 KB), "adds": int, "changes": int,
+  "destroys": int, "uploaded_at": iso}|null, "edges": [{"id", "name", "joined": bool}], "created_at",
+  "decided_by", "error"}`; `POST …/{id}/approve` `{"region"?, "size"?, "count"? (1..20)}`; `POST
+  …/{id}/apply`(only from `planned`, and only when `plan.destroys == 0` — a plan that destroys anything is
+  refused 409 `plan_destroys`); `POST …/{id}/reject`; `POST /api/v1/provisioning/proposals` `{"group",
+  "region", "size", "count"}` (manual proposal, same flow). Audit every action.
+- Provisioner API (bearer `PROVISIONER_TOKEN`): `GET /api/v1/provisioner/jobs/next` → `{"job": {"id",
+  "action": "plan"|"apply", "group", "region", "size", "count", "edges": [{"name", "join_token"? (plan
+  only, once)}], "controller_url", "release": <effective pin>|null}|null}`; `POST
+  /api/v1/provisioner/jobs/{id}/plan` `{"summary", "adds", "changes", "destroys"}`; `POST
+  /api/v1/provisioner/jobs/{id}/result` `{"ok": bool, "error": str|null}`. The summary must not contain
+  join tokens (the controller rejects 422 if any `jt_` token of the job appears in it).
+- Alerts: `provision_proposed:<group>` (info, links the proposal), `provision_failed:<id>` (warning).
+**Provisioner (D, `tools/provision/pcdn-provision`, Python stdlib + the `terraform` binary):**
+`pcdn-provision --controller URL --token-file F --workdir DIR --module terraform/providers/<name> [--once]`
+polls `jobs/next` every 60 s; for `plan`: writes `terraform.tfvars.json` (no secrets; join tokens go into a
+`0600` `secrets.auto.tfvars.json` deleted after apply) and runs `terraform init -input=false`, `terraform
+plan -out=plan.bin -input=false -no-color`, `terraform show -no-color plan.bin` → masked summary (join
+tokens replaced by `jt_***`) → `jobs/{id}/plan`; for `apply`: `terraform apply -input=false plan.bin` →
+`result`. Cloud credentials only from its env (`HCLOUD_TOKEN`, …). Never runs `destroy`.
+**Terraform (D, new `terraform/`):** `terraform/modules/pcdn-edge-node` (provider-agnostic: inputs
+`controller_url`, `join_tokens` (sensitive), `region`, `role`, `release`, `names`; output: `user_data`
+per node = cloud-init that runs `curl -fsSL --proto '=https' <controller>/edge/bootstrap.sh |
+PCDN_JOIN_TOKEN=<token> bash -s -- --controller <url> --role <role> --region <region> [--version
+<release>]`), `terraform/providers/hcloud` (example: `hcloud_server` per name with the module's
+user_data; server type/location from size/region maps in variables), `terraform/providers/fake` (uses
+`terraform_data` + `local_file` to write the user_data — used by tests and CI `terraform validate`; no
+cloud). Other providers (e.g. ArvanCloud IaaS) are documented as "add a providers/<name> directory with the
+same variables" — their resource names are assumptions to verify, not shipped untested.
+**Edge (B):** `bootstrap.sh`/`install.sh` accept a join token via env `PCDN_JOIN_TOKEN` or `--join-token-file`
+(never argv, like §11.1 tokens): install.sh calls `POST /edge/v1/join` (curl, https only unless
+`--insecure-http`), writes the returned edge token into agent.conf (0600) and continues as with
+`--token`; 401 → exit 1 «توکن پیوستن نامعتبر یا منقضی است» / "join token invalid or expired".
+**WHMCS admin (C):** page «پیشنهاد افزودن نود»: proposals with reason, editable region/size/count,
+«تأیید» → state; when `planned`, the plan summary in a monospace box with adds/changes/destroys and
+«اجرای طرح» (disabled when destroys > 0); join progress per edge; «رد».
+**Tests**: A — proposal creation on alert open (once per group), sizing formula, state machine 409s, edge
+rows + join tokens, token wipe after first fetch, join endpoint (single use, expiry, rate limit, constant-
+time compare), plan summary token check, `plan_destroys` refusal, provisioner auth. D — provisioner against a
+fake controller + the `fake` module (`terraform` in CI when available, else the runner is tested with a fake
+`terraform` shim), masking, never-destroy. B — join flow in install.sh with a fake controller.
+
+### 23.10 Abuse desk
+**Model (A):** `abuse_reports`: `id`, `ticket` (`AB-` + 8 chars Crockford base32, unique), `created_at`,
+`category` (`phishing`|`malware`|`illegal`|`spam`|`copyright`|`other`), `urls` (JSON, 1..10 http(s) URLs,
+≤ 2048 chars each), `description` (≤ 4000), `reporter_email` (encrypted, optional), `reporter_email_hash`,
+`reporter_ip_hash` (HMAC with a daily-rotated key, only for rate limiting, cleared after 30 days),
+`status_token_hash`, `status` (`new`|`triage`|`notified`|`actioned`|`closed`|`rejected`), `site_id` (FK
+SET NULL; matched from the URL hosts: exact record host or the apex domain), `deadline_at`,
+`action` (`none`|`warned`|`suspended`|`unsuspended`), `public_note` (≤ 500, shown to the reporter),
+`updated_at`. `abuse_events`: `report_id`, `at`, `actor`, `kind` (`created`|`triaged`|`notified`|`note`|
+`action`|`status`|`reporter_update`), `data` (JSON, internal notes ≤ 2000).
+**Site suspension for abuse:** new column `sites.abuse_suspended` (default false). `effective_status` →
+`"suspended"` when it is true (edge config, DNS and capi behave exactly as for billing suspension);
+WHMCS billing unsuspend does **not** clear it (only the abuse desk does). `site_to_dict` gains
+`"abuse_suspended": bool`. Webhook/notification `site.suspended` carries `{"reason": "abuse"|"billing"}`.
+**Public intake:**
+- Controller public endpoints (no auth, CORS `*` for GET/POST like `/status.json`): `GET
+  /public/v1/abuse/challenge` → `{"id": "<uuid>", "salt": "<hex>", "bits": 20 (ABUSE_POW_BITS, 16..26),
+  "expires_at"}` (stateless HMAC-signed id); `POST /public/v1/abuse/reports` `{"category", "urls",
+  "description", "email"?, "challenge": {"id", "salt", "nonce"}, "website": ""}` (proof of work: sha256(salt
+  + nonce) has ≥ bits leading zero bits; `website` is a honeypot that must be empty; each challenge usable
+  once, 10 min) → `201 {"ticket": "AB-…", "status_token": "<24 chars, shown once>"}`; 422 bad input;
+  429 > `ABUSE_RATE_PER_HOUR` (default 5) per IP hash. `GET /public/v1/abuse/reports/{ticket}?token=…` →
+  `{"ticket", "status", "created_at", "updated_at", "public_note"}` — nothing else (no site owner, no
+  actions, no other reporters). Env `ABUSE_ENABLED` (default **false**: endpoints 404).
+- WHMCS page (C) addon clientarea `page=abuse` (`requirelogin => false`): same form, the challenge solved in
+  the browser (small JS), submitted server-side to the admin API `POST /api/v1/abuse/reports` (same body)
+  with header `X-PCDN-Reporter-IP: <client IP>` (the controller hashes it immediately and never stores
+  it); status lookup `page=abuse&ticket=…&token=…`.
+- Status site (D): `status/abuse.html` + `abuse.js` (no dependencies, RTL fa with en toggle) using the
+  public endpoints; link from `status/index.html`.
+**Admin queue (A + C):** `GET /api/v1/abuse/reports?status=&category=&q=&limit=` (q matches ticket/URL
+host), `GET /api/v1/abuse/reports/{id}` (with events, the matched site domain + `external_id` +
+`client_id` — admin only), `PATCH /api/v1/abuse/reports/{id}` `{"status"?, "site": "<domain>"?,
+"public_note"?, "note"?}`, `POST /api/v1/abuse/reports/{id}/notify` `{"deadline_hours": 48
+(ABUSE_DEADLINE_HOURS, 1..720), "lang": "fa"|"en", "message"?: str}` → puts an `abuse.notice` e-mail into
+the notification outbox for the site owner (§23.5; template vars: domain, category, URLs, deadline, ticket
+— never the reporter's identity), sets `notified`, `deadline_at`; `POST …/{id}/action` `{"action":
+"warn"|"suspend"|"unsuspend"|"close"|"reject", "public_note"?}` (`suspend` sets
+`sites.abuse_suspended`, DNS/edge sync immediately; `unsuspend` clears it). Each change → `abuse_events` +
+audit `abuse.<action>`; reporter status e-mail (when an e-mail was given) on `notified`/`actioned`/`closed`
+via the controller SMTP settings (`SMTP_*`, fa/en, contains only ticket + status + public note).
+Overdue (`deadline_at` passed, status `notified`) → admin alert `abuse_overdue:<id>` (warning).
+`overview` gains `abuse_open: int`.
+**WHMCS admin (C)** page «گزارش‌های تخلف» / "Abuse reports": filters, queue table (ticket, category, host,
+status, age, deadline), detail with evidence links (rendered as text, `rel="noopener noreferrer
+nofollow"`, never fetched or previewed by the panel), linked site/owner (link to the WHMCS client/service),
+actions with confirmations, notes timeline. Owner e-mail template «Pasargad CDN Abuse Notice» fa/en (C).
+**Privacy:** no personal data is published; reporter e-mail is encrypted, shown only to admins, deleted
+`ABUSE_RETENTION_DAYS` (default 365) after closing; IP hashes after 30 days; public status shows only
+status + public note.
+**Tests**: A — PoW verify (bits, reuse, expiry, signature), honeypot, rate limit, URL validation, site
+matching, status lookup token, owner notice into outbox (no reporter data), suspend/unsuspend vs billing
+suspend interplay (`effective_status`, edge config), overdue alert, retention, `ABUSE_ENABLED=false` 404.
+C — form + server-side submit with a stubbed controller, admin actions, no "WHMCS" in customer text. D —
+`abuse.js` PoW solver unit test under node.
+
+### 23.11 SLO dashboard for the operator
+**SLIs per edge group (A, `slo.py`):**
+- **availability**: each `job_probe` tick, per group: *good* when at least one enabled, non-draining edge
+  of every region pool of the group that has edges answered the controller probe (§8.1) successfully;
+  ticks with no enabled edge in the group are not counted. (A second, informational SLI
+  `edge_availability` = good probes / all probes over the group's edges.)
+- **latency**: probes of the group with `probe_ms ≤ SLO_LATENCY_MS` (default 300) / successful probes.
+- **errors**: `1 − platform_errors / requests` from `analytics_minute` `pe` (§23.5 edge) per minute, falling
+  back to hourly `usage_hourly` platform errors for edges that do not send `pe`.
+**Storage:** `slo_buckets` (`group`, `start`, `res` = `5m`|`1h`, `avail_good`, `avail_total`, `lat_good`,
+`lat_total`, `requests`, `errors`); 5 m rows kept 3 days, 1 h rows `SLO_RETENTION_DAYS` (default 400).
+**Objectives (env):** `SLO_AVAILABILITY` (default 99.9), `SLO_LATENCY` (99.0), `SLO_ERRORS` (99.5), window
+= calendar month (UTC); per-group overrides `SLO_OVERRIDES` JSON (`{"tunnel": {"availability": 99.5}}`).
+**Error budget & burn (A):** budget = 1 − objective; burn rate over window W = (bad/total)/budget.
+Multi-window alerts (Google SRE): **fast burn** `slo_burn_fast:<group>:<sli>` (critical) when burn ≥ 14.4
+over both 1 h and 5 m; **slow burn** `slo_burn_slow:<group>:<sli>` (warning) when burn ≥ 6 over both 6 h and
+30 m; resolve when the short window drops below the threshold. Budget exhausted for the month →
+`slo_budget_exhausted:<group>:<sli>` (warning). `SLO_ENABLED` (default true — operator-only data and
+alerts; no customer impact; set false to silence).
+**API (A):** `GET /api/v1/slo?month=YYYY-MM` → `{"month", "objectives": {…}, "groups": [{"group":
+"general", "slis": {"availability": {"objective": 99.9, "actual": 99.95, "good": n, "total": n,
+"budget_remaining_pct": 52.0, "burn": {"5m": 0.0, "30m": 0.1, "1h": 0.2, "6h": 0.4}, "alert":
+null|"fast"|"slow"|"exhausted"}, "latency": {…}, "errors": {…}}, "edge_availability": 99.97, "daily":
+[{"day": "2026-10-01", "availability": 100.0, "latency": 99.2, "errors": 99.99}]}]}`.
+**/metrics (A):** `pcdn_slo_objective{group,sli}`, `pcdn_slo_ratio{group,sli,window="30d"|"month"}`,
+`pcdn_slo_error_budget_remaining{group,sli}`, `pcdn_slo_burn_rate{group,sli,window="5m"|"30m"|"1h"|"6h"}`.
+**Monitoring kit (D):** `deploy/monitoring/prometheus/rules/pcdn-slo.yml` (burn-rate alerts on the metrics
+above, labelled `source="prometheus"`; docs say to use either these or the controller alerts as the pager,
+not both), promtool rule tests in `deploy/monitoring/prometheus/tests/`, Grafana dashboard
+`pcdn-slo.json`.
+**WHMCS admin (C):** page «SLO و بودجهٔ خطا»: month picker, per group cards (objective vs actual, budget
+remaining bar, current burn per window, alert state), daily chart. No customer page (customers keep the
+§14.3 SLA report).
+**Tests**: A — tick classification (region pools, draining excluded, empty group), latency SLI, errors
+from `pe` + hourly fallback, budget and burn math on fixtures, fast/slow multi-window conditions and
+resolution, overrides, rollup/retention, `/metrics` lines. D — promtool tests.
+
+### 23.12 Customer-visible node naming
+**23.12.1 Display label (A).** New column `edges.display_city` (String(32), NULL; Persian city name such as
+«تهران», «مشهد», «شیراز», «تبریز», «اصفهان»; admin-editable, `EdgePatch.display_city` ≤ 32 chars,
+letters/spaces/ZWNJ only, `""` → NULL). English names come from `controller/app/data/cities.json`
+(`{"تهران": "Tehran", "مشهد": "Mashhad", "شیراز": "Shiraz", "تبریز": "Tabriz", "اصفهان": "Isfahan",
+"کرج": "Karaj", "اهواز": "Ahvaz", "قم": "Qom", "کرمانشاه": "Kermanshah", "رشت": "Rasht", …}`), unknown
+cities → the Persian name in both languages. Optional `edges.display_city_en` override (String(32), NULL).
+- Default when `display_city` is NULL: region `home` → «ایران» / "Iran"; `global` → «بین‌المللی» /
+  "International".
+- Label = «نود {city}» / "{City} node"; when two or more edges (all edges, enabled or not, so numbers do not
+  shift when one is disabled) share the same effective city: «نود تهران ۱», «نود تهران ۲» / "Tehran node 1",
+  "Tehran node 2" — numbered by ascending edge id, Persian digits in fa. Pure function
+  `edge_labels.labels(db) -> {edge_id: {"fa": str, "en": str}}` (cached per request).
+- `edge_to_dict` (admin) gains `display_city`, `display_city_en`, `display_label`, `display_label_en`,
+  `public_tag`.
+**23.12.2 Public tag (A + B).** `node.public_tag` = first 8 hex of HMAC-SHA256(key, `edge:<id>`) where key =
+HKDF of `DATA_ENCRYPTION_KEY` (info `pcdn-node-tag`) or, without it, of the controller's persistent random
+`state` value `node_tag_key` (created once). It cannot be reversed to a name and is stable per edge. Edge
+config `node.public_tag` (8 hex; rendered key). The agent uses it for `X-Pcdn-Node` (speed test, §15.6) and
+for `X-Served-By`, falling back to today's `node_tag(name)` hash only when the key is absent (old
+controller). **`X-Served-By $hostname` is removed**: every proxied response sends `X-Served-By:
+<public_tag>` instead (B, `render/site.py:624`; the template placeholder `{{NODE_TAG}}` already exists in
+`pcdn-base.conf`). Admin node detail shows the tag so support can map a customer's header to a node;
+`GET /api/v1/edges?tag=<8 hex>` filters by it.
+**23.12.3 Customer-facing places (audit result) and changes:**
+| place | today | change |
+|---|---|---|
+| `GET /api/v1/sites/{d}/tunnel/quality` + `/capi/v1/tunnel/quality` `edges[]` (`tunnel_quality.py:157-165`) | `name` = internal `Edge.name` | `name` = fa display label (old WHMCS clients render it unchanged → they show the label), new `label_en`, `key` = public tag; sorted by label; never `id` |
+| WHMCS client per-node table (`tunnelq.js:284-298`) | renders `e.name` in an LTR `<bdi>` | renders `label` (fa) / `label_en` (en) RTL-aware; `data-edge` = `key` |
+| diagnostics report (§23.8) | — | labels only (customer audience) |
+| every proxied response header `X-Served-By` (`render/site.py:624`) | OS host name | public tag |
+| speed-test `X-Pcdn-Node` (`render/http.py:94`) | unkeyed hash of the name | public tag (`tunnelq.js` keeps showing it as «شناسهٔ نود پاسخ‌دهنده (برای پشتیبانی)») |
+| tunnel drops `maintenance` (§22.12), status page, SLA, security events, log export, webhooks, notifications (§23.5), RUM | no node identity | unchanged; tests assert no `Edge.name` appears |
+**23.12.4 `edge_ips` (origin allow-list).** The site dict's `edge_ips` (all enabled edges' addresses, used by
+the client app's origin-firewall / real-IP tutorials) is the only place customers see node addresses. It is
+kept by default because origins must allow-list the CDN (removing it would break customers' firewalls); it
+is changed to be **unlabeled and unordered by node**: sorted numerically, IPv4 then IPv6, no names, no city,
+no group, de-duplicated, the same addresses as today — so it reveals nothing beyond what an origin sees in its
+own access log. There is **no switch to hide these addresses**: removing node addresses from customers'
+view would mainly serve to hide node IPs, which is out of scope under the hard constraint (and customers'
+resolvers see them anyway). The goal of §23.12 is only that customers see a friendly city label instead of
+internal node names.
+**23.12.5 Admin UI (C):** Nodes page column «شهر نمایشی» with inline edit (datalist of the cities in
+`cities.json`, mirrored in C as a static list), preview of the resulting customer label, tag shown in the
+node detail with a «جست‌وجو با شناسه» box.
+**Tests**: A — label numbering (shared city, disabled edge keeps numbers, region fallback, en), HMAC tag
+stability/irreversibility (different key → different tag), quality endpoint has no internal name (a site
+served by edges named `edge-secret-1` → the string never appears in any customer endpoint response:
+quality, drops, diagnostics, rum, profile, history, alerts), `?tag=` filter.
+B — `X-Served-By` renders the tag (never `$hostname`), speed-test tag from config, fallback hash without
+`node.public_tag`. C — table renders labels in both languages.
+
+### 23.13 Data model (migration `0023`, A)
+- `edges`: `display_city` String(32) NULL; `display_city_en` String(32) NULL; `release` String(40) NULL;
+  `upgrade_state` Text NULL (latest heartbeat `upgrade` object).
+- `sites`: `abuse_suspended` Boolean NOT NULL default false.
+- new tables (all `id` Integer PK unless noted; FKs `ON DELETE CASCADE` unless noted; indexes as listed):
+  - `site_config_versions`: `site_id` FK (index), `version` Integer, `at` DateTime (index), `actor_kind`
+    String(16), `actor` String(120), `on_behalf_of` String(64) NULL, `source` String(16), `sections` Text
+    JSON, `restored_from` Integer NULL; unique (`site_id`, `version`).
+  - `site_config_values`: `version_id` FK `site_config_versions` (index), `section` String(32), `sha256`
+    String(64), `value` Text; unique (`version_id`, `section`).
+  - `backup_runs`: `kind` String(8), `started_at` (index), `finished_at` NULL, `ok` Boolean NULL, `name`
+    String(80) NULL, `size` BigInteger NULL, `sha256` String(64) NULL, `location` String(8) NULL, `level`
+    String(8) NULL, `checks` Text JSON, `error` Text NULL (scrubbed).
+  - `pcdn_live_marker` (`id` only, one row) — §23.3 scratch-DB guard.
+  - `notification_subscriptions`, `notification_targets`, `notification_link_codes` (`client_id`, `kind`
+    `sms_verify`|`bale`|`telegram`, `target_id` NULL, `code_hash`, `expires_at`, `tries`, `used_at`),
+    `notification_outbox` (`client_id` (index), `site_id` FK SET NULL, `event` String(32), `severity`,
+    `channel` String(8), `target_id` NULL, `lang`, `subject` Text, `text` Text, `vars` Text JSON,
+    `dedup_key` String(128) (index), `status` `pending`|`sent`|`failed`|`deferred`|`skipped`|`expired`,
+    `attempts`, `next_attempt_at` (index), `created_at` (index), `sent_at` NULL, `error` Text NULL);
+    outbox rows pruned after 30 days.
+  - `import_sessions`: `id` String(20) PK (`imp_…`), `site_id` FK, `provider` String(16), `data` Text
+    (encrypted), `created_at`, `expires_at` (index).
+  - `rum_hourly`: `site_id` FK, `hour` (index), `dim` String(8), `key` String(200), `n` BigInteger, `hist`
+    Text JSON; unique (`site_id`, `hour`, `dim`, `key`).
+  - `abuse_reports` (`site_id` FK **SET NULL**), `abuse_events` (FK `abuse_reports`).
+  - `slo_buckets`: `group` String(16), `start` DateTime, `res` String(3), counters BigInteger; unique
+    (`group`, `start`, `res`).
+  - `rollouts`, `rollout_edges` (`rollout_id` FK, `edge_id` FK edges; unique (`rollout_id`, `edge_id`)).
+  - `edge_join_tokens`: `edge_id` FK, `token_hash` String(64) unique, `expires_at`, `used_at` NULL,
+    `created_at`, `created_by` String(64).
+  - `provision_proposals`: `group`, `region`, `size`, `count`, `reason` Text, `state` String(16) (index),
+    `plan_summary` Text NULL, `plan_adds`/`plan_changes`/`plan_destroys` Integer NULL, `plan_at` NULL,
+    `join_tokens_enc` Text NULL (wiped after the first fetch), `edge_ids` Text JSON, `created_at`,
+    `decided_by` String(64) NULL, `error` Text NULL, `updated_at`.
+- `edge_events.kind` values gain `rollout_start`, `rollout_done`, `rollback`, `joined`.
+- Section `rum` lives in `sites.config` (no column). `manage.py encrypt-secrets` / `rotate-key` cover
+  `notification_targets.value`, `abuse_reports.reporter_email`, `import_sessions.data`,
+  `provision_proposals.join_tokens_enc`.
+- `test_migrations` upgrade/downgrade on SQLite and PostgreSQL; downgrade drops the new tables/columns.
+
+### 23.14 Environment and agent settings (all defaults keep today's behaviour)
+| controller env | default | § |
+|---|---|---|
+| `PCDN_VERSION` | `""` (VERSION file) | 23.1 |
+| `PCDN_ENVIRONMENT` | `""` | 23.1 |
+| `EDGE_RELEASES_DIR`, `EDGE_RELEASE` | `""` (live bundle, no pin) | 23.1 |
+| `ROLLOUT_SOAK_MINUTES`, `ROLLOUT_PARALLEL`, `ROLLOUT_MAX_ERROR_PCT`, `ROLLOUT_AUTO_ROLLBACK`, `ROLLOUT_DRAIN_MINUTES`, `ROLLOUT_UPGRADE_TIMEOUT_MINUTES` | 30, 1, 1.0, true, 15, 60 (inert until a rollout is created) | 23.2 |
+| `BACKUP_ENCRYPTION_KEY` | `""` (alias of `BACKUP_PASSPHRASE`) | 23.3 |
+| `BACKUP_REQUIRE_ENCRYPTION`, `BACKUP_S3_KEEP_DAYS` | false, 0 | 23.3 |
+| `BACKUP_VERIFY_ENABLED`, `BACKUP_VERIFY_WEEKDAY`, `BACKUP_VERIFY_HOUR`, `BACKUP_VERIFY_DATABASE_URL` | false, 6, 4, `""` | 23.3 |
+| `CONFIG_HISTORY_ENABLED`, `CONFIG_HISTORY_MAX_VERSIONS`, `CONFIG_HISTORY_DAYS` | true, 100, 90 (records history only; no behaviour change) | 23.4 |
+| `SMS_PROVIDER`, `SMS_API_KEY`, `SMS_SENDER`, `SMS_API_URL`, `SMS_ALLOW_INTERNATIONAL` | `""` (off), `""`, `""`, `""`, false | 23.5 |
+| `TELEGRAM_CUSTOMER_BOT_TOKEN`, `TELEGRAM_CUSTOMER_BOT_USERNAME`, `BALE_BOT_TOKEN`, `BALE_BOT_USERNAME`, `BALE_API_URL` | `""` (off), …, `https://tapi.bale.ai` | 23.5 |
+| `NOTIFY_DEDUP_MINUTES`, `NOTIFY_RATE_SMS_HOUR`, `NOTIFY_RATE_SMS_DAY`, `NOTIFY_RATE_MSG_HOUR`, `NOTIFY_RATE_EMAIL_HOUR`, `NOTIFY_BRAND` | 30, 10, 30, 30, 20, `پاسارگاد CDN` | 23.5 |
+| `IMPORT_ENABLED`, `IMPORT_SESSION_MINUTES`, `ARVAN_API_URL`, `CLOUDFLARE_API_URL` | true, 30, Arvan / Cloudflare public API | 23.6 |
+| `RUM_RETENTION_DAYS` | 30 | 23.7 |
+| `PROVISIONING_ENABLED`, `PROVISIONER_TOKEN`, `PROVISION_TARGET_PCT`, `PROVISION_SIZES`, `JOIN_TOKEN_HOURS` | false, `""`, 60, `{"small":500,"medium":1000,"large":2500}`, 24 | 23.9 |
+| `ABUSE_ENABLED`, `ABUSE_POW_BITS`, `ABUSE_RATE_PER_HOUR`, `ABUSE_DEADLINE_HOURS`, `ABUSE_RETENTION_DAYS` | false, 20, 5, 48, 365 | 23.10 |
+| `SLO_ENABLED`, `SLO_AVAILABILITY`, `SLO_LATENCY`, `SLO_ERRORS`, `SLO_LATENCY_MS`, `SLO_OVERRIDES`, `SLO_RETENTION_DAYS` | true (operator-only), 99.9, 99.0, 99.5, 300, `{}`, 400 | 23.11 |
+New agent.conf keys (B): `RUM_ASN_DB` (`/usr/share/pcdn/geo/asn.mmdb`, used only if present),
+`RUM_REGION_DB` (`""`), `UPGRADE_DIR` (`/var/lib/pcdn/upgrade`), `RELEASES_DIR` (`/var/lib/pcdn/releases`),
+`SELF_UPGRADE` (`yes`; `no` → capability false, rollouts mark the node `manual`). WHMCS addon settings (C):
+`support_department` (default: first department), abuse page on/off (default off).
+
+### 23.15 Plan features (DEFAULT_FEATURES, `Features`, `FeaturesIn`, WHMCS FeatureEditor/Pricing)
+| key | default | range | § |
+|---|---|---|---|
+| `rum` | false | bool | 23.7 |
+| `alert_sms` | false | bool | 23.5 |
+| `alert_messengers` | false | bool | 23.5 |
+| `max_alert_subscriptions` | 20 | 0..100 | 23.5 |
+Labels (C): «پایش تجربهٔ کاربران (RUM)» / "Real user monitoring", «هشدار پیامکی» / "SMS alerts", «هشدار
+در بله و تلگرام» / "Bale & Telegram alerts", «حداکثر اشتراک هشدار» / "Alert subscriptions". Per-domain
+overrides (§21) accept the new keys. Product configurable options are not added this wave.
+
+### 23.16 Backward compatibility
+- **New controller, old agents:** `node.upgrade` and `rum` are ignored (rollouts show the node as `manual`
+  because `capabilities.self_upgrade` is missing; RUM shows «پس از به‌روزرسانی نودها»); `node.public_tag`
+  ignored → old agents keep `X-Served-By $hostname` until upgraded (documented: upgrade every node to close
+  the host-name leak); no `release` in heartbeats → release column «—», pin badge hidden; no `oe`/`pe` →
+  `origin.down` never fires for sites served only by old agents, SLO errors use hourly data.
+- **Old controller, new agents:** unknown heartbeat fields (`release`, `upgrade`) and usage/live keys
+  (`rum`, `oe`, `pe`) are ignored by the old models (the models use pydantic's default `extra="ignore"`; A keeps it that
+  way and pins it with a test);
+  `POST /edge/v1/join` 404 → install with `--join-token` fails clearly; bootstrap `--version` against a
+  controller without `/edge/releases` → error «این کنترلر نسخهٔ پین‌شده ارائه نمی‌کند».
+- **WHMCS with an old controller:** every new page/section is hidden when its endpoint 404s (history,
+  alerts, import, rum, diagnostics, releases, backups, abuse, SLO, provisioning); `edges[].label_en`
+  missing → the client shows `name`.
+- **Bundle routes:** without `EDGE_RELEASES_DIR`/`EDGE_RELEASE` every route behaves exactly as today.
+- All new plan features default to off/current; all new platform switches default off or are inert
+  (`CONFIG_HISTORY_ENABLED` and `SLO_ENABLED` only record data / alert the operator).
+- The only default-visible change for visitors is `X-Served-By` carrying the tag instead of the host name
+  (privacy fix); scripts that parsed host names from it must use the admin `?tag=` lookup.
+
+### 23.17 Docs to update
+- A: `docs/API.md` (all new endpoints and dict fields), `docs/OPERATIONS.md` (rollouts, backups/verify,
+  provisioning approvals, abuse desk runbook, notification providers), `docs/MONITORING.md` (new alerts,
+  SLO metrics), `docs/SECURITY.md` (import key handling, notification secrets, join tokens, PoW intake,
+  public tag, RUM privacy), `docs/UPGRADE.md` (section «۱۲) موج ۱۴ — انتشار ایمن،
+  عملیات و تجربهٔ مشتری»: migration 0023, env switches, upgrade nodes to drop `X-Served-By` host names),
+  `docs/DISASTER_RECOVERY.md` (weekly verify, scratch DB), `docs/NODES.md` (display city, join tokens),
+  `CHANGELOG.md` (controller entries).
+- B: `docs/EDGE.md` (self-upgrade, release file/cache, `--version`, `--join-token`, RUM script/ingestion/
+  log/aggregation and ASN DB, `oe`/`pe`, public tag headers, new agent.conf keys).
+- C: `docs/WHMCS.md` (all new client pages, admin pages, e-mail templates, addon settings, feature labels).
+- D: new `docs/RELEASE.md` (versioning, prepare/tag/release workflow, staging gate, security checklist +
+  sign-off, evidence folder, the rule that merge/tag/publish need the owner's confirmation), `docs/ROLLOUT.md`
+  (point §۴–۵ to automated rollouts), `docs/LOADTEST.md` + `docs/STAGING.md` (staging gate),
+  `docs/TERRAFORM.md` (node provisioning section, distinct from the customer provider), `docs/CLI.md`
+  (history commands), `status/README.md` (abuse page), `mkdocs.yml` nav (RELEASE.md).
+
+### 23.18 Work split (four agents in parallel, disjoint files)
+| agent | owns | must not touch |
+|---|---|---|
+| **A — controller** | `controller/**` (models, migration `0023`, `bundle.py`/`routes_bundle.py` releases, new modules `rollout.py`, `config_history.py`, `notify.py`, `notify_providers.py`, `notify_templates.py`, `importers/arvan.py`, `importers/cloudflare.py`, `rum.py`, `diagnostics.py`, `provisioning.py`, `abuse.py`, `slo.py`, `edge_labels.py`, `data/isp_names.json`, `data/cities.json`, routes, scheduler jobs `job_rollout`, `job_backup_verify`, `job_bots`, `job_notify`, `job_slo`, `job_abuse`, backup changes, `/metrics`, `/healthz`, tests, `controller/Dockerfile`), docs `API.md`, `OPERATIONS.md`, `MONITORING.md`, `SECURITY.md`, `UPGRADE.md`, `DISASTER_RECOVERY.md`, `NODES.md`, `CHANGELOG.md` (each other agent hands A its CHANGELOG lines in its PR description; A alone edits the file) | edge/, whmcs/, tools/, terraform/, cli/, status/, deploy/, .github/ |
+| **B — edge** | `edge/**` (agent `upgrade.py`, RUM aggregation + log tailing, live `oe`/`pe`, release file, join flow, render: `X-Served-By`/`X-Pcdn-Node` tag, RUM locations/injection/`Server-Timing`, njs `rumIngest`, `pages/rum.js`, `pcdn-base.conf`, `install.sh`, `bootstrap.sh`, `pcdn-geoip-update.sh --asn`, tests), `tests/integration/**`, `docs/EDGE.md` | controller/, whmcs/, tools/, deploy/ |
+| **C — WHMCS** | `whmcs/**` (client app: `history.js`, `alerts.js`, `rum.js`, import wizard, diagnostics dialog, tunnelq labels, tutorials `origin_ips_hidden`, `i18n-en.js`, `ClientApi.php` routes/queries/redaction; server module PHP for diagnostics tickets; addon: pages Releases/Rollouts, Backups, Abuse, SLO, Provisioning, node display city/tag/release columns, FeatureEditor/Pricing keys, settings, `AlertMail.php` cron, abuse public page, e-mail templates, addon version bump to `1.7.0`), `docs/WHMCS.md` | controller/, edge/, tools/ |
+| **D — release & ops tooling** | `VERSION`, `tools/release/**` (prepare, changelog-section, build-edge-bundle, fetch-edge-release, staging-verify, security-check), `tools/provision/**`, `tools/preflight/**` (backup verify check), `tools/loadtest/**` (threshold flags `--max-error-pct`/`--max-p99-ms` with non-zero exit if missing today), `terraform/**` (new), `cli/**` (history commands), `status/**` (abuse page), `deploy/**` (monitoring SLO rules/dashboards/tests, staging env for the gate), `.github/workflows/**` (new `release-platform.yml`, `ci.yml` additions only: `release-meta`, provisioner/terraform-fake/status tests — never remove or weaken an existing job/step), `mkdocs.yml`, `docs-site/**`, docs `RELEASE.md` (new), `ROLLOUT.md`, `LOADTEST.md`, `STAGING.md`, `TERRAFORM.md`, `CLI.md`, `status/README.md` | controller/, edge/, whmcs/, `terraform-provider-pcdn/` (unchanged this wave) |
+
+**Cross-boundary contracts** (frozen by this section; any change goes through the SPEC first):
+1. **Edge config (A emits, B consumes):** `node.upgrade` (§23.2, non-rendered), `node.public_tag` (§23.12,
+   rendered), per-site `rum` (§23.7).
+2. **Heartbeat (B emits, A consumes):** `release` (str|null), `upgrade` object (§23.2), capabilities
+   `self_upgrade`, `rum`.
+3. **Usage / live (B emits, A consumes):** usage item `rum` with the histogram bucket contract (§23.7);
+   live item `oe`, `pe` (§23.5).
+4. **Edge-facing HTTP (A serves, B calls):** `POST /edge/v1/join`; `GET /edge/releases`,
+   `GET /edge/bundle.tar.gz?version=&group=`, `GET /edge/releases/<v>.sha256`, `GET /edge/version`
+   (`release` field).
+5. **Admin / client / capi API (A serves, C and D call):** releases + rollouts (§23.2), backups (§23.3),
+   config history (§23.4), accounts alerts + notifications outbox/ack/status (§23.5), import
+   preview/apply/delete (§23.6), rum (§23.7), diagnostics (§23.8), provisioning + join-token (§23.9),
+   abuse admin + public (§23.10), slo (§23.11), `edge_to_dict` fields `release`, `pinned_release`,
+   `release_ok`, `upgrade`, `display_city`, `display_city_en`, `display_label`, `display_label_en`,
+   `public_tag`; `EdgePatch.display_city(_en)`; `GET /api/v1/edges?tag=`; `/tunnel/quality` `edges[]`
+   `{name (= fa label), label_en, key}`; site dict `abuse_suspended`, `origin_ips_hidden`; plan features
+   §23.15; section `rum`; `X-PCDN-Actor` values `client:<id>` / `share:<id>:<role>`; `X-PCDN-Reporter-IP`.
+6. **Provisioner API (A serves, D calls):** `jobs/next`, `jobs/{id}/plan`, `jobs/{id}/result` (§23.9).
+7. **Release artefacts (D produces, A and B consume):** `VERSION` format; bundle tarball layout (top dir
+   `edge/`, `edge/RELEASE`, same exclusions as `bundle.py`), file names `pcdn-edge-vX.Y.Z.tar.gz` +
+   `.sha256` in `sha256sum` format.
+8. **Cloud-init contract (D's Terraform → B's bootstrap):** `PCDN_JOIN_TOKEN` env +
+   `bootstrap.sh --controller <url> --role <role> --region <region> [--version vX.Y.Z]`.
+Each agent tests its side against fixtures written from these shapes (A: fake heartbeats/usage/
+provisioner calls; B: fake controller config, join and release endpoints; C: harness stubs of every new
+controller answer; D: a fake controller HTTP server, a fake `terraform` shim and the `fake` Terraform
+module), so no agent waits for another. Integration (B, `tests/integration`, when compose is available):
+pinned bootstrap with `--version`, a two-edge rollout with an injected failure → automatic rollback, RUM
+beacon → usage → controller report, `X-Served-By` is the tag.
+
+### 23.19 Summary
+- Alembic revision: **`0023`** (`0023_release_ops_cx.py`, down_revision `0022`).
+- New plan features: **`rum`** (false), **`alert_sms`** (false), **`alert_messengers`** (false),
+  **`max_alert_subscriptions`** (20). New section: **`rum`**.
+- New env switches (all default to today's behaviour): `PCDN_VERSION`, `PCDN_ENVIRONMENT`,
+  `EDGE_RELEASES_DIR`, `EDGE_RELEASE`, `ROLLOUT_*`, `BACKUP_ENCRYPTION_KEY`, `BACKUP_REQUIRE_ENCRYPTION`,
+  `BACKUP_S3_KEEP_DAYS`, `BACKUP_VERIFY_*`, `CONFIG_HISTORY_*`, `SMS_*`, `TELEGRAM_CUSTOMER_BOT_*`, `BALE_*`,
+  `NOTIFY_*`, `IMPORT_*`, `ARVAN_API_URL`, `CLOUDFLARE_API_URL`, `RUM_RETENTION_DAYS`, `PROVISIONING_ENABLED`,
+  `PROVISIONER_TOKEN`, `PROVISION_*`, `JOIN_TOKEN_HOURS`, `ABUSE_*`, `SLO_*`.
+- New endpoints: `GET /edge/releases`, `GET /edge/releases/{v}.sha256`, `?version=` on
+  `/edge/bundle.tar.gz`, `POST /edge/v1/join`; `GET /api/v1/releases`, `POST|GET /api/v1/rollouts`,
+  `GET /api/v1/rollouts/{id}`, `POST /api/v1/rollouts/{id}/{start|pause|resume|abort|rollback}`,
+  `POST /api/v1/rollouts/{id}/edges/{eid}/{skip|force|retry}`; `GET /api/v1/backups`,
+  `POST /api/v1/backups/{run|verify}`; `GET …/config/history`, `GET …/config/history/{v}`,
+  `GET …/config/history/{v}/diff`, `POST …/config/history/{v}/restore` (admin + capi);
+  `/api/v1/accounts/{client_id}/alerts` (+ `/subscriptions`, `/targets/…`, `/test`),
+  `GET /api/v1/notifications/outbox`, `POST /api/v1/notifications/outbox/ack`,
+  `GET /api/v1/notifications/status`, `GET /capi/v1/alerts`; `POST …/import/preview|apply`,
+  `DELETE …/import/{id}` (admin + capi); `GET …/rum` (+ capi); `GET …/diagnostics` (+ capi);
+  `/api/v1/provisioning/proposals` (+ `approve|apply|reject`), `/api/v1/provisioner/jobs/…`,
+  `POST /api/v1/edges/{id}/join-token`; `GET|POST /public/v1/abuse/…`, `/api/v1/abuse/reports` (+ PATCH,
+  `notify`, `action`); `GET /api/v1/slo`; `GET /api/v1/edges?tag=`.
+- New edge config keys: `node.upgrade`, `node.public_tag`, per-site `rum`. Heartbeat: `release`,
+  `upgrade`, capabilities `self_upgrade`, `rum`. Usage `rum`; live `oe`, `pe`. agent.conf: `RUM_ASN_DB`,
+  `RUM_REGION_DB`, `UPGRADE_DIR`, `RELEASES_DIR`, `SELF_UPGRADE`.
+- Ownership: A = `controller/**` + API/OPERATIONS/MONITORING/SECURITY/UPGRADE/DISASTER_RECOVERY/NODES docs +
+  CHANGELOG; B = `edge/**` + `tests/integration/**` + `docs/EDGE.md`; C = `whmcs/**` + `docs/WHMCS.md`;
+  D = `VERSION`, `tools/**`, `terraform/**`, `cli/**`, `status/**`, `deploy/**`, `.github/workflows/**`
+  (additions only), `mkdocs.yml`, `docs-site/**`, `docs/RELEASE.md` (new) + ROLLOUT/LOADTEST/STAGING/
+  TERRAFORM/CLI docs.
+- Merging the wave PRs to `main`, tagging and publishing a release require the owner's explicit
+  confirmation; no agent does it.
