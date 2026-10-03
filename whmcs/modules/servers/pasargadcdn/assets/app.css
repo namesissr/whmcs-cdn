@@ -1680,3 +1680,39 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-xfer-agree input { width: 18px; height: 18px; margin-top: 3px; flex: none; accent-color: var(--pc-brand); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-xfer-quote { margin: 8px 0; padding: 8px 12px; border-inline-start: 3px solid var(--pc-border); background: var(--pc-surface-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-xfer-table td { overflow-wrap: anywhere; }
+
+/* ---------------------------------------------------------------- wave 13 (SPEC §22): multi-origin editor, timeouts, guide, drops */
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-multi-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-multi-head h5 { margin: 0; font-size: 14px; font-weight: 700; flex: 1; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origins { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin { display: flex; align-items: flex-start; gap: 8px; padding: 10px; border: 1px solid var(--pc-border); border-radius: 10px; background: var(--pc-surface); min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin.is-backup { border-style: dashed; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin > .pcdn-rule-no { margin-top: 30px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin-fields { flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr) minmax(0, .8fr) minmax(0, 1.4fr); gap: 8px 10px; align-items: end; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin-fields > .pcdn-toggle { border-bottom: 0; padding: 0 0 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin-ctl { display: flex; flex-direction: column; gap: 2px; flex: none; margin-top: 22px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-timeouts { color: var(--pc-muted); font-size: 12.5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-timeouts .pcdn-icon { width: 15px; height: 15px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-recline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 8px 0 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-recline .pcdn-icon { width: 16px; height: 16px; flex: none; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tn-h3 { margin-top: 10px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tg-appseg { flex-wrap: wrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tg-table td:first-child { white-space: nowrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tg-val { font-family: var(--pc-mono); font-size: 12.5px; overflow-wrap: anywhere; word-break: break-word; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tg-val.is-text { font-family: inherit; font-size: inherit; font-weight: 600; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tg-support td, :is(#pcdn-app, #pcdn-layer) .pcdn-tg-support th { white-space: nowrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tq-sub { margin: 18px 0 8px; font-size: 14px; font-weight: 700; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tq-reasons { margin-top: 12px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tq-reasons li.is-zero { opacity: .55; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tq-reasons .pcdn-barlist-label { align-items: center; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tq-reason-why { margin: 4px 0 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-tq-maint li { margin-bottom: 4px; }
+@media (max-width: 640px) {
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin-fields { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin-fields > .pcdn-tn-o-addr { grid-column: 1 / -1; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin > .pcdn-rule-no { margin-top: 2px; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tn-origin-ctl { margin-top: 0; }
+  :is(#pcdn-app, #pcdn-layer) .pcdn-tg-table td:first-child { white-space: normal; }
+}
+#pcdn-app.pc-narrow .pcdn-tn-origin-fields { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+#pcdn-app.pc-narrow .pcdn-tn-origin-fields > .pcdn-tn-o-addr { grid-column: 1 / -1; }

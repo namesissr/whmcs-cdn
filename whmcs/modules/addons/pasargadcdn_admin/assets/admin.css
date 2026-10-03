@@ -638,3 +638,16 @@
   .pcdna .pcdna-fo-table tr.is-overridden > td:first-child { box-shadow: none; }
   .pcdna .pcdna-fo-table .pcdna-input { max-width: 100%; }
 }
+
+/* ---------- Wave 13 (§22): node drain, tunnel probe, per-node HTTP/3, node detail «پایداری تونل» */
+.pcdna .pcdna-edge-drain .pcdna-menu-list { min-width: 260px; padding: 10px; }
+.pcdna .pcdna-drain-form .pcdna-alert { margin: 0; }
+.pcdna .pcdna-h3-btn[data-h3="nocap"] { cursor: not-allowed; }
+.pcdna .pcdna-drain { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.pcdna .pcdna-countdown { font-variant-numeric: tabular-nums; }
+.pcdna .pcdna-edges td.pcdna-probe-cell { white-space: nowrap; }
+.pcdna .pcdna-weight { margin-top: 3px; }
+.pcdna .pcdna-detail-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.pcdna .pcdna-detail-title { font-size: 18px; margin: 0; font-weight: 700; }
+.pcdna .pcdna-edge-detail .pcdna-form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; position: relative; }
+.pcdna .pcdna-probe-table td[dir="ltr"], .pcdna .pcdna-tuning-table td { white-space: nowrap; }

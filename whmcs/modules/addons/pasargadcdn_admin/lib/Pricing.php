@@ -39,6 +39,7 @@ final class Pricing
         'dnssec' => ['DNSSEC', 'DNSSEC', 'bool'],
         'tunnel' => ['تونل (VPN پشت CDN)', 'Tunnel (VPN over CDN)', 'bool'],
         'max_tunnel_paths' => ['مسیر تونل', 'Tunnel paths', 'num'],
+        'max_tunnel_origins' => ['مبدأ هر مسیر تونل (جایگزینی خودکار)', 'Origins per tunnel path (automatic failover)', 'num'],
         'waiting_room' => ['اتاق انتظار', 'Waiting room', 'bool'],
         'access' => ['دسترسی محافظت‌شده', 'Protected access', 'bool'],
     ];
@@ -186,6 +187,10 @@ final class Pricing
             foreach (self::FEATURES as $k => [, , $kind]) {
                 $feat[$k] = $kind === 'bool' ? !empty($f[$k]) : (int) ($f[$k] ?? 0);
             }
+            // SPEC §22.4: a tunnel plan without the «Tunnel Origins» option gets the controller default (1 origin per path)
+            if (!empty($f['tunnel']) && $feat['max_tunnel_origins'] <= 0) {
+                $feat['max_tunnel_origins'] = 1;
+            }
             $plans[] = ['id' => (int) $p->id, 'name' => (string) $p->name, 'monthly' => $m, 'annually' => $a,
                 'quota_gb' => $quota, 'features' => $feat,
                 'order_url' => ['monthly' => $m !== null ? 'cart.php?a=add&pid=' . (int) $p->id . '&billingcycle=monthly' : null,
@@ -311,7 +316,7 @@ final class Pricing
                 $v = $p['features'][$k];
                 $h .= '<td>' . ($kind === 'bool' ? '<span class="' . ($v ? 'pp-y' : 'pp-n') . '" role="img" aria-label="' . self::e(self::tx($v ? 'yes' : 'no', $lang))
                     . '" title="' . self::e(self::tx($v ? 'yes' : 'no', $lang)) . '">' . ($v ? '✓' : '✗') . '</span>'
-                    : self::e($v > 0 ? self::num($v, $lang) : ($k === 'max_tunnel_paths' || $k === 'max_records' ? self::tx('na', $lang) : self::num(0, $lang)))) . '</td>';
+                    : self::e($v > 0 ? self::num($v, $lang) : ($k === 'max_tunnel_paths' || $k === 'max_tunnel_origins' || $k === 'max_records' ? self::tx('na', $lang) : self::num(0, $lang)))) . '</td>';
             }
             $h .= '</tr>';
         }

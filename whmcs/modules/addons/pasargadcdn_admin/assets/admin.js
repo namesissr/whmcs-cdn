@@ -203,4 +203,19 @@
       });
     });
   });
+
+  // SPEC §22.1: live countdown of a node drain («۱۲:۰۵ مانده») next to «در حال تخلیه (تا HH:MM)».
+  var cds = root.querySelectorAll('[data-countdown]');
+  if (cds.length) {
+    var tick = function () {
+      Array.prototype.forEach.call(cds, function (el) {
+        var t = Date.parse(el.getAttribute('data-countdown') || '');
+        if (isNaN(t)) return;
+        var s = Math.round((t - Date.now()) / 1000);
+        el.textContent = s <= 0 ? 'رو به پایان' : faNum(Math.floor(s / 60)) + ':' + (s % 60 < 10 ? '۰' : '') + faNum(s % 60) + ' مانده';
+      });
+    };
+    tick();
+    window.setInterval(tick, 1000);
+  }
 })();

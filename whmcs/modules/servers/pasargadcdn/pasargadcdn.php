@@ -116,6 +116,7 @@ function pasargadcdn_ConfigOptions()
  *   Storage GB — number / dropdown «50|50 GB» (SPEC §16.8 features.storage_gb)
  *   Edge Functions — yes/no; Max Functions — number (SPEC §16.9 features.edge_functions / max_functions)
  *   Secondary DNS — yes/no (security review H1: features.dns_secondary, default off on the controller)
+ *   Tunnel Origins — number 1..10 (SPEC §22.4 features.max_tunnel_origins: origins per tunnel path, controller default 1)
  * Products saved before v2 have empty configoption5..14, i.e. every v2
  * feature off / 0 until the admin ticks them; likewise products saved before
  * tunnel mode (configoption15..19 empty) get tunnel off, group "general".
@@ -215,6 +216,12 @@ function pasargadcdn_plan(array $params): array
     // without the feature never receives the key; Features is extra="forbid").
     if (isset($co['Secondary DNS'])) {
         $plan['features']['dns_secondary'] = (bool) $co['Secondary DNS'];
+    }
+    // SPEC §22.4 (wave 13): configurable option «Tunnel Origins» (number) → features.max_tunnel_origins (origins per tunnel path
+    // with automatic failover), sent ONLY when the product has the option (older controllers: Features extra="forbid"; without it
+    // the controller default 1 = one origin per path applies). Clamped to the controller's 1..10.
+    if (isset($co['Tunnel Origins']) && $co['Tunnel Origins'] !== '') {
+        $plan['features']['max_tunnel_origins'] = min(10, max(1, (int) $co['Tunnel Origins']));
     }
     // Wave 10 (SPEC §18.1 / §18.2): plan features waiting_room / access from configoption20 / 21 (on | off; auto
     // or empty = not sent), overridable per service by the yes/no configurable options «Waiting Room» / «Access».
@@ -1141,6 +1148,9 @@ function pasargadcdn_features_text(array $f): string
         $txt .= sprintf(' · tunnel: %d paths, %s conns, %s Mbps', $f['max_tunnel_paths'] ?? 0,
             !empty($f['max_tunnel_connections']) ? (string) $f['max_tunnel_connections'] : '∞',
             !empty($f['tunnel_max_mbps']) ? (string) $f['tunnel_max_mbps'] : '∞');
+        if (isset($f['max_tunnel_origins']) && (int) $f['max_tunnel_origins'] > 1) {
+            $txt .= sprintf(', %d origins/path', (int) $f['max_tunnel_origins']);
+        }
     }
     if (!empty($f['l4_proxy'])) {
         $txt .= sprintf(' · TCP/UDP: %d apps', $f['max_l4_apps'] ?? 0);
@@ -1294,7 +1304,7 @@ function pasargadcdn_assets(string $base, string $lang = 'fa'): array
         'css' => $base . '/assets/app.css?v=' . $ver('assets/app.css'),
         'scripts' => array_map(function ($f) use ($base, $ver) {
             return $base . '/assets/' . $f . '?v=' . $ver('assets/' . $f);
-        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'waflearn.js', 'w10.js', 'tutorials.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'sharing.js', 'xfer.js', 'reseller.js', 'app.js'])),
+        }, array_merge($lang === 'en' ? ['i18n-en.js'] : [], ['i18n.js', 'ui.js', 'pages.js', 'rules.js', 'reports.js', 'platform.js', 'w8.js', 'storage.js', 'functions.js', 'waflearn.js', 'w10.js', 'tutorials.js', 'tguide.js', 'tunnel.js', 'tcheck.js', 'tunnelq.js', 'apikeys.js', 'usage.js', 'statement.js', 'growth.js', 'sharing.js', 'xfer.js', 'reseller.js', 'app.js'])),
     ];
 }
 

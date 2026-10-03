@@ -286,6 +286,12 @@ final class Admin
             case 'edge_rotate':
             case 'edge_delete':
                 return self::edgeAction($action, (int) ($post['id'] ?? 0), (string) ($post['enabled'] ?? ''), $admin);
+            case 'edge_drain':
+                return self::edgeDrain($post, $admin);
+            case 'edge_undrain':
+                return self::edgeUndrain($post, $admin);
+            case 'edge_http3':
+                return self::edgeHttp3($post, $admin);
             case 'edge_addr_add':
                 return self::edgeAddrAdd($post, $admin);
             case 'edge_addr_edit':
@@ -683,6 +689,109 @@ final class Admin
         } catch (\Throwable $e) {
             return [[['bad', View::e('عملیات روی نود ناموفق بود: ' . $e->getMessage())]], []];
         }
+    }
+
+    // ------------------------------------------------------------------ SPEC §22 (wave 13): drain before upgrade, per-node HTTP/3
+
+    /** Minutes of a drain: 1..120 (Persian digits accepted), default 15 when empty; null when invalid. */
+    public static function drainMinutes(string $v): ?int
+    {
+        $v = trim(strtr($v, ['۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4', '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9']));
+        if ($v === '') {
+            return 15;
+        }
+        return ctype_digit($v) && strlen($v) <= 3 && (int) $v >= 1 && (int) $v <= 120 ? (int) $v : null;
+    }
+
+    /**
+     * «تخلیه برای به‌روزرسانی…» (SPEC §22.1): POST /api/v1/edges/{id}/drain {minutes, reason, force}. The node leaves DNS now and
+     * refuses NEW tunnel connections after the DNS grace; established sessions keep running. 409 last_edge → the form comes back
+     * open with the «با این حال تخلیه کن» (force) checkbox; a re-POST while draining only moves drain_until.
+     */
+    private static function edgeDrain(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $min = self::drainMinutes(Env::input($post['minutes'] ?? ''));
+        $reason = trim(Env::input($post['reason'] ?? ''));
+        $force = ($post['force'] ?? '') === '1';
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        if ($min === null) {
+            return [[['bad', 'مدت تخلیه باید عددی بین ۱ تا ۱۲۰ دقیقه باشد.']], []];
+        }
+        if ($reason !== '' && (mb_strlen($reason) > 64 || preg_match('/[\x00-\x1F\x7F]/', $reason))) {
+            return [[['bad', 'دلیل تخلیه حداکثر ۶۴ نویسهٔ قابل‌چاپ باشد.']], []];
+        }
+        $body = ['minutes' => $min, 'reason' => $reason !== '' ? $reason : 'admin', 'force' => $force];
+        try {
+            $r = Env::api(15)->request('POST', '/api/v1/edges/' . $id . '/drain', $body);
+        } catch (\Throwable $e) {
+            $code = (int) $e->getCode();
+            if ($code === 409 && $e->getMessage() === 'last_edge') {
+                Pages::$drainForce = $id;
+                Pages::$drainForceIn = ['minutes' => $min, 'reason' => $reason];
+                return [[['warn', 'آخرین نود فعال این گروه/منطقه است؛ تخلیه انجام نشد. اگر مطمئنید، در کادر «تخلیهٔ نود» گزینهٔ «با این حال تخلیه کن» را بزنید.']], []];
+            }
+            if ($code === 409 && $e->getMessage() === 'already_draining') {
+                return [[['warn', 'این نود همین حالا در حال تخلیه است.']], []];
+            }
+            if ($code === 404) {
+                return [[['bad', 'نودی با این شناسه پیدا نشد (یا کنترلر هنوز تخلیه را پشتیبانی نمی‌کند).']], []];
+            }
+            return [[['bad', View::e('تخلیهٔ نود ناموفق بود: ' . $e->getMessage())]], []];
+        }
+        $edge = is_array($r['edge'] ?? null) ? $r['edge'] : [];
+        $name = (string) ($edge['name'] ?? '#' . $id);
+        $until = is_array($edge['drain'] ?? null) ? ($edge['drain']['until'] ?? null) : null;
+        Env::log('edge ' . $name . ' drain started for ' . $min . ' min (reason: ' . $body['reason'] . ($force ? ', forced' : '') . ') by admin #' . $admin);
+        Pages::reset();
+        $dnsFailed = (int) ($r['dns_failed'] ?? 0);
+        return [[['ok', 'نود ' . View::ltr($name) . ' در حال تخلیه است' . ($until ? ' (تا ' . View::e(Pages::hm($until)) . ')' : '')
+            . '؛ از DNS خارج شد و پس از مهلت DNS اتصال تونلی تازه نمی‌پذیرد. نشست‌های برقرار ادامه دارند.'
+            . ($dnsFailed > 0 ? ' به‌روزرسانی DNS برای ' . View::n($dnsFailed) . ' سایت ناموفق بود و در دور بعدی تکرار می‌شود.' : '')]], []];
+    }
+
+    /** «لغو تخلیه» (SPEC §22.1): DELETE /api/v1/edges/{id}/drain — idempotent; the node returns to DNS. */
+    private static function edgeUndrain(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        try {
+            $r = Env::api(15)->request('DELETE', '/api/v1/edges/' . $id . '/drain');
+        } catch (\Throwable $e) {
+            return [[['bad', View::e('لغو تخلیهٔ نود ناموفق بود: ' . $e->getMessage())]], []];
+        }
+        $name = is_array($r['edge'] ?? null) ? (string) ($r['edge']['name'] ?? '#' . $id) : '#' . $id;
+        Env::log('edge ' . $name . ' undrained by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', 'تخلیهٔ نود ' . View::ltr($name) . ' لغو شد؛ نود دوباره در پاسخ DNS قرار می‌گیرد.']], []];
+    }
+
+    /** Per-node HTTP/3 switch (SPEC §22.9): PATCH /api/v1/edges/{id} {"http3_enabled": bool}. */
+    private static function edgeHttp3(array $post, int $admin): array
+    {
+        $id = (int) ($post['id'] ?? 0);
+        $v = Env::input($post['http3'] ?? '');
+        if ($id <= 0) {
+            return [[['bad', 'شناسه نود نامعتبر است.']], []];
+        }
+        if ($v !== '1' && $v !== '0') {
+            return [[['bad', 'مقدار HTTP/3 نامعتبر است.']], []];
+        }
+        $on = $v === '1';
+        try {
+            $r = Env::api(10)->request('PATCH', '/api/v1/edges/' . $id, ['http3_enabled' => $on]);
+        } catch (\Throwable $e) {
+            return [[['bad', View::e('تغییر HTTP/3 نود ناموفق بود: ' . $e->getMessage())]], []];
+        }
+        $name = is_array($r['edge'] ?? null) ? (string) ($r['edge']['name'] ?? '#' . $id) : '#' . $id;
+        Env::log('edge ' . $name . ' HTTP/3 ' . ($on ? 'enabled' : 'disabled') . ' by admin #' . $admin);
+        Pages::reset();
+        return [[['ok', $on ? 'HTTP/3 روی نود ' . View::ltr($name) . ' روشن شد (اگر nginx نود آن را دارد).'
+            : 'HTTP/3 روی نود ' . View::ltr($name) . ' خاموش شد؛ نسخهٔ HTTP/3 مسیرهای XHTTP برای سایت‌های این گروه دیگر پیشنهاد نمی‌شود.']], []];
     }
 
     // ------------------------------------------------------------------ §12 multi-address edges & health-based failover

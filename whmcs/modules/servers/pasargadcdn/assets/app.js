@@ -89,7 +89,8 @@
     { title: 'DNS', items: ['dns', 'dnssec', 'secondary'] },
     // Wave 7 (SPEC §15.7): quality / usage / speed test appear once the controller answers tunnel/health
     // (tunnelq.js P.w7.probe); the browser-only config checker needs no endpoint.
-    { title: t('تونل'), items: ['tunnel', 'tquality', 'tusage', 'tconfig', 'speedtest'] },
+    // Wave 13 (SPEC §22.11): «تنظیمات پیشنهادی برنامه‌ها» once the controller answers tunnel/profile (tguide.js P.tprofile.probe).
+    { title: t('تونل'), items: ['tunnel', 'tquality', 'tusage', 'tconfig', 'tguide', 'speedtest'] },
     { title: t('عملکرد'), items: ['cache', 'pagerules', 'image', 'video', 'pools'] },
     // Wave 8 (SPEC §16.4 / §16.5): TCP/UDP apps and video delivery, shown only when the controller returns `l4` / `video`.
     { title: 'TCP/UDP', items: ['tcpudp'] },
@@ -1742,12 +1743,16 @@
   renderAll();
   // Wave 7 (SPEC §15): one background GET tunnel/health decides whether the tunnel quality / usage /
   // speed-test pages exist on this controller (an older one 404s and they stay hidden).
-  if (S.site && P.w7 && P.w7.probe) {
-    P.w7.probe().then(function (ok) {
-      if (!ok) return;
-      refreshNav();
-      var w = later && available(later.page) ? later : null;
-      if (w && S.page === 'overview' && /^#pcdn=/.test(window.location.hash || '')) go(w.page, w.sub, { fromHistory: true, fromBoot: true });
-    });
+  function probed(ok) {
+    if (!ok) return;
+    refreshNav();
+    var w = later && available(later.page) ? later : null;
+    if (w && S.page === 'overview' && /^#pcdn=/.test(window.location.hash || '')) go(w.page, w.sub, { fromHistory: true, fromBoot: true });
+    // a page already open (e.g. «تونل») redraws once with the wave-13 pieces it feature-detects
+    if (S.page === 'tunnel' && P.tprofile && P.tprofile.ok() === true && !(S.form && S.form.dirty()) && !document.querySelector('.pcdn-dlg')) renderMain();
   }
+  if (S.site && P.w7 && P.w7.probe) P.w7.probe().then(probed);
+  // Wave 13 (SPEC §22.11): one background GET tunnel/profile on tunnel plans — an older controller 404s and the guide page,
+  // per-path idle timeout, multi-origin editor, timeout checks and the HTTP/3 variant stay hidden.
+  if (S.site && P.tprofile && P.tprofile.probe && features().tunnel) P.tprofile.probe().then(probed);
 })();

@@ -49,6 +49,7 @@ final class FeatureEditor
         'features.max_tunnel_paths' => 'حداکثر مسیر تونل',
         'features.max_tunnel_connections' => 'حداکثر اتصال تونل (۰ = نامحدود)',
         'features.tunnel_max_mbps' => 'سقف سرعت اتصال تونل (Mbps، ۰ = بدون سقف)',
+        'features.max_tunnel_origins' => 'حداکثر مبدأ هر مسیر تونل',
         'features.edge_group' => 'گروه نود',
         'features.max_transform_rules' => 'حداکثر قوانین تبدیل',
         'features.max_redirects' => 'حداکثر ریدایرکت',

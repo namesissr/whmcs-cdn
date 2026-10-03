@@ -1,6 +1,7 @@
 /*
  * Pasargad CDN — Wave 7 (docs/SPEC.md §15) tunnel diagnostics for the client app:
  *   - «کیفیت تونل»        (tquality)  GET tunnel/quality?hours=24|168|720 + GET tunnel/health
+ *                                       + wave 13 (§22.12) «چرا اتصال من قطع شد؟»: GET tunnel/drops?hours=… (hidden on 404)
  *   - «مصرف تونل»          (tusage)    GET tunnel/usage?days=30
  *   - «بررسی کانفیگ سرور»  (tconfig)   browser-only checker (tcheck.js): no network call, nothing stored
  *   - «تست سرعت»           (speedtest) latency / download / upload against the customer's OWN domain
@@ -90,7 +91,8 @@
   }
 
   /** Stacked daily bars (inline SVG, same look as reports.js charts). series: [{name, color, values}] */
-  function stackedBars(host, labels, series, aria) {
+  function stackedBars(host, labels, series, aria, fmt) {
+    fmt = fmt || P.bytes;
     var totals = labels.map(function (_, i) { return series.reduce(function (tx, sr) { return tx + (sr.values[i] || 0); }, 0); });
     var maxV = Math.max.apply(null, [1].concat(totals));
     var p10 = Math.pow(10, Math.floor(Math.log(maxV) / Math.LN10)), nn = maxV / p10;
@@ -104,7 +106,7 @@
     for (var i = 0; i <= 4; i++) {
       var yy = y(max * i / 4);
       svg.appendChild(s('line', { x1: L, x2: W - R, y1: yy, y2: yy, class: i ? 'pcdn-gridline' : 'pcdn-baseline' }));
-      svg.appendChild(s('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'pcdn-axis' }, i ? P.bytes(max * i / 4).replace(/\s*[٫.]0+ /, ' ') : t('۰')));
+      svg.appendChild(s('text', { x: L - 8, y: yy + 4, 'text-anchor': 'end', class: 'pcdn-axis' }, i ? (fmt === P.bytes ? P.bytes(max * i / 4).replace(/\s*[٫.]0+ /, ' ') : fmt(max * i / 4)) : t('۰')));
     }
     var n = labels.length, slot = pw / Math.max(1, n), bw = Math.max(2, Math.min(26, slot * 0.66));
     var step = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / (narrow ? 64 : 80)))));
@@ -121,13 +123,13 @@
         base += v;
       });
       g.appendChild(s('title', {}, lb + ' — ' + series.filter(function (sr) { return sr.values[i2] > 0; })
-        .map(function (sr) { return sr.name + ': ' + P.bytes(sr.values[i2]); }).join(t('، ')) + (totals[i2] ? '' : t(' بدون ترافیک'))));
+        .map(function (sr) { return sr.name + ': ' + fmt(sr.values[i2]); }).join(t('، ')) + (totals[i2] ? '' : fmt === P.bytes ? t(' بدون ترافیک') : '')));
       svg.appendChild(g);
     });
     wrap.appendChild(svg);
     host.appendChild(h('div', { className: 'pcdn-legend' }, series.map(function (sr) {
       var tot = sr.values.reduce(function (tx, v) { return tx + (v || 0); }, 0);
-      return h('span', { className: 'pcdn-legend-item' }, h('span', { className: 'pcdn-key', style: 'background:' + sr.color }), h('span', { text: sr.name }), h('strong', { text: P.bytes(tot) }));
+      return h('span', { className: 'pcdn-legend-item' }, h('span', { className: 'pcdn-key', style: 'background:' + sr.color }), h('span', { text: sr.name }), h('strong', { text: fmt(tot) }));
     })));
   }
 
@@ -145,7 +147,7 @@
   };
   var ERR_KEYS = ['origin_refused', 'origin_timeout', 'origin_error', 'limit', 'country', 'protocol', 'edge'];
 
-  function qState() { var st = S(); return st.tq || (st.tq = { hours: '24', data: {}, at: {} }); }
+  function qState() { var st = S(); return st.tq || (st.tq = { hours: '24', data: {}, at: {}, drops: {}, dropsAt: {}, dropsOk: undefined }); }
 
   function healthBadge(W) {
     var hd = W.health || {}, st = hd.state;
@@ -191,9 +193,32 @@
         draw(holder, Q.data[hours], Number(hours));
       });
     }
+    var dropsSlot = h('div', { className: 'pcdn-tq-drops-slot', 'data-drops-slot': '1' });
+    function loadDrops(force) {
+      if (Q.dropsOk === false) return;   // older controller: section hidden
+      if (!force && Q.drops[hours] && Date.now() - (Q.dropsAt[hours] || 0) < 60000) { setTimeout(function () { if (alive()) drawDrops(dropsSlot, Q.drops[hours], Number(hours)); }, 0); return; }
+      P.api('GET', 'tunnel/drops', undefined, { hours: hours }).then(function (res) {
+        if (!alive()) return;
+        clear(dropsSlot);
+        if (!res.ok) {
+          if (res.status === 404) { Q.dropsOk = false; return; }
+          dropsSlot.appendChild(P.errorBox(res, t('دریافت گزارش دلیل قطع اتصال ممکن نشد')));
+          return;
+        }
+        Q.dropsOk = true;
+        Q.drops[hours] = res.data || {};
+        Q.dropsAt[hours] = Date.now();
+        drawDrops(dropsSlot, Q.drops[hours], Number(hours));
+      });
+    }
+    var load0 = load;
+    load = function (b, force) { load0(b, force); loadDrops(force); };
     load(null, false);
-    S().redrawCharts = function () { if (Q.data[hours] && alive()) draw(holder, Q.data[hours], Number(hours)); };
-    return [bar, healthSlot, holder];
+    S().redrawCharts = function () {
+      if (Q.data[hours] && alive()) draw(holder, Q.data[hours], Number(hours));
+      if (Q.drops[hours] && alive()) drawDrops(dropsSlot, Q.drops[hours], Number(hours));
+    };
+    return [bar, healthSlot, holder, dropsSlot];
   }
   function skeletons() {
     return h('div', { className: 'pcdn-stack' }, h('div', { className: 'pcdn-kpis' }, [1, 2, 3, 4].map(function () { return h('div', { className: 'pcdn-kpi' }, P.skeleton(3)); })),
@@ -300,10 +325,135 @@
         h('div', null, h('dt', { text: t('نشست‌ها') }), h('dd', { text: num(p.sessions || 0) })),
         h('div', null, h('dt', { text: t('قطع غیرعادی') }), h('dd', { text: pct(p.abnormal_pct) })),
         h('div', null, h('dt', { text: t('زمان اتصال به سرور') }), h('dd', { text: ms(p.connect_ms_avg) })),
-        h('div', null, h('dt', { text: t('میانگین طول نشست') }), h('dd', { text: avg > 0 ? P.dur(Math.round(avg)) : NO_DATA }))),
+        h('div', null, h('dt', { text: t('میانگین طول نشست') }), h('dd', { text: avg > 0 ? P.dur(Math.round(avg)) : NO_DATA })),
+        // §22.7: share of connects that reused a kept-alive connection to your server (approximation; null without data)
+        p.reuse_pct !== undefined ? h('div', { 'data-tq-reuse': isNum(p.reuse_pct) ? String(p.reuse_pct) : '' }, h('dt', { text: t('استفاده‌ی دوباره از اتصال به سرور') }),
+          h('dd', { text: pct(p.reuse_pct) })) : null),
       chips.length ? h('div', { className: 'pcdn-tq-chips' }, chips) : null,
       top ? P.alertBox(tone === 'success' ? 'info' : 'warning', [h('strong', { text: t('مشکل اصلی: ') + ISSUE[top][0] + '. ' }), advice || ''], { icon: 'bulb' })
         : (isNum(p.success_pct) ? h('p', { className: 'pcdn-muted pcdn-small', text: t('مشکل قابل توجهی دیده نشد.') }) : null));
+  }
+
+  // ================================================================== «چرا اتصال من قطع شد؟» (§22.12)
+  //
+  // Why accepted tunnel sessions ended, per reason / hour / path, plus rejected reconnects, the plan state and planned node
+  // maintenance — never a node name or address (the controller sends none: `maintenance` rows carry only time + kind).
+
+  var END_KEYS = ['normal', 'idle_timeout', 'origin', 'node_reload', 'node_drain', 'other'];
+  var END = {
+    normal: [t('عادی (برنامه یا سرور شما بست)'), t('برنامه‌ی شما یا سرور شما اتصال را بست (عادی).'), 'var(--pc-c-2xx)'],
+    idle_timeout: [t('مهلت بیکاری'), t('اتصال مدتی بی‌استفاده ماند و پس از مهلت بیکاری بسته شد؛ keepalive برنامه را طبق «تنظیمات پیشنهادی» کم کنید یا مهلت بیکاری مسیر را بیشتر کنید.'), 'var(--pc-c-4xx)'],
+    origin: [t('قطع از سمت سرور شما'), t('سرور شما (Xray/sing-box) اتصال را قطع کرد یا ری‌استارت شد؛ لاگ سرور را بررسی کنید.'), 'var(--pc-c-5xx)'],
+    node_reload: [t('اعمال تنظیمات روی نود'), t('یک نود هنگام اعمال تنظیمات جدید، اتصال‌های بسیار طولانی را پس از مهلت مجاز بست؛ برنامه خودکار دوباره وصل می‌شود.'), 'var(--pc-c-req)'],
+    node_drain: [t('تخلیه‌ی نود برای به‌روزرسانی'), t('نود برای به‌روزرسانی برنامه‌ریزی‌شده تخلیه شد؛ اتصال‌های جدید به نودهای دیگر رفتند.'), 'var(--pc-c-bytes)'],
+    other: [t('خطای لبه'), t('خطای داخلی لبه؛ اگر تکرار شد با پشتیبانی تماس بگیرید.'), 'var(--pc-faint)']
+  };
+
+  function drawDrops(slot, d, hours) {
+    clear(slot);
+    var c = P.card({ title: t('چرا اتصال من قطع شد؟'), icon: 'warn', tone: 'warning', id: 'tq-drops',
+      subtitle: t('دلیل پایان نشست‌های تونل در همین بازه، به زبان ساده.') });
+    slot.appendChild(c);
+    if (!d || d.has_data === false) {
+      c.body.appendChild(P.alertBox('info', t('گزارش دلیل قطع پس از به‌روزرسانی نودها در دسترس است.')));
+      c.body.lastChild.setAttribute('data-drops-nodata', '1');
+      planNotes(c.body, d || {});
+      return;
+    }
+    var reasons = d.reasons && typeof d.reasons === 'object' ? d.reasons : {};
+    var total = isNum(d.total) ? d.total : END_KEYS.reduce(function (a, k) { return a + (Number(reasons[k]) || 0); }, 0);
+    var top = d.top && END[d.top] ? d.top : null;
+    planNotes(c.body, d);
+    if (top) {
+      c.body.appendChild(P.alertBox(top === 'other' || top === 'origin' ? 'warning' : 'info',
+        [h('strong', { text: t('بیشترین دلیل قطع (غیر از عادی): ') + END[top][0] + '. ' }), END[top][1]], { icon: 'bulb' }));
+      c.body.lastChild.setAttribute('data-drops-top', top);
+    } else if (total > 0) {
+      c.body.appendChild(h('p', { className: 'pcdn-muted pcdn-small', 'data-drops-top': '', text: t('بیشتر نشست‌ها عادی بسته شده‌اند؛ دلیل غیرعادی قابل توجهی دیده نشد.') }));
+    }
+    if (!total) {
+      c.body.appendChild(P.empty('activity', t('در این بازه نشستی پایان نیافته است'), null));
+      rejectedNotes(c.body, d);
+      return;
+    }
+    // reasons: bars with count, share and the plain-language explanation
+    var keys = END_KEYS.slice().sort(function (a, b) { return (Number(reasons[b]) || 0) - (Number(reasons[a]) || 0); });
+    var max = Math.max(1, Number(reasons[keys[0]]) || 0);
+    c.body.appendChild(h('ul', { className: 'pcdn-barlist pcdn-tq-reasons', 'data-drops-reasons': '1' }, keys.map(function (k) {
+      var v = Number(reasons[k]) || 0;
+      return h('li', { 'data-reason': k, className: v ? '' : 'is-zero' },
+        h('div', { className: 'pcdn-barlist-row' },
+          h('span', { className: 'pcdn-barlist-label' }, h('span', { className: 'pcdn-key', style: 'background:' + END[k][2] }), h('span', { text: END[k][0] })),
+          h('span', { className: 'pcdn-barlist-val' }, h('strong', { text: num(v) }), h('span', { className: 'pcdn-muted', text: P.pct(v, total) }))),
+        h('span', { className: 'pcdn-barlist-track' }, h('span', { className: 'pcdn-barlist-bar', style: 'width:' + (v ? Math.max(1, Math.round(v * 100 / max)) : 0) + '%;background:' + END[k][2] })),
+        v && k !== 'normal' ? h('p', { className: 'pcdn-muted pcdn-small pcdn-tq-reason-why', text: END[k][1] }) : null);
+    })));
+    // hourly stacked series (4-hourly for 7 days, daily for 30)
+    var series = Array.isArray(d.series) ? d.series.filter(function (x) { return x && typeof x === 'object'; }) : [];
+    var size = hours <= 48 ? 1 : hours <= 168 ? 4 : 24, pts = [];
+    for (var i = 0; i < series.length; i += size) {
+      var b = { t: series[i].t };
+      END_KEYS.forEach(function (k) { b[k] = 0; });
+      for (var j = i; j < Math.min(series.length, i + size); j++) END_KEYS.forEach(function (k) { b[k] += Number(series[j][k]) || 0; });
+      pts.push(b);
+    }
+    if (pts.some(function (x) { return END_KEYS.some(function (k) { return x[k] > 0; }); })) {
+      var ch = h('div', { className: 'pcdn-tq-drops-chart', 'data-drops-chart': '1' });
+      c.body.appendChild(h('h4', { className: 'pcdn-tq-sub', text: t('روند قطع‌ها') }));
+      c.body.appendChild(ch);
+      stackedBars(ch, pts.map(function (x) { return size >= 24 ? P.date(x.t, { month: 'short', day: 'numeric' }) : P.date(x.t, hours <= 48 ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', hour: '2-digit' }); }),
+        END_KEYS.map(function (k) { return { name: END[k][0], color: END[k][2], values: pts.map(function (x) { return x[k]; }) }; }),
+        t('نمودار دلیل پایان نشست‌های تونل'), function (v) { return num(Math.round(v)); });
+    }
+    // per path: total + top reason
+    var paths = Array.isArray(d.paths) ? d.paths.filter(function (p) { return p && typeof p === 'object'; }) : [];
+    if (paths.length) {
+      var names = pathNames();
+      var tbody = h('tbody');
+      paths.forEach(function (p) {
+        var tp = p.top && END[p.top] ? p.top : null;
+        tbody.appendChild(h('tr', { 'data-drops-path': String(p.id || '') },
+          h('td', { 'data-label': t('مسیر') }, h('bdi', { dir: 'ltr', className: 'pcdn-tn-pathval', text: names[p.id] || String(p.id || '—') })),
+          h('td', { 'data-label': t('نشست‌های پایان‌یافته'), className: 'pcdn-num', text: num(p.total || 0) }),
+          h('td', { 'data-label': t('دلیل اصلی') }, tp ? P.badge(END[tp][0], tp === 'other' || tp === 'origin' ? 'danger' : 'warning') : h('span', { className: 'pcdn-muted', text: t('عادی') }))));
+      });
+      c.body.appendChild(h('h4', { className: 'pcdn-tq-sub', text: t('به تفکیک مسیر') }));
+      c.body.appendChild(h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table pcdn-rtable pcdn-tq-droppaths' },
+        h('caption', { className: 'pcdn-sr', text: t('دلیل قطع به تفکیک مسیر') }),
+        h('thead', null, h('tr', null, [t('مسیر'), t('نشست‌های پایان‌یافته'), t('دلیل اصلی')].map(function (x) { return h('th', { scope: 'col', text: x }); }))),
+        tbody)));
+    }
+    rejectedNotes(c.body, d);
+    // planned maintenance (time + kind only)
+    var mt = Array.isArray(d.maintenance) ? d.maintenance.filter(function (m) { return m && m.t; }) : [];
+    if (mt.length) {
+      c.body.appendChild(h('h4', { className: 'pcdn-tq-sub', text: t('نگهداری برنامه‌ریزی‌شده‌ی نودها در این بازه') }));
+      c.body.appendChild(h('ul', { className: 'pcdn-ul pcdn-tq-maint', 'data-drops-maint': String(mt.length) }, mt.slice(0, 20).map(function (m) {
+        return h('li', null, h('time', { dateTime: String(m.t), text: P.date(m.t, { dateStyle: 'medium', timeStyle: 'short' }) }), ' — ',
+          h('span', { text: m.kind === 'upgrade' ? t('به‌روزرسانی یک نود (اتصال‌ها پیش از آن به نودهای دیگر منتقل شدند)') : t('تخلیه‌ی یک نود برای نگهداری') }));
+      })));
+    }
+  }
+  function planNotes(body, d) {
+    var pl = d.plan && typeof d.plan === 'object' ? d.plan : {};
+    if (pl.over_quota_since) {
+      body.appendChild(P.alertBox('danger', [h('strong', { text: t('ترافیک ماهانه‌ی سرویس تمام شده است.') + ' ' }),
+        t('از {0} اتصال‌های تازه پذیرفته نمی‌شوند؛ ترافیک افزوده بخرید یا پلن را ارتقا دهید.', P.date(pl.over_quota_since, { dateStyle: 'medium', timeStyle: 'short' }))]));
+      body.lastChild.setAttribute('data-drops-plan', 'over_quota');
+    } else if (pl.suspended) {
+      body.appendChild(P.alertBox('danger', t('سرویس معلق است و اتصال تونلی پذیرفته نمی‌شود.')));
+      body.lastChild.setAttribute('data-drops-plan', 'suspended');
+    }
+  }
+  function rejectedNotes(body, d) {
+    var r = d.rejected && typeof d.rejected === 'object' ? d.rejected : {};
+    var items = [];
+    if (Number(r.limit) > 0) items.push(['limit', num(r.limit) + ' — ' + t('تلاش‌های اتصال دوباره به سقف اتصال پلن یا سهم منصفانه‌ی نود خورد.')]);
+    if (Number(r.origin_refused) > 0) items.push(['origin_refused', num(r.origin_refused) + ' — ' + t('سرور شما اتصال دوباره را رد کرد.')]);
+    if (Number(r.origin_timeout) > 0) items.push(['origin_timeout', num(r.origin_timeout) + ' — ' + t('سرور شما به اتصال دوباره در زمان مناسب پاسخ نداد.')]);
+    if (!items.length) return;
+    body.appendChild(h('div', { className: 'pcdn-tq-rejected', 'data-drops-rejected': '1' }, h('h4', { className: 'pcdn-tq-sub', text: t('تلاش‌های اتصال دوباره که پذیرفته نشدند') }),
+      h('ul', { className: 'pcdn-ul' }, items.map(function (x) { return h('li', { 'data-rejected': x[0], text: x[1] }); }))));
   }
 
   // ================================================================== «مصرف تونل» (§15.3 usage)
@@ -414,13 +564,23 @@
     var hosts = P.tunnelHosts ? P.tunnelHosts() : [];
     return { domain: site().domain, paths: list.filter(function (p) { return p && p.path; }).map(function (p) {
       var ports = [], tls = false;
-      var cands = p.origin || p.pool ? [null] : (hosts.length ? hosts : [null]);
+      var cands = p.origin || p.pool || (Array.isArray(p.origins) && p.origins.length) ? [null] : (hosts.length ? hosts : [null]);
+      var many = Array.isArray(p.origins) && p.origins.length > 0;
       cands.forEach(function (hn) {
         var l = P.tunnelListen ? P.tunnelListen(p, hn) : { port: p.origin ? Number(p.origin.port) || (p.origin.tls ? 443 : 80) : 80, tls: !!(p.origin && p.origin.tls) };
-        if (ports.indexOf(l.port) < 0) ports.push(l.port);
+        // §22.4: every origin of a multi-origin path is a valid listen port
+        (many && P.tunnelPorts ? P.tunnelPorts(p, hn) : [l.port]).forEach(function (v) { if (ports.indexOf(v) < 0) ports.push(v); });
         tls = l.tls;
       });
-      return { id: String(p.id || ''), path: String(p.path), protocol: String(p.protocol || ''), ports: ports, tls: tls, mode: p.pool ? 'pool' : p.origin ? 'custom' : 'site' };
+      var out = { id: String(p.id || ''), path: String(p.path), protocol: String(p.protocol || ''), ports: ports, tls: tls,
+        mode: many ? 'multi' : p.pool ? 'pool' : p.origin ? 'custom' : 'site' };
+      // §22.5: edge idle timeout + recommended keepalive of the saved path (wave-13 controllers only; read from the cached profile — no request)
+      var pp = P.tprofile && P.tprofile.ok() === true ? P.tprofile.path(out.id) : null;
+      if (pp && isNum(pp.idle_timeout_s)) {
+        out.idle_timeout_s = pp.idle_timeout_s;
+        out.keepalive_s = pp.recommended && isNum(pp.recommended.keepalive_s) ? pp.recommended.keepalive_s : (P.tguide ? P.tguide.keepalive(pp.idle_timeout_s, P.tprofile.edge().client_idle_s) : null);
+      }
+      return out;
     }) };
   }
 
@@ -442,6 +602,7 @@
       if (!C) { result.appendChild(P.alertBox('danger', t('بررسی‌کننده بارگذاری نشد؛ صفحه را دوباره باز کنید.'))); return; }
       var text = ta.value;
       if (text.length > MAX_CFG) { result.appendChild(P.alertBox('danger', t('کانفیگ بیش از حد بزرگ است.'))); return; }
+      ctx = checkCtx();   // wave 13: the profile (edge idle timeouts) may have arrived after the page was drawn — cached, no request
       var r = C.run(text, ctx);
       result.appendChild(resultView(r, ctx));
       var first = result.querySelector('.pcdn-tc-summary');
@@ -456,16 +617,19 @@
     if (!ctx.paths.length) ref.body.appendChild(P.alertBox('warning', [t('هنوز مسیر تونلی ذخیره نشده است. '), Aa.goLink('tunnel', t('ساخت مسیر در صفحه تونل'))]));
     else {
       var tbody = h('tbody');
+      var withIdle = ctx.paths.some(function (p) { return isNum(p.idle_timeout_s); });
       ctx.paths.forEach(function (p) {
         tbody.appendChild(h('tr', { 'data-tc-path': p.id },
           h('td', { 'data-label': t('مسیر') }, h('bdi', { dir: 'ltr', className: 'pcdn-tn-pathval', text: p.path })),
           h('td', { 'data-label': t('پروتکل') }, protoBadge(p.protocol)),
           h('td', { 'data-label': t('پورت مورد انتظار') }, h('bdi', { dir: 'ltr', text: p.ports.join(' / ') })),
-          h('td', { 'data-label': t('TLS روی سرور') }, h('span', { text: p.tls ? t('بله (security: tls)') : t('خیر (security: none)') }))));
+          h('td', { 'data-label': t('TLS روی سرور') }, h('span', { text: p.tls ? t('بله (security: tls)') : t('خیر (security: none)') })),
+          withIdle ? h('td', { 'data-label': t('مهلت بیکاری لبه / keepalive') }, h('span', { text: isNum(p.idle_timeout_s) ? P.dur(p.idle_timeout_s) + ' / ' + num(p.keepalive_s) + t(' ثانیه') : '—' })) : null));
       });
       ref.body.appendChild(h('div', { className: 'pcdn-table-wrap' }, h('table', { className: 'pcdn-table pcdn-rtable' },
         h('caption', { className: 'pcdn-sr', text: t('مسیرهای تونل سایت') }),
-        h('thead', null, h('tr', null, [t('مسیر'), t('پروتکل'), t('پورت مورد انتظار'), t('TLS روی سرور')].map(function (tx) { return h('th', { scope: 'col', text: tx }); }))),
+        h('thead', null, h('tr', null, [t('مسیر'), t('پروتکل'), t('پورت مورد انتظار'), t('TLS روی سرور')].concat(withIdle ? [t('مهلت بیکاری لبه / keepalive')] : [])
+          .map(function (tx) { return h('th', { scope: 'col', text: tx }); }))),
         tbody)));
     }
     out.push(ref);

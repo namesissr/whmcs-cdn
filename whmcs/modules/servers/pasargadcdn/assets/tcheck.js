@@ -7,7 +7,10 @@
  * the checker returns goes through mask().
  *
  *   PCDN.tunnelCheck.run(text, ctx) → {ok, kind: 'xray'|'singbox'|null, error, findings: [...], summary}
- *     ctx = {domain, paths: [{id, path, protocol, ports: [int], tls: bool, mode: 'site'|'custom'|'pool'}]}
+ *     ctx = {domain, paths: [{id, path, protocol, ports: [int], tls: bool, mode: 'site'|'custom'|'pool'|'multi',
+ *                             idle_timeout_s?: int, keepalive_s?: int}]}
+ *       idle_timeout_s / keepalive_s come from GET tunnel/profile (wave 13, §22.5); without them (older controller) the
+ *       keepalive / idle-timeout findings (codes timeout.*) are skipped.
  *     finding = {level: 'error'|'warning'|'ok'|'info', code, title, fix|null, inbound|null, path|null}
  *   PCDN.tunnelCheck.mask(text) → text with secrets shortened (…ab12)
  *   PCDN.tunnelCheck.parse(text) → {data} | {error, line, col, near}
@@ -18,7 +21,7 @@
   'use strict';
   var P = root.PCDN = root.PCDN || {};
   // i18n.js (SPEC §16.10); identity outside the browser (node unit tests)
-  var t = P.t || function (s) { return s; };
+  var t = P.t || function (s) { var a = arguments; return String(s).replace(/\{(\d+)\}/g, function (m, i) { return a[+i + 1] === undefined ? m : String(a[+i + 1]); }); };
 
   // ------------------------------------------------------------------ masking
 
@@ -108,6 +111,16 @@
 
   function obj(x) { return x && typeof x === 'object' && !Array.isArray(x) ? x : null; }
   function str(x) { return typeof x === 'string' ? x : x === undefined || x === null ? '' : String(x); }
+  /** Seconds of an Xray integer / sing-box duration string ("60s", "1m30s", "500ms"); null when unknown. */
+  function secsOf(v) {
+    if (typeof v === 'number' && isFinite(v)) return v;
+    if (typeof v !== 'string' || !v.trim()) return null;
+    var x = v.trim();
+    if (/^\d+(\.\d+)?$/.test(x)) return Number(x);
+    var re = /(\d+(?:\.\d+)?)(ms|h|m|s)/g, m2, tot = 0, used = '';
+    while ((m2 = re.exec(x))) { tot += Number(m2[1]) * { ms: 0.001, h: 3600, m: 60, s: 1 }[m2[2]]; used += m2[0]; }
+    return used === x ? tot : null;
+  }
   function portOf(v) {
     if (typeof v === 'number' && isFinite(v)) return Math.floor(v);
     if (typeof v === 'string' && /^\d{1,5}$/.test(v.trim())) return Number(v.trim());
@@ -134,7 +147,18 @@
     var sec = str(ss.security || 'none').toLowerCase();
     var tls = obj(ss.tlsSettings) || {};
     var sock = obj(ss.sockopt) || {};
+    var g2 = obj(ss.grpcSettings) || {}, xs2 = obj(ss.xhttpSettings) || obj(ss.splithttpSettings) || {};
+    var xm = obj((obj(xs2.extra) || {}).xmux) || obj(xs2.xmux) || {};
+    var timers = {
+      ws_heartbeat: net === 'ws' ? secsOf((obj(ss.wsSettings) || {}).heartbeatPeriod) : null,
+      grpc_idle: net === 'grpc' ? secsOf(g2.idle_timeout) : null, grpc_idle_field: 'grpcSettings.idle_timeout',
+      grpc_ping: net === 'grpc' ? secsOf(g2.health_check_timeout) : null, grpc_ping_field: 'grpcSettings.health_check_timeout',
+      xmux_keepalive: net === 'xhttp' ? secsOf(xm.hKeepAlivePeriod) : null,
+      origin_idle: null, origin_idle_field: null,
+      tcp_keepalive: sock.tcpKeepAliveIdle !== undefined || sock.tcpKeepAliveInterval !== undefined
+    };
     return {
+      timers: timers,
       kind: 'xray', idx: idx, tag: str(ib.tag), proto: str(ib.protocol).toLowerCase(), network: net,
       path: path === undefined || path === null ? null : str(path), pathField: field,
       port: portOf(ib.port), portRaw: ib.port, listen: ib.listen === undefined || ib.listen === null ? '' : str(ib.listen),
@@ -159,7 +183,18 @@
     var tls = obj(ib.tls) || {};
     var reality = obj(tls.reality) || {};
     var users = Array.isArray(ib.users) ? ib.users : [];
+    // sing-box: grpc transport idle_timeout / ping_timeout are the HTTP/2 ping; an inbound or other transport idle_timeout closes idle connections
+    var oi = ib.idle_timeout !== undefined ? secsOf(ib.idle_timeout) : (net !== 'grpc' && tr.idle_timeout !== undefined ? secsOf(tr.idle_timeout) : null);
+    var timers = {
+      ws_heartbeat: null,
+      grpc_idle: net === 'grpc' ? secsOf(tr.idle_timeout) : null, grpc_idle_field: 'transport.idle_timeout',
+      grpc_ping: net === 'grpc' ? secsOf(tr.ping_timeout) : null, grpc_ping_field: 'transport.ping_timeout',
+      xmux_keepalive: null,
+      origin_idle: oi, origin_idle_field: ib.idle_timeout !== undefined ? 'idle_timeout' : 'transport.idle_timeout',
+      tcp_keepalive: false
+    };
     return {
+      timers: timers,
       kind: 'singbox', idx: idx, tag: str(ib.tag), proto: str(ib.type).toLowerCase(), network: net,
       path: path === undefined || path === null ? null : str(path), pathField: field,
       port: portOf(ib.listen_port), portRaw: ib.listen_port, listen: ib.listen === undefined || ib.listen === null ? '' : str(ib.listen),
@@ -185,6 +220,12 @@
     var xr = items.some(function (x) { return x.protocol !== undefined; });
     kind = sb && !xr ? 'singbox' : 'xray';
     var inbounds = items.map(function (x, i) { return kind === 'singbox' ? singboxInbound(x, i) : xrayInbound(x, i); });
+    // Xray closes a connection idle for policy.levels.<level>.connIdle seconds (default 300) — an origin-side idle timeout
+    if (kind === 'xray' && obj(data)) {
+      var lv = obj((obj(data.policy) || {}).levels) || {}, ci = null;
+      Object.keys(lv).forEach(function (k) { var v = secsOf((obj(lv[k]) || {}).connIdle); if (v !== null && (ci === null || v < ci)) ci = v; });
+      if (ci !== null) inbounds.forEach(function (ib) { ib.timers.origin_idle = ci; ib.timers.origin_idle_field = 'policy.levels.connIdle'; });
+    }
     var tunnelish = inbounds.filter(function (x) { return TUNNEL_PROTOCOLS[x.proto]; });
     var localOnly = inbounds.length > 0 && !tunnelish.length && inbounds.every(function (x) { return /^(socks|mixed|http|tun|dokodemo-door|tproxy|redirect)$/.test(x.proto); });
     var hasOut2 = obj(data) && Array.isArray(data.outbounds) && data.outbounds.some(function (o) { var p = str((obj(o) || {}).protocol || (obj(o) || {}).type).toLowerCase(); return !!TUNNEL_PROTOCOLS[p]; });
@@ -391,6 +432,37 @@
     } else if (ib.security === 'none' && !want) {
       add('ok', 'tls-match', L + t(': بدون TLS؛ درست است (CDN خودش TLS بازدیدکننده را باز می‌کند).'), null, ib, match);
     }
+    checkTimers(ib, match, add, L);
+  }
+
+  /**
+   * Wave 13 (§22.5): keepalive / ping intervals of the server inbound against the edge idle timeout of the matched path.
+   * Codes: timeout.edge_idle (info), timeout.ws_heartbeat, timeout.grpc_idle, timeout.xmux_keepalive, timeout.origin_idle
+   * (warnings with the recommended value), timeout.tcp_keepalive (info: socket keepalive does not keep a tunnel stream alive).
+   */
+  function checkTimers(ib, match, add, L) {
+    var idle = match.idle_timeout_s;
+    if (typeof idle !== 'number' || !isFinite(idle) || idle <= 0) return;
+    var k = typeof match.keepalive_s === 'number' && match.keepalive_s > 0 ? match.keepalive_s : Math.max(10, Math.min(60, Math.floor(Math.min(idle, 600) / 3)));
+    var tm = ib.timers || {};
+    var LATE = t('فاصله‌ی keepalive از مهلت بیکاری لبه بیشتر است؛ اتصال بیکار قبل از ping قطع می‌شود.');
+    add('info', 'timeout.edge_idle', L + t(': مهلت بیکاری لبه برای این مسیر: {0} ثانیه؛ keepalive پیشنهادی: {1} ثانیه.', idle, k), null, ib, match);
+    function late(code, field, v, rec) {
+      if (v === null || v === undefined || !(v >= idle - 5)) return;
+      add('warning', code, L + ': ' + field + ' = ' + fmt(v) + ' — ' + LATE, t('مقدار پیشنهادی: ') + field + ' = ' + rec, ib, match);
+    }
+    function fmt(v) { return ib.kind === 'singbox' ? v + 's' : String(v); }
+    late('timeout.ws_heartbeat', 'wsSettings.heartbeatPeriod', tm.ws_heartbeat, String(k));
+    late('timeout.grpc_idle', tm.grpc_idle_field, tm.grpc_idle, ib.kind === 'singbox' ? k + 's' : String(k));
+    late('timeout.grpc_idle', tm.grpc_ping_field, tm.grpc_ping, ib.kind === 'singbox' ? '20s' : '20');
+    late('timeout.xmux_keepalive', 'xhttpSettings.extra.xmux.hKeepAlivePeriod', tm.xmux_keepalive, String(k));
+    if (tm.origin_idle !== null && tm.origin_idle !== undefined && tm.origin_idle > 0 && tm.origin_idle < k) {
+      add('warning', 'timeout.origin_idle', L + ': ' + tm.origin_idle_field + ' = ' + fmt(tm.origin_idle) + ' — ' + t('سرور شما اتصال بیکار را زودتر از ping کلاینت می‌بندد.'),
+        t('مقدار پیشنهادی: {0} دست‌کم {1}', tm.origin_idle_field, ib.kind === 'singbox' ? Math.max(k * 2, 120) + 's' : String(Math.max(k * 2, 300))), ib, match);
+    }
+    if (tm.tcp_keepalive) {
+      add('info', 'timeout.tcp_keepalive', L + t(': sockopt.tcpKeepAlive* فقط اتصال TCP بین نود و سرور را زنده نگه می‌دارد، نه جریان بیکار تونل را؛ برای آن keepalive برنامه‌ی کاربر را طبق «تنظیمات پیشنهادی» بگذارید.'), null, ib, match);
+    }
   }
 
   function netFor(proto, kind) {
@@ -403,6 +475,6 @@
     return host === domain || host.slice(-domain.length - 1) === '.' + domain;
   }
 
-  P.tunnelCheck = { run: run, parse: parse, mask: mask, strip: strip, _model: model };
+  P.tunnelCheck = { run: run, parse: parse, mask: mask, strip: strip, secs: secsOf, _model: model };
   if (typeof module !== 'undefined' && module.exports) module.exports = P.tunnelCheck;
 })(typeof window !== 'undefined' ? window : this);

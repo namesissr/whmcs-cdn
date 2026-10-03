@@ -266,15 +266,30 @@
     }
   }
   function capMbps() { return Math.max(0, Number(feats().tunnel_max_mbps) || 0); }
+  /** Wave 13 (§22): the tunnel profile when this controller serves it (tguide.js), else null — gates every wave-13 piece. */
+  function tp() { return P.tprofile && P.tprofile.ok() === true ? P.tprofile : null; }
+  /** SPEC §22.4 plan feature max_tunnel_origins (1..10); null when the controller does not know it (older controller). */
+  function maxOrigins() { var m = feats().max_tunnel_origins; return m === undefined || m === null ? null : Math.max(1, Math.min(10, Math.floor(Number(m) || 1))); }
+  function multi(p) { return !!(p && Array.isArray(p.origins) && p.origins.length); }
+  var BALANCES = [['failover', t('جایگزینی خودکار (اصلی/پشتیبان)'), t('همه‌ی اتصال‌ها به سرور اول می‌روند؛ اگر از دسترس خارج شد اتصال‌های تازه به سرور بعدی می‌روند.'), 'refresh', t('پیشنهادی')],
+    ['round_robin', t('چرخشی'), t('اتصال‌های تازه به نسبت وزن بین سرورهای اصلی پخش می‌شوند.'), 'lb'],
+    ['sticky_ip', t('ثابت برای هر IP کاربر'), t('هر کاربر (بر اساس IP) همیشه به یک سرور مشخص می‌رسد.'), 'link']];
+  var BAL = {};
+  BALANCES.forEach(function (b) { BAL[b[0]] = b[1]; });
   function maxPaths() { var m = feats().max_tunnel_paths; return m === undefined || m === null ? 10 : Math.max(0, Number(m) || 0); }
 
   function originText(p) {
+    if (multi(p)) return t('{0} سرور مبدأ — {1}', num(p.origins.length), BAL[p.balance || 'failover'] || BAL.failover);
     if (p.pool) return t('استخر توزیع بار «') + p.pool + '»';
     if (p.origin) return (p.origin.address || '?') + ':' + (p.origin.port || (p.origin.tls ? 443 : 80)) + (p.origin.tls ? ' (TLS)' : '');
     return t('همان سرور اصلی سایت');
   }
   /** Where the tunnel reaches the customer's server: {port, tls, note}. */
   function listenOf(p, host) {
+    if (multi(p)) {
+      var prim = p.origins.filter(function (x) { return x && !x.backup; })[0] || p.origins[0];
+      return { port: Number(prim.port) || (prim.tls ? 443 : 80), tls: !!prim.tls };
+    }
     if (p.origin) return { port: Number(p.origin.port) || (p.origin.tls ? 443 : 80), tls: !!p.origin.tls };
     var sslc = (site().config && site().config.ssl) || {}, https = sslc.origin_protocol === 'https';
     if (p.pool) {
@@ -286,20 +301,35 @@
     return { port: r && r.origin_port ? Number(r.origin_port) : (https ? 443 : 80), tls: https };
   }
 
+  /** SPEC §22.4: every listen port the CDN may use for this path (each origin of a multi-origin path; the checker accepts all). */
+  function portsOf(p, host) {
+    if (multi(p)) {
+      var out = [];
+      p.origins.forEach(function (x) { var v = Number(x && x.port) || (x && x.tls ? 443 : 80); if (out.indexOf(v) < 0) out.push(v); });
+      return out;
+    }
+    return [listenOf(p, host).port];
+  }
+
   /**
    * Ready-to-use configs for one path.
-   * o = {protocol, path, host, uuid, port (origin listen port), tls (origin TLS), mode (xhttp), remark}
+   * o = {protocol, path, host, uuid, port (origin listen port), tls (origin TLS), mode (xhttp), remark,
+   *      rec (wave 13 recommended values, tguide.js recommend(); optional), h3 (xhttp over HTTP/3 variant; optional)}
    * → {link, xray (server config.json text), singbox (outbound JSON text | null), serviceName, alpn}
    */
   function tunnelConfig(o) {
     var proto = o.protocol, path = String(o.path || '/'), host = String(o.host || ''), uuid = String(o.uuid || '');
     var svc = path.replace(/^\/+/, '');
     var mode = proto === 'h2' ? 'stream-one' : (o.mode || 'auto');
-    var alpn = proto === 'grpc' || proto === 'h2' ? ['h2'] : proto === 'xhttp' ? ['h2', 'http/1.1'] : ['http/1.1'];
+    var alpn = proto === 'grpc' || proto === 'h2' ? ['h2'] : proto === 'xhttp' ? (o.h3 ? ['h3'] : ['h2', 'http/1.1']) : ['http/1.1'];
+    var rec = o.rec && typeof o.rec === 'object' ? o.rec : null;
+    var extra = rec && proto === 'xhttp' && P.tguide ? P.tguide.xmuxExtra(rec.xmux) : null;
     var q = [['encryption', 'none'], ['security', 'tls'], ['sni', host], ['fp', 'chrome'], ['alpn', alpn.join(',')],
       ['type', proto === 'h2' ? 'xhttp' : proto]];
     if (proto === 'grpc') q.push(['serviceName', svc], ['mode', 'gun']);
     else if (proto === 'xhttp' || proto === 'h2') q.push(['host', host], ['path', path], ['mode', mode]);
+    // §22.11: the recommended XMUX values travel in the share link's `extra` (Xray share-link format); stability only
+    if (extra) q.push(['extra', JSON.stringify(extra)]);
     else q.push(['host', host], ['path', path]);
     var link = 'vless://' + uuid + '@' + host + ':443?' + q.map(function (kv) { return kv[0] + '=' + encodeURIComponent(kv[1]); }).join('&') +
       '#' + encodeURIComponent(o.remark || host);
@@ -311,7 +341,7 @@
         certificates: [{ certificateFile: '/etc/ssl/pcdn/fullchain.pem', keyFile: '/etc/ssl/pcdn/privkey.pem' }] };
     }
     if (proto === 'grpc') ss.grpcSettings = { serviceName: svc };
-    else if (proto === 'ws') ss.wsSettings = { path: path };
+    else if (proto === 'ws') ss.wsSettings = rec && rec.ws_heartbeat_s ? { path: path, heartbeatPeriod: rec.ws_heartbeat_s } : { path: path };
     else if (proto === 'httpupgrade') ss.httpupgradeSettings = { path: path };
     else ss.xhttpSettings = { path: path, mode: proto === 'h2' ? 'stream-one' : 'auto' };
     var xray = {
@@ -328,16 +358,20 @@
     // sing-box client outbound (sing-box has no XHTTP transport).
     var sb = null;
     if (proto === 'grpc' || proto === 'ws' || proto === 'httpupgrade') {
-      var tr = proto === 'grpc' ? { type: 'grpc', service_name: svc }
+      var gr = rec && rec.grpc ? rec.grpc : null;
+      var tr = proto === 'grpc' ? (gr ? { type: 'grpc', service_name: svc, idle_timeout: gr.idle_timeout_s + 's', ping_timeout: gr.health_check_timeout_s + 's', permit_without_stream: false }
+        : { type: 'grpc', service_name: svc })
         : proto === 'ws' ? { type: 'ws', path: path, headers: { Host: host } } : { type: 'httpupgrade', host: host, path: path };
       sb = { type: 'vless', tag: 'pcdn-' + (o.id || proto), server: host, server_port: 443, uuid: uuid,
         tls: { enabled: true, server_name: host, alpn: alpn, utls: { enabled: true, fingerprint: 'chrome' } }, transport: tr };
+      if (rec) sb.multiplex = { enabled: false };
     }
     return { link: link, xray: JSON.stringify(xray, null, 2), singbox: sb ? JSON.stringify(sb, null, 2) : null, serviceName: svc, alpn: alpn };
   }
   P.tunnelConfig = tunnelConfig;
   // Wave 7: the config checker (tunnelq.js) compares a pasted server config with these.
   P.tunnelListen = listenOf;
+  P.tunnelPorts = portsOf;
   P.tunnelHosts = hosts;
 
   // ------------------------------------------------------------------ small pieces
@@ -358,15 +392,88 @@
 
   // ------------------------------------------------------------------ path editor (drawer)
 
-  function pathEditor(orig, list, done) {
+  function blankOrigin(tls) { return { address: '', port: 2053, tls: !!tls, sni: null, verify: false, weight: 1, backup: false }; }
+
+  /**
+   * A wave-13 controller always returns origins / balance / health / idle_timeout on every path (null when unused): keep the key as
+   * null then (no spurious «unsaved» state); an older controller never had it, so the key stays absent (extra="forbid").
+   */
+  function unset(x, k) { if (Object.prototype.hasOwnProperty.call(x, k) && (x[k] !== null || tp())) x[k] = null; }
+
+  /** ctx = {idle: the section's (draft) idle_timeout} — for the per-path idle timeout and keepalive hint (wave 13). */
+  function pathEditor(orig, list, done, ctx) {
+    ctx = ctx || {};
     var isNew = !orig;
     var x = orig ? clone(orig) : { id: '', path: randomPath(), protocol: 'grpc', origin: null, pool: null };
-    var st = { mode: x.pool ? 'pool' : x.origin ? 'custom' : 'site' };
+    var st = { mode: multi(x) ? 'multi' : x.pool ? 'pool' : x.origin ? 'custom' : 'site', ownIdle: typeof x.idle_timeout === 'number' };
+    var maxO = maxOrigins();
+    var first = multi(x) ? x.origins[0] : null;
+    // §22.4: every origin of a path shares tls / verify / sni — edited once here, copied to each origin on «تأیید»
+    var mo = { tls: !!(first && first.tls), sni: first ? first.sni || null : null, verify: !!(first && first.verify) };
     var pl = pools(), lb = !!feats().load_balancer && pl.length > 0;
     var d = P.dialog({ title: isNew ? t('مسیر تونل جدید') : t('ویرایش مسیر تونل'), subtitle: t('آدرس مخفی، پروتکل و سرور مقصد این مسیر را تعیین کنید.'), icon: 'tunnel', kind: 'drawer', wide: true });
     d.el.classList.add('pcdn-tn-editor');
     var err = h('div'), holder = h('div', { className: 'pcdn-form' });
     append(d.body, [err, holder]);
+    function siteIdle() { return Number(ctx.idle) || 3600; }
+    function multiPanel() {
+      var n = x.origins.length, full = n >= (maxO || 1);
+      var ol = h('ol', { className: 'pcdn-tn-origins' });
+      x.origins.forEach(function (o, i) {
+        if (o.weight === undefined || o.weight === null) o.weight = 1;
+        ol.appendChild(h('li', { className: 'pcdn-tn-origin' + (o.backup ? ' is-backup' : ''), 'data-origin': String(i) },
+          h('span', { className: 'pcdn-rule-no', 'aria-hidden': 'true', text: num(i + 1) }),
+          h('div', { className: 'pcdn-tn-origin-fields' },
+            P.input(o, 'address', t('آدرس سرور'), { placeholder: '185.1.2.3', cls: 'pcdn-tn-o-addr' }),
+            P.input(o, 'port', t('پورت'), { type: 'number', min: 1, max: 65535, cls: 'pcdn-tn-o-port' }),
+            P.input(o, 'weight', t('وزن'), { type: 'number', min: 1, max: 100, cls: 'pcdn-tn-o-weight' }),
+            P.toggle(o, 'backup', t('پشتیبان'), { cls: 'pcdn-tn-o-backup', onchange: draw })),
+          h('div', { className: 'pcdn-tn-origin-ctl' },
+            P.iconBtn('up', t('بالا بردن سرور {0}', num(i + 1)), function () { if (i > 0) { x.origins.splice(i - 1, 0, x.origins.splice(i, 1)[0]); draw(); } }, { write: true, disabled: i === 0, cls: 'pcdn-tn-o-up' }),
+            P.iconBtn('down', t('پایین بردن سرور {0}', num(i + 1)), function () { if (i < x.origins.length - 1) { x.origins.splice(i + 1, 0, x.origins.splice(i, 1)[0]); draw(); } }, { write: true, disabled: i === x.origins.length - 1, cls: 'pcdn-tn-o-down' }),
+            P.iconBtn('trash', t('حذف سرور ') + num(i + 1), function () { x.origins.splice(i, 1); draw(); }, { write: true, disabled: x.origins.length <= 2, cls: 'is-danger pcdn-tn-o-del' }))));
+      });
+      var add = P.btn(t('افزودن سرور'), { icon: 'plus', size: 'sm', write: true, cls: 'pcdn-tn-o-add', disabled: full, title: full ? t('به سقف مبدأهای پلن رسیده‌اید') : null,
+        onclick: function () { x.origins.push(blankOrigin(mo.tls)); draw(); } });
+      var http = x.health.type === 'http';
+      return h('div', { className: 'pcdn-subpanel pcdn-tn-multi', 'data-multi': '1' },
+        h('div', { className: 'pcdn-tn-multi-head' }, h('h5', { text: t('سرورهای مبدأ') }),
+          h('span', { className: 'pcdn-limit' + (n > (maxO || 1) ? ' is-full' : ''), 'data-origins-limit': String(maxO || 1) }, t('{0} از {1} سرور', num(n), num(maxO || 1))), add),
+        h('p', { className: 'pcdn-muted pcdn-small', text: t('ترتیب مهم است: در «جایگزینی خودکار» سرور اول اصلی است و بقیه به ترتیب جایگزین می‌شوند. اتصال‌های برقرار جابه‌جا نمی‌شوند؛ فقط اتصال‌های تازه به سرور سالم بعدی می‌روند.') }),
+        ol,
+        n > (maxO || 1) ? P.alertBox('warning', t('پلن فعلی فقط {0} مبدأ برای هر مسیر اجازه می‌دهد؛ سرورهای اضافه را حذف کنید.', num(maxO || 1))) : null,
+        P.toggle(mo, 'tls', t('اتصال CDN به سرورها با TLS'), { help: t('برای همه‌ی سرورهای این مسیر یکسان است.'), onchange: draw }),
+        mo.tls ? h('div', { className: 'pcdn-grid' },
+          P.input(mo, 'sni', t('SNI (اختیاری)'), { nullable: true, placeholder: site().domain, help: t('خالی = نام دامنه سایت. باید با گواهی سرور شما بخواند.') }),
+          P.toggle(mo, 'verify', t('بررسی اعتبار گواهی سرور'), { help: t('فقط اگر گواهی معتبر (مثلاً Let\'s Encrypt) روی سرور دارید.') })) : null,
+        P.choice(x, 'balance', t('روش توزیع'), BALANCES, { cols: 1, onchange: draw }),
+        P.choice(x.health, 'type', t('بررسی سلامت'), [['tcp', t('اتصال TCP (پیشنهادی)'), t('هر چند ثانیه اتصال TCP به پورت هر سرور؛ برای Xray / sing-box مناسب است.'), 'zap'],
+          ['http', 'HTTP', t('درخواست HTTP به مسیر زیر؛ فقط اگر سرور شما به آن پاسخ معمولی می‌دهد.'), 'globe']], { cols: 2, onchange: draw }),
+        h('div', { className: 'pcdn-grid' },
+          http ? P.input(x.health, 'path', t('مسیر بررسی'), { placeholder: '/' }) : null,
+          http ? P.input(x.health, 'expect', t('کدهای سالم'), { placeholder: '2xx,3xx,4xx' }) : null,
+          P.input(x.health, 'interval', t('فاصله‌ی بررسی'), { type: 'number', min: 5, max: 300, suffix: t('ثانیه'), suffixRtl: true }),
+          P.input(x.health, 'timeout', t('مهلت هر بررسی'), { type: 'number', min: 1, max: 30, suffix: t('ثانیه'), suffixRtl: true })),
+        http && x.protocol === 'grpc' ? P.alertBox('warning', t('بیشتر سرورهای gRPC به درخواست HTTP معمولی پاسخ ۲xx نمی‌دهند؛ نوع بررسی را tcp بگذارید.')) : null);
+    }
+    function idlePanel() {
+      if (!tp()) return null;
+      var eff = st.ownIdle && Number(x.idle_timeout) > 0 ? Number(x.idle_timeout) : siteIdle();
+      var k = P.tguide.keepalive(eff, P.tprofile.edge().client_idle_s);
+      var hint = h('p', { className: 'pcdn-muted pcdn-small pcdn-tn-kahint', 'data-keepalive': String(k) },
+        t('keepalive پیشنهادی برنامه‌ها برای این مسیر: {0} ثانیه', num(k)));
+      return h('div', { className: 'pcdn-subpanel pcdn-tn-idle', 'data-idle': '1' },
+        P.toggle(st, 'ownIdle', t('مهلت بیکاری جدا برای این مسیر'), { help: t('خاموش = همان «مهلت بیکاری اتصال» سایت ({0}).', P.dur(siteIdle())),
+          onchange: function (v) { if (v && typeof x.idle_timeout !== 'number') x.idle_timeout = siteIdle(); draw(); } }),
+        st.ownIdle ? P.duration(x, 'idle_timeout', t('مهلت بیکاری این مسیر'), { min: 60, max: 86400, picks: [[300, t('۵ دقیقه')], [600, t('۱۰ دقیقه')], [3600, t('۱ ساعت')], [21600, t('۶ ساعت')]],
+          help: t('اتصال تونلی این مسیر که این مدت هیچ داده‌ای نداشته باشد بسته می‌شود.'),
+          oninput: function () {
+            var e2 = Number(x.idle_timeout) > 0 ? Number(x.idle_timeout) : siteIdle(), k2 = P.tguide.keepalive(e2, P.tprofile.edge().client_idle_s);
+            hint.textContent = t('keepalive پیشنهادی برنامه‌ها برای این مسیر: {0} ثانیه', num(k2));
+            hint.setAttribute('data-keepalive', String(k2));
+          } }) : null,
+        hint);
+    }
     function draw() {
       clear(holder);
       var pathIn = P.input(x, 'path', t('مسیر (آدرس مخفی)'), { placeholder: '/my-secret-service', maxlength: 201,
@@ -377,19 +484,33 @@
         var inp = holder.querySelector('.pcdn-tn-pathrow input');
         if (inp) { inp.value = x.path; inp.dispatchEvent(new Event('input', { bubbles: true })); }
       } });
+      var modes = [
+        ['site', t('همان سرور اصلی سایت'), t('به آدرس و پورت رکورد پروکسی‌شده (و پروتکل «اتصال به سرور اصلی» در SSL) وصل می‌شود.'), 'server'],
+        ['custom', t('آدرس و پورت دلخواه'), t('مثلاً سرور جداگانه Xray روی پورت ۲۰۵۳. پیشنهادی وقتی روی همین سرور سایت هم دارید.'), 'edit'],
+        ['pool', t('استخر توزیع بار'), lb ? t('بین چند سرور VPN تقسیم می‌شود و سرور خراب کنار گذاشته می‌شود.') : t('ابتدا در بخش «توزیع بار» یک استخر بسازید (در پلن شما: ') + (feats().load_balancer ? t('فعال') : t('غیرفعال')) + ').', 'lb']
+      ];
+      // §22.4: inline origins with failover — offered when the plan allows more than one origin per path (or the path already has them)
+      if (maxO !== null && (maxO > 1 || multi(x))) modes.push(['multi', t('چند سرور مبدأ'), t('دو تا {0} سرور VPN با جایگزینی خودکار وقتی یکی از دسترس خارج شود.', num(Math.max(2, maxO))), 'refresh', t('پایدارتر')]);
       append(holder, [
         h('div', { className: 'pcdn-tn-pathrow' }, pathIn, gen),
         P.choice(x, 'protocol', t('پروتکل'), PROTOCOLS, { cols: 2, onchange: draw }),
-        P.choice(st, 'mode', t('سرور مقصد (سرور VPN شما)'), [
-          ['site', t('همان سرور اصلی سایت'), t('به آدرس و پورت رکورد پروکسی‌شده (و پروتکل «اتصال به سرور اصلی» در SSL) وصل می‌شود.'), 'server'],
-          ['custom', t('آدرس و پورت دلخواه'), t('مثلاً سرور جداگانه Xray روی پورت ۲۰۵۳. پیشنهادی وقتی روی همین سرور سایت هم دارید.'), 'edit'],
-          ['pool', t('استخر توزیع بار'), lb ? t('بین چند سرور VPN تقسیم می‌شود و سرور خراب کنار گذاشته می‌شود.') : t('ابتدا در بخش «توزیع بار» یک استخر بسازید (در پلن شما: ') + (feats().load_balancer ? t('فعال') : t('غیرفعال')) + ').', 'lb']
-        ], { cols: 3, onchange: function (v) {
+        P.choice(st, 'mode', t('سرور مقصد (سرور VPN شما)'), modes, { cols: modes.length > 3 ? 2 : 3, onchange: function (v) {
+          if (v !== 'multi') { unset(x, 'origins'); unset(x, 'balance'); unset(x, 'health'); }
           if (v === 'custom') { x.origin = x.origin || { address: '', port: 2053, tls: false, sni: null, verify: false }; x.pool = null; }
           else if (v === 'pool') { x.origin = null; x.pool = x.pool || (pl[0] ? pl[0].name : null); }
-          else { x.origin = null; x.pool = null; }
+          else if (v === 'multi') {
+            if (!multi(x)) {
+              x.origins = x.origin && String(x.origin.address || '').trim() ? [Object.assign(blankOrigin(), x.origin, { weight: 1, backup: false }), blankOrigin(x.origin.tls)] : [blankOrigin(), blankOrigin()];
+              mo = { tls: !!x.origins[0].tls, sni: x.origins[0].sni || null, verify: !!x.origins[0].verify };
+            }
+            x.origin = null; x.pool = null;
+            x.balance = x.balance || 'failover';
+            x.health = x.health && typeof x.health === 'object' ? x.health : { type: 'tcp', interval: 10, timeout: 3, path: '/', expect: '2xx,3xx,4xx' };
+          } else { x.origin = null; x.pool = null; }
           draw();
         } }),
+        maxO === 1 && !multi(x) ? h('div', { className: 'pcdn-tn-upsell-origins', 'data-tn-upsell': 'origins' }, P.alertBox('info', [h('strong', { text: t('چند سرور مبدأ با جایگزینی خودکار: ') }),
+          t('برای چند سرور مبدأ پلن را ارتقا دهید.')], { icon: 'sparkles' })) : null,
         st.mode === 'custom' ? h('div', { className: 'pcdn-subpanel' },
           h('div', { className: 'pcdn-grid' },
             P.input(x.origin, 'address', t('آدرس سرور'), { placeholder: '185.1.2.3', help: t('IPv4، IPv6 یا نام میزبان.') }),
@@ -400,12 +521,33 @@
             P.toggle(x.origin, 'verify', t('بررسی اعتبار گواهی سرور'), { help: t('فقط اگر گواهی معتبر (مثلاً Let\'s Encrypt) روی سرور دارید.') })) : null) : null,
         st.mode === 'pool' ? (lb ? P.select(x, 'pool', t('استخر'), pl.map(function (p) { return [p.name, p.name + ' (' + num((p.origins || []).length) + t(' سرور)')]; }))
           : P.alertBox('warning', [t('هنوز استخری ندارید. '), A().goLink('pools', t('ساخت استخر در «توزیع بار»'))])) : null,
+        st.mode === 'multi' ? multiPanel() : null,
+        idlePanel(),
         x.protocol === 'grpc' && /\/.*\//.test(x.path) ? P.alertBox('warning', t('برای gRPC مسیر تک‌بخشی (بدون / میانی) بگذارید؛ بعضی کلاینت‌ها serviceName چندبخشی را پشتیبانی نمی‌کنند.')) : null,
         x.protocol === 'h2' ? P.alertBox('info', t('حالت h2: سرور شما باید HTTP/2 بدون TLS (h2c) یا با TLS را بپذیرد؛ در Xray، ورودی XHTTP با حالت stream-one.')) : null
       ]);
       A().lockWrites(holder);
     }
     draw();
+    function multiProblem() {
+      var n = x.origins.length, seen = {};
+      if (n < 2) return t('برای چند سرور مبدأ دست‌کم ۲ سرور لازم است؛ برای یک سرور «آدرس و پورت دلخواه» را انتخاب کنید.');
+      if (n > (maxO || 1)) return t('حداکثر {0} مبدأ برای هر مسیر تونل در پلن شما مجاز است.', num(maxO || 1));
+      for (var i = 0; i < n; i++) {
+        var o = x.origins[i], a = String(o.address || '').trim();
+        if (!a || /\s/.test(a)) return t('آدرس سرور {0} را وارد کنید.', num(i + 1));
+        if (!(Number(o.port) >= 1 && Number(o.port) <= 65535 && Math.floor(Number(o.port)) === Number(o.port))) return t('پورت سرور {0} باید عددی بین ۱ و ۶۵۵۳۵ باشد.', num(i + 1));
+        if (!(Number(o.weight) >= 1 && Number(o.weight) <= 100 && Math.floor(Number(o.weight)) === Number(o.weight))) return t('وزن سرور {0} باید عددی بین ۱ و ۱۰۰ باشد.', num(i + 1));
+        var key = a.toLowerCase() + ':' + Number(o.port);
+        if (seen[key]) return t('هر سرور (آدرس و پورت) فقط یک بار می‌تواند در فهرست باشد.');
+        seen[key] = true;
+      }
+      if (!x.origins.some(function (o) { return !o.backup; })) return t('دست‌کم یک سرور باید اصلی (غیر پشتیبان) باشد.');
+      var hc = x.health, iv = Number(hc.interval), to = Number(hc.timeout);
+      if (!(iv >= 5 && iv <= 300) || !(to >= 1 && to <= 30) || to >= iv || Math.floor(iv) !== iv || Math.floor(to) !== to) return t('فاصله‌ی بررسی سلامت ۵ تا ۳۰۰ ثانیه و مهلت هر بررسی ۱ تا ۳۰ ثانیه و کمتر از فاصله باشد.');
+      if (hc.type === 'http' && !/^\/\S{0,200}$/.test(String(hc.path || ''))) return t('مسیر بررسی HTTP باید با / شروع شود.');
+      return null;
+    }
     var ok = P.btn(t('تأیید'), { kind: 'primary', icon: 'check', write: true, cls: 'pcdn-drawer-ok', onclick: function () {
       clear(err);
       x.path = String(x.path || '').trim();
@@ -416,8 +558,25 @@
       else if (st.mode === 'custom' && !String(x.origin.address || '').trim()) problem = t('آدرس سرور مقصد را وارد کنید.');
       else if (st.mode === 'custom' && !(Number(x.origin.port) >= 1 && Number(x.origin.port) <= 65535)) problem = t('پورت باید عددی بین ۱ و ۶۵۵۳۵ باشد.');
       else if (st.mode === 'pool' && !x.pool) problem = t('یک استخر انتخاب کنید.');
+      else if (st.mode === 'multi') problem = multiProblem();
+      if (!problem && tp() && st.ownIdle && !(Number(x.idle_timeout) >= 60 && Number(x.idle_timeout) <= 86400 && Math.floor(Number(x.idle_timeout)) === Number(x.idle_timeout))) {
+        problem = t('مهلت بیکاری مسیر باید بین ۶۰ ثانیه و ۱ روز باشد.');
+      }
       if (problem) { err.appendChild(P.alertBox('danger', problem)); return; }
       if (x.origin) { x.origin.address = String(x.origin.address).trim(); x.origin.port = Number(x.origin.port); if (!x.origin.tls) { x.origin.sni = null; x.origin.verify = false; } }
+      if (st.mode === 'multi') {
+        x.origins = x.origins.map(function (o) {
+          return { address: String(o.address).trim(), port: Number(o.port), tls: !!mo.tls, sni: mo.tls && mo.sni ? String(mo.sni).trim() || null : null,
+            verify: !!(mo.tls && mo.verify), weight: Number(o.weight) || 1, backup: !!o.backup };
+        });
+        var hc = x.health;
+        x.health = hc.type === 'http' ? { type: 'http', interval: Number(hc.interval), timeout: Number(hc.timeout), path: String(hc.path || '/'), expect: String(hc.expect || '2xx,3xx,4xx') }
+          : { type: 'tcp', interval: Number(hc.interval), timeout: Number(hc.timeout) };
+        x.origin = null; x.pool = null;
+      }
+      // per-path idle timeout only when set (an older controller never receives the key)
+      if (!tp() || !st.ownIdle) unset(x, 'idle_timeout');
+      else x.idle_timeout = Number(x.idle_timeout);
       if (!x.id) x.id = newId(list, x.protocol);
       d.close(true);
       done(x);
@@ -446,7 +605,8 @@
       });
       clear(body);
       var a = apps.filter(function (x) { return x.id === cur; })[0] || apps[0];
-      var sup = (a.support || {})[p.protocol] || 'yes', label = PROTO[p.protocol] ? PROTO[p.protocol].label : p.protocol;
+      // §22.11: one app ↔ protocol table (tguide.js) for the six apps it covers; the app's own entry otherwise (Shadowrocket)
+      var sup = P.tguide && P.tguide.SUPPORT[a.id] ? P.tguide.support(a.id, p.protocol) : (a.support || {})[p.protocol] || 'yes', label = PROTO[p.protocol] ? PROTO[p.protocol].label : p.protocol;
       append(body, [
         h('p', { className: 'pcdn-muted pcdn-small', text: a.name + ' — ' + a.os + t(' — هسته ') + a.core }),
         sup === 'no' ? P.alertBox('danger', a.name + t(' پروتکل ') + label + t(' را پشتیبانی نمی‌کند؛ برای کاربران این برنامه یک مسیر gRPC یا WebSocket بسازید.'))
@@ -464,16 +624,29 @@
     try { mem = JSON.parse(P.store(key) || '{}') || {}; } catch (e) { mem = {}; }
     var hs = hosts();
     var st = { host: hs.indexOf(mem.host) >= 0 ? mem.host : (hs[0] || ''), uuid: /^[0-9a-f-]{36}$/i.test(mem.uuid || '') ? mem.uuid : uuid4(), mode: mem.mode || 'auto' };
+    // wave 13 (§22.9 / §22.11): recommended keepalive / mux values in the configs, and the HTTP/3 variant of an xhttp path
+    // only when EVERY node serving this site speaks HTTP/3 (profile http3.available) — never a gamble.
+    var prof = tp(), pp = prof && !p._new ? prof.path(p.id) : null;
+    var h3ok = !!(prof && p.protocol === 'xhttp' && pp && pp.http3 && prof.http3() && prof.http3().available);
+    st.h3 = h3ok && mem.h3 === true;
+    function recOf() {
+      if (!prof) return null;
+      var base = pp && pp.protocol === p.protocol && pp.idle_timeout_s === (typeof p.idle_timeout === 'number' ? p.idle_timeout : pp.idle_timeout_s) ? pp
+        : (typeof p.idle_timeout === 'number' ? { protocol: p.protocol, idle_timeout: p.idle_timeout } : { protocol: p.protocol });
+      return P.tguide.recommend(base, prof.edge(), saved().idle_timeout);
+    }
     var d = P.dialog({ title: t('پیکربندی آماده — ') + PROTO[p.protocol].label, subtitle: p.path, icon: 'qr', kind: 'drawer', wide: true });
     d.el.classList.add('pcdn-tn-config');
     var out = h('div', { className: 'pcdn-stack' });
-    function remember() { P.store(key, JSON.stringify({ host: st.host, uuid: st.uuid, mode: st.mode })); }
+    function remember() { P.store(key, JSON.stringify({ host: st.host, uuid: st.uuid, mode: st.mode, h3: !!st.h3 })); }
+    function guideLink() { var a = A().goLink('tguide', t('تنظیمات پیشنهادی هر برنامه')); a.addEventListener('click', function () { d.close(); }); return a; }
     function draw() {
       clear(out);
       remember();
       var lis = listenOf(p, st.host);
+      var rec = recOf();
       var c = tunnelConfig({ id: p.id, protocol: p.protocol, path: p.path, host: st.host || 'YOUR-HOST', uuid: st.uuid, port: lis.port, tls: lis.tls,
-        mode: st.mode, remark: (st.host || site().domain) + '-' + p.id });
+        mode: st.mode, remark: (st.host || site().domain) + '-' + p.id + (st.h3 ? '-h3' : ''), rec: rec, h3: !!st.h3 });
       var q = qrSvg(c.link, 232);
       append(out, [
         h('section', { className: 'pcdn-tn-share', 'data-share': '1' },
@@ -483,6 +656,13 @@
             h('div', { className: 'pcdn-tn-link' }, h('code', { dir: 'ltr', className: 'pcdn-tn-link-text', text: c.link }),
               P.copyBtn(c.link, t('کپی لینک اشتراک'), { text: t('کپی لینک'), cls: 'pcdn-copy-link', done: t('لینک کپی شد') })),
             p.protocol === 'xhttp' || p.protocol === 'h2' ? P.alertBox('info', t('XHTTP فقط در کلاینت‌های با هسته Xray (v2rayNG و v2rayN نسخه‌های جدید، Hiddify با هسته Xray، Streisand) کار می‌کند.')) : null,
+            p.protocol === 'xhttp' && prof ? (h3ok
+              ? h('div', { className: 'pcdn-tn-h3', 'data-h3': 'available' }, P.toggle(st, 'h3', t('نسخه‌ی HTTP/3 (QUIC)'), {
+                help: t('همه‌ی نودهای این سرویس HTTP/3 دارند؛ لینک با alpn=h3 ساخته می‌شود. اگر شبکه‌ی کاربر UDP را محدود می‌کند همان نسخه‌ی h2 را بدهید.'), onchange: draw }))
+              : h('div', { className: 'pcdn-tn-h3', 'data-h3': 'unavailable' }, P.alertBox('info', t('همه‌ی نودهای این سرویس هنوز HTTP/3 ندارند؛ نسخه‌ی HTTP/3 این مسیر فعلاً ارائه نمی‌شود.')))) : null,
+            rec ? h('p', { className: 'pcdn-muted pcdn-small pcdn-tn-recline', 'data-rec': String(rec.keepalive_s) }, icon('bulb'),
+              h('span', { text: t('مقدارهای پایداری (keepalive {0} ثانیه، Mux {1}) در لینک و کانفیگ‌ها گذاشته شده است.', num(rec.keepalive_s), rec.mux === 'off' ? t('خاموش') : t('کم')) + ' ' }),
+              guideLink()) : null,
             appGuide(p, st)),
           q ? h('div', { className: 'pcdn-tn-qr', 'data-qr': '1' }, q) : h('p', { className: 'pcdn-muted', text: t('لینک برای QR بیش از حد طولانی است.') })),
         h('section', { 'data-server': '1' },
@@ -628,6 +808,16 @@
 
   // ------------------------------------------------------------------ page
 
+  /** §22.5: «مهلت بیکاری: …، keepalive پیشنهادی: …» under a path (wave 13 controllers only; drafts computed like the controller). */
+  function timeoutsLine(p, d) {
+    if (!tp()) return null;
+    var rec = P.tguide.recommend(typeof p.idle_timeout === 'number' ? { protocol: p.protocol, idle_timeout: p.idle_timeout } : { protocol: p.protocol },
+      P.tprofile.edge(), d.idle_timeout);
+    return h('div', { className: 'pcdn-sentence pcdn-tn-timeouts', 'data-tn-timeouts': rec.idle_s + '/' + rec.keepalive_s },
+      icon('clock'), h('span', { className: 'pcdn-w', text: t('مهلت بیکاری: ') + P.dur(rec.idle_s) + (typeof p.idle_timeout === 'number' ? t(' (ویژه‌ی این مسیر)') : '') }),
+      h('span', { className: 'pcdn-w', text: t('keepalive پیشنهادی: ') + num(rec.keepalive_s) + t(' ثانیه') }));
+  }
+
   function renderTunnel(Aa) {
     var f = feats(), cap = capMbps(), maxP = maxPaths(), hs = hosts(), s = site();
     var notes = [];
@@ -657,7 +847,7 @@
 
       var add = P.btn(t('مسیر جدید'), { kind: 'primary', icon: 'plus', size: 'sm', write: true, cls: 'pcdn-tn-add', disabled: full,
         title: full ? t('به سقف ') + num(maxP) + t(' مسیر پلن رسیده‌اید') : null,
-        onclick: function () { pathEditor(null, d.paths, function (np) { np._new = true; d.paths.push(np); f2.redraw(); }); } });
+        onclick: function () { pathEditor(null, d.paths, function (np) { np._new = true; d.paths.push(np); f2.redraw(); }, { idle: d.idle_timeout }); } });
       var pc = P.card({ title: t('مسیرهای تونل'), icon: 'link', id: 'tpaths', subtitle: t('هر مسیر یک آدرس مخفی روی دامنه شماست که با پروتکل انتخابی به سرور VPN می‌رسد.'),
         actions: [h('span', { className: 'pcdn-limit' + (full ? ' is-full' : '') }, num(d.paths.length) + t(' از ') + num(maxP) + t(' مسیر')), add] });
       if (!d.paths.length) {
@@ -671,10 +861,11 @@
               h('div', { className: 'pcdn-rule-name' }, protoBadge(p.protocol), h('bdi', { className: 'pcdn-vchip pcdn-tn-pathval', dir: 'ltr', text: p.path }),
                 p._new ? P.badge(t('ذخیره نشده'), 'warning') : null),
               h('div', { className: 'pcdn-sentence' }, h('span', { className: 'pcdn-w', text: t('مقصد:') }), h('span', { className: 'pcdn-w pcdn-w-strong', text: originText(p) }),
-                h('span', { className: 'pcdn-mini', dir: 'ltr', text: 'id: ' + (p.id || '—') }))),
+                h('span', { className: 'pcdn-mini', dir: 'ltr', text: 'id: ' + (p.id || '—') })),
+              timeoutsLine(p, d)),
             h('div', { className: 'pcdn-rule-ctl' },
               h('button', { type: 'button', className: 'pcdn-btn pcdn-btn-sm pcdn-tn-cfg', 'data-ro-ok': '1', onclick: function () { configDrawer(p); } }, icon('qr'), h('span', { text: t('پیکربندی آماده') })),
-              P.iconBtn('edit', t('ویرایش مسیر ') + num(i + 1), function () { pathEditor(p, d.paths, function (np) { if (p._new) np._new = true; d.paths[i] = np; f2.redraw(); }); }, { write: true }),
+              P.iconBtn('edit', t('ویرایش مسیر ') + num(i + 1), function () { pathEditor(p, d.paths, function (np) { if (p._new) np._new = true; d.paths[i] = np; f2.redraw(); }, { idle: d.idle_timeout }); }, { write: true }),
               P.iconBtn('trash', t('حذف مسیر ') + num(i + 1), function () { d.paths.splice(i, 1); f2.redraw(); P.toast(t('مسیر از فهرست حذف شد؛ برای اعمال «ذخیره» را بزنید.'), 'info'); }, { write: true, cls: 'is-danger' })));
           P.reg('paths.' + i, li);
           ol.appendChild(li);
@@ -709,6 +900,8 @@
         (d.paths || []).forEach(function (p) { delete p._new; });
         return d;
       },
+      // wave 13: the profile (timeouts, recommended values) follows the saved paths
+      onSaved: function () { if (P.tprofile) P.tprofile.invalidate(); },
       savedMsg: t('تغییرات ذخیره شد و تا چند ثانیه روی همه نودهای تونل اعمال می‌شود.')
     });
     return [notes, form.el, h('div', { className: 'pcdn-grid-2 pcdn-tn-bottom' }, checkCard(Aa), guideCard(Aa)), statsCard(Aa)];

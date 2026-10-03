@@ -71,6 +71,9 @@ final class Pages
     public static function reset(): void
     {
         self::$ctl = [];
+        self::$multiSites = 0;
+        self::$drainForce = 0;
+        self::$drainForceIn = [];
     }
 
     // ------------------------------------------------------------------ layout
@@ -706,6 +709,363 @@ final class Pages
         return $b !== '' ? '<div class="pcdna-badges pcdna-edge-warns">' . $b . '</div>' : '';
     }
 
+    // ------------------------------------------------------------------ SPEC §22 (wave 13): drain, tunnel probe, reloads, tuning, HTTP/3, weights
+    //
+    // Every piece is feature-detected per edge object: a controller from before wave 13 returns no `drain` / `tunnel_probe` /
+    // `http3_enabled` / `reloads` / `tuning` / `dns_weight` keys, and then nothing new is rendered (columns show «—», no buttons).
+
+    /** Edge id whose drain was refused with 409 last_edge in this request (+ the submitted minutes / reason): a confirmation card with
+     *  the «با این حال تخلیه کن» force checkbox is shown above the node table / on the node detail. */
+    public static $drainForce = 0;
+    public static $drainForceIn = [];
+
+    /** True when the controller reports the wave-13 edge fields. */
+    public static function wave13(array $edges): bool
+    {
+        foreach ($edges as $e) {
+            if (is_array($e) && (array_key_exists('drain', $e) || array_key_exists('tunnel_probe', $e))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** HH:MM (server time zone, Persian digits) of an ISO time; «—» when invalid. */
+    public static function hm($iso): string
+    {
+        $t = is_string($iso) && $iso !== '' ? strtotime($iso) : false;
+        return $t ? View::digits(date('H:i', $t)) : '—';
+    }
+
+    /** «۱۲:۰۵ مانده» until an ISO time (the admin.js countdown keeps it live). */
+    public static function remain($iso): string
+    {
+        $t = is_string($iso) && $iso !== '' ? strtotime($iso) : false;
+        if (!$t) {
+            return '';
+        }
+        $s = $t - time();
+        if ($s <= 0) {
+            return 'رو به پایان';
+        }
+        return View::digits(sprintf('%d:%02d', intdiv($s, 60), $s % 60)) . ' مانده';
+    }
+
+    private static function drainOf(array $e): ?array
+    {
+        return is_array($e['drain'] ?? null) ? $e['drain'] : null;
+    }
+
+    /** Node row badge: «در حال تخلیه (تا HH:MM)» + live countdown + connections, or «تخلیه شد». */
+    public static function drainBadge(array $e): string
+    {
+        $d = self::drainOf($e);
+        $st = $d ? (string) ($d['state'] ?? '') : '';
+        if ($st === 'draining') {
+            $until = is_string($d['until'] ?? null) ? (string) $d['until'] : '';
+            $who = ($d['by'] ?? '') === 'edge' ? 'خود نود (به‌روزرسانی)' : 'مدیر';
+            return '<div class="pcdna-drain" data-drain="draining">'
+                . View::badge('در حال تخلیه' . ($until !== '' ? ' (تا ' . self::hm($until) . ')' : ''), 'warn',
+                    ' title="' . View::e('از DNS خارج است و پس از مهلت DNS اتصال تونلی تازه نمی‌پذیرد؛ شروع‌کننده: ' . $who
+                        . (!empty($d['reason']) ? '، دلیل: ' . $d['reason'] : '')) . '"')
+                . ($until !== '' ? ' <span class="pcdna-small pcdna-muted pcdna-countdown" data-countdown="' . View::e($until) . '">' . View::e(self::remain($until)) . '</span>' : '')
+                . (isset($d['conns']) && $d['conns'] !== null ? ' <span class="pcdna-small pcdna-muted" data-drain-conns="' . (int) $d['conns'] . '">· ' . View::n((int) $d['conns']) . ' اتصال</span>' : '')
+                . '</div>';
+        }
+        if ($st === 'drained') {
+            return '<div class="pcdna-drain" data-drain="drained">' . View::badge('تخلیه شد', 'muted', ' title="اتصال‌ها تمام شده‌اند؛ پس از به‌روزرسانی «لغو تخلیه» را بزنید"') . '</div>';
+        }
+        return '';
+    }
+
+    /** «پروب تونل» cell (SPEC §22.3): ✓ / ✗ degraded since / «پشتیبانی نمی‌شود» / «—» (old agent or no report yet). */
+    public static function probeCell(array $e): string
+    {
+        if (!array_key_exists('tunnel_probe', $e)) {
+            return '<span class="pcdna-muted" data-probe="none">—</span>';
+        }
+        $p = is_array($e['tunnel_probe']) ? $e['tunnel_probe'] : [];
+        $last = is_array($p['last'] ?? null) ? $p['last'] : null;
+        if (!empty($p['degraded'])) {
+            return View::badge('✗ خراب', 'bad', ' data-probe="degraded" title="' . View::e('مسیر تونل این نود در پروب داخلی شکست خورده و برای سایت‌های تونل از DNS خارج است'
+                . (!empty($p['since']) ? ' (از ' . View::date($p['since'], true) . ')' : '')) . '"')
+                . (!empty($p['since']) ? '<div class="pcdna-small pcdna-muted">از ' . View::e(View::ago($p['since'])) . '</div>' : '');
+        }
+        if (!$last) {
+            return '<span class="pcdna-muted" data-probe="none" title="agent قدیمی یا هنوز گزارشی نفرستاده است">—</span>';
+        }
+        $uns = function ($x) {
+            return !is_array($x) || !empty($x['unsupported']);
+        };
+        if ($uns($last['ws'] ?? null) && $uns($last['grpc'] ?? null)) {
+            return '<span class="pcdna-small pcdna-muted" data-probe="unsupported">پشتیبانی نمی‌شود</span>';
+        }
+        $ok = !empty($last['ok']);
+        $ws = is_array($last['ws'] ?? null) ? $last['ws'] : [];
+        $ms = isset($ws['setup_ms']) && is_numeric($ws['setup_ms']) ? (int) $ws['setup_ms'] : null;
+        return View::badge($ok ? '✓ سالم' : '✗ ناموفق', $ok ? 'ok' : 'warn', ' data-probe="' . ($ok ? 'ok' : 'fail') . '" title="' . View::e('آخرین پروب: ' . View::ago($last['at'] ?? null)
+            . (!empty($last['consecutive_fail']) ? '، ' . View::n((int) $last['consecutive_fail']) . ' شکست پیاپی' : '')) . '"')
+            . ($ms !== null ? '<div class="pcdna-small pcdna-muted" dir="ltr">' . View::n($ms) . ' ms</div>' : '');
+    }
+
+    /** Per-node HTTP/3 switch (SPEC §22.9) — disabled with a tooltip when nginx on the node has no HTTP/3. */
+    private static function edgeHttp3Toggle(array $e, int $id, array $q): string
+    {
+        if (!array_key_exists('http3_enabled', $e)) {
+            return '';
+        }
+        $on = $e['http3_enabled'] !== false;
+        $caps = is_array($e['capabilities'] ?? null) ? $e['capabilities'] : [];
+        $capable = ($caps['http3'] ?? false) === true;
+        $name = (string) ($e['name'] ?? ('#' . $id));
+        $tip = !$capable ? 'nginx این نود HTTP/3 ندارد (نصب با install.sh --http3)' : ($on ? 'HTTP/3 روشن است؛ برای خاموش کردن کلیک کنید' : 'HTTP/3 خاموش است؛ برای روشن کردن کلیک کنید');
+        return '<form method="post" action="' . View::url($q) . '" class="pcdna-inline pcdna-h3-form"' . ($capable ? ' data-confirm="' . View::e($on
+                ? 'HTTP/3 روی نود «' . $name . '» خاموش شود؟ تا روشن شدن دوباره، نسخهٔ HTTP/3 مسیرهای XHTTP به مشتریان این گروه پیشنهاد نمی‌شود.'
+                : 'HTTP/3 روی نود «' . $name . '» روشن شود؟ فایروال باید UDP پورت HTTPS را باز بگذارد.') . '"' : '') . '>' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_http3"><input type="hidden" name="id" value="' . $id . '">'
+            . '<input type="hidden" name="http3" value="' . ($on ? '0' : '1') . '">'
+            . '<button type="submit" class="pcdna-shield-btn pcdna-h3-btn' . ($on && $capable ? ' is-on' : '') . '" role="switch" aria-checked="' . ($on && $capable ? 'true' : 'false') . '"'
+            . ($capable ? '' : ' disabled') . ' data-h3="' . ($capable ? ($on ? 'on' : 'off') : 'nocap') . '"'
+            . ' aria-label="' . View::e('HTTP/3 نود ' . $name) . '" title="' . View::e($tip) . '">'
+            . '<span class="pcdna-sw" aria-hidden="true"></span><span>HTTP/3</span></button></form>';
+    }
+
+    /** DNS weight of the node (SPEC §22.10, DNS_WEIGHTS=capacity): q 1..4 and the load level that lowered it. */
+    private static function weightNote(array $e): string
+    {
+        $w = is_array($e['dns_weight'] ?? null) ? $e['dns_weight'] : null;
+        if (!$w || !isset($w['q']) || !is_numeric($w['q'])) {
+            return '';
+        }
+        $q = (int) $w['q'];
+        $lv = (int) ($w['level'] ?? 0);
+        return '<div class="pcdna-small pcdna-muted pcdna-weight" data-weight="' . $q . '" title="سهم این نود در پاسخ DNS نسبت به نودهای هم‌گروه، از ظرفیت و بار (۱ تا ۴)">وزن DNS '
+            . View::n($q) . ' از ۴' . ($lv > 0 ? ' · <span class="pcdna-c-warn">کاهش‌یافته (بار ' . ($lv === 1 ? 'بالای ۷۰٪' : 'بالای ۸۵٪') . ')</span>' : '') . '</div>';
+    }
+
+    /** overview.tunnel_multi_origin_sites of this request (0 = none / older controller → no flag). */
+    public static $multiSites = 0;
+
+    /** «تخلیه برای به‌روزرسانی…» menu + «لغو تخلیه» button of a node row / detail page; nothing when the controller has no drain. */
+    private static function drainControls(array $e, int $id, array $q): string
+    {
+        $d = self::drainOf($e);
+        if ($d === null) {
+            return '';
+        }
+        $st = (string) ($d['state'] ?? '');
+        $name = (string) ($e['name'] ?? ('#' . $id));
+        $form = '<form method="post" action="' . View::url($q) . '" class="pcdna-edge-form pcdna-drain-form" data-drain-form="' . $id . '">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_drain"><input type="hidden" name="id" value="' . $id . '">'
+            . '<p class="pcdna-small pcdna-muted">نود فوراً از DNS خارج می‌شود و پس از مهلت DNS اتصال تونلی <b>تازه</b> نمی‌پذیرد؛ نشست‌های برقرار تا پایان مدت ادامه دارند. '
+            . 'پس از به‌روزرسانی «لغو تخلیه» را بزنید (تخلیهٔ مدیر خودکار لغو نمی‌شود؛ کنترلر پس از مهلت نگه‌داری حداکثر آن را برمی‌گرداند).</p>'
+            . '<label><span>مدت (دقیقه، ۱ تا ۱۲۰)</span><input class="pcdna-input" name="minutes" type="number" min="1" max="120" dir="ltr" inputmode="numeric" value="15" required></label>'
+            . '<label><span>دلیل (اختیاری)</span><input class="pcdna-input" name="reason" maxlength="64" dir="ltr" placeholder="upgrade"></label>'
+            . '<button type="submit" class="pcdna-btn pcdna-btn-sm pcdna-btn-primary">' . View::icon('history') . '<span>' . ($st === 'draining' ? 'تغییر مدت تخلیه' : 'شروع تخلیه') . '</span></button></form>';
+        return '<details class="pcdna-menu pcdna-edge-drain"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="' . View::e('تخلیهٔ نود ' . $name)
+            . '" title="تخلیه برای به‌روزرسانی…">' . View::icon('history') . '</summary><div class="pcdna-menu-list">' . $form . '</div></details>'
+            . ($st !== '' ? View::postButton($q, 'edge_undrain', ['id' => $id], 'لغو تخلیه', 'pcdna-btn pcdna-btn-sm pcdna-btn-icon pcdna-undrain',
+                'تخلیهٔ نود «' . $name . '» لغو شود؟ نود دوباره در پاسخ DNS قرار می‌گیرد.', 'refresh') : '');
+    }
+
+    /** After 409 last_edge: «تخلیهٔ نود X» card — reason + the «با این حال تخلیه کن» checkbox, minutes / reason kept. */
+    public static function drainForceCard(array $edges, array $q): string
+    {
+        $id = self::$drainForce;
+        if ($id <= 0) {
+            return '';
+        }
+        $name = '#' . $id;
+        foreach ($edges as $e) {
+            if (is_array($e) && (int) ($e['id'] ?? 0) === $id) {
+                $name = (string) ($e['name'] ?? $name);
+            }
+        }
+        $in = self::$drainForceIn;
+        $min = (int) ($in['minutes'] ?? 15);
+        $form = '<form method="post" action="' . View::url($q) . '" class="pcdna-form pcdna-drain-force" data-drain-force="' . $id . '">' . View::csrf()
+            . '<input type="hidden" name="a" value="edge_drain"><input type="hidden" name="id" value="' . $id . '">'
+            . '<input type="hidden" name="minutes" value="' . $min . '"><input type="hidden" name="reason" value="' . View::e((string) ($in['reason'] ?? '')) . '">'
+            . View::alert('warn', '<strong>آخرین نود فعال این گروه/منطقه است.</strong> با تخلیهٔ ' . View::ltr($name) . ' هیچ نود فعال دیگری در گروه/منطقهٔ آن نمی‌ماند؛ '
+                . 'کنترلر برای اینکه پاسخ DNS خالی نشود نود را در DNS نگه می‌دارد، ولی اتصال تونلی تازه پس از مهلت DNS رد می‌شود.')
+            . '<p>' . self::check('force', false, 'با این حال تخلیه کن (' . View::n($min) . ' دقیقه)') . '</p>'
+            . '<div class="pcdna-form-actions"><button type="submit" class="pcdna-btn pcdna-btn-primary">' . View::icon('history') . '<span>تخلیه</span></button>'
+            . '<a class="pcdna-btn pcdna-btn-ghost" href="' . View::url($q) . '">انصراف</a></div></form>';
+        return View::card('تخلیهٔ نود ' . $name, $form, '', 'pcdna-drain-force-card', 'history');
+    }
+
+    /** HTTP/3 summary per group: [group => [h3 nodes, enabled nodes]], or null on a controller without the switch. */
+    public static function h3Summary(array $edges): ?array
+    {
+        $known = false;
+        $out = [];
+        foreach (array_keys(self::EDGE_GROUPS) as $g) {
+            $out[$g] = [0, 0];
+        }
+        foreach ($edges as $e) {
+            if (!is_array($e) || empty($e['enabled'])) {
+                continue;
+            }
+            $known = $known || array_key_exists('http3_enabled', $e);
+            $g = isset($out[$e['group'] ?? 'general']) ? ($e['group'] ?? 'general') : 'general';
+            $out[$g][1]++;
+            $caps = is_array($e['capabilities'] ?? null) ? $e['capabilities'] : [];
+            if (($caps['http3'] ?? false) === true && ($e['http3_enabled'] ?? true) !== false) {
+                $out[$g][0]++;
+            }
+        }
+        return $known ? $out : null;
+    }
+
+    const RELOAD_LABELS = [
+        'count_1h' => 'بارگذاری مجدد در ساعت گذشته', 'count_24h' => 'بارگذاری مجدد در ۲۴ ساعت', 'coalesced_1h' => 'تغییرات ادغام‌شده (ساعت گذشته)',
+        'pending_s' => 'سن تنظیمات در انتظار', 'forced_shutdowns_24h' => 'خاموشی اجباری کارگرها (محافظ حافظه، ۲۴ ساعت)',
+    ];
+
+    /** Node detail «پایداری تونل» (SPEC §22.1–§22.3, §22.6, §22.9, §22.10): drain, probe, reloads, kernel tuning, HTTP/3, DNS weight. */
+    public static function edgeDetail(int $id): string
+    {
+        $back = '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::url(['page' => 'edges']) . '">' . View::icon('server') . '<span>بازگشت به نودها</span></a>';
+        if ($id <= 0) {
+            return $back . View::alert('bad', 'شناسه نود نامعتبر است.');
+        }
+        $ping = self::ping();
+        if (!$ping['ok']) {
+            return $back . self::ctlError($ping);
+        }
+        $r = self::fetch(['/api/v1/edges']);
+        if (!self::ok($r['/api/v1/edges'])) {
+            return $back . View::alert('bad', 'فهرست نودها دریافت نشد: ' . View::e((string) $r['/api/v1/edges']['error']));
+        }
+        $edge = null;
+        foreach ((array) $r['/api/v1/edges']['data'] as $e) {
+            if (is_array($e) && (int) ($e['id'] ?? 0) === $id) {
+                $edge = $e;
+                break;
+            }
+        }
+        if ($edge === null) {
+            return $back . View::alert('bad', 'نودی با این شناسه پیدا نشد.');
+        }
+        $e = $edge;
+        $name = (string) ($e['name'] ?? ('#' . $id));
+        $q = ['page' => 'edges', 'view' => 'detail', 'id' => $id];
+        $row = function (string $k, string $label, string $val) {
+            return '<div data-d="' . View::e($k) . '"><dt>' . View::e($label) . '</dt><dd>' . $val . '</dd></div>';
+        };
+        $na = '<span class="pcdna-muted">—</span>';
+        if (!self::wave13([$e])) {
+            return View::card('پایداری تونل نود ' . $name, View::alert('info', 'کنترلر فعلی جزئیات تخلیه، پروب تونل، بارگذاری مجدد و تنظیمات هسته را گزارش نمی‌کند؛ برای این بخش کنترلر را به موج ۱۳ به‌روزرسانی کنید.'), $back, '', 'activity');
+        }
+        $h = '';
+        $force = self::drainForceCard([$e], $q);
+        // drain
+        $d = self::drainOf($e) ?? [];
+        $st = (string) ($d['state'] ?? '');
+        $body = '<dl class="pcdna-dl pcdna-dl-cols" data-detail="drain">'
+            . $row('state', 'وضعیت', $st === 'draining' ? self::drainBadge($e) : ($st === 'drained' ? View::badge('تخلیه شد', 'muted') : View::badge('عادی (در DNS)', 'ok')))
+            . $row('since', 'شروع', !empty($d['since']) ? View::e(View::date($d['since'], true)) : $na)
+            . $row('until', 'پایان', !empty($d['until']) ? View::e(View::date($d['until'], true)) : $na)
+            . $row('by', 'شروع‌کننده', ($d['by'] ?? '') === 'edge' ? 'خود نود (به‌روزرسانی با --drain)' : (($d['by'] ?? '') === 'admin' ? 'مدیر' : $na))
+            . $row('reason', 'دلیل', !empty($d['reason']) ? View::ltr((string) $d['reason']) : $na)
+            . $row('conns', 'اتصال‌های باز کاربران', isset($d['conns']) && $d['conns'] !== null ? View::n((int) $d['conns']) : $na)
+            . '</dl><div class="pcdna-form-actions">' . self::drainControls($e, $id, $q) . '</div>'
+            . '<p class="pcdna-small pcdna-muted">روی خود نود هم می‌توانید بنویسید: <code dir="ltr">bootstrap.sh --upgrade --drain=15</code> — به‌روزرسانی پس از تخلیه انجام و نود خودکار برگردانده می‌شود.</p>';
+        $h .= View::card('تخلیه برای به‌روزرسانی', $body, '', '', 'history');
+        // tunnel probe
+        $p = is_array($e['tunnel_probe'] ?? null) ? $e['tunnel_probe'] : [];
+        $last = is_array($p['last'] ?? null) ? $p['last'] : null;
+        $body = '<dl class="pcdna-dl pcdna-dl-cols" data-detail="probe">' . $row('state', 'وضعیت', self::probeCell($e))
+            . $row('at', 'آخرین پروب', $last && !empty($last['at']) ? View::e(View::ago($last['at'])) : $na)
+            . $row('fails', 'شکست پیاپی', $last && isset($last['consecutive_fail']) ? View::n((int) $last['consecutive_fail']) : $na) . '</dl>';
+        if ($last) {
+            $body .= '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-probe-table"><thead><tr><th>پروب</th><th>نتیجه</th><th>زمان برقراری</th><th>اکو</th><th>دانلود</th><th>آپلود</th><th>آخرین خطا</th></tr></thead><tbody>';
+            foreach (['ws' => 'WebSocket', 'grpc' => 'gRPC'] as $k => $lbl) {
+                $x = $last[$k] ?? null;
+                if (!is_array($x) || !empty($x['unsupported'])) {
+                    $body .= '<tr data-probe-kind="' . $k . '"><td>' . $lbl . '</td><td colspan="6" class="pcdna-muted">پشتیبانی نمی‌شود</td></tr>';
+                    continue;
+                }
+                $kb = function ($v) {
+                    return is_numeric($v) ? View::e(self::mbps(((float) $v) / 1000)) : '—';
+                };
+                $body .= '<tr data-probe-kind="' . $k . '"><td>' . $lbl . '</td><td>' . (!empty($x['ok']) ? View::badge('سالم', 'ok') : View::badge('ناموفق', 'bad')) . '</td>'
+                    . '<td dir="ltr">' . (is_numeric($x['setup_ms'] ?? null) ? View::n((int) $x['setup_ms']) . ' ms' : '—') . '</td>'
+                    . '<td>' . (array_key_exists('echo_ok', $x) ? (!empty($x['echo_ok']) ? '✓' : '✗') : '—') . '</td>'
+                    . '<td dir="ltr">' . $kb($x['down_kbps'] ?? null) . '</td><td dir="ltr">' . ($k === 'ws' ? $kb($x['up_kbps'] ?? null) : '—') . '</td>'
+                    . '<td>' . (!empty($x['error']) ? '<code dir="ltr">' . View::e(View::clip((string) $x['error'], 120)) . '</code>' : '—') . '</td></tr>';
+            }
+            $body .= '</tbody></table></div>';
+        }
+        $body .= '<p class="pcdna-small pcdna-muted">پروب داخلی سلامت خود نود را می‌سنجد (nginx، TLS و مسیر تونل به یک مبدأ آزمایشی محلی) — نه دسترسی از شبکهٔ کاربران. نود خراب فقط برای سایت‌های تونل و با سقف بودجهٔ هر گروه از DNS خارج می‌شود.</p>';
+        $h .= View::card('پروب تونل', $body, '', '', 'activity');
+        // reloads
+        $rl = is_array($e['reloads'] ?? null) ? $e['reloads'] : null;
+        $m = is_array($e['metrics'] ?? null) ? $e['metrics'] : [];
+        $body = '<dl class="pcdna-dl pcdna-dl-cols" data-detail="reloads">';
+        foreach (['count_1h', 'count_24h', 'coalesced_1h'] as $k) {
+            $body .= $row($k, self::RELOAD_LABELS[$k], $rl && is_numeric($rl[$k] ?? null) ? View::n((int) $rl[$k]) : $na);
+        }
+        $body .= $row('last_at', 'آخرین بارگذاری مجدد', $rl && !empty($rl['last_at']) ? View::e(View::ago($rl['last_at'])) : $na)
+            . $row('pending_s', self::RELOAD_LABELS['pending_s'], $rl && is_numeric($rl['pending_s'] ?? null) ? ((int) $rl['pending_s'] > 0 ? View::n((int) $rl['pending_s']) . ' ثانیه'
+                . (!empty($rl['deferred']) ? ' ' . View::badge('به تعویق افتاده', 'warn') : '') : 'ندارد') : $na)
+            . $row('wst', 'مهلت خاموشی کارگرها (WST)', $rl && is_numeric($rl['wst_s'] ?? null) ? View::e(self::secs((int) $rl['wst_s'])) : $na)
+            . $row('draining_workers', 'نسل‌های در حال تخلیه', is_numeric($m['draining_workers'] ?? null) ? View::n((int) $m['draining_workers']) : $na)
+            . $row('forced', self::RELOAD_LABELS['forced_shutdowns_24h'], $rl && is_numeric($rl['forced_shutdowns_24h'] ?? null) ? View::n((int) $rl['forced_shutdowns_24h']) : $na)
+            . $row('socks', 'سوکت‌های TCP / TIME-WAIT', is_numeric($m['sock_tcp'] ?? null) ? View::n((int) $m['sock_tcp']) . ' / ' . View::n((int) ($m['sock_tw'] ?? 0)) : $na)
+            . '</dl><p class="pcdna-small pcdna-muted">تغییرات تنظیمات پشت‌سرهم ادغام و حداکثر با یک بارگذاری مجدد اعمال می‌شوند؛ اتصال‌های طولانی در نسل قبلی کارگرها تا پایان WST ادامه دارند.</p>';
+        $h .= View::card('بارگذاری مجدد nginx', $body, '', '', 'refresh');
+        // tuning
+        $tu = is_array($e['tuning'] ?? null) ? $e['tuning'] : null;
+        if ($tu === null) {
+            $body = View::emptyState('گزارشی نیست', 'agent این نود هنوز پروفایل تنظیمات هسته را گزارش نکرده است.', 'info');
+        } else {
+            $mis = is_array($tu['mismatches'] ?? null) ? array_filter($tu['mismatches'], 'is_array') : [];
+            $body = '<dl class="pcdna-dl pcdna-dl-cols" data-detail="tuning">'
+                . $row('ok', 'وضعیت', !empty($tu['ok']) ? View::badge('✓ مطابق پروفایل', 'ok') : View::badge(View::n(count($mis)) . ' مورد ناهمخوان', 'warn'))
+                . $row('profile', 'پروفایل', View::ltr((string) ($tu['profile'] ?? '—')) . (is_numeric($tu['ram_mb'] ?? null) ? ' · ' . View::n((int) $tu['ram_mb']) . ' MB RAM' : ''))
+                . $row('cc', 'کنترل ازدحام', !empty($tu['cc']) ? View::ltr((string) $tu['cc']) : $na)
+                . $row('qdisc', 'qdisc', !empty($tu['qdisc']) ? View::ltr((string) $tu['qdisc']) : $na)
+                . $row('nofile', 'حداکثر فایل باز nginx', is_numeric($tu['nofile'] ?? null) ? View::n((int) $tu['nofile']) : $na) . '</dl>';
+            if ($mis) {
+                $body .= '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-tuning-table"><thead><tr><th>کلید</th><th>مقدار مورد انتظار</th><th>مقدار فعلی</th></tr></thead><tbody>';
+                foreach (array_slice($mis, 0, 20) as $x) {
+                    $body .= '<tr data-mismatch="' . View::e((string) ($x['key'] ?? '')) . '"><td>' . View::ltr(View::clip((string) ($x['key'] ?? ''), 64)) . '</td><td>'
+                        . View::ltr(View::clip((string) ($x['want'] ?? ''), 64)) . '</td><td>' . View::ltr(View::clip((string) ($x['have'] ?? ''), 64)) . '</td></tr>';
+                }
+                $body .= '</tbody></table></div><p class="pcdna-small pcdna-muted">روی نود <code dir="ltr">pcdn-agent tune --write</code> را اجرا کنید.</p>';
+            }
+        }
+        $h .= View::card('تنظیمات هسته', $body, '', '', 'sliders');
+        // HTTP/3, capacity weight, capabilities
+        $caps = is_array($e['capabilities'] ?? null) ? $e['capabilities'] : [];
+        $w = is_array($e['dns_weight'] ?? null) ? $e['dns_weight'] : null;
+        $flag = function ($k) use ($caps) {
+            return ($caps[$k] ?? null) === true ? View::badge('دارد', 'ok') : View::badge('ندارد', 'muted');
+        };
+        $body = '<dl class="pcdna-dl pcdna-dl-cols" data-detail="network">'
+            . $row('http3', 'HTTP/3 (QUIC)', array_key_exists('http3_enabled', $e) ? self::edgeHttp3Toggle($e, $id, $q) : $na)
+            . $row('capacity', 'ظرفیت اعلام‌شده', (int) ($e['capacity_mbps'] ?? 0) > 0 ? View::e(self::mbps((int) $e['capacity_mbps'])) : 'نامشخص')
+            . $row('weight', 'وزن DNS', $w && is_numeric($w['q'] ?? null) ? self::weightNote($e) : '<span class="pcdna-muted">وزن‌دهی DNS خاموش است (همه هم‌وزن)</span>')
+            . $row('cap_drain', 'تخلیه روی نود', $flag('drain')) . $row('cap_probe', 'پروب تونل', $flag('tunnel_probe'))
+            . $row('cap_multi', 'چند مبدأ برای مسیر تونل', $flag('tunnel_multi_origin')) . $row('cap_resolve', 'اتصال ماندگار به مبدأ دامنه‌ای', $flag('upstream_resolve'))
+            . '</dl>';
+        $h .= View::card('شبکه، HTTP/3 و وزن', $body, '', '', 'zap');
+        return '<div class="pcdna-detail-head">' . $back . '<h2 class="pcdna-detail-title">پایداری تونل نود ' . View::ltr($name) . '</h2></div>' . $force
+            . '<div class="pcdna-grid-2 pcdna-edge-detail">' . $h . '</div>';
+    }
+
+    private static function secs(int $s): string
+    {
+        if ($s >= 3600 && $s % 3600 === 0) {
+            return View::n($s / 3600) . ' ساعت';
+        }
+        if ($s >= 60 && $s % 60 === 0) {
+            return View::n($s / 60) . ' دقیقه';
+        }
+        return View::n($s) . ' ثانیه';
+    }
+
     /**
      * @param array $edges edge objects
      * @param bool $actions render the per-row action menu
@@ -716,8 +1076,10 @@ final class Pages
         if (!$edges) {
             return View::emptyState('هنوز نودی ثبت نشده است', 'برای شروع، از صفحه «نودها» اولین نود را اضافه کنید.', 'server');
         }
+        $w13 = $actions && self::wave13($edges);
+        $multiFleet = $w13 && self::$multiSites > 0;
         $h = '<div class="pcdna-table-wrap"><table class="pcdna-table pcdna-edges"><thead><tr><th>نام / IP</th><th>منطقه / گروه</th><th>وضعیت</th>'
-            . '<th>بار لحظه‌ای</th><th>در دسترس‌بودن</th><th>آخرین ارتباط</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
+            . ($w13 ? '<th>پروب تونل</th>' : '') . '<th>بار لحظه‌ای</th><th>در دسترس‌بودن</th><th>آخرین ارتباط</th>' . ($actions ? '<th><span class="pcdna-sr">عملیات</span></th>' : '') . '</tr></thead><tbody>';
         foreach ($edges as $e) {
             $online = self::edgeOnline($e);
             $fresh = !empty($e['enabled']) && empty($e['last_seen_at']);
@@ -736,7 +1098,12 @@ final class Pages
                 // «Shield» (SPEC §14.1) sits under the status badge: the status column has room, the group column does not.
                 . '<td>' . $status . (!$actions && !empty($e['shield']) ? ' ' . View::badge('Shield', 'ok', ' title="لایهٔ کش میانی (Origin Shield)"') : '')
                 . ($actions && $shieldKnown ? '<div class="pcdna-shield-cell">' . self::edgeShieldToggle($e, $id) . '</div>' : '')
-                . self::edgeWarnBadges($e) . '</td><td class="pcdna-load-cell">' . self::loadCell($e) . '</td>'
+                . ($actions && array_key_exists('http3_enabled', $e) ? '<div class="pcdna-shield-cell">' . self::edgeHttp3Toggle($e, $id, ['page' => 'edges']) . '</div>' : '')
+                . ($actions ? self::drainBadge($e) : '')
+                . ($multiFleet && ($e['group'] ?? '') === 'tunnel' && is_array($e['capabilities'] ?? null) && ($e['capabilities']['tunnel_multi_origin'] ?? false) !== true
+                    ? View::badge('بدون چند مبدأ', 'warn', ' data-warn="multi_origin" title="' . View::e('agent این نود قدیمی است؛ ' . View::n(self::$multiSites) . ' سایت مسیر تونل با چند سرور مبدأ دارد و روی این نود فقط به سرور اصلی می‌رسد (بدون جایگزینی خودکار). نود را به‌روزرسانی کنید.') . '"') : '')
+                . self::edgeWarnBadges($e) . '</td>' . ($w13 ? '<td class="pcdna-probe-cell">' . self::probeCell($e) . '</td>' : '')
+                . '<td class="pcdna-load-cell">' . self::loadCell($e) . ($actions ? self::weightNote($e) : '') . '</td>'
                 . '<td class="pcdna-uptime-cell">' . self::uptimeCell($e, $series[$id] ?? null) . '</td>'
                 . '<td title="' . View::e($e['last_seen_at'] ?? '') . '">' . View::e(View::ago($e['last_seen_at'] ?? null))
                 . (!empty($e['applied_version']) ? '<div class="pcdna-small pcdna-muted" title="نسخه تنظیمات اعمال‌شده">' . View::ltr(substr((string) $e['applied_version'], 0, 8), 'pcdna-code') . '</div>' : '')
@@ -767,7 +1134,10 @@ final class Pages
                     . ' href="' . View::url(['page' => 'edges', 'view' => 'addresses', 'id' => $id]) . '" title="آدرس‌ها'
                     . ($addrCount ? ' (' . View::n($addrCount) . ' آدرس اضافی)' : '') . '" aria-label="آدرس‌های نود ' . View::e($e['name'] ?? '') . '">'
                     . View::icon('globe') . ($addrDown ? '<span class="pcdna-addr-dot" aria-hidden="true"></span>' : '') . '<span class="pcdna-sr">آدرس‌ها</span></a>';
-                $h .= '<td class="pcdna-actions">' . $addrLink . $logsLink . $up
+                $detailLink = $w13 ? '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" data-detail-link="' . $id . '" href="' . View::url(['page' => 'edges', 'view' => 'detail', 'id' => $id])
+                    . '" title="پایداری تونل (تخلیه، پروب، بارگذاری مجدد، تنظیمات هسته)" aria-label="' . View::e('پایداری تونل نود ' . ($e['name'] ?? '')) . '">' . View::icon('activity')
+                    . '<span class="pcdna-sr">پایداری تونل</span></a>' : '';
+                $h .= '<td class="pcdna-actions">' . $addrLink . $logsLink . $detailLink . $up . self::drainControls($e, $id, $q)
                     . '<details class="pcdna-menu pcdna-edge-edit"><summary class="pcdna-btn pcdna-btn-sm pcdna-btn-icon" aria-label="ویرایش نود ' . View::e($e['name'] ?? '') . '" title="گروه، ظرفیت و منطقه">'
                     . View::icon('sliders') . '</summary><div class="pcdna-menu-list"><form method="post" action="' . View::url($q) . '" class="pcdna-edge-form">' . View::csrf()
                     . '<input type="hidden" name="a" value="edge_edit"><input type="hidden" name="id" value="' . $id . '">'
@@ -786,7 +1156,7 @@ final class Pages
             }
             $h .= '</tr>';
             if ($err !== '') {
-                $h .= '<tr class="pcdna-errrow"><td colspan="' . ($actions ? 7 : 6) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
+                $h .= '<tr class="pcdna-errrow"><td colspan="' . (($actions ? 7 : 6) + ($w13 ? 1 : 0)) . '"><span class="pcdna-err-label">' . View::icon('warn') . 'آخرین خطا:</span> '
                     . '<code dir="ltr" title="' . View::e(View::clip($err, 600)) . '">' . View::e(View::clip($err, 300)) . '</code></td></tr>';
             }
         }
@@ -825,6 +1195,7 @@ final class Pages
     private static function groupCards(array $edges): string
     {
         $h = '<div class="pcdna-groups">';
+        $h3 = self::h3Summary($edges);
         foreach (self::groupTotals($edges) as $g => $t) {
             [$label] = self::EDGE_GROUPS[$g];
             $peak = max($t['rx'], $t['tx']);
@@ -834,7 +1205,11 @@ final class Pages
                 . '<div class="pcdna-group-val"><span dir="ltr">↓' . View::e(self::mbps($t['rx'])) . ' ↑' . View::e(self::mbps($t['tx'])) . '</span>'
                 . ($t['cap'] > 0 ? '<small>از ظرفیت ' . View::e(self::mbps($t['cap'])) . '</small>' : '') . '</div>'
                 . ($t['cap'] > 0 ? View::meter(min(1, $peak / $t['cap']), $peak / $t['cap'] > .8 ? 'warn' : 'brand') : '')
-                . '<div class="pcdna-small pcdna-muted">' . View::n($t['conns']) . ' اتصال همزمان</div></div>';
+                . '<div class="pcdna-small pcdna-muted">' . View::n($t['conns']) . ' اتصال همزمان</div>'
+                // SPEC §22.9: the client app offers the HTTP/3 variant of an xhttp path only when every node of the group speaks it
+                . ($h3 !== null ? '<div class="pcdna-small" data-h3-summary="' . $h3[$g][0] . '/' . $h3[$g][1] . '" title="نسخهٔ HTTP/3 مسیرهای XHTTP فقط وقتی به مشتری پیشنهاد می‌شود که همهٔ نودهای گروه HTTP/3 داشته باشند">'
+                    . View::badge('HTTP/3: ' . View::n($h3[$g][0]) . ' از ' . View::n($h3[$g][1]) . ' نود', $h3[$g][1] > 0 && $h3[$g][0] === $h3[$g][1] ? 'ok' : 'muted') . '</div>' : '')
+                . '</div>';
         }
         return $h . '</div>';
     }
@@ -1189,6 +1564,9 @@ final class Pages
         if (($get['view'] ?? '') === 'addresses') {
             return self::edgeAddresses((int) ($get['id'] ?? 0));
         }
+        if (($get['view'] ?? '') === 'detail') {
+            return self::edgeDetail((int) ($get['id'] ?? 0));
+        }
         $ping = self::ping();
         $h = '';
         $ctlUrl = Env::controllerUrl();
@@ -1209,7 +1587,10 @@ final class Pages
         if (!$ping['ok']) {
             return $h . self::ctlError($ping);
         }
-        $r = self::fetch(['/api/v1/edges', '/edge/version']);
+        $r = self::fetch(['/api/v1/edges', '/edge/version', '/api/v1/overview']);
+        // SPEC §22.4: how many sites use several origins per tunnel path (overview.tunnel_multi_origin_sites, wave 13)
+        self::$multiSites = self::ok($r['/api/v1/overview']) && is_numeric($r['/api/v1/overview']['data']['tunnel_multi_origin_sites'] ?? null)
+            ? (int) $r['/api/v1/overview']['data']['tunnel_multi_origin_sites'] : 0;
         $bundle = self::ok($r['/edge/version']) && is_string($r['/edge/version']['data']['version'] ?? null)
             ? (string) $r['/edge/version']['data']['version'] : null;
         $edges = self::ok($r['/api/v1/edges']) ? (array) $r['/api/v1/edges']['data'] : null;
@@ -1219,6 +1600,7 @@ final class Pages
         }
         $series = $edges !== null ? self::uptimeSeries($edges) : null;
         if ($edges !== null) {
+            $h .= self::drainForceCard($edges, ['page' => 'edges']);
             foreach (self::saturated($edges) as $e) {
                 $h .= View::alert(!empty($e['shed']) ? 'bad' : 'warn', 'نود ' . View::ltr($e['name'] ?? '') . (!empty($e['shed'])
                     ? ' اشباع شده و موقتاً از پاسخ DNS خارج است؛ ترافیک به نودهای دیگر همان گروه می‌رود. ظرفیت اضافه کنید یا نود جدید به این گروه بیاورید.'

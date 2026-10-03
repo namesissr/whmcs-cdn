@@ -34,6 +34,7 @@ final class FeatureOverrides
         'features.tunnel_max_mbps' => [0, 100000], 'features.max_transform_rules' => [0, 1000], 'features.max_redirects' => [0, 10000],
         'features.max_webhooks' => [0, 50], 'features.sla_target' => [0, 100], 'features.max_l4_apps' => [0, 100],
         'features.storage_gb' => [0, 1000000], 'features.max_functions' => [0, 32],
+        'features.max_tunnel_origins' => [1, 10],
     ];
     const ENUMS = ['features.edge_group' => ['general', 'tunnel']];
     const FIELD_RE = '/^(?:bandwidth_limit_gb|max_records|ssl_allowed|rate_limit_rps|features\.[a-z][a-z0-9_]{0,47})$/D';

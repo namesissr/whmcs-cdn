@@ -119,6 +119,9 @@ class ClientApi
             // SPEC §18.1–§18.3 (wave 10): waiting-room live stats, access sign-in log, monthly statement
             // (format=json here; pdf/csv are streamed by download()) and the site's audit entries (json/csv)
             self::W10_WAITING_ROOM, self::W10_ACCESS_LOG, self::W10_STATEMENT, self::W10_AUDIT,
+            // SPEC §22.11 / §22.12 (wave 13): recommended client settings per path (edge timers, keepalive, mux, HTTP/3
+            // availability — never a node name or address) and the «why did my connection drop?» report (read-only)
+            self::W16_PROFILE, self::W16_DROPS,
         ],
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'apikeys', 'redirects/import',
             'logs/test', 'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)',
@@ -166,7 +169,15 @@ class ClientApi
         self::W10_AUDIT => ['from' => self::W10_TIME, 'to' => self::W10_TIME, 'format' => '/^(json|csv)$/D'],
         self::W10_ACCESS_LOG => ['limit' => '/^([1-9][0-9]?|1[0-9]{2}|200)$/D'],
         self::W10_WAITING_ROOM => ['hours' => '/^([1-9]|[1-9][0-9]|1[0-5][0-9]|16[0-8])$/D'],
+        // SPEC §22.12: drops report hours 1..744, same rule as tunnel/quality (the app uses 24/168/720). tunnel/profile takes no query.
+        self::W16_DROPS => ['hours' => '/^([1-9]|[1-9][0-9]|[1-6][0-9]{2}|7[0-3][0-9]|74[0-4])$/D'],
     ];
+
+    // ------------------------------------------------------------------ wave 13 (SPEC §22) — tunnel speed and stability
+    /** GET → {edge: {...timers}, http3: {site, nodes, nodes_h3, available}, paths: [{id, idle_timeout_s, recommended, http3, …}]} (§22.11) */
+    const W16_PROFILE = 'tunnel/profile';
+    /** GET ?hours → {hours, total, reasons, rejected, paths, series, maintenance, plan, top, has_data} (§22.12) */
+    const W16_DROPS = 'tunnel/drops';
 
     // ------------------------------------------------------------------ wave 10 (SPEC §18) — the controller contract in one place
     /** GET → {enabled, active_estimate, queued_estimate, last_hour: {...}, hourly: [...]} (§18.1) */
