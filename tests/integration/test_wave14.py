@@ -101,8 +101,12 @@ def test_rum_beacon_reaches_the_report(api, edges, site):
             "Host": DOMAIN, "Content-Type": "text/plain;charset=UTF-8", "Origin": f"http://{DOMAIN}"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status == 204
-    for _ in range(3):
-        assert send()
+    # Each beacon is retried until the edge answers 204: right after the agent's reload a new connection can
+    # still land on a worker of the previous configuration for a moment (reuseport listeners are shared by
+    # the old and new workers), which answers the old tree's 404 for /__pcdn/ - even though rum.js was
+    # already served by a new worker. Only beacons answered 204 are counted below.
+    for i in range(3):
+        wait_until(send, f"beacon {i + 1} accepted (204) by {name}")
 
     def report():
         rep = api.get(f"/api/v1/sites/{DOMAIN}/rum?hours=24")

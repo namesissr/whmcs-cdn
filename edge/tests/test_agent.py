@@ -25,6 +25,10 @@ def make_cfg(tmp_path, **over):
         "ACCESS_LOG": str(tmp_path / "access.log"), "L4_ACCESS_LOG": str(tmp_path / "l4.log"), "FN_USAGE_LOG": str(tmp_path / "fn-usage.log"),
         "ERROR_LOG": str(tmp_path / "error.log"),
         "BUNDLE_VERSION_FILE": str(tmp_path / "bundle.version"),
+        # SPEC §23: never the host's installed release / RUM databases / upgrade dirs
+        "RELEASE_FILE": str(tmp_path / "release"), "RUM_ASN_DB": str(tmp_path / "missing-asn.mmdb"),
+        "RUM_REGION_DB": "", "RUM_LOG": str(tmp_path / "rum.log"), "UPGRADE_DIR": str(tmp_path / "upgrade"),
+        "RELEASES_DIR": str(tmp_path / "releases"),
         "PAGES_DIR": str(HERE.parent / "pages"),
         "NJS_FILE": str(HERE.parent / "njs/pcdn.js"),
         "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"),

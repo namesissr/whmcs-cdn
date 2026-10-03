@@ -85,7 +85,7 @@ def env(tmp_path_factory):
     cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
-        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "RUM_LOG": str(tmp / "rum.log"),
+        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "RUM_LOG": str(tmp / "rum.log"), "RUM_ASN_DB": str(tmp / "no-asn.mmdb"), "RUM_REGION_DB": "",
         "FN_USAGE_LOG": str(tmp / "fn.log"), "PAGES_DIR": str(HERE.parent / "pages"),
         "NJS_FILE": str(HERE.parent / "njs/pcdn.js"), "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"),
         "GEOIP_DB": str(tmp / "none.mmdb"), "RESOLVER": "127.0.0.1", "NGINX_USER": "root", "LISTEN_IPV6": "no",

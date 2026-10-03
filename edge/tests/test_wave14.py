@@ -703,26 +703,32 @@ def test_njs_rum_ingest_validation_clamping_origin(tmp_path):
 # ================================================================= §23.7 beacon script (node)
 
 BEACON_HARNESS = r"""
-const fs = require('fs');
+// The script runs in its own vm context whose globals are exactly these fakes: Node >= 21 has a read-only
+// global `navigator` (and its own performance / fetch), so assigning over Node's globals is not reliable.
+const fs = require('fs'), vm = require('vm');
 const opts = JSON.parse(process.argv[3]);
 const sent = [], listeners = {}, obs = [];
-global.window = global;
-global.location = { pathname: opts.path || '/products' };
-global.history = { pushState: function () {} };
-global.Math.random = () => opts.random;
-global.matchMedia = q => ({ matches: q.indexOf('767') >= 0 ? opts.mobile : false });
-global.navigator = { sendBeacon: (u, b) => { sent.push({ u, b: JSON.parse(b) }); return true; } };
-global.fetch = () => { throw new Error('no fetch expected'); };
-global.performance = { getEntriesByType: t => t === 'navigation' ? [{ activationStart: 0, responseStart: 300.4,
-  domainLookupStart: 1, domainLookupEnd: 11, connectStart: 11, connectEnd: 61, secureConnectionStart: 31,
-  domInteractive: 1200, loadEventEnd: 2100, type: 'navigate', serverTiming: [{ name: 'cdn-cache', description: 'hit' }] }] : [] };
-global.PerformanceObserver = function (cb) { this.cb = cb; obs.push(this); };
-global.PerformanceObserver.prototype.observe = function (o) { this.type = o.type; };
+function PO(cb) { this.cb = cb; obs.push(this); }
+PO.prototype.observe = function (o) { this.type = o.type; };
 const doc = { visibilityState: 'visible', currentScript: { getAttribute: n => n === 'data-s' ? opts.s : (opts.spa ? '1' : null) },
   addEventListener: (t, f) => { (listeners['d:' + t] = listeners['d:' + t] || []).push(f); } };
-global.document = doc;
-global.addEventListener = (t, f) => { (listeners['w:' + t] = listeners['w:' + t] || []).push(f); };
-eval(fs.readFileSync(process.argv[2], 'utf8'));
+const g = {
+  location: { pathname: opts.path || '/products' },
+  history: { pushState: function () {} },
+  matchMedia: q => ({ matches: q.indexOf('767') >= 0 ? opts.mobile : false }),
+  navigator: { sendBeacon: (u, b) => { sent.push({ u, b: JSON.parse(b) }); return true; } },
+  fetch: () => { throw new Error('no fetch expected'); },
+  performance: { getEntriesByType: t => t === 'navigation' ? [{ activationStart: 0, responseStart: 300.4,
+    domainLookupStart: 1, domainLookupEnd: 11, connectStart: 11, connectEnd: 61, secureConnectionStart: 31,
+    domInteractive: 1200, loadEventEnd: 2100, type: 'navigate', serverTiming: [{ name: 'cdn-cache', description: 'hit' }] }] : [] },
+  PerformanceObserver: PO,
+  document: doc,
+  addEventListener: (t, f) => { (listeners['w:' + t] = listeners['w:' + t] || []).push(f); },
+};
+g.window = g;
+vm.createContext(g);
+vm.runInContext('Math.random = function () { return ' + Number(opts.random) + '; };', g);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), g, { filename: 'rum.js' });
 const emit = (type, entries) => obs.filter(o => o.type === type).forEach(o => o.cb({ getEntries: () => entries }));
 emit('paint', [{ name: 'first-contentful-paint', startTime: 800 }]);
 emit('largest-contentful-paint', [{ startTime: 1500 }, { startTime: 1700 }]);
@@ -731,7 +737,7 @@ emit('layout-shift', [{ value: 0.05, startTime: 100, hadRecentInput: false }, { 
 emit('event', [{ interactionId: 0, duration: 900 }, { interactionId: 5, duration: 120 }]);
 (listeners['d:pointerdown'] || []).forEach(f => f());
 emit('largest-contentful-paint', [{ startTime: 4000 }]);   // after the first input: ignored
-if (opts.spa) { global.location.pathname = '/next'; global.history.pushState({}, '', '/next');
+if (opts.spa) { g.location.pathname = '/next'; g.history.pushState({}, '', '/next');
   emit('event', [{ interactionId: 7, duration: 60 }]); }
 doc.visibilityState = 'hidden';
 (listeners['d:visibilitychange'] || []).forEach(f => f());
