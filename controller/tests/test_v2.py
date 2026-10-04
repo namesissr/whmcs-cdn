@@ -84,6 +84,30 @@ def test_plan_gates_and_limits(client):
     assert client.put(f"{S}/config/waf", json={"mode": "block", "paranoia": 2}).status_code == 200
 
 
+def test_ddos_gate_and_render(client):
+    # plan without DDoS: picking "captcha for everyone" (or any non-off mode) is refused, so the
+    # panel can never silently save a mode the plan would just force back off.
+    site(client, features={"ddos": False})
+    assert client.put(f"{S}/config/ddos", json={"mode": "captcha"}).status_code == 403
+    assert client.put(f"{S}/config/ddos", json={"mode": "js"}).status_code == 403
+    assert client.put(f"{S}/config/ddos", json={"mode": "auto"}).status_code == 403
+    assert client.put(f"{S}/config/ddos", json={"mode": "off"}).status_code == 200  # turning off always allowed
+
+    # plan with DDoS: the mode saves, and the edge receives it unchanged.
+    assert client.patch(f"{S}/plan", json={"features": {"ddos": True}}).status_code == 200
+    assert client.put(f"{S}/config/ddos", json={"mode": "captcha"}).status_code == 200
+    token = add_edge(client)
+    cfg = edge_get(client, token, "/edge/v1/config").json()["sites"][0]
+    assert cfg["ddos"]["mode"] == "captcha"
+
+    # a later plan downgrade (DDoS removed) forces the rendered mode back to off (defense in depth),
+    # even though "captcha" is still stored.
+    assert client.patch(f"{S}/plan", json={"features": {"ddos": False}}).status_code == 200
+    cfg = edge_get(client, token, "/edge/v1/config").json()["sites"][0]
+    assert cfg["ddos"]["mode"] == "off"
+    assert client.get(f"{S}/config/ddos").json()["mode"] == "captcha"
+
+
 def test_pools_records_and_edge_config(client):
     site(client)
     pools = {"pools": [{"name": "main", "method": "ip_hash", "origins": [

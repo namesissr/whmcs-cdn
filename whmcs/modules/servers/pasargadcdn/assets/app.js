@@ -1086,12 +1086,21 @@
         }), { id: 'dev', cls: cache.dev_mode ? 'is-on' : '' })
     ];
     if (f.ddos) {
-      var dd = config('ddos'), attack = dd.mode === 'js';
-      rows.push(row('shieldBolt', 'danger', t('حالت زیر حمله'), attack ? t('روشن است: همه بازدیدکنندگان یک چالش کوتاه می‌بینند.') : t('در زمان حمله روشن کنید؛ همه بازدیدکنندگان پیش از ورود یک چالش کوتاه JS می‌بینند.'),
+      // "Under attack" = every visitor is challenged. Both the JS-challenge ("js") and the
+      // CAPTCHA-for-everyone ("captcha") modes challenge all visitors, so the switch reads ON for
+      // either one. "auto" (challenge only above the threshold) and "off" read OFF. A saved
+      // "captcha" must show ON and keep its CAPTCHA — the display must never rewrite it to "js".
+      var dd = config('ddos'), attack = dd.mode === 'js' || dd.mode === 'captcha';
+      var attackDesc = attack
+        ? (dd.mode === 'captcha' ? t('روشن است: همه بازدیدکنندگان باید یک کپچا حل کنند.') : t('روشن است: همه بازدیدکنندگان یک چالش کوتاه می‌بینند.'))
+        : t('در زمان حمله روشن کنید؛ همه بازدیدکنندگان پیش از ورود یک چالش کوتاه JS می‌بینند.');
+      rows.push(row('shieldBolt', 'danger', t('حالت زیر حمله'), attackDesc,
         sw(attack, 'pcdn-qa-attack', function (v, el) {
           var body = config('ddos');
-          if (v) { P.store('prevddos-' + SID, body.mode === 'js' ? 'off' : body.mode); body.mode = 'js'; }
-          else { var prev = P.store('prevddos-' + SID); body.mode = prev && prev !== 'js' && /^(off|auto|captcha)$/.test(prev) ? prev : 'off'; P.store('prevddos-' + SID, null); }
+          // turning ON is reachable only from off/auto (captcha/js already read ON), so this never
+          // clobbers a saved CAPTCHA; turning OFF restores the previous non-challenge mode.
+          if (v) { P.store('prevddos-' + SID, /^(off|auto)$/.test(body.mode) ? body.mode : 'off'); body.mode = 'js'; }
+          else { var prev = P.store('prevddos-' + SID); body.mode = prev && /^(off|auto)$/.test(prev) ? prev : 'off'; P.store('prevddos-' + SID, null); }
           putSection('ddos', body).then(function (res) {
             done(el, res, v ? t('حالت زیر حمله روشن شد. پس از پایان حمله خاموشش کنید.') : t('حالت زیر حمله خاموش شد (حالت قبلی: ') + modeLabel('ddos', body.mode)[0] + ').', !v);
           });

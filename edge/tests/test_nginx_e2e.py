@@ -501,6 +501,28 @@ def test_captcha_flow(env):
     assert env.req("cap.test", "/dash", headers={"Cookie": js_cookie}).status == 403
 
 
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def test_captcha_challenges_real_browser(env):
+    # "CAPTCHA for everyone": a normal browser (not a verified crawler, no allow rule) must see the
+    # captcha before reaching the origin, and solving it must grant access for that same browser.
+    hdr = {"User-Agent": BROWSER_UA}
+    r = env.req("cap.test", "/area", headers=hdr)
+    assert r.status == 403 and "<svg" in r.text, r.text[:300]
+    assert env.last_log("cap.test", "/area")["v"] == "captcha:ddos:captcha"
+    t, ret = captcha_form(r.text)
+    nonce = t.split(".")[1]
+    hx = hmac.new(SECRET.encode(), f"capans|{nonce}".encode(), hashlib.sha256).hexdigest()
+    answer = "".join(CAPTCHA_ALPHABET[int(hx[i * 4:i * 4 + 4], 16) % len(CAPTCHA_ALPHABET)] for i in range(5))
+    form = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": BROWSER_UA}
+    good = env.req("cap.test", "/__pcdn/captcha", "POST", form, urllib.parse.urlencode({"t": t, "a": answer, "r": ret}))
+    assert good.status == 302
+    cookie = good.cookies[0].split(";")[0]
+    assert env.req("cap.test", "/area", headers={"Cookie": cookie, "User-Agent": BROWSER_UA}).status == 200
+
+
 # ----------------------------------------------------------------- rate limit
 
 def test_rate_limit_429(env):

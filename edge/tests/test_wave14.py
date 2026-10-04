@@ -7,6 +7,7 @@ install.sh / bootstrap.sh blocks (release check / files, join flow, --version, l
 The real-nginx scenarios (RUM injection and ingestion, the RUM log, X-Served-By) are in
 test_wave14_e2e.py."""
 
+import datetime
 import hashlib
 import io
 import json
@@ -386,7 +387,10 @@ def test_agent_keeps_node_upgrade_and_reports_release(tmp_path, monkeypatch):
 # ================================================================= §23.5 live oe / pe
 
 def _line(**kw):
-    e = {"t": "2026-10-03T10:00:05+00:00", "h": "a.com", "b": 10, "s": 200, "c": "", "ip": "1.2.3.4", "cc": "IR",
+    # a timestamp a few minutes ago so the live host-minute is always inside read_usage's 24 h window
+    # (a fixed date falls out of the window once the wall clock moves past it: a time-bomb test)
+    recent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:05+00:00")
+    e = {"t": recent, "h": "a.com", "b": 10, "s": 200, "c": "", "ip": "1.2.3.4", "cc": "IR",
          "m": "GET", "u": "/", "v": "ok", "tn": "", "rt": 0.01, "bu": 100, "ub": "", "us": "200", "pg": "",
          "uct": "0.001"}
     e.update(kw)
