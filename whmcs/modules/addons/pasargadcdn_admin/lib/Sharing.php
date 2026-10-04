@@ -19,10 +19,12 @@ if (class_exists(__NAMESPACE__ . '\\Sharing', false)) {
  *  - client area `index.php?m=pasargadcdn_admin&page=shared` («دامنه‌های اشتراکی»): the member's invitations (accept /
  *    decline, bound to the client's primary e-mail), shared domains (role, owner display name only), «مدیریت» → the module's
  *    client app in a `shared` context, «خروج»; `page=shared&invite=<token>` is the e-mailed accept link;
- *  - `page=sharedapi&share=<id>&path=…` — the app's JSON proxy for a member: client session + module CSRF; the share row is
- *    re-read on EVERY request (member id, status active, owner service still the owner's and live), so a revoked / left /
- *    re-roled member is refused (403) or limited on the next call; ClientApi::handle() then applies the whitelist and the
- *    role's allow-list (deny by default) and audits every write with `share:<member>:<role>`;
+ *  - `sharedapi.php?share=<id>&path=…` (standalone file, like the server module's api.php) — the app's JSON proxy for a
+ *    member: client session + module CSRF. A direct file, NOT the WHMCS client-area router, because some web servers answer
+ *    POST to `index.php?…&page=sharedapi` with a bare HTTP 405; the `page=sharedapi` route is kept for GET fallback. The share
+ *    row is re-read on EVERY request (member id, status active, owner service still the owner's and live), so a revoked /
+ *    left / re-roled member is refused (403) or limited on the next call; ClientApi::handle() then applies the whitelist and
+ *    the role's allow-list (deny by default) and audits every write with `share:<member>:<role>`;
  *  - admin: page «اشتراک‌ها» (all shares, filters, revoke, audit trail), operator-site sharing (Operator page), cron expiry,
  *    home-page card of pending invitations.
  */
@@ -335,8 +337,13 @@ final class Sharing
         I18n::$current = $prev;
         $base = function_exists('pasargadcdn_module_url') ? \pasargadcdn_module_url() : 'modules/servers/pasargadcdn';
         $assets = \pasargadcdn_assets($base, $lang);
+        // The app talks to the standalone sharedapi.php (NOT index.php?page=sharedapi): a direct file,
+        // like the owner's api.php, so a member's writes are never answered with a bare HTTP 405 by a
+        // web server that rejects POST to the WHMCS client-area router. Same root as the assets base.
+        $apiBase = \preg_replace('#modules/servers/pasargadcdn$#', 'modules/addons/pasargadcdn_admin', $base);
+        $sharedApi = $apiBase . '/sharedapi.php?share=' . $id;
         $h = '<link rel="stylesheet" href="' . self::e($assets['css']) . '">'
-            . '<div id="pcdn-app" class="pcdn" dir="' . ($lang === 'en' ? 'ltr' : 'rtl') . '" lang="' . $lang . '" data-api="' . self::e(self::API . '&share=' . $id)
+            . '<div id="pcdn-app" class="pcdn" dir="' . ($lang === 'en' ? 'ltr' : 'rtl') . '" lang="' . $lang . '" data-api="' . self::e($sharedApi)
             . '" data-csrf="' . self::e(self::csrf()) . '" data-shared="1"><div class="pcdn-boot-loading" role="status">'
             . self::e(self::tx('در حال بارگذاری پنل CDN…', 'Loading the CDN panel…')) . '</div></div>'
             . '<script type="application/json" id="pcdn-boot">' . \pasargadcdn_boot_json($boot) . '</script>';
