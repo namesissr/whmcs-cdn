@@ -459,6 +459,24 @@ class ClientApi
     }
 
     /**
+     * Release the PHP session write-lock before a long controller call. PHP serialises every request in
+     * one browser session on a single session file lock, so while the client app's background boot calls
+     * (tunnel/health, tunnel/profile, config/history, account alerts, …) are still in flight holding it,
+     * the NEXT request — e.g. a page refresh calling session_start() — BLOCKS until they finish and the
+     * page appears to hang; re-opening the service later works only because the calls have since drained.
+     * By here the request has already READ everything it needs from the session (the CSRF token and the
+     * client id, captured into $req by the entry point) and writes nothing more, so the lock can go now.
+     * clientError() is the only path that writes the session and it never reaches these call sites.
+     * A no-op under tests / CLI, where no session is active; @ silences a late-close notice.
+     */
+    private static function releaseSession(): void
+    {
+        if (\function_exists('session_write_close') && \session_status() === \PHP_SESSION_ACTIVE) {
+            @\session_write_close();
+        }
+    }
+
+    /**
      * Shared controller proxy tail: validate body/query/domain/server and forward the
      * whitelisted call to the controller, returning [status, data]. Used for normal,
      * admin and reseller-site modes alike (same whitelist, CSRF and rules).
@@ -466,6 +484,7 @@ class ClientApi
     private static function proxy(string $method, string $path, string $domain, $server, array $req,
                                   bool $admin, int $adminId, $svc, ?callable $clientFactory): array
     {
+        self::releaseSession();
         $body = null;
         if ($method === 'POST' || $method === 'PUT') {
             $raw = (string) ($req['body'] ?? '');
@@ -832,6 +851,7 @@ class ClientApi
             $body = json_encode($data === [] ? new \stdClass() : $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
         $target = '/api/v1/accounts/' . $cid . '/alerts' . ($sub === '' ? '' : '/' . $sub);
+        self::releaseSession();
         try {
             $params = ['serverhostname' => $server->hostname, 'serverip' => $server->ipaddress, 'serversecure' => $server->secure,
                 'serverport' => $server->port, 'serveraccesshash' => $server->accesshash,
@@ -1162,6 +1182,9 @@ class ClientApi
             // Non-resellers get the same generic answer — the panel is simply absent for them.
             return self::fail(404, 'یافت نشد.');
         }
+        // Reseller report / bulk / export fan out to several controller calls; drop the session lock first
+        // (see releaseSession) so they never hold up a concurrent page load in the same browser session.
+        self::releaseSession();
         $factory = $clientFactory ? function ($server) use ($clientFactory) {
             return $clientFactory([
                 'serverhostname' => $server->hostname, 'serverip' => $server->ipaddress,
