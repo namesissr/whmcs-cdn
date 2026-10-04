@@ -226,6 +226,11 @@
   // ------------------------------------------------------------------ API
 
   var CFG = { api: '', csrf: '', serviceId: 0, rsid: 0 };
+  // Every call is bounded: a request that never answers (a stalled proxy, a lost connection the
+  // browser does not surface, a server still waiting on something) must not leave a card spinning
+  // forever — the page has to finish loading. The server's own controller timeout is ~20 s, so this
+  // ceiling only ever trips on a genuine stall, where it turns the spinner into a retriable error.
+  var API_TIMEOUT_MS = Number(window.PCDN_API_TIMEOUT_MS) > 0 ? Number(window.PCDN_API_TIMEOUT_MS) : 45000;
   function api(method, path, body, query) {
     // The admin-mode endpoint (addonmodules.php?module=…) already has a query string.
     var url = CFG.api + (CFG.api.indexOf('?') >= 0 ? '&' : '?') + 'id=' + encodeURIComponent(CFG.serviceId) + '&path=' + encodeURIComponent(path);
@@ -240,11 +245,21 @@
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
+    // Abort a stalled request so its promise always settles (older browsers without AbortController
+    // simply skip the ceiling — they keep the pre-existing behaviour).
+    var ctl = typeof AbortController !== 'undefined' ? new AbortController() : null, timedOut = false, timer = null;
+    if (ctl) {
+      init.signal = ctl.signal;
+      timer = setTimeout(function () { timedOut = true; try { ctl.abort(); } catch (e) { /* ignore */ } }, API_TIMEOUT_MS);
+    }
+    function done(v) { if (timer) { clearTimeout(timer); timer = null; } return v; }
     return fetch(url, init).then(function (r) {
       return r.json().catch(function () { return { detail: t('پاسخ نامعتبر از سرور (HTTP ') + r.status + ')' }; })
-        .then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
+        .then(function (data) { return done({ ok: r.ok, status: r.status, data: data }); });
     }, function () {
-      return { ok: false, status: 0, data: { detail: t('ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.') } };
+      return done({ ok: false, status: 0, data: { detail: timedOut
+        ? t('پاسخ سرور بیش از حد طول کشید؛ صفحه را دوباره باز کنید یا کمی بعد تلاش کنید.')
+        : t('ارتباط با سرور برقرار نشد. اتصال اینترنت را بررسی کنید.') } });
     });
   }
 
