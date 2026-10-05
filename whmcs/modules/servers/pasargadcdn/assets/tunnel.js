@@ -326,11 +326,16 @@
     var extra = rec && proto === 'xhttp' && P.tguide ? P.tguide.xmuxExtra(rec.xmux) : null;
     var q = [['encryption', 'none'], ['security', 'tls'], ['sni', host], ['fp', 'chrome'], ['alpn', alpn.join(',')],
       ['type', proto === 'h2' ? 'xhttp' : proto]];
-    if (proto === 'grpc') q.push(['serviceName', svc], ['mode', 'gun']);
-    else if (proto === 'xhttp' || proto === 'h2') q.push(['host', host], ['path', path], ['mode', mode]);
-    // §22.11: the recommended XMUX values travel in the share link's `extra` (Xray share-link format); stability only
-    if (extra) q.push(['extra', JSON.stringify(extra)]);
-    else q.push(['host', host], ['path', path]);
+    if (proto === 'grpc') {
+      // gRPC carries serviceName + mode; it must NOT get host/path params (some clients reject the link then).
+      q.push(['serviceName', svc], ['mode', 'gun']);
+    } else if (proto === 'xhttp' || proto === 'h2') {
+      q.push(['host', host], ['path', path], ['mode', mode]);
+      // §22.11: the recommended XMUX values travel in the share link's `extra` (Xray share-link format); stability only
+      if (extra) q.push(['extra', JSON.stringify(extra)]);
+    } else {   // ws, httpupgrade
+      q.push(['host', host], ['path', path]);
+    }
     var link = 'vless://' + uuid + '@' + host + ':443?' + q.map(function (kv) { return kv[0] + '=' + encodeURIComponent(kv[1]); }).join('&') +
       '#' + encodeURIComponent(o.remark || host);
 
