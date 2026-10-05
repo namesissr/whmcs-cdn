@@ -892,9 +892,13 @@ def test_tcp_checker_and_push(tmp_path):
         hc.set_targets([[f"7|p|127.0.0.1:{up_port}", "127.0.0.1", up_port, 10, 2],
                         [f"7|p|127.0.0.1:{closed_port}", "127.0.0.1", closed_port, 10, 2]])
         assert hc.step(now=1000) == {f"7|p|127.0.0.1:{up_port}": 0, f"7|p|127.0.0.1:{closed_port}": 1}
-        assert hc.step(now=1005) == {}                       # not due yet
-        assert hc.step(now=1010) == {f"7|p|127.0.0.1:{closed_port}": 2}   # only changes are pushed
-        assert hc.step(now=1020) == {f"7|p|127.0.0.1:{closed_port}": 3}
+        # §22.4 fast re-check (HC_FAST_RETRY): a FIRST failure is retried within a second instead of a
+        # whole interval, so the confirming failure — the down mark pick() reads — lands almost at once
+        # rather than 2x interval later. The healthy origin keeps its normal interval.
+        assert hc.step(now=1001) == {f"7|p|127.0.0.1:{closed_port}": 2}
+        # once confirmed down it goes back to the normal interval (a dead origin is not hammered)
+        assert hc.step(now=1005) == {}                       # nothing due yet
+        assert hc.step(now=1011) == {f"7|p|127.0.0.1:{closed_port}": 3}   # only changes are pushed
         assert len(hc.step(now=1700)) == 2                   # every entry again after HC_REFRESH
         hc.set_targets([[f"7|p|127.0.0.1:{up_port}", "127.0.0.1", up_port, 10, 2]])
         assert set(hc.fails) == {f"7|p|127.0.0.1:{up_port}"}

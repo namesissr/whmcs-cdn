@@ -22,6 +22,14 @@ from .validation.origin import origin_host_allowed, origin_hp_allowed
 HC_MAX_CONCURRENT = 64
 HC_PUSH_MAX_KEYS = 4096
 HC_REFRESH = 600     # s: every entry is re-pushed this often (the pcdn_hc dict times out after 3600 s)
+# Consecutive failures before pick() treats an origin as down — mirrors HC_FALL in njs/pcdn.js.
+HC_FALL = 2
+# s: delay before re-checking an origin whose check just FAILED but is not confirmed down yet. Without
+# it the confirming failure waits a whole `interval`, so a dead origin keeps receiving NEW tunnel
+# sessions for up to 2x interval (20 s at the 10 s default). The checker loop ticks every second, so
+# this turns the detection window into roughly one interval plus a second. A confirmed-down origin goes
+# back to its normal interval instead of being hammered.
+HC_FAST_RETRY = 1
 
 
 def tcp_targets(files: dict) -> list:
@@ -125,8 +133,13 @@ class TcpHealth:
                 results = [check(t[1], t[2], t[4]) for t in due]
             with self._lock:
                 for t, ok in zip(due, results):
-                    self.fails[t[0]] = 0 if ok else min(1000, self.fails.get(t[0], 0) + 1)
-                    self.due[t[0]] = now + t[3]
+                    n = 0 if ok else min(1000, self.fails.get(t[0], 0) + 1)
+                    self.fails[t[0]] = n
+                    # Re-check a just-failed origin almost at once (see HC_FAST_RETRY) so the failure
+                    # count reaches HC_FALL — and pick() stops handing it new sessions — within about a
+                    # second instead of a second full interval. Never longer than the configured interval.
+                    retry = 0 < n < HC_FALL
+                    self.due[t[0]] = now + (min(HC_FAST_RETRY, t[3]) if retry else t[3])
         full = now - self.last_full >= HC_REFRESH
         with self._lock:
             out = {k: v for k, v in self.fails.items() if full or self.pushed.get(k) != v}
