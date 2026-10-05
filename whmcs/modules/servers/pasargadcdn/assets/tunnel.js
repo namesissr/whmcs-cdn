@@ -312,6 +312,29 @@
   }
 
   /**
+   * SPEC §23.13: the per-city hostname of `host` — "vpn.example.com" + "tehran" -> "vpn-tehran.example.com",
+   * the apex -> "tehran.example.com". Mirrors the controller's city_hostname(): the name stays ONE label
+   * under the apex, because the site's certificate covers only `domain` + `*.domain` and a deeper name
+   * would fail the client's TLS handshake. null when `host` is already deeper than one label.
+   */
+  function cityHost(host, domain, slug) {
+    host = String(host || ''); domain = String(domain || '');
+    if (!host || !domain || !slug) return null;
+    if (host === domain) return slug + '.' + domain;
+    var tail = '.' + domain;
+    if (host.length <= tail.length || host.slice(-tail.length) !== tail) return null;
+    var head = host.slice(0, -tail.length);
+    if (!head || head.indexOf('.') >= 0) return null;
+    return head + '-' + slug + '.' + domain;
+  }
+
+  /** The cities the controller publishes a hostname for (tunnel/profile `cities`), or []. */
+  function cities() {
+    var d = tp() ? P.tprofile.data() : null;
+    return d && Array.isArray(d.cities) ? d.cities : [];
+  }
+
+  /**
    * Ready-to-use configs for one path.
    * o = {protocol, path, host, uuid, port (origin listen port), tls (origin TLS), mode (xhttp), remark,
    *      rec (wave 13 recommended values, tguide.js recommend(); optional), h3 (xhttp over HTTP/3 variant; optional)}
@@ -653,6 +676,40 @@
       var c = tunnelConfig({ id: p.id, protocol: p.protocol, path: p.path, host: st.host || 'YOUR-HOST', uuid: st.uuid, port: lis.port, tls: lis.tls,
         mode: st.mode, remark: (st.host || site().domain) + '-' + p.id + (st.h3 ? '-h3' : ''), rec: rec, h3: !!st.h3 });
       var q = qrSvg(c.link, 232);
+      /**
+       * SPEC §23.13: one link per region, each on a hostname that answers ONLY that region's healthy
+       * nodes. The client measures them itself (URL test / auto-select) and stays on the lowest-latency
+       * one, re-picking when it slows down — DNS cannot do this, it never sees the user's real RTT.
+       * Hidden with fewer than two regions (nothing to choose) or when the host takes no per-city name.
+       */
+      function fastest() {
+        var list = cities();
+        if (list.length < 2) return null;
+        var dom = site().domain, rows = [], links = [];
+        list.forEach(function (ct) {
+          var hh = cityHost(st.host, dom, ct.slug);
+          if (!hh) return;
+          var name = (ct.label && (P.isEn ? ct.label.en : ct.label.fa)) || ct.slug;
+          var cc = tunnelConfig({ id: p.id, protocol: p.protocol, path: p.path, host: hh, uuid: st.uuid,
+            port: lis.port, tls: lis.tls, mode: st.mode, remark: name, rec: rec, h3: !!st.h3 });
+          links.push(cc.link);
+          rows.push(h('li', { className: 'pcdn-rule pcdn-tn-city', 'data-city': ct.slug },
+            h('div', { className: 'pcdn-rule-main' },
+              h('div', { className: 'pcdn-rule-name' }, h('span', { className: 'pcdn-w pcdn-w-strong', text: name }),
+                h('bdi', { className: 'pcdn-vchip', dir: 'ltr', text: hh }))),
+            h('div', { className: 'pcdn-rule-ctl' }, P.copyBtn(cc.link, t('کپی لینک ') + name, { text: t('کپی') }))));
+        });
+        if (!rows.length) return null;
+        var card = P.card({ title: t('سریع‌ترین نود برای هر کاربر'), icon: 'gauge', tone: 'brand', id: 'tn-fastest',
+          subtitle: t('هر منطقه یک نام جدا دارد که فقط به نودهای همان منطقه پاسخ می‌دهد.') });
+        append(card.body, [
+          h('p', { className: 'pcdn-muted' }, t('همهٔ این لینک‌ها را یک‌جا در کلاینت وارد کنید (در v2rayNG / Hiddify / Streisand: «Import from clipboard») و «URL Test» یا انتخاب خودکار را روشن کنید. کلاینت تأخیر هر منطقه را از روی دستگاه خودِ کاربر می‌سنجد، او را به کم‌ترین میلی‌ثانیه وصل می‌کند و اگر آن منطقه کند شد خودکار جابه‌جا می‌شود. منطقه‌ای که نودهایش سالم نباشند در این فهرست نمی‌آید.')),
+          h('ul', { className: 'pcdn-rules pcdn-tn-cities' }, rows),
+          h('div', { className: 'pcdn-row-actions' },
+            P.copyBtn(links.join('\n'), t('کپی همهٔ لینک‌ها'),
+              { text: t('کپی همهٔ لینک‌ها ({0} منطقه)', num(links.length)), cls: 'pcdn-copy-cities', done: t('کپی شد') }))]);
+        return card;
+      }
       append(out, [
         h('section', { className: 'pcdn-tn-share', 'data-share': '1' },
           h('div', { className: 'pcdn-tn-share-text' },
@@ -670,6 +727,7 @@
               guideLink()) : null,
             appGuide(p, st)),
           q ? h('div', { className: 'pcdn-tn-qr', 'data-qr': '1' }, q) : h('p', { className: 'pcdn-muted', text: t('لینک برای QR بیش از حد طولانی است.') })),
+        fastest(),
         h('section', { 'data-server': '1' },
           h('h4', { text: t('۲. تنظیم سرور شما (Xray)') }),
           h('p', { className: 'pcdn-muted' }, t('این فایل را در '), ltr('/usr/local/etc/xray/config.json'), t(' بگذارید (یا فقط بخش inbounds را به پیکربندی فعلی اضافه کنید) و '), ltr('systemctl restart xray'), t(' را اجرا کنید. '),
