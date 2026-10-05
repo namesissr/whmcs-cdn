@@ -386,3 +386,82 @@ def test_f34_force_https_with_tunnel_paths_warning(client):
     r = client.put(f"{S}/config/tunnel", json={"enabled": True,
                    "paths": [{"id": "w1", "path": "/ws", "protocol": "ws"}]})
     assert r.status_code == 200 and any("force_https" in w for w in _warnings(r))
+
+
+# ------------------------------------------------------------------ §23.13: per-city tunnel hostnames
+
+def _city_edge(ip, city=None, en=None, region="home"):
+    return SimpleNamespace(ipv4=ip, ipv6=None, region=region, group="general", shed=False,
+                           metrics_at=utcnow() - timedelta(seconds=5), addresses=[],
+                           display_city=city, display_city_en=en,
+                           probe_ok4=True, probe_fail4=0, probe_ok6=None, probe_fail6=0)
+
+
+def _city_site(label="vpn", config='{"tunnel": {"enabled": true}}'):
+    return SimpleNamespace(domain="ex.com", features='{"edge_group": "general"}', config=config,
+                           records=[rec(label, "A", "1.2.3.4", proxied=True)])
+
+
+def _contents(site_obj, edges):
+    return {(r["name"], r["type"]): r["records"][0]["content"]
+            for r in dnsbuild.build_rrsets(site_obj, edges)}
+
+
+def test_city_hostnames_answer_only_their_own_city(monkeypatch):
+    monkeypatch.setattr(settings, "dns_city_labels", True)
+    monkeypatch.setattr(settings, "edge_probe", False)
+    monkeypatch.setattr(settings, "geoip_enabled", False)
+    monkeypatch.setattr(settings, "tunnel_lua_selector", "all")
+    edges = [_city_edge("5.0.0.1", "تهران", "Tehran"), _city_edge("5.0.0.2", "تهران", "Tehran"),
+             _city_edge("5.0.0.3", "مشهد", "Mashhad")]
+    rr = _contents(_city_site(), edges)
+    # the pooled hostname is untouched: it still answers every healthy node
+    pooled = rr[("vpn.ex.com.", "LUA")]
+    assert "5.0.0.1" in pooled and "5.0.0.3" in pooled
+    # each city hostname answers ONLY its own city's nodes
+    tehran = rr[("vpn-tehran.ex.com.", "LUA")]
+    assert "5.0.0.1" in tehran and "5.0.0.2" in tehran and "5.0.0.3" not in tehran
+    mashhad = rr[("vpn-mashhad.ex.com.", "LUA")]
+    assert "5.0.0.3" in mashhad and "5.0.0.1" not in mashhad
+    # and it MUST stay inside the site's own *.domain certificate, or the client's TLS would fail
+    assert sslmod.covers(["ex.com", "*.ex.com"], "vpn-tehran.ex.com")
+
+
+def test_city_hostnames_skip_unhealthy_city_and_unlabelled_nodes(monkeypatch):
+    monkeypatch.setattr(settings, "dns_city_labels", True)
+    monkeypatch.setattr(settings, "edge_probe", False)
+    monkeypatch.setattr(settings, "geoip_enabled", False)
+    down = _city_edge("5.0.0.9", "شیراز", "Shiraz")
+    down.probe_ok4, down.probe_fail4 = False, 99          # withdrawn by health
+    # a city whose English name is missing has no DNS label at all -> no hostname for it
+    noen = _city_edge("5.0.0.8", "جزیره‌ای", None)
+    rr = _contents(_city_site(), [_city_edge("5.0.0.1", "تهران", "Tehran"), down, noen])
+    assert ("vpn-tehran.ex.com.", "LUA") in rr
+    # Shiraz has one enabled address, so §12.3 fail-open keeps its own pool rather than emptying it
+    assert "5.0.0.9" in rr[("vpn-shiraz.ex.com.", "LUA")]
+    assert not any(n.startswith("vpn-") and "shiraz" not in n and "tehran" not in n for n, _ in rr)
+
+
+def test_city_hostnames_off_for_web_sites_deep_names_and_by_setting(monkeypatch):
+    monkeypatch.setattr(settings, "edge_probe", False)
+    monkeypatch.setattr(settings, "geoip_enabled", False)
+    edges = [_city_edge("5.0.0.1", "تهران", "Tehran")]
+    monkeypatch.setattr(settings, "dns_city_labels", True)
+    # a non-tunnel site never gets them
+    web = _city_site(config="{}")
+    assert not any("tehran" in n for n, _ in _contents(web, edges))
+    # a name deeper than one label is outside *.domain, so a per-city child would fail TLS: skipped
+    deep = _city_site(label="a.b")
+    assert not any("tehran" in n for n, _ in _contents(deep, edges))
+    assert not sslmod.covers(["ex.com", "*.ex.com"], "a.b-tehran.ex.com")
+    # and the operator can turn the whole thing off
+    monkeypatch.setattr(settings, "dns_city_labels", False)
+    assert not any("tehran" in n for n, _ in _contents(_city_site(), edges))
+
+
+def test_city_hostname_helper_apex_and_limits():
+    assert dnsbuild.city_hostname("ex.com", "ex.com", "tehran") == "tehran.ex.com"
+    assert dnsbuild.city_hostname("vpn.ex.com", "ex.com", "tehran") == "vpn-tehran.ex.com"
+    assert dnsbuild.city_hostname("a.b.ex.com", "ex.com", "tehran") is None
+    assert dnsbuild.city_hostname("other.net", "ex.com", "tehran") is None
+    assert dnsbuild.city_hostname("v" * 60 + ".ex.com", "ex.com", "tehran") is None   # label > 63

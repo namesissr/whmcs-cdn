@@ -126,6 +126,10 @@ class Settings:
     # Xray/sing-box dialer can fail over immediately and keep TLS resumption. "all" answers with
     # every healthy edge of the pool; general (non-tunnel) sites keep LUA_SELECTOR.
     tunnel_lua_selector: str = field(default_factory=lambda: os.getenv("TUNNEL_LUA_SELECTOR", "all"))
+    # SPEC §23.13: also publish a per-city hostname for every proxied host of a TUNNEL site
+    # ("vpn-tehran.example.com"), answering only that city's healthy nodes, so a client can measure
+    # each region itself and stay on the lowest-latency one. Off -> only the pooled hostname exists.
+    dns_city_labels: bool = field(default_factory=lambda: _bool("DNS_CITY_LABELS", True))
     edge_probe: bool = field(default_factory=lambda: _bool("EDGE_PROBE", True))
     health_url: str = field(default_factory=lambda: os.getenv("EDGE_HEALTH_URL", "http://health.pcdn/__pcdn/health"))
 

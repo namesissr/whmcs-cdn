@@ -67,6 +67,23 @@ def city_of(e) -> tuple[str, str]:
     return fa, en
 
 
+_SLUG_SEP = re.compile(r"[^a-z0-9]+")
+
+
+def city_slug(e) -> str:
+    """A DNS label for an edge's customer-visible city, from its ENGLISH name ("Tehran" -> "tehran",
+    "Bandar Abbas" -> "bandar-abbas"). Used for the per-city hostnames of a tunnel site (§23.13).
+
+    "" when the English name yields no usable ASCII label — e.g. a `display_city` that is not in
+    cities.json and has no `display_city_en`, where city_of() falls back to the Persian name. The
+    caller then skips that city rather than emitting a broken label, so setting `display_city_en`
+    is what turns a city's hostname on.
+    """
+    slug = _SLUG_SEP.sub("-", city_of(e)[1].strip().lower()).strip("-")
+    # a DNS label starts with a letter/digit; keep room for the "<host>-" prefix of city_hostname()
+    return slug[:24].strip("-") if slug[:1].isalnum() else ""
+
+
 def label_for(city_fa: str, city_en: str, n: int | None) -> dict[str, str]:
     if n is None:
         return {"fa": f"نود {city_fa}", "en": f"{city_en} node"}

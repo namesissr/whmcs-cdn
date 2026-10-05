@@ -251,6 +251,30 @@ def http3_status(db: Session, site: Site) -> dict:
             "available": bool(site_h3 and serving and h3 == len(serving))}
 
 
+def tunnel_cities(db: Session, site: Site) -> list[dict]:
+    """SPEC §23.13: the cities a client can pin a tunnel hostname to — [{slug, label{fa,en}}].
+
+    One entry per city DNS actually publishes a hostname for, so a city whose nodes are all withdrawn
+    is left out and never reaches a client's list. Carries only the operator-set city label and its DNS
+    slug — never a node name, address or per-city node count.
+    """
+    from . import dnsbuild, edge_labels
+    from .config import settings
+    from .services import online_edges
+
+    if not settings.dns_city_labels:
+        return []
+    serving = dnsbuild.dns_edges(site, online_edges(db))
+    published = dnsbuild.city_pools(serving, 4)
+    out: dict[str, dict] = {}
+    for e in serving:
+        slug = edge_labels.city_slug(e)
+        if slug in published and slug not in out:
+            fa, en = edge_labels.city_of(e)
+            out[slug] = {"slug": slug, "label": edge_labels.label_for(fa, en, None)}
+    return [out[k] for k in sorted(out)]
+
+
 def _origin_count(cfg: dict, p: dict, max_origins: int) -> int:
     if p.get("origins"):
         return min(len(p["origins"]), max(1, max_origins))
@@ -283,4 +307,4 @@ def profile(db: Session, site: Site) -> dict | None:
             "recommended": recommended(p["protocol"], k),
         })
     return {"edge": {**EDGE_TUNNEL_TIMERS, "tcp_keepalive": dict(EDGE_TUNNEL_TIMERS["tcp_keepalive"])},
-            "http3": h3, "paths": paths}
+            "http3": h3, "paths": paths, "cities": tunnel_cities(db, site)}

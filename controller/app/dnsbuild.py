@@ -8,6 +8,7 @@ import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from . import edge_labels
 from .config import settings
 from .models import Edge, Site, utcnow
 from .validation import fqdn
@@ -230,6 +231,54 @@ def edge_pools(edges: list[Edge], family: int) -> tuple[list[str], list[str]]:
             if advertised:
                 adv[region].append(ip)
     return _budget(known["home"], adv["home"], family), _budget(known["global"], adv["global"], family)
+
+
+def city_pools(edges: list, family: int) -> dict[str, list[str]]:
+    """{city slug: advertised addresses of `family`} — one pool per customer-visible city (§23.12).
+
+    Exactly the enabled/advertised rules and the §12.3 fail-open budget of edge_pools(), applied per
+    city, so a city's pool is never emptied by health state while it still has an enabled address.
+    Cities whose English name yields no DNS label (edge_labels.city_slug) are skipped.
+    """
+    known: dict[str, list[str]] = {}
+    adv: dict[str, list[str]] = {}
+    for e in edges:
+        slug = edge_labels.city_slug(e)
+        if not slug:
+            continue
+        for ip, enabled, advertised in _edge_family_addresses(e, family):
+            if not enabled:
+                continue
+            known.setdefault(slug, []).append(ip)
+            adv.setdefault(slug, [])
+            if advertised:
+                adv[slug].append(ip)
+    out = {}
+    for slug, ips in known.items():
+        pool = _budget(ips, adv.get(slug, []), family)
+        if pool:
+            out[slug] = pool
+    return out
+
+
+def city_hostname(name: str, domain: str, slug: str) -> str | None:
+    """`name` with a per-city suffix, kept ONE label under the apex so the site's `*.domain`
+    certificate covers it (ssl.covers): "vpn.example.com" -> "vpn-tehran.example.com", the apex
+    itself -> "tehran.example.com".
+
+    None when it cannot be built safely: a name deeper than one label (already outside the wildcard,
+    so a per-city child would fail TLS too) or a label over the 63-byte DNS limit.
+    """
+    if name == domain:
+        label = slug
+    elif name.endswith("." + domain):
+        head = name[: -(len(domain) + 1)]
+        if "." in head:
+            return None
+        label = f"{head}-{slug}"
+    else:
+        return None
+    return f"{label}.{domain}" if len(label) <= 63 else None
 
 
 def _budget(known: list[str], adv: list[str], family: int) -> list[str]:
@@ -482,6 +531,27 @@ def build_rrsets(site: Site, edges: list[Edge]) -> list[dict]:
             add(name, "LUA", settings.proxied_ttl,
                 "AAAA \"" + lua_expression(v6_home, v6_global, home_alive, global_alive, "AAAA",
                                            selector=selector, weights=w6) + "\"")
+    # SPEC §23.13: per-city hostnames of a TUNNEL site. Each answers ONLY that city's healthy nodes, so
+    # a client can measure every region itself (its own URL test) and keep the lowest-latency one, with
+    # automatic re-selection when that node slows down. Never a substitute for the pooled hostname, which
+    # stays the default. The name is kept one label under the apex so the site's *.domain certificate
+    # covers it, and a name the customer already uses is left alone.
+    if tunnel and have_v4 and settings.dns_city_labels:
+        taken = {k[0] for k in grouped} | {dot(n) for n in proxied_names}
+        c4, c6 = city_pools(edges, 4), city_pools(edges, 6) if have_v6 else {}
+        for base in sorted(proxied_names):
+            for slug, ips in sorted(c4.items()):
+                cname = city_hostname(base, domain, slug)
+                if not cname or dot(cname) in taken:
+                    continue
+                taken.add(dot(cname))
+                add(cname, "LUA", settings.proxied_ttl,
+                    "A \"" + lua_expression(ips, [], True, False, selector=selector, weights=w4) + "\"")
+                if c6.get(slug):
+                    add(cname, "LUA", settings.proxied_ttl,
+                        "AAAA \"" + lua_expression(c6[slug], [], True, False, "AAAA",
+                                                   selector=selector, weights=w6) + "\"")
+
     if proxied_names:
         add(f"{DIAG_LABEL}.{domain}", "LUA", 5, "TXT \"" + diag_expression(home_alive, global_alive) + "\"")
 
