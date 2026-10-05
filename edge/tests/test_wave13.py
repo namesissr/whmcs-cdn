@@ -310,6 +310,30 @@ def test_upgrade_auto_undrain_conditions(tmp_path, monkeypatch):
     assert c.state["drain"]["state"] == ""
 
 
+def test_upgrade_undrain_forced_after_grace_when_probe_keeps_failing(tmp_path, monkeypatch):
+    # SPEC §22.1 safety net: a self-probe that never passes must not strand the node drained forever
+    # (that refuses every tunnel connection on the node). After UPGRADE_UNDRAIN_GRACE_S it undrains anyway.
+    monkeypatch.setattr(agent, "set_flag", lambda c, on, opener=None: True)
+    cfg = make_cfg(tmp_path, CONTROLLER_URL="http://c", EDGE_TOKEN="t", PROBE_ENABLED="yes",
+                   PROBE_DIR=str(tmp_path / "probe"))
+    assert agent.ensure_probe_files(cfg)
+    drain = {"state": "drained", "since": agent.iso(1000), "until": agent.iso(1900), "by": "edge",
+             "upgrade": True, "at": 1000}
+    agent.save_state(cfg["STATE_FILE"], {"drain": drain})
+    a = agent.Agent(cfg)
+    a.ctl, a.first_apply_ok = FakeCtl([(200, {"state": ""})]), True
+    a.probe_runner.rounds, a.probe_runner.result = 5, {"ok": False}   # probe keeps failing
+    # within the grace window: still stranded (service held back while the probe might recover)
+    a.state["drain"]["restart_at"] = agent.iso(time.time() - 10)
+    a.maybe_upgrade_undrain()
+    assert a.ctl.calls == [] and a.state["drain"]["state"] == "drained"
+    # past the grace window: undrain anyway so tunnel service returns
+    a.state["drain"]["restart_at"] = agent.iso(time.time() - (agent.UPGRADE_UNDRAIN_GRACE_S + 5))
+    a.maybe_upgrade_undrain()
+    assert a.ctl.calls == [("POST", "/edge/v1/drain", {"action": "stop"})]
+    assert a.state["drain"]["state"] == "" and not a.upgrade_restart
+
+
 def test_cli_drain_written_under_lock_survives_agent_save(tmp_path):
     cfg = make_cfg(tmp_path)
     a = bare_agent(cfg, state={"pending": {"x": 1}})

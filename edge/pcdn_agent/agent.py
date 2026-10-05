@@ -17,8 +17,13 @@ from .common import MAX_EVENTS, MAX_ITEMS, _int
 from .controller import Controller
 from .drain import (
     DRAIN_CHECK_S, DRAIN_STATES, apply_config_drain, drained_check, end_drain, heartbeat_drain, iso,
-    merge_disk_drain, norm_drain, public_conns, refuse_now, set_flag, state_lock,
+    merge_disk_drain, norm_drain, parse_iso, public_conns, refuse_now, set_flag, state_lock,
 )
+
+# SPEC §22.1 safety net: the longest an upgrade drain may wait for the tunnel self-probe to pass before
+# the node undrains ANYWAY. A self-probe is a quality signal; a probe that never passes must not keep the
+# node refusing every tunnel connection forever (total outage) — restoring service with a warning is safer.
+UPGRADE_UNDRAIN_GRACE_S = 300
 from .functions import functions_enabled, read_fn_usage, sync_functions
 from .heartbeat import (
     RELOAD_KEEP_S, RELOAD_TIMES_MAX, collect_metrics, count_draining_workers, heartbeat_capabilities, memory_guard,
@@ -608,8 +613,19 @@ class Agent:
         if d.get("state") not in DRAIN_STATES or not d.get("upgrade"):
             self.__dict__["upgrade_restart"] = False
             return
-        if not self.__dict__.get("first_apply_ok") or not self.probe_runner.first_passed_or_unsupported():
+        if not self.__dict__.get("first_apply_ok"):
             return
+        now = time.time()
+        forced = False
+        if not self.probe_runner.first_passed_or_unsupported():
+            # The first config apply is in but the self-probe has not passed yet. Give it up to
+            # UPGRADE_UNDRAIN_GRACE_S from the restart, then undrain ANYWAY: a node that keeps refusing
+            # every new tunnel connection (503) is a worse outcome than one serving with a failing probe,
+            # and a probe that never passes would otherwise strand the node dark forever.
+            started = parse_iso(d.get("restart_at")) or now
+            if now - started < UPGRADE_UNDRAIN_GRACE_S:
+                return
+            forced = True
         try:
             self.ctl.call("POST", "/edge/v1/drain", {"action": "stop"})
         except urllib.error.HTTPError as e:
@@ -619,10 +635,14 @@ class Agent:
         except (urllib.error.URLError, OSError) as e:
             log.warning("upgrade undrain: controller not reachable (%s); retrying", type(e).__name__)
             return
-        end_drain(st, time.time())
+        end_drain(st, now)
         st.pop("ctl_drain", None)   # stale until the next config shows the stop
         self.__dict__["upgrade_restart"] = False
-        log.info("upgrade finished: node undrained")
+        if forced:
+            log.warning("upgrade undrain: tunnel self-probe still not passing after %ds; undraining anyway "
+                        "to restore tunnel service (check the node's tunnel probe)", UPGRADE_UNDRAIN_GRACE_S)
+        else:
+            log.info("upgrade finished: node undrained")
         self.drain_step()
 
     def _adopt_disk_drain(self):
