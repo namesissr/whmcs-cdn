@@ -532,6 +532,14 @@ def test_real_seaweed_file_manager(client, real_seaweed):
                                              "content_type": "application/pdf"})
     assert up.status_code == 200, up.text
     assert web.put(up.json()["url"], content=b"PDF-BODY").status_code == 200
+    # the preflight the browser sends before that PUT: it only passes because presign_upload wrote
+    # the bucket's CORS rule first
+    pre = web.request("OPTIONS", up.json()["url"].split("?")[0],
+                      headers={"Origin": "https://panel.example",
+                               "Access-Control-Request-Method": "PUT"})
+    assert pre.status_code in (200, 204), (pre.status_code, pre.text)
+    assert pre.headers.get("access-control-allow-origin") in ("*", "https://panel.example"), \
+        dict(pre.headers)
 
     page = client.get(base).json()
     assert [f["name"] for f in page["folders"]] == ["docs"]
