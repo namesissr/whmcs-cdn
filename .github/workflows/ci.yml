@@ -63,6 +63,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: find whmcs -name '*.php' -print0 | xargs -0 -n1 php -l
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # the client app's own guards: no billing-software name in customer-facing text (SPEC §16.10)
+      # and the file manager's key handling (SPEC §16.8)
+      - run: node --test "whmcs/tests/*.test.js"
+      - run: for f in whmcs/modules/servers/pasargadcdn/assets/*.js; do node --check "$f"; done
 
   terraform:
     runs-on: ubuntu-24.04

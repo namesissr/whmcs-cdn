@@ -241,6 +241,10 @@
     var u = b.usage || {};
     var rot = P.btn(t('کلید جدید'), { icon: 'key', size: 'sm', write: true, cls: 'pcdn-st-rotate', onclick: function () { rotate(b, rot, reload); } });
     var del = P.iconBtn('trash', t('حذف باکت ') + b.name, function () { remove(b, del, reload); }, { write: true, cls: 'is-danger pcdn-st-del' });
+    var files = P.btn(t('فایل‌ها'), { kind: 'primary', icon: 'package', size: 'sm', cls: 'pcdn-st-files',
+      title: t('آپلود، دانلود و ساخت لینک برای فایل‌های این باکت'),
+      onclick: function () { if (P.fileManager) P.fileManager(b, d); } });
+    files.setAttribute('data-ro-ok', '1');
     var origin = P.btn(t('مبدأ CDN'), { icon: 'cloud', size: 'sm', write: true, cls: 'pcdn-st-origin', title: t('ساخت رکورد پروکسی‌شده که فایل‌های این باکت را از CDN تحویل می‌دهد'), onclick: function () { useAsOrigin(b); } });
     var guide = P.btn(t('راهنمای اتصال'), { icon: 'terminal', size: 'sm', cls: 'pcdn-st-guide-btn', onclick: function () {
       var g = document.querySelector('[data-card="storage-guide"]');
@@ -265,7 +269,7 @@
             h('bdi', { text: num(Number(u.objects) || 0) + t(' فایل') }))),
           h('div', null, h('dt', { text: t('سقف این باکت') }), h('dd', null, h('bdi', { text: quota > 0 ? P.bytes(quota) : '—' })))),
         b.rotated_at ? h('p', { className: 'pcdn-help', text: t('آخرین تعویض کلید: ') + P.date(b.rotated_at) }) : null),
-      h('div', { className: 'pcdn-wh-ctl pcdn-st-actions' }, origin, rot, guide, del));
+      h('div', { className: 'pcdn-wh-ctl pcdn-st-actions' }, files, origin, rot, guide, del));
   }
 
   function guideCard(d) {
@@ -393,6 +397,7 @@
   };
 
   P.storage = {
+    useAsOrigin: useAsOrigin,
     known: known, enabled: enabled, recordFields: recordFields, recordBodyExtra: recordBodyExtra,
     // exported for tests
     nameProblem: nameProblem, snippets: snippets

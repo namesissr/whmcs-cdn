@@ -1823,3 +1823,33 @@ html.pcdn-noscroll, html.pcdn-noscroll body { overflow: hidden; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-diag-row dd { margin: 2px 0 0; font-weight: 600; overflow-wrap: anywhere; }
 :is(#pcdn-app, #pcdn-layer) .pcdn-diag-md { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; font-size: 12px; background: var(--pc-fill); padding: 10px; border-radius: 8px; margin: 0; color: var(--pc-text); }
 :is(#pcdn-app, #pcdn-layer) .pcdn-tq-node { font-weight: 600; }
+
+/* ---- file manager (SPEC §16.8): toolbar, breadcrumb, rows, upload queue */
+:is(#pcdn-app, #pcdn-layer) .pcdn-hidden { display: none !important; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-cap { font-size: 12px; margin-inline-start: auto; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-crumbs { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; font-size: 13px; margin-bottom: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-crumb { padding-inline: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-crumb.is-current { padding-inline: 6px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-list { display: flex; flex-direction: column; border: 1px solid var(--pc-border); border-radius: 10px; overflow: hidden; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--pc-border); min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-row:last-child { border-bottom: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-row:hover { background: var(--pc-fill); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-row.is-folder .pcdn-fm-ico { color: var(--pc-brand); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-cells { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; flex-wrap: wrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-name.is-folder { background: none; border: 0; padding: 0; color: var(--pc-brand); cursor: pointer; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-meta { font-size: 12px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-acts { display: flex; align-items: center; gap: 4px; margin-inline-start: auto; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-more { align-self: center; margin: 8px auto; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-uploads { margin-bottom: 8px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-job { padding: 6px 0; border-bottom: 1px solid var(--pc-border); }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-job:last-child { border-bottom: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-job-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-job-name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-job-head .pcdn-iconbtn { margin-inline-start: auto; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-fm-ttl { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
+:is(#pcdn-app, #pcdn-layer) .pcdn-dlg.is-dropping { outline: 2px dashed var(--pc-brand); outline-offset: -6px; }
+@media (max-width: 640px) {
+  :is(#pcdn-app, #pcdn-layer) .pcdn-fm-acts { margin-inline-start: 0; width: 100%; justify-content: flex-end; }
+}

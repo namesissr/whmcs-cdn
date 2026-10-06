@@ -164,6 +164,28 @@ config لبه حذف می‌شوند.
 | `GET /sites/{d}/storage/usage?month=YYYY-MM` | گزارش GB-ساعت ماه برای صورتحساب (بدون month = ماه جاری) |
 | `GET /storage/usage?month=YYYY-MM` | همان گزارش برای همهٔ سایت‌هایی که آن ماه مصرف داشته‌اند (cron) |
 
+**فایل‌منیجر** (همهٔ مسیرها زیر `/sites/{d}/storage/buckets/{name}/objects`؛ بدنه JSON):
+
+| روش و مسیر | پاسخ |
+|---|---|
+| `GET /objects?prefix=&token=&limit=200` | `{"prefix","folders":[{key,name}],"objects":[{key,name,size,modified,etag,public_url}],"next_token","public_base","max_upload_bytes"}` |
+| `POST /objects/download` `{"key","expires_in"?,"attachment"?}` | `{"url","method":"GET","expires_in","public_url"}` — لینک امضاشدهٔ موقت (پیش‌فرض ۱ ساعت، سقف ۷ روز) و لینک همیشگی CDN اگر باکت مبدأ رکوردی باشد |
+| `POST /objects/upload` `{"key","size","content_type"?,"expires_in"?}` | `{"url","method":"PUT","key","expires_in"}` — یک PUT امضاشده برای فایل کوچک |
+| `POST /objects/multipart` `{"key","size","content_type"?,"parts"?}` | `{"key","upload_id","urls":{"<شماره>":"<url>"},"expires_in","part_max":1000}` |
+| `POST /objects/multipart/parts` `{"key","upload_id","first","count"}` | `{"urls","expires_in","part_max"}` — دستهٔ بعدی لینک‌های بخش‌ها (حداکثر ۱۰۰ در هر فراخوانی) |
+| `POST /objects/multipart/complete` `{"key","upload_id","parts":[{"part","etag"}]}` | `{"key","parts"}` |
+| `POST /objects/multipart/abort` `{"key","upload_id"}` | `{"ok": true}` |
+| `POST /objects/folder` `{"key":"photos/"}` | **201** `{"key"}` |
+| `POST /objects/rename` `{"key","to"}` | `{"key"}` (کپی + حذف؛ پوشه هم پشتیبانی می‌شود) |
+| `POST /objects/delete` `{"keys":[...],"prefixes":[...]}` | `{"deleted","failed","truncated"}` — حداکثر ۲۰۰ کلید در هر فراخوانی؛ هر prefix تا همین تعداد باز می‌شود |
+
+کدها: 400 کلید نامعتبر (کاراکتر کنترلی، `..`، بیش از ۱۰۲۴ بایت) یا بزرگ‌تر از `STORAGE_MAX_UPLOAD_GB`،
+403 فضای ذخیره‌سازی غیرفعال، 404 باکت ناموجود، 409 فضای سرویس پر، 502 خطای سرور ذخیره‌سازی.
+
+**بایت‌ها هرگز از کنترلر نمی‌گذرند:** کنترلر فقط URL امضاشده (SigV4 query، `UNSIGNED-PAYLOAD`) می‌دهد و مرورگر
+مستقیم با سرور ذخیره‌سازی حرف می‌زند. برای همین اولین آپلود هر باکت، CORS را روی آن باکت تنظیم می‌کند
+(`STORAGE_CORS_ORIGINS`، پیش‌فرض `*`؛ هر ۱۰ دقیقه کش می‌شود).
+
 کدها: 422 نام نامعتبر (۳ تا ۴۰ کاراکتر `a-z 0-9 -`، شروع و پایان با حرف/رقم)، 403 پلن بدون فضای ذخیره‌سازی / سقف
 تعداد باکت / سایت پر، 404 باکت یا سایت ناموجود، 409 نام تکراری یا نام گرفته‌شده روی سرور ذخیره‌سازی، 502 خطای سرور ذخیره‌سازی (هر چه
 ساخته شده بود برگردانده می‌شود)، 503 فضای ذخیره‌سازی روی کنترلر تنظیم نشده.
@@ -175,7 +197,7 @@ config لبه حذف می‌شوند.
   "storage_gb": 50, "limit_bytes": 53687091200,
   "used_bytes": 1048576, "used_gb": 0.001, "over_quota": false,
   "endpoint": "https://s3.pasargadmizban.com", "region": "us-east-1",
-  "max_buckets": 10, "usage_stale": false,
+  "max_buckets": 10, "usage_stale": false, "max_upload_bytes": 7516192768,
   "buckets": [{
     "name": "assets", "bucket": "cdn-k3m9q2xa-assets", "access_key": "PCDN7Q4J2M1X0A9B8C7D",
     "endpoint": "https://s3.pasargadmizban.com", "region": "us-east-1",
@@ -212,8 +234,20 @@ WHMCS باید `secret_key` را فقط به مشتری نشان دهد و جا�
 * اگر کنترلر چند ساعت خاموش باشد، ساعت‌های جاافتاده (حداکثر ۷۲ ساعت) با **کمترین** مقدار قبل و بعد پر می‌شوند تا
   هرگز بیشتر از واقعیت صورتحساب نشود.
 
-**صفحهٔ مشتری «فضای ذخیره‌سازی»** (بعداً در WHMCS): نمایش endpoint، region، فهرست باکت‌ها با مصرف و سهمیه،
-فرم ساخت باکت، دکمهٔ حذف (فقط خالی) و «کلید جدید»، و نمونهٔ تنظیم:
+**صفحهٔ مشتری «فضای ذخیره‌سازی»:** نمایش endpoint، region، فهرست باکت‌ها با مصرف و سهمیه، فرم ساخت باکت،
+دکمهٔ حذف (فقط خالی) و «کلید جدید»، دکمهٔ «استفاده به‌عنوان مبدأ» و دکمهٔ «فایل‌ها» که فایل‌منیجر را باز می‌کند.
+
+**فایل‌منیجر** (برای مشتری‌هایی که نمی‌خواهند با `aws`/`rclone` سر و کله بزنند):
+* مرور پوشه‌ها با breadcrumb و صفحه‌بندی، ساخت پوشه، تغییر نام، حذف (فایل یا کل پوشه با تأیید).
+* آپلود با کشیدن و رها کردن یا انتخاب فایل؛ چند فایل در صف با درصد پیشرفت و امکان لغو. تا ۳۲ مگابایت یک PUT
+  ساده، بالاتر از آن چندبخشی با قطعات ۳۲ مگابایتی و ۳ خط موازی — یعنی فایل‌های چندگیگابایتی هم بالا می‌روند.
+  سقف حجم هر فایل `STORAGE_MAX_UPLOAD_GB` (پیش‌فرض ۷ گیگابایت) است و جدا از آن فضای پلن هم بررسی می‌شود.
+* «لینک دانلود»: اگر باکت مبدأ یک رکورد پروکسی‌شده باشد لینک همیشگی CDN، وگرنه لینک امضاشدهٔ ۱ ساعته / ۱ روزه /
+  ۷ روزه؛ هر دو با یک کلیک کپی می‌شوند. دکمهٔ دانلود هم فایل را با نام اصلی پایین می‌آورد.
+* نام فایل مشتری همیشه به **یک** بخش کلید تبدیل می‌شود (جداکننده مسیر و کاراکتر کنترلی هرگز از مرورگر بیرون
+  نمی‌رود) و کلید همیشه داخل پوشهٔ در حال نمایش ساخته می‌شود.
+
+برای ابزارهای خط فرمان نمونهٔ تنظیم:
 ```sh
 aws configure set aws_access_key_id PCDN...; aws configure set aws_secret_access_key ...
 aws --endpoint-url https://s3.pasargadmizban.com s3 cp ./logo.png s3://cdn-k3m9q2xa-assets/img/logo.png

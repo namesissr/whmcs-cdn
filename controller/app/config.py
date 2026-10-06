@@ -303,6 +303,13 @@ class Settings:
     # controller identity's policy on the storage server (arn:aws:s3:::cdn-*)
     storage_bucket_prefix: str = field(
         default_factory=lambda: (os.getenv("STORAGE_BUCKET_PREFIX") or "cdn-").strip().lower())
+    # §16.8 file manager: the biggest single file the panel accepts (the browser uploads straight to
+    # the storage server, multipart above 32 MiB), and the browser origins allowed to do it. Empty
+    # origins mean "*", which grants nothing by itself: a presigned URL carries its own signature and
+    # no cookie is involved. Set it to your panel's origin(s) to narrow it anyway.
+    storage_max_upload_gb: float = field(
+        default_factory=lambda: max(0.1, min(100.0, float(os.getenv("STORAGE_MAX_UPLOAD_GB") or 7))))
+    storage_cors_origins: str = field(default_factory=lambda: os.getenv("STORAGE_CORS_ORIGINS", "").strip())
     storage_max_buckets: int = field(
         default_factory=lambda: min(100, max(1, int(os.getenv("STORAGE_MAX_BUCKETS") or 10))))
     # only for a storage server on a private network without TLS (never over the internet): allow http://

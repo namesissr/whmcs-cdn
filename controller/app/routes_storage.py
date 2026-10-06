@@ -52,6 +52,7 @@ def _overview(db: Session, site: Site, live: bool = True) -> dict:
         "region": storage.settings.storage_region,
         "max_buckets": storage.settings.storage_max_buckets,
         "usage_stale": not fresh,
+        "max_upload_bytes": storage.max_upload_bytes(),
         "buckets": [storage.bucket_dict(b) for b in rows],
     }
 
@@ -102,6 +103,150 @@ def rotate_key(domain: str, name: str, request: Request, db: Session = Depends(g
     db.commit()
     _audit(db, request, "storage.bucket.rotate_key", site.domain, {"name": b.name})
     return _credentials(b, secret)
+
+
+# ------------------------------------------------------------------ file manager (SPEC §16.8)
+#
+# The browser never gets a key: it gets presigned URLs, one object at a time, from the controller's
+# own identity. Listing / deleting / folders / renames run here, where the site's limits apply.
+
+
+class ObjectsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    keys: list[str] = Field(default_factory=list, max_length=storage.DELETE_MAX)
+    prefixes: list[str] = Field(default_factory=list, max_length=10)
+
+
+class PresignIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+    expires_in: int | None = Field(default=None, ge=60, le=storage.PRESIGN_MAX_S)
+    attachment: bool = True
+
+
+class UploadIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+    size: int = Field(default=0, ge=0, le=1 << 50)
+    content_type: str = Field(default="", max_length=255)
+    expires_in: int | None = Field(default=None, ge=60, le=storage.PRESIGN_MAX_S)
+    parts: int = Field(default=storage.MULTIPART_URLS_PER_CALL, ge=1,
+                       le=storage.MULTIPART_URLS_PER_CALL)
+
+
+class PartsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+    upload_id: str = Field(min_length=1, max_length=256)
+    first: int = Field(default=1, ge=1, le=storage.MULTIPART_PART_MAX)
+    count: int = Field(default=storage.MULTIPART_URLS_PER_CALL, ge=1,
+                      le=storage.MULTIPART_URLS_PER_CALL)
+    expires_in: int | None = Field(default=None, ge=60, le=storage.PRESIGN_MAX_S)
+
+
+class Part(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    part: int = Field(ge=1, le=storage.MULTIPART_PART_MAX)
+    etag: str = Field(min_length=1, max_length=128)
+
+
+class CompleteIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+    upload_id: str = Field(min_length=1, max_length=256)
+    parts: list[Part] = Field(min_length=1, max_length=storage.MULTIPART_PART_MAX)
+
+
+class KeyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+
+
+class RenameIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+    to: str = Field(min_length=1, max_length=storage.MAX_KEY_BYTES)
+
+
+def _call(fn, *args, **kw):
+    try:
+        return fn(*args, **kw)
+    except storage.StorageError as e:
+        _fail(e)
+
+
+@router.get("/sites/{domain}/storage/buckets/{name}/objects")
+def list_objects(domain: str, name: str, prefix: str = "", token: str = "",
+                 limit: int = storage.LIST_DEFAULT, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.list_objects, db, site, name, prefix, token, limit)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/download")
+def presign_download(domain: str, name: str, body: PresignIn, db: Session = Depends(get_db)):
+    """A time-limited download URL for one object (and the permanent CDN URL when the bucket is
+    wired to a record)."""
+    site = get_site(db, domain)
+    return _call(storage.presign_download, db, site, name, body.key, body.expires_in, body.attachment)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/upload")
+def presign_upload(domain: str, name: str, body: UploadIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.presign_upload, db, site, name, body.key, body.size, body.content_type,
+                 body.expires_in)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/multipart")
+def multipart_start(domain: str, name: str, body: UploadIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.multipart_start, db, site, name, body.key, body.size, body.content_type,
+                 body.parts, body.expires_in)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/multipart/parts")
+def multipart_parts(domain: str, name: str, body: PartsIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.multipart_part_urls, db, site, name, body.key, body.upload_id, body.first,
+                 body.count, body.expires_in)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/multipart/complete")
+def multipart_complete(domain: str, name: str, body: CompleteIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.multipart_finish, db, site, name, body.key, body.upload_id,
+                 [p.model_dump() for p in body.parts])
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/multipart/abort")
+def multipart_abort(domain: str, name: str, body: PartsIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.multipart_cancel, db, site, name, body.key, body.upload_id)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/folder", status_code=201)
+def make_folder(domain: str, name: str, body: KeyIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.make_folder, db, site, name, body.key)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/rename")
+def rename_object(domain: str, name: str, body: RenameIn, db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    return _call(storage.rename_object, db, site, name, body.key, body.to)
+
+
+@router.post("/sites/{domain}/storage/buckets/{name}/objects/delete")
+def delete_objects(domain: str, name: str, body: ObjectsIn, request: Request,
+                   db: Session = Depends(get_db)):
+    site = get_site(db, domain)
+    out = _call(storage.delete_objects, db, site, name, body.keys, body.prefixes)
+    if out["deleted"]:
+        # the keys themselves are customer content: the audit entry counts, it does not list them
+        _audit(db, request, "storage.objects.delete", site.domain,
+               {"name": name, "deleted": out["deleted"]})
+        db.commit()
+    return out
 
 
 @router.get("/sites/{domain}/storage/usage")

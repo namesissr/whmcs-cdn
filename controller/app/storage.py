@@ -29,6 +29,7 @@ STORAGE_PUBLIC_ENDPOINT), a bucket name is validated to [a-z0-9-] and always pre
 import logging
 import re
 import secrets
+import time
 from datetime import datetime, timedelta
 
 import httpx
@@ -625,3 +626,286 @@ def edge_buckets(db: Session) -> dict[tuple[int, str], StorageBucket]:
     if not available():
         return {}
     return {(b.site_id, b.name): b for b in db.scalars(select(StorageBucket))}
+
+
+# ------------------------------------------------------------------ file manager (SPEC §16.8)
+#
+# The customer's browser talks to the storage server DIRECTLY with presigned URLs the controller
+# signs with its own identity: a file never passes through the controller (a 7 GB upload would
+# otherwise cost the controller that bandwidth and memory), the customer's own secret key is never
+# needed for it, and each URL is good for one object and a few minutes. Listing, deleting, folders
+# and renames are server-side calls, where the answer is small and the controller can enforce the
+# site's limits.
+
+MAX_KEY_BYTES = 1024
+LIST_MAX = 1000
+LIST_DEFAULT = 200
+PRESIGN_DEFAULT_S = 3600
+PRESIGN_MAX_S = 7 * 24 * 3600          # S3's own ceiling for a SigV4 query signature
+MULTIPART_PART_MAX = 1000              # part numbers per upload (S3)
+MULTIPART_URLS_PER_CALL = 100
+DELETE_MAX = 200                       # keys per call; a prefix is expanded up to this many
+_CORS_TTL_S = 600
+_cors_applied: dict[str, float] = {}
+
+# a key may hold any UTF-8, but not these: they break paths, listings or the edge's URI mapping
+_KEY_BAD = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def max_upload_bytes() -> int:
+    return int(settings.storage_max_upload_gb * GIB)
+
+
+def validate_key(key: str, folder: bool = False) -> str:
+    """A customer-supplied object key, normalised (no leading slash) and refused when it could not
+    round-trip: empty / only slashes, a "." or ".." segment, a double slash, a control character, or
+    more than 1024 bytes. `folder` requires (and keeps) the trailing slash."""
+    k = (key or "").strip().lstrip("/")
+    if not k or _KEY_BAD.search(k) or "//" in k:
+        raise StorageError("نام فایل یا پوشه معتبر نیست")
+    if any(seg in (".", "..") for seg in k.split("/")):
+        raise StorageError("نام فایل یا پوشه معتبر نیست")
+    if len(k.encode()) > MAX_KEY_BYTES:
+        raise StorageError(f"مسیر فایل بیش از {MAX_KEY_BYTES} بایت است")
+    if folder:
+        k = k.rstrip("/") + "/"
+        if k == "/":
+            raise StorageError("نام پوشه خالی است")
+    elif k.endswith("/"):
+        raise StorageError("نام فایل نمی‌تواند به / تمام شود")
+    return k
+
+
+def _prefix(prefix: str) -> str:
+    """A listing prefix: "" (the bucket root) or a validated folder key."""
+    p = (prefix or "").strip().lstrip("/")
+    return validate_key(p, folder=True) if p else ""
+
+
+def cors_origins() -> list[str]:
+    """Origins the customer's browser may upload from. Empty config means "*", which grants nothing
+    on its own: a presigned URL carries its own authentication and no cookie is involved."""
+    raw = [o.strip() for o in (settings.storage_cors_origins or "").split(",")]
+    return [o for o in raw if o] or ["*"]
+
+
+def ensure_cors(cli, bucket: str, now: float | None = None) -> None:
+    """Put the CORS rule on the bucket, at most once per _CORS_TTL_S per process. Never fatal: a
+    server that refuses it only means the browser upload will fail, which the caller reports."""
+    now = now if now is not None else time.monotonic()
+    if now - _cors_applied.get(bucket, 0.0) < _CORS_TTL_S:
+        return
+    try:
+        cli.put_bucket_cors(bucket, cors_origins())
+        _cors_applied[bucket] = now
+    except MinioError as e:
+        log.warning("storage: CORS on %s not applied: %s", bucket, e)
+
+
+def public_base(db: Session, site: Site, bucket_name: str) -> str | None:
+    """`https://host` of a proxied record served from this bucket, so the file manager can show a
+    permanent CDN link instead of an expiring one. None when no record uses the bucket."""
+    from .models import Record
+
+    rec = db.scalar(select(Record).where(Record.site_id == site.id, Record.proxied.is_(True),
+                                        Record.storage_bucket == bucket_name).order_by(Record.id))
+    if rec is None:
+        return None
+    host = site.domain if rec.name in ("@", "", None) else f"{rec.name}.{site.domain}"
+    return "https://" + host
+
+
+def list_objects(db: Session, site: Site, name: str, prefix: str = "", token: str = "",
+                 limit: int = LIST_DEFAULT) -> dict:
+    b = find_bucket(db, site, name)
+    cli = _require()
+    p = _prefix(prefix)
+    try:
+        page = cli.list_objects(b.bucket, p, token, max(1, min(LIST_MAX, int(limit or LIST_DEFAULT))))
+    except MinioError as e:
+        raise StorageError(f"خواندن فهرست فایل‌ها ناموفق بود: {e}", 502) from None
+    base = public_base(db, site, b.name)
+    objects = []
+    for o in page["objects"]:
+        if o["key"] == p:          # the folder marker itself
+            continue
+        objects.append({**o, "name": o["key"][len(p):],
+                        "public_url": (base + "/" + o["key"]) if base else None})
+    return {"prefix": p, "folders": [{"key": f, "name": f[len(p):].rstrip("/")} for f in page["folders"]],
+            "objects": objects, "next_token": page["next_token"], "public_base": base,
+            "max_upload_bytes": max_upload_bytes()}
+
+
+def _expires(seconds: int | None) -> int:
+    return max(60, min(PRESIGN_MAX_S, int(seconds or PRESIGN_DEFAULT_S)))
+
+
+def presign_download(db: Session, site: Site, name: str, key: str, seconds: int | None = None,
+                     attachment: bool = True) -> dict:
+    b = find_bucket(db, site, name)
+    cli = _require()
+    k = validate_key(key)
+    exp = _expires(seconds)
+    query = {}
+    if attachment:
+        filename = k.rsplit("/", 1)[-1].replace('"', "")
+        query["response-content-disposition"] = f'attachment; filename="{filename}"'
+    return {"url": cli.presign("GET", b.bucket, k, exp, query), "method": "GET", "expires_in": exp,
+            "public_url": (lambda base: base + "/" + k if base else None)(public_base(db, site, b.name))}
+
+
+def _headroom(db: Session, site: Site, size: int) -> None:
+    """Refuse an upload that cannot fit in the plan. The usage figure is a minute old at worst, so
+    this is a guard rather than a hard accountant — the bucket quota on the server is the hard stop."""
+    size = max(0, int(size or 0))
+    if size > max_upload_bytes():
+        raise StorageError(f"حجم هر فایل حداکثر {settings.storage_max_upload_gb} گیگابایت است")
+    rows = site_buckets(db, site)
+    limit = limit_bytes(site)
+    if limit <= 0:
+        raise StorageError("فضای ذخیره‌سازی برای این سرویس فعال نیست", 403)
+    if used_bytes(rows) + size > limit:
+        raise StorageError("فضای ذخیره‌سازی سرویس پر است؛ فایلی حذف کنید یا پلن را ارتقا دهید", 409)
+
+
+def presign_upload(db: Session, site: Site, name: str, key: str, size: int = 0,
+                   content_type: str = "", seconds: int | None = None) -> dict:
+    """One presigned PUT for a whole (small) file."""
+    b = find_bucket(db, site, name)
+    cli = _require()
+    k = validate_key(key)
+    _headroom(db, site, size)
+    ensure_cors(cli, b.bucket)
+    exp = _expires(seconds)
+    return {"url": cli.presign("PUT", b.bucket, k, exp), "method": "PUT", "expires_in": exp,
+            "key": k, "content_type": content_type or ""}
+
+
+def multipart_start(db: Session, site: Site, name: str, key: str, size: int = 0,
+                    content_type: str = "", parts: int = MULTIPART_URLS_PER_CALL,
+                    seconds: int | None = None) -> dict:
+    """Start a multipart upload and hand out the first batch of presigned part URLs. The browser asks
+    for more with multipart_part_urls() as it goes, so one stalled upload never holds 1000 URLs."""
+    b = find_bucket(db, site, name)
+    cli = _require()
+    k = validate_key(key)
+    _headroom(db, site, size)
+    ensure_cors(cli, b.bucket)
+    try:
+        upload_id = cli.create_multipart(b.bucket, k, content_type)
+    except MinioError as e:
+        raise StorageError(f"شروع آپلود چندبخشی ناموفق بود: {e}", 502) from None
+    return {"key": k, "upload_id": upload_id,
+            **multipart_part_urls(db, site, name, k, upload_id, 1, parts, seconds)}
+
+
+def multipart_part_urls(db: Session, site: Site, name: str, key: str, upload_id: str, first: int,
+                        count: int, seconds: int | None = None) -> dict:
+    b = find_bucket(db, site, name)
+    cli = _require()
+    k = validate_key(key)
+    first = max(1, min(MULTIPART_PART_MAX, int(first or 1)))
+    count = max(1, min(MULTIPART_URLS_PER_CALL, int(count or 1)))
+    last = min(MULTIPART_PART_MAX, first + count - 1)
+    exp = _expires(seconds)
+    urls = [{"part": n, "url": cli.presign("PUT", b.bucket, k, exp,
+                                           {"uploadId": upload_id, "partNumber": str(n)})}
+            for n in range(first, last + 1)]
+    return {"urls": urls, "expires_in": exp, "part_max": MULTIPART_PART_MAX}
+
+
+def multipart_finish(db: Session, site: Site, name: str, key: str, upload_id: str,
+                     parts: list[dict]) -> dict:
+    b = find_bucket(db, site, name)
+    cli = _require()
+    k = validate_key(key)
+    clean = []
+    for p in parts or []:
+        try:
+            n, tag = int(p.get("part")), str(p.get("etag") or "").strip('"')
+        except (TypeError, ValueError):
+            raise StorageError("فهرست بخش‌های آپلود معتبر نیست") from None
+        if not (1 <= n <= MULTIPART_PART_MAX) or not re.fullmatch(r"[A-Za-z0-9+/=._-]{1,128}", tag):
+            raise StorageError("فهرست بخش‌های آپلود معتبر نیست")
+        clean.append({"part": n, "etag": tag})
+    if not clean:
+        raise StorageError("فهرست بخش‌های آپلود خالی است")
+    try:
+        cli.complete_multipart(b.bucket, k, upload_id, clean)
+    except MinioError as e:
+        raise StorageError(f"تکمیل آپلود ناموفق بود: {e}", 502) from None
+    return {"key": k, "parts": len(clean)}
+
+
+def multipart_cancel(db: Session, site: Site, name: str, key: str, upload_id: str) -> dict:
+    b = find_bucket(db, site, name)
+    cli = _require()
+    try:
+        cli.abort_multipart(b.bucket, validate_key(key), upload_id)
+    except MinioError as e:
+        raise StorageError(f"لغو آپلود ناموفق بود: {e}", 502) from None
+    return {"ok": True}
+
+
+def make_folder(db: Session, site: Site, name: str, key: str) -> dict:
+    """A zero-byte object ending in "/" — what every S3 tool shows as a folder."""
+    b = find_bucket(db, site, name)
+    cli = _require()
+    k = validate_key(key, folder=True)
+    try:
+        cli.put_object(b.bucket, k, b"")
+    except MinioError as e:
+        raise StorageError(f"ساخت پوشه ناموفق بود: {e}", 502) from None
+    return {"key": k}
+
+
+def rename_object(db: Session, site: Site, name: str, src: str, dst: str) -> dict:
+    """Server-side copy + delete (S3 has no rename). Files only: renaming a folder would mean copying
+    every key under it, which the file manager does not offer."""
+    b = find_bucket(db, site, name)
+    cli = _require()
+    s, d = validate_key(src), validate_key(dst)
+    if s == d:
+        return {"key": d}
+    try:
+        cli.copy_object(b.bucket, s, d)
+        cli.delete_object(b.bucket, s)
+    except MinioError as e:
+        raise StorageError(f"تغییر نام ناموفق بود: {e}", 502) from None
+    return {"key": d}
+
+
+def delete_objects(db: Session, site: Site, name: str, keys: list[str] | None = None,
+                   prefixes: list[str] | None = None) -> dict:
+    """Delete up to DELETE_MAX objects. A prefix (folder) is expanded server-side up to the same cap
+    and `truncated` tells the caller to repeat — a folder of 100k files is many calls, never one
+    request that times out."""
+    b = find_bucket(db, site, name)
+    cli = _require()
+    todo: list[str] = []
+    for k in (keys or [])[:DELETE_MAX]:
+        todo.append(validate_key(k.rstrip("/") + "/" if str(k).endswith("/") else k,
+                                 folder=str(k).endswith("/")))
+    truncated = False
+    for p in (prefixes or [])[:10]:
+        pre = validate_key(p, folder=True)
+        page = cli.list_objects(b.bucket, pre, "", DELETE_MAX, delimiter="")
+        todo += [o["key"] for o in page["objects"]]
+        if page["next_token"]:
+            truncated = True
+        else:
+            # the folder itself last: SeaweedFS keeps buckets as a real directory tree, so an emptied
+            # folder would otherwise stay in the listing (and the key is also the marker a plain S3
+            # tool would have left behind)
+            todo.append(pre)
+    done, failed = 0, []
+    for k in dict.fromkeys(todo):
+        try:
+            cli.delete_object(b.bucket, k)
+            done += 1
+        except MinioError as e:
+            log.warning("storage: delete of %s failed: %s", b.bucket, e)
+            failed.append(k)
+    if failed and not done:
+        raise StorageError("حذف فایل ناموفق بود", 502)
+    return {"deleted": done, "failed": failed, "truncated": truncated}

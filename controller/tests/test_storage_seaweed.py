@@ -316,9 +316,22 @@ def _weed_bin() -> str | None:
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A free port below 50000: SeaweedFS derives its gRPC ports as port + 10000, and anything above
+    55535 makes the volume server die with "invalid port"."""
+    for _ in range(100):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port < 50000:
+            return port
+    for port in range(20000, 40000):
+        try:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    pytest.skip("no free port below 50000")
 
 
 def _shipped_controller_policy(prefix: str = "cdn-") -> dict:
@@ -433,3 +446,154 @@ def test_real_seaweed(client, real_seaweed):
         "DELETE", f"/{c['bucket']}/hello.txt")
     assert client.delete(f"{S}/storage/buckets/assets").status_code == 200
     assert not cli.bucket_exists(c["bucket"])
+
+
+# ------------------------------------------------------------------ file manager (§16.8)
+
+def test_key_validation():
+    for good, want in (("a/b.txt", "a/b.txt"), ("/x.txt", "x.txt"), ("عکس/تست.jpg", "عکس/تست.jpg"),
+                       ("a b.txt", "a b.txt")):
+        assert storage.validate_key(good) == want
+    for bad in ("", "/", "   ", "a//b", "../x", "a/./b", "a/../b", "x/", "a\x00b", "a\nb",
+                "x" * (storage.MAX_KEY_BYTES + 1)):
+        with pytest.raises(storage.StorageError):
+            storage.validate_key(bad)
+    assert storage.validate_key("photos", folder=True) == "photos/"
+    assert storage.validate_key("photos/", folder=True) == "photos/"
+    with pytest.raises(storage.StorageError):
+        storage.validate_key("/", folder=True)
+
+
+def test_expiry_and_upload_limits(monkeypatch):
+    assert storage._expires(None) == storage.PRESIGN_DEFAULT_S
+    assert storage._expires(1) == 60                      # never shorter than a minute
+    assert storage._expires(10 ** 9) == storage.PRESIGN_MAX_S
+    monkeypatch.setattr(settings, "storage_max_upload_gb", 7)
+    assert storage.max_upload_bytes() == 7 * GIB
+    monkeypatch.setattr(settings, "storage_cors_origins", "")
+    assert storage.cors_origins() == ["*"]
+    monkeypatch.setattr(settings, "storage_cors_origins", "https://a.example , https://b.example")
+    assert storage.cors_origins() == ["https://a.example", "https://b.example"]
+
+
+def test_presigned_url_shape(cli):
+    url = cli.presign("PUT", BUCKET, "a/b c.txt", 900)
+    assert url.startswith(f"{ENDPOINT}/{BUCKET}/a/b%20c.txt?")
+    for part in ("X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Expires=900", "X-Amz-SignedHeaders=host",
+                 f"X-Amz-Credential={AK}%2F", "X-Amz-Signature="):
+        assert part in url, part
+    assert SK not in url and "x-amz-content-sha256" not in url.lower()
+    # a forced download name travels in the query, so no header has to survive the redirect
+    get = cli.presign("GET", BUCKET, "a/b.pdf", 60, {"response-content-disposition": 'attachment; filename="b.pdf"'})
+    assert "response-content-disposition=attachment%3B%20filename%3D%22b.pdf%22" in get
+
+
+def test_upload_is_refused_without_room(client, seaweed, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setattr(settings, "data_encryption_key", Fernet.generate_key().decode())
+    monkeypatch.setattr(settings, "storage_max_upload_gb", 7)
+    make_site(client, storage_gb=1)
+    bucket = client.post(f"{S}/storage/buckets", json={"name": "assets"}).json()
+    base = f"{S}/storage/buckets/assets/objects"
+    # a file larger than the per-file cap: refused by the cap, with the cap in the message
+    r = client.post(f"{base}/upload", json={"key": "big.bin", "size": 8 * GIB})
+    assert r.status_code == 422 and "7 گیگابایت" in r.json()["detail"], r.text
+    # one that fits the cap but not the plan
+    r = client.post(f"{base}/upload", json={"key": "big.bin", "size": 2 * GIB})
+    assert r.status_code == 409 and "پر است" in r.json()["detail"], r.text
+    seaweed.usage = {bucket["bucket"]: (GIB, 1)}
+    with SessionLocal() as db:
+        storage.refresh_usage(db, storage.site_buckets(db, db.scalar(select(__import__("app.models", fromlist=["Site"]).Site))))
+        db.commit()
+    r = client.post(f"{base}/upload", json={"key": "more.bin", "size": 10 * 1024 * 1024})
+    assert r.status_code == 409 and "پر است" in r.json()["detail"]
+    # and a key the panel must never send
+    assert client.post(f"{base}/upload", json={"key": "../escape", "size": 1}).status_code == 422
+
+
+def test_real_seaweed_file_manager(client, real_seaweed):
+    """The whole file-manager flow against a real server: list, presigned upload and download,
+    folders, rename, multipart and delete — the browser's half done with plain HTTP, as a browser
+    would, so a signature or CORS mistake fails here rather than in a customer's panel."""
+    url = real_seaweed
+    make_site(client, storage_gb=1)
+    bucket = client.post(f"{S}/storage/buckets", json={"name": "assets"})
+    assert bucket.status_code == 201, bucket.text
+    base = f"{S}/storage/buckets/assets/objects"
+    web = httpx.Client(trust_env=False, timeout=60)
+
+    empty = client.get(base).json()
+    assert empty["objects"] == [] and empty["folders"] == [] and empty["public_base"] is None
+    assert empty["max_upload_bytes"] == int(settings.storage_max_upload_gb * GIB)
+
+    # upload one file with a presigned PUT, exactly as the browser does
+    up = client.post(f"{base}/upload", json={"key": "docs/report 1.pdf", "size": 8,
+                                             "content_type": "application/pdf"})
+    assert up.status_code == 200, up.text
+    assert web.put(up.json()["url"], content=b"PDF-BODY").status_code == 200
+
+    page = client.get(base).json()
+    assert [f["name"] for f in page["folders"]] == ["docs"]
+    docs = client.get(base, params={"prefix": "docs/"}).json()
+    assert [(o["name"], o["size"]) for o in docs["objects"]] == [("report 1.pdf", 8)]
+
+    # download URL: fetched by the browser, with the file's own name forced
+    dl = client.post(f"{base}/download", json={"key": "docs/report 1.pdf"}).json()
+    got = web.get(dl["url"])
+    assert got.status_code == 200 and got.content == b"PDF-BODY"
+    assert 'filename="report 1.pdf"' in got.headers.get("content-disposition", "")
+    assert dl["public_url"] is None          # no record uses this bucket yet
+
+    # folder, rename, and a listing that shows both
+    assert client.post(f"{base}/folder", json={"key": "photos"}).status_code == 201
+    assert client.post(f"{base}/rename", json={"key": "docs/report 1.pdf",
+                                               "to": "docs/final.pdf"}).status_code == 200
+    docs = client.get(base, params={"prefix": "docs/"}).json()
+    assert [o["name"] for o in docs["objects"]] == ["final.pdf"]
+    assert "photos" in [f["name"] for f in client.get(base).json()["folders"]]
+
+    # a multipart upload: two presigned parts, then the server stitches them
+    start = client.post(f"{base}/multipart", json={"key": "big/blob.bin", "size": 5 * 1024 * 1024 + 4,
+                                                  "parts": 2})
+    assert start.status_code == 200, start.text
+    body = start.json()
+    parts = []
+    for item, chunk in zip(body["urls"], (b"a" * (5 * 1024 * 1024), b"tail")):
+        r = web.put(item["url"], content=chunk)
+        assert r.status_code == 200, r.text
+        parts.append({"part": item["part"], "etag": r.headers["ETag"].strip('"')})
+    done = client.post(f"{base}/multipart/complete", json={"key": body["key"],
+                                                           "upload_id": body["upload_id"],
+                                                           "parts": parts})
+    assert done.status_code == 200, done.text
+    blob = client.get(base, params={"prefix": "big/"}).json()["objects"][0]
+    assert blob["size"] == 5 * 1024 * 1024 + 4
+
+    # an aborted upload leaves nothing behind
+    start = client.post(f"{base}/multipart", json={"key": "big/gone.bin", "size": 1024})
+    aborted = start.json()
+    assert client.post(f"{base}/multipart/abort", json={"key": aborted["key"],
+                                                        "upload_id": aborted["upload_id"]}).status_code == 200
+    assert [o["name"] for o in client.get(base, params={"prefix": "big/"}).json()["objects"]] == ["blob.bin"]
+
+    # the permanent CDN link appears once a record is served from the bucket
+    rec = client.post(f"{S}/records", json={"name": "files", "type": "CNAME", "content": "",
+                                            "proxied": True, "storage": "assets"})
+    assert rec.status_code == 201, rec.text
+    dl = client.post(f"{base}/download", json={"key": "docs/final.pdf"}).json()
+    assert dl["public_url"] == "https://files.example.com/docs/final.pdf"
+
+    # delete: one key, then a whole folder by prefix
+    out = client.post(f"{base}/delete", json={"keys": ["docs/final.pdf"]}).json()
+    assert out == {"deleted": 1, "failed": [], "truncated": False}
+    # a folder: its objects and the folder itself (SeaweedFS keeps real directories, so an emptied
+    # folder would otherwise stay in the listing)
+    out = client.post(f"{base}/delete", json={"prefixes": ["big/"]}).json()
+    assert out["deleted"] == 2 and out["truncated"] is False
+    left = client.get(base).json()
+    assert left["objects"] == [] and "big" not in [f["name"] for f in left["folders"]]
+    assert sorted(f["name"] for f in left["folders"]) == ["docs", "photos"]
+    # and the empty folder the customer made, removed the same way
+    assert client.post(f"{base}/delete", json={"prefixes": ["photos/"]}).json()["deleted"] == 1
+    assert [f["name"] for f in client.get(base).json()["folders"]] == ["docs"]

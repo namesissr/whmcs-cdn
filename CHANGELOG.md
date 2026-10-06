@@ -136,6 +136,30 @@ start at all.
 - Docs: STORAGE.md rewritten (setup, policy, backup, upgrade, troubleshooting, and §11 on the MinIO
   path and how to migrate off it), SPEC §16.8, UPGRADE, `.env.example`.
 
+### Added — a file manager in the customer's storage section
+
+A customer who buys storage no longer needs `aws`/`rclone` to put a file there and hand out its link.
+
+- Controller: `.../storage/buckets/{name}/objects` — list (folders + objects, paged), presigned
+  download (and the permanent CDN URL when the bucket is a proxied record's origin), presigned upload,
+  multipart start / parts / complete / abort, folder, rename and delete (keys or whole prefixes, 200
+  per call). The bytes never pass through the controller: it issues SigV4 **query**-presigned URLs
+  (`UNSIGNED-PAYLOAD`) and the browser talks to the storage server, so the first upload to a bucket
+  also writes its CORS rule (`STORAGE_CORS_ORIGINS`, default `*`). `STORAGE_MAX_UPLOAD_GB` (default
+  **7**) caps one file, on top of the plan's own free-space check. Keys are validated (no control
+  character, no `..`, ≤ 1024 bytes) and the delete audit entry counts files instead of listing them.
+- `app/minio_client.py` gained the presigner and the object calls both backends share
+  (`list_objects`, `presign`, `put/delete/copy_object`, multipart, `put_bucket_cors`).
+- WHMCS client app: a «فایل‌ها» button per bucket opens the manager — breadcrumb browsing, drag & drop
+  or picked uploads in a queue with progress and cancel (one PUT up to 32 MiB, multipart above it with
+  32 MiB parts and 3 parallel lanes, so multi-gigabyte files work), download, link dialog (permanent
+  CDN link, or 1 h / 1 d / 7 d presigned), new folder, rename and delete. A customer's file name
+  becomes exactly one key segment inside the folder on screen. English strings included.
+- Tests: `controller/tests/test_storage_seaweed.py::test_real_seaweed_file_manager` drives the whole
+  flow against a real `weed` binary; `whmcs/tests/fm.test.js` covers the key and upload-shape helpers,
+  and the `whmcs` CI job now runs the JS tests and `node --check` on every asset.
+- Docs: STORAGE.md (§۴ endpoints and the customer page), SPEC §16.8, `.env.example`.
+
 ### Fixed — node stability under memory pressure and a broken nginx pid file
 
 - Edge: a reload that fails while `NGINX_PID_FILE` does not point at a live master (an empty or stale

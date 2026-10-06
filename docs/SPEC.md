@@ -1200,7 +1200,15 @@ feature `storage_gb` (0 = none); `POST /api/v1/sites/{d}/storage/buckets {name}`
 scoped access key (secret shown once, stored encrypted), `GET` lists buckets with usage, `DELETE`
 (only empty). Usage collected
 hourly and billed via WHMCS (GB-month). A record/origin shortcut `origin: {storage: "<bucket>"}`
-makes a bucket a CDN origin. Customer app page «فضای ذخیره‌سازی».
+makes a bucket a CDN origin. Customer app page «فضای ذخیره‌سازی», including a **file manager**
+(`assets/fm.js`, routes `.../storage/buckets/{name}/objects…`): browse/folder/rename/delete, upload by
+drag & drop with a progress queue, and a download link — the permanent CDN URL when the bucket is a
+record's origin, otherwise a presigned one (1 h / 1 d / 7 d). The bytes never pass through the
+controller: it only issues SigV4 query-presigned URLs (UNSIGNED-PAYLOAD) and the browser talks to the
+storage server directly — a single PUT up to 32 MiB, multipart above it (32 MiB parts, 3 in parallel,
+part URLs handed out 100 at a time), which is why the first upload to a bucket also sets its CORS
+rules (`STORAGE_CORS_ORIGINS`). Per-file cap `STORAGE_MAX_UPLOAD_GB` (default 7) on top of the plan's
+own headroom check; a customer's file name becomes exactly one key segment inside the folder shown.
 
 ### 16.9 Edge Functions (isolated)
 Customer JavaScript at the edge is untrusted multi-tenant code; it must NOT run inside nginx/njs.

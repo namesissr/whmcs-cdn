@@ -110,8 +110,8 @@ class ClientApi
             // Wave 7 (SPEC §15.3/§15.4): tunnel quality, tunnel usage and origin health — read-only
             'tunnel/quality', 'tunnel/usage', 'tunnel/health',
             // SPEC §16.8 object storage: overview + buckets (never a secret — the controller returns
-            // secret_key only in the create / rotate-key answers)
-            'storage', 'storage/buckets',
+            // secret_key only in the create / rotate-key answers) and the file manager's listing
+            'storage', 'storage/buckets', 'storage/buckets/' . self::BUCKET . '/objects',
             // SPEC §16.9 edge functions: invocations / CPU / errors of the last `hours` (read-only)
             'functions/stats',
             // SPEC §17.3 WAF learning mode: state, progress and proposals (read-only; starting / stopping
@@ -133,6 +133,12 @@ class ClientApi
             'image/transform-secret',
             // SPEC §16.8: new bucket / new access key — secret_key returned once, never logged (ApiClient::redact)
             'storage/buckets', 'storage/buckets/' . self::BUCKET . '/rotate-key',
+            // SPEC §16.8 file manager: presigned upload / download URLs (one object, minutes), the
+            // multipart handshake, folders, rename and delete. A presigned URL is a credential for
+            // that one object, so these answers are not logged either (ApiClient::quiet).
+            'storage/buckets/' . self::BUCKET . '/objects/(?:upload|download|folder|rename|delete)',
+            'storage/buckets/' . self::BUCKET . '/objects/multipart',
+            'storage/buckets/' . self::BUCKET . '/objects/multipart/(?:parts|complete|abort)',
             // SPEC §17.3: apply the chosen learning-mode proposals — body re-checked by applyBody()
             'waf/learning/apply',
             // SPEC §18.2: new access secret (all sign-in sessions end) — body must be empty, see sectionBody()
@@ -572,6 +578,12 @@ class ClientApi
             }
             if ($method === 'POST' && $path === self::W17_IMPORT_PREVIEW && method_exists($api, 'quiet')) {
                 // SPEC §23.6: the preview body carries the customer's provider key — never in the module log (nor the answer)
+                $api->quiet(true);
+            }
+            // SPEC §16.8 file manager: the answer carries presigned URLs, which ARE the credential for
+            // that one object until they expire — keep them out of the module log.
+            if ($method === 'POST' && \preg_match('#^storage/buckets/[^/]+/objects/(?:upload|download|multipart)#', $path) === 1
+                && \method_exists($api, 'quiet')) {
                 $api->quiet(true);
             }
             if (isset(self::PUBLIC_FILES[$path])) {
