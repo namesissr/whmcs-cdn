@@ -27,6 +27,15 @@ while [ $# -gt 0 ]; do
 done
 [ -f .env ] || { echo ".env missing: cp .env.example .env and edit it" >&2; exit 1; }
 
+# Docker creates a DIRECTORY for a bind-mount source that does not exist yet, so a `docker compose
+# up -d` run before the first bootstrap leaves an empty s3.json/ behind — and the gateway then dies
+# with "fail to load config file ... is a directory" (Caddy answers 502). Clean that up here.
+if [ -d s3.json ]; then
+  rmdir s3.json 2>/dev/null || {
+    echo "s3.json is a directory and not empty; move it aside and run this again" >&2; exit 1; }
+  echo "removed the empty s3.json directory Docker had created for the bind mount"
+fi
+
 rand() { head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-"$1"; }
 value_of() { sed -n "s/^$1=//p" .env | tail -1; }
 
@@ -80,8 +89,10 @@ JSON
 chmod 600 s3.json
 
 $COMPOSE up -d
-# the static identities are read at startup, so the gateway has to see the new file
-$COMPOSE restart seaweedfs >/dev/null
+# The static identities are read at startup, so the gateway has to see the new file. Recreate rather
+# than restart: when the bind-mount source has just changed (a file where a directory was), a
+# restarted container keeps the old mount.
+$COMPOSE up -d --force-recreate seaweedfs >/dev/null
 echo
 echo "Put these into the CONTROLLER's .env (not this server's), then restart the controller:"
 echo "  STORAGE_BACKEND=seaweedfs"

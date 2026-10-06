@@ -60,28 +60,33 @@
    تخصیص دیسک. ۱ گیگابایت برای باکت‌های مشتری مناسب است؛ اگر چند باکت بسیار بزرگ دارید آن را بالا ببرید. تعداد
    volume سقف ندارد (`-volume.max=0`، یعنی فضای آزاد تقسیم بر این اندازه) — پیش‌فرض خود SeaweedFS ۸ volume است که
    کل سرور را روی چند باکت متوقف می‌کرد (`No writable volumes and no free volumes left`).
-5. **اجرا:**
-   ```sh
-   docker compose up -d
-   docker compose ps                    # seaweedfs و caddy باید healthy شوند
-   docker compose logs --tail 30 caddy  # صدور گواهی
-   curl -fsS https://s3.pasargadmizban.com/
-   ```
-   (پاسخ 403 به یک درخواست بدون امضا یعنی gateway بالا است و درست رد می‌کند.)
-6. **هویت‌ها:**
+5. **هویت‌ها و اجرا (به همین ترتیب):**
    ```sh
    ./bootstrap.sh
    ```
-   این اسکریپت `s3.json` را می‌سازد (هویت ادمین اضطراری `pcdn-admin`، هویت محدود `pcdn-controller`، و هویت
-   `anonymous` بی‌مجوز که فقط policy باکت می‌تواند به آن اجازهٔ GET بدهد)، سرویس را ری‌استارت می‌کند و **یک بار**
-   این دو مقدار را چاپ می‌کند:
+   `bootstrap.sh` اول `s3.json` را می‌سازد (هویت ادمین اضطراری `pcdn-admin`، هویت محدود
+   `pcdn-controller`، و هویت `anonymous` بی‌مجوز که فقط policy باکت می‌تواند به آن اجازهٔ GET بدهد)، بعد
+   خودش `docker compose up -d` را اجرا می‌کند و در پایان **یک بار** این دو مقدار را چاپ می‌کند:
    ```
    STORAGE_ADMIN_ACCESS_KEY=...
    STORAGE_ADMIN_SECRET_KEY=...
    ```
-   اجرای دوباره چیزی را عوض نمی‌کند؛ `--rotate` کلید تازه برای کنترلر می‌سازد (بعد `.env` کنترلر را به‌روز و
-   کنترلر را ری‌استارت کنید). برخلاف مینیو، این مقادیر در `s3.json` روی همین سرور می‌مانند، پس اگر گم شدند
-   می‌توانید از همان فایل بخوانید — و همین فایل را باید محرمانه نگه دارید (0600).
+   > **`docker compose up -d` را قبل از `bootstrap.sh` اجرا نکنید.** مسیر `./s3.json` به کانتینر mount
+   > می‌شود و Docker برای یک mount source که وجود ندارد **پوشه** می‌سازد؛ بعد gateway با
+   > `fail to load config file … is a directory` می‌میرد و Caddy پاسخ 502 می‌دهد. اگر این اتفاق افتاد،
+   > همان `./bootstrap.sh` پوشهٔ خالی را خودش پاک می‌کند و کانتینر را از نو می‌سازد.
+
+   اجرای دوبارهٔ `bootstrap.sh` چیزی را عوض نمی‌کند؛ `--rotate` کلید تازه برای کنترلر می‌سازد (بعد `.env`
+   کنترلر را به‌روز و کنترلر را ری‌استارت کنید). برخلاف مینیو این مقادیر در `s3.json` روی همین سرور
+   می‌مانند، پس اگر گم شدند از همان فایل بخوانید — و همین فایل را محرمانه نگه دارید (0600).
+6. **بررسی:**
+   ```sh
+   docker compose ps                    # seaweedfs و caddy باید healthy شوند
+   docker compose logs --tail 30 caddy  # صدور گواهی
+   curl -sS -o /dev/null -w '%{http_code}\n' https://s3.pasargadmizban.com/
+   ```
+   خروجی `403` درست است: gateway بالا است و درخواست بدون امضا را رد می‌کند. `502` یعنی gateway بالا
+   نیامده (`docker compose logs --tail 40 seaweedfs`).
 
 کلیدهای مشتری‌ها در `s3.json` نیستند: کنترلر آن‌ها را روی IAM می‌سازد و سرور در filer نگه می‌دارد.
 
@@ -313,6 +318,7 @@ POST /api/v1/sites/example.com/records
 | 503 «پیکربندی نشده» | `STORAGE_ENDPOINT`/`STORAGE_ADMIN_*` در `.env` کنترلر؛ endpoint باید `https://` باشد. |
 | 502 با `AccessDenied` | policy کنترلر اعمال نشده یا پیشوند با `cdn-*` نمی‌خواند (`./bootstrap.sh`)؛ IP کنترلر در `ADMIN_ALLOW_IPS`. |
 | 502 با `SignatureDoesNotMatch` | رمز اشتباه یا ساعت سرورها هم‌زمان نیست (NTP). |
+| 502 از همهٔ مسیرها، و در لاگ `fail to load config file … is a directory` | `docker compose up -d` قبل از `bootstrap.sh` اجرا شده و Docker برای `s3.json` پوشه ساخته؛ `./bootstrap.sh` را بزنید (خودش پاک و بازسازی می‌کند). |
 | ساخت کلید مشتری با 403 روی IAM | سرور با `-s3.iam.readOnly=false` اجرا نشده (پیش‌فرض خودش `true` است و هر نوشتن IAM را 403 می‌کند)، یا POST به `/` از IP کنترلر نیست. |
 | آپلود با 500 و «No writable volumes» | سقف تعداد volume پر شده: `-volume.max=0` و `VOLUME_SIZE_MB` کوچک‌تر (هر باکت collection خودش را دارد). |
 | هشدار `storage_usage` | کنترلر مسیر متریک را نمی‌خواند (`STORAGE_METRICS_PATH`، دسترسی IP در Caddy)؛ هر دقیقه دوباره تلاش می‌کند. |

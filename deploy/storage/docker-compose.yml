@@ -41,7 +41,10 @@ services:
     # one certificate covers. Virtual-host style would need a wildcard certificate for *.<domain>.
     volumes:
       - ${SEAWEED_DATA_DIR:-/srv/seaweedfs/data}:/data
-      # written by bootstrap.sh: the operator admin identity and the controller's scoped identity.
+      # Written by bootstrap.sh: the operator admin identity and the controller's scoped identity.
+      # Run ./bootstrap.sh for the first start (it writes this file and brings the stack up itself):
+      # a `docker compose up -d` before it exists makes Docker create a DIRECTORY here and the
+      # gateway dies on "fail to load config file ... is a directory".
       # Customer identities are NOT here — the controller creates them over the IAM API and the
       # server keeps them in the filer, so they survive a restart and are never in a file on disk.
       - ./s3.json:/etc/seaweedfs/s3.json:ro
