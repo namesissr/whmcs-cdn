@@ -87,6 +87,15 @@ cat > s3.json <<JSON
 }
 JSON
 chmod 600 s3.json
+# The image drops privileges to uid/gid 1000 (user `seaweed`) before starting the server, so a
+# root-owned 0600 file is unreadable to it: the S3 gateway then dies on "fail to load config file"
+# and the container crash-loops while its healthcheck (the master) still answers, so `ps` looks fine
+# and Caddy answers 502. Keep the file secret and hand it to that uid.
+chown 1000:1000 s3.json 2>/dev/null || {
+  chmod 644 s3.json
+  echo "note: could not chown s3.json to uid 1000 (rootless docker?); left it world-readable on this"
+  echo "      server so the container can read it"
+}
 
 $COMPOSE up -d
 # The static identities are read at startup, so the gateway has to see the new file. Recreate rather

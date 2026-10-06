@@ -318,6 +318,7 @@ POST /api/v1/sites/example.com/records
 | 503 «پیکربندی نشده» | `STORAGE_ENDPOINT`/`STORAGE_ADMIN_*` در `.env` کنترلر؛ endpoint باید `https://` باشد. |
 | 502 با `AccessDenied` | policy کنترلر اعمال نشده یا پیشوند با `cdn-*` نمی‌خواند (`./bootstrap.sh`)؛ IP کنترلر در `ADMIN_ALLOW_IPS`. |
 | 502 با `SignatureDoesNotMatch` | رمز اشتباه یا ساعت سرورها هم‌زمان نیست (NTP). |
+| 502 از همهٔ مسیرها و `connection refused` به پورت 8333 در لاگ Caddy | gateway بالا نیامده؛ شایع‌ترین علت این است که `s3.json` برای کاربر کانتینر (uid 1000) خواندنی نیست: `chown 1000:1000 s3.json && docker compose up -d --force-recreate seaweedfs`. کانتینر در این حالت crash-loop می‌کند ولی چون healthcheck به master نگاه می‌کند، `docker compose ps` همان `healthy` را نشان می‌دهد. |
 | 502 از همهٔ مسیرها، و در لاگ `fail to load config file … is a directory` | `docker compose up -d` قبل از `bootstrap.sh` اجرا شده و Docker برای `s3.json` پوشه ساخته؛ `./bootstrap.sh` را بزنید (خودش پاک و بازسازی می‌کند). |
 | ساخت کلید مشتری با 403 روی IAM | سرور با `-s3.iam.readOnly=false` اجرا نشده (پیش‌فرض خودش `true` است و هر نوشتن IAM را 403 می‌کند)، یا POST به `/` از IP کنترلر نیست. |
 | آپلود با 500 و «No writable volumes» | سقف تعداد volume پر شده: `-volume.max=0` و `VOLUME_SIZE_MB` کوچک‌تر (هر باکت collection خودش را دارد). |

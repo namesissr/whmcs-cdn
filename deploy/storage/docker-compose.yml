@@ -47,6 +47,7 @@ services:
       # gateway dies on "fail to load config file ... is a directory".
       # Customer identities are NOT here — the controller creates them over the IAM API and the
       # server keeps them in the filer, so they survive a restart and are never in a file on disk.
+      # owned by uid 1000 (the image drops privileges to the `seaweed` user), 0600
       - ./s3.json:/etc/seaweedfs/s3.json:ro
     expose:
       - "8333"   # S3 (through Caddy only)
