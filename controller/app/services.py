@@ -123,8 +123,9 @@ def record_metrics(e: Edge, metrics: dict, now: datetime | None = None):
     # SPEC §22.2 draining-generation pile-up and §22.10 DNS weight level hysteresis (internal counters)
     level, up, down = edge_state.weight_level(int(e.dns_weight_level or 0), pct, prev)
     e.dns_weight_level = level
+    mem_n, mem_high = edge_state.mem_counter(prev, clean, settings.edge_mem_alert)
     e.metrics = json.dumps({**clean, "_pileup_n": edge_state.pileup_counter(prev, clean),
-                            "_wl_up": up, "_wl_down": down})
+                            "_wl_up": up, "_wl_down": down, "_mem_n": mem_n, "_mem_high": mem_high})
     e.load_high = (e.load_high or 0) + 1 if pct is not None and pct > LOAD_ALERT_PERCENT else 0
     ratio = cpu_ratio(clean)
     e.cpu_high = (e.cpu_high or 0) + 1 if ratio is not None and ratio > settings.edge_cpu_alert else 0

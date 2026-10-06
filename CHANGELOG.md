@@ -107,6 +107,25 @@ DNS, rollouts or provisioning — enforced by an import test).
 - Docs: API, OPERATIONS (§۱۰), MONITORING, SECURITY (§۱۲), UPGRADE («۱۲) موج ۱۴ — انتشار ایمن، عملیات و
   تجربهٔ مشتری»), DISASTER_RECOVERY (weekly restore test), NODES (§۱۴); `.env.example` wave 14 block.
 
+### Fixed — node stability under memory pressure and a broken nginx pid file
+
+- Edge: a reload that fails while `NGINX_PID_FILE` does not point at a live master (an empty or stale
+  `/run/nginx.pid` → `invalid PID number ""`, reported without any `nginx -t` or `emerg` error while nginx
+  keeps serving the old config) now rewrites that file from the running master, retries, and falls back to
+  `SIGHUP`, with a WARN either way. Before, such a node silently never loaded another config change — new
+  sites, rotated certificates and the tunnel self-probe's server blocks included.
+- Edge: the memory guard gained a critical tier (`MEM_GUARD_HARD_PCT` 97, `MEM_GUARD_MAX_KILLS` 3,
+  `MEM_GUARD_KILL_GRACE_S` 60): it acts on the first heartbeat, stops several draining generations at once,
+  and escalates to `SIGKILL`; a worker already signalled is skipped. While a generation drains at that
+  memory level the reload back-pressure goes to its 600 s ceiling (`RELOAD_MAX_WAIT` still forces the
+  pending version). Rationale: the kernel's OOM killer picks its own victim, which can be the nginx master
+  — every tunnel on the node goes with it.
+- Controller: the memory part of `edge_health:<id>` gained hysteresis (`EDGE_MEM_ALERT` for 3 heartbeats,
+  resolving 10 points lower) and a `critical` tier from 97 % on the first report, naming the node's draining
+  generations and the remedies.
+- Docs: NODES (§۱۳-۱-۱ node memory and worker generations, troubleshooting row for the empty pid file),
+  EDGE, MONITORING, SPEC (§6, §22.2).
+
 ### Added — wave 13: tunnel speed and stability (SPEC §22), controller
 
 Migration `0022` (edges drain / probe / reload / tuning / `http3_enabled` / `dns_weight_level` columns,

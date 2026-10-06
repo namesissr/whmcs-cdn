@@ -274,6 +274,48 @@ def test_bundle_upgrade_is_an_edge_event(client):
 
 # ================================================================== §22.2 reloads + metrics
 
+def test_edge_memory_alert(client, alert_settings):
+    """§22.2: the memory part of edge_health gets hysteresis and a critical tier — above it the kernel's
+    OOM killer gets there first, and its victim can be the nginx master (every tunnel on the node with
+    it). EDGE_MEM_ALERT stays the operator's threshold."""
+    from app import config, edge_state
+
+    (e1, t1), _ = two_edges(client)
+    m = {"rx_mbps": 1, "tx_mbps": 1, "connections": 1, "load1": 0.1, "cpus": 2}
+    open_pct = config.settings.edge_mem_alert
+
+    def cond():
+        with SessionLocal() as db:
+            alerts.check_edge_health(db)
+        return {c["key"]: c for c in alerts.open_alerts()}.get(f"edge_health:{e1}")
+
+    for _ in range(edge_state.MEM_ALERT_CHECKS - 1):
+        hb(client, t1, metrics={**m, "mem_pct": open_pct})
+    assert cond() is None                                  # one heartbeat short
+    hb(client, t1, metrics={**m, "mem_pct": open_pct})
+    c = cond()
+    assert c is not None and c["severity"] == "warning" and f"{open_pct:.0f}٪ مصرف" in c["text"]
+    # hysteresis: just below the threshold keeps it open, MEM_RESOLVE_MARGIN points below closes it
+    hb(client, t1, metrics={**m, "mem_pct": open_pct - 1})
+    assert cond() is not None
+    hb(client, t1, metrics={**m, "mem_pct": open_pct - edge_state.MEM_RESOLVE_MARGIN})
+    assert cond() is None
+    # from MEM_CRIT_PCT a single report is enough and the alert is critical, with the node's generations
+    hb(client, t1, metrics={**m, "mem_pct": 99.1, "draining_workers": 7})
+    c = cond()
+    assert c["severity"] == "critical" and "99٪" in c["text"] and "7 نسل" in c["text"]
+    assert "تونل" in c["text"] and "shutdown-timeout" in c["text"]
+    # a heartbeat without mem_pct (older agent) cannot show the condition, but the stored state is kept:
+    # the next report at the threshold opens the alert again at once instead of restarting the streak
+    hb(client, t1, metrics=m)
+    assert cond() is None
+    hb(client, t1, metrics={**m, "mem_pct": open_pct})
+    assert cond() is not None
+    hb(client, t1, metrics={**m, "mem_pct": 10.0})
+    assert cond() is None
+    assert not any(k.startswith("_") for k in edge_dict(client, e1)["metrics"])
+
+
 def test_metrics_fields_reloads_storage_alerts_and_prometheus(client, alert_settings):
     (e1, t1), _ = two_edges(client)
     m = {"rx_mbps": 1, "tx_mbps": 2, "connections": 5, "load1": 0.1, "cpus": 1,

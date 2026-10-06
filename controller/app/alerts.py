@@ -439,6 +439,7 @@ def check_edge_load(db) -> None:
 
 def check_edge_health(db) -> None:
     """edge_health:{id} for sustained high CPU load, or a full disk / memory (agent metrics)."""
+    from . import edge_state
     from .models import Edge
     from .services import LOAD_ALERT_CHECKS, cpu_ratio, edge_metrics, metrics_fresh
 
@@ -459,8 +460,21 @@ def check_edge_health(db) -> None:
             problems.append(f"دیسک {disk:.0f}٪ پر است؛ فضای کش رو به اتمام است.")
             severity = "critical"
         mem = m.get("mem_pct")
-        if mem is not None and mem >= settings.edge_mem_alert:
-            problems.append(f"حافظه {mem:.0f}٪ مصرف شده است.")
+        # §22.2: hysteresis (edge_state.mem_counter) so a node hovering at the threshold does not flap,
+        # and critical from MEM_CRIT_PCT: there the kernel's OOM killer gets there before the agent's
+        # memory guard, and its victim can be the nginx master — every tunnel on the node dies with it
+        # and /run/nginx.pid is left empty, so later reloads fail too.
+        if mem is not None and edge_state.memory_high(e):
+            gens = m.get("draining_workers")
+            problems.append(
+                f"حافظه {mem:.0f}٪ مصرف شده است"
+                + (f" و {gens} نسل کارگر nginx هنوز در حال خاموش شدن است" if gens else "")
+                + (". اگر کار به OOM killer کرنل برسد، قربانی را کرنل انتخاب می‌کند و می‌تواند مستر nginx "
+                   "باشد؛ در آن حالت همه‌ی تونل‌های نود قطع می‌شوند. چاره‌ها: RAM بیشتر، "
+                   "`worker_shutdown_timeout` کوتاه‌تر (`install.sh --shutdown-timeout 30m`) یا ظرفیت "
+                   "کمتر برای این نود." if mem >= edge_state.MEM_CRIT_PCT else "."))
+            if mem >= edge_state.MEM_CRIT_PCT:
+                severity = "critical"
         if problems:
             active[key] = (
                 f"نود {e.name} تحت فشار است",

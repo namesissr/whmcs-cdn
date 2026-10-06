@@ -214,6 +214,7 @@ json-exporter برای فیلدهای `null` (نودی که هنوز متریک 
 | `edge_tunnel_degraded:<id>` | «مسیر تونل نود X خراب است (پروب داخلی)»: `TUNNEL_PROBE_FAIL_CHECKS` گزارش ناموفق پیاپی پروب داخلی؛ با بازگشت (`TUNNEL_PROBE_OK_CHECKS` گزارش موفق و ≥ ۱۰ دقیقه) بسته می‌شود | warning |
 | `edge_reload_storm:<id>` | بیش از ۱۲ بارگذاری مجدد در ساعت در ۳ heartbeat پیاپی؛ با ≤ ۶ بسته می‌شود | warning |
 | `edge_draining_pileup:<id>` | `draining_workers` بیش از ۴ × تعداد هسته در ۵ heartbeat پیاپی | warning |
+| `edge_health:<id>` (بخش حافظه) | `mem_pct` ≥ `EDGE_MEM_ALERT` در ۳ heartbeat پیاپی؛ با ۱۰ واحد پایین‌تر بسته می‌شود. از ۹۷٪ همان گزارش اول و با شدت `critical`: در آن نقطه OOM killer کرنل جلوتر از محافظ حافظه‌ی عامل می‌رسد و قربانی را کرنل انتخاب می‌کند — می‌تواند مستر nginx و در نتیجه همهٔ تونل‌های نود باشد | warning / critical |
 | `edge_tuning:<id>` | بررسی تنظیمات هسته‌ی نود (sysctl/qdisc/nofile) در ≥ ۳ heartbeat ناموفق | info |
 | `edge_drain_stuck:<id>` | تخلیه‌ای که `DRAIN_MAX_HOLD_MINUTES` بعد از پایانش هنوز باز بود خودکار لغو شد؛ با تخلیه/لغو بعدی همان نود بسته می‌شود | warning |
 

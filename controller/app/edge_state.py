@@ -39,6 +39,11 @@ PROBE_STALE = timedelta(minutes=20)
 # §22.2 alert thresholds
 RELOAD_STORM_OPEN, RELOAD_STORM_RESOLVE, RELOAD_STORM_CHECKS = 12, 6, 3
 PILEUP_PER_CPU, PILEUP_CHECKS = 4, 5
+# §22.2 node memory (the memory part of edge_health): EDGE_MEM_ALERT for MEM_ALERT_CHECKS heartbeats,
+# resolving MEM_RESOLVE_MARGIN points lower. From MEM_CRIT_PCT the alert opens on the first report and is
+# critical: there the kernel's OOM killer is minutes away and it picks its own victim, which can be the
+# nginx master -- and every tunnel on the node goes with it.
+MEM_ALERT_CHECKS, MEM_RESOLVE_MARGIN, MEM_CRIT_PCT = 3, 10.0, 97.0
 TUNING_CHECKS = 3
 # §22.10 load levels: factor per level, up thresholds (2 reports) and down thresholds (3 reports)
 LEVEL_FACTOR = {0: 1.0, 1: 0.5, 2: 0.25}
@@ -318,6 +323,28 @@ def pileup_counter(prev: dict, metrics: dict) -> int:
     if dw is None or cpus <= 0 or dw <= PILEUP_PER_CPU * cpus:
         return 0
     return int(prev.get("_pileup_n") or 0) + 1
+
+
+def mem_counter(prev: dict, metrics: dict, open_pct: float) -> tuple[int, bool]:
+    """(consecutive heartbeats at or above `open_pct`, alert state) with hysteresis: the state opens after
+    MEM_ALERT_CHECKS of them (at once from MEM_CRIT_PCT up) and closes MEM_RESOLVE_MARGIN points below
+    `open_pct`. A node that reports no mem_pct (older agent) never alerts, and never resolves on the
+    missing value alone."""
+    mem = metrics.get("mem_pct")
+    high = bool(prev.get("_mem_high"))
+    if mem is None:
+        return int(prev.get("_mem_n") or 0), high
+    mem = float(mem)
+    n = int(prev.get("_mem_n") or 0) + 1 if mem >= open_pct else 0
+    if mem >= MEM_CRIT_PCT or n >= MEM_ALERT_CHECKS:
+        high = True
+    elif mem <= max(0.0, open_pct - MEM_RESOLVE_MARGIN):
+        high = False
+    return n, high
+
+
+def memory_high(e: Edge) -> bool:
+    return bool(loads(e.metrics).get("_mem_high"))
 
 
 # ------------------------------------------------------------------ DNS weight level (§22.10)

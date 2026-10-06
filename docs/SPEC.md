@@ -384,7 +384,11 @@ tunnel on each site edit. The agent therefore:
   create/rotate responses include `"token"` exactly once. An edge is "online" when last_seen_at is
   within EDGE_OFFLINE_SECONDS (default 180 s); the "node offline" alert fires earlier, at
   EDGE_ALERT_SECONDS. `edge_health:{id}` alerts on sustained high CPU load or (with a recent agent)
-  a full disk/memory.
+  a full disk/memory. The memory part uses hysteresis (`EDGE_MEM_ALERT` for `MEM_ALERT_CHECKS` = 3
+  heartbeats, resolving `MEM_RESOLVE_MARGIN` = 10 points lower) and becomes `critical` at or above
+  `MEM_CRIT_PCT` = 97 % on the first report: there the kernel's OOM killer gets there before the agent's
+  memory guard, and the victim it picks can be the nginx master — every tunnel on the node goes with it
+  and `/run/nginx.pid` is left empty, so later reloads fail too.
 
 ---------------------------------------------------------------------------
 ## 7. Tunnel mode (VPN-over-CDN: WebSocket, HTTPUpgrade, gRPC, XHTTP, raw HTTP/2)
@@ -1770,7 +1774,10 @@ Keep F5/F20/F21 as they are and add:
   422); stored on `Edge.reload_stats` (Text JSON); exposed in `edge_to_dict["reloads"]` and in the
   `/metrics` Prometheus output as `pcdn_edge_reloads_1h{edge}`, `pcdn_edge_draining_workers{edge}`.
   Alert `edge_reload_storm:<id>` when `count_1h > 12` for 3 consecutive heartbeats (resolves when ≤ 6),
-  `edge_draining_pileup:<id>` when `draining_workers > 4 × cpus` for 5 heartbeats.
+  `edge_draining_pileup:<id>` when `draining_workers > 4 × cpus` for 5 heartbeats, `edge_memory:<id>`
+  and the memory part of `edge_health:<id>` (§6) carries the hysteresis counters `_mem_n`/`_mem_high` on
+  `Edge.metrics`, with the critical tier described there; a node whose agent sends no `mem_pct` never
+  alerts on memory.
 - **WHMCS admin (C)**: Node detail shows «تعداد بارگذاری مجدد در ساعت/۲۴ ساعت», «نسل‌های در حال تخلیه»,
   «مهلت خاموشی کارگرها (WST)», «تغییرات ادغام‌شده».
 - **Tests**: B — RELOAD_MAX_WAIT forcing apply under back-pressure/F21, digest invariance for non-rendered
