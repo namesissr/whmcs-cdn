@@ -1,0 +1,59 @@
+# Local test stack: WHMCS (your licensed copy in ./whmcs) + MariaDB + WHMCS cron
+# + the Pasargad CDN controller from this repo (SQLite, no PowerDNS).
+#   docker compose up -d --build     →  http://localhost:8080/install/install.php
+services:
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: root-dev-pass
+      MARIADB_DATABASE: whmcs
+      MARIADB_USER: whmcs
+      MARIADB_PASSWORD: whmcs-dev-pass
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - db-data:/var/lib/mysql
+
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    volumes:
+      - ./whmcs:/var/www/html
+      # the CDN modules come straight from this repo, so code changes apply immediately
+      - ../../whmcs/modules/servers/pasargadcdn:/var/www/html/modules/servers/pasargadcdn
+      - ../../whmcs/modules/addons/pasargadcdn_admin:/var/www/html/modules/addons/pasargadcdn_admin
+
+  cron:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - web
+    user: www-data
+    volumes:
+      - ./whmcs:/var/www/html
+      - ../../whmcs/modules/servers/pasargadcdn:/var/www/html/modules/servers/pasargadcdn
+      - ../../whmcs/modules/addons/pasargadcdn_admin:/var/www/html/modules/addons/pasargadcdn_admin
+    # WHMCS cron every 5 minutes (only after WHMCS is installed)
+    entrypoint: ["sh", "-c", "while true; do [ -f /var/www/html/crons/cron.php ] && [ ! -d /var/www/html/install ] && php -q /var/www/html/crons/cron.php; sleep 300; done"]
+
+  controller:
+    build: ../../controller
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: sqlite:////data/cdn.db
+      ADMIN_API_KEY: dev-admin-key
+      PDNS_ENABLED: "false"
+      SCHEDULER_ENABLED: "true"
+      NAMESERVERS: ns1.pasargadmizban.com,ns2.pasargadmizban.com
+    ports:
+      - "8000:8000"
+    volumes:
+      - controller-data:/data
+
+volumes:
+  db-data:
+  controller-data:

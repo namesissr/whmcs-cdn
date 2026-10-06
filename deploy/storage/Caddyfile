@@ -1,0 +1,64 @@
+# S3 endpoint of the object storage (SPEC §16.8): TLS by Let's Encrypt, everything proxied to the
+# SeaweedFS S3 gateway.
+{
+	email {$ACME_EMAIL}
+}
+
+{$STORAGE_DOMAIN} {
+	# The gateway's Prometheus metrics carry the per-bucket usage the controller bills from. They are
+	# unauthenticated, so only the controller's address(es) may read them (STORAGE_METRICS_PATH on
+	# the controller must be this path).
+	@metrics path /__pcdn/storage-metrics /__pcdn/storage-metrics/*
+	@metrics_denied {
+		path /__pcdn/storage-metrics /__pcdn/storage-metrics/*
+		not remote_ip {$ADMIN_ALLOW_IPS}
+	}
+	respond @metrics_denied 403
+	handle @metrics {
+		rewrite * /metrics
+		reverse_proxy seaweedfs:9327
+	}
+
+	# The volume server's /status is the only place the server says how big its disk is (no metric
+	# carries it), which the admin dashboard's capacity panel reads. Unauthenticated like the
+	# metrics, so the controller's address(es) only (STORAGE_STATUS_PATH on the controller).
+	@status path /__pcdn/storage-status /__pcdn/storage-status/*
+	@status_denied {
+		path /__pcdn/storage-status /__pcdn/storage-status/*
+		not remote_ip {$ADMIN_ALLOW_IPS}
+	}
+	respond @status_denied 403
+	handle @status {
+		rewrite * /status
+		reverse_proxy seaweedfs:8080
+	}
+
+	# The IAM API (customer access keys) is a POST to / — it is SigV4-signed and only the
+	# controller's identity may call it, but it is operator surface, so it is also address-limited.
+	@iam_denied {
+		method POST
+		path /
+		not remote_ip {$ADMIN_ALLOW_IPS}
+	}
+	respond @iam_denied 403
+
+	# S3 itself is public: signed requests from customers, and the edges' Referer-conditioned
+	# anonymous GET of a bucket used as a CDN origin.
+	# No request body limit beyond a part's 5 GiB, stream both ways, keep the Host header (Caddy
+	# forwards it unchanged, which SigV4 needs), long transfers allowed.
+	request_body {
+		max_size 6GB
+	}
+	reverse_proxy seaweedfs:8333 {
+		flush_interval -1
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 300s
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

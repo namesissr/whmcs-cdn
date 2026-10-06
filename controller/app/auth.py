@@ -25,6 +25,11 @@ def new_token() -> str:
     return "edge_" + secrets.token_urlsafe(32)
 
 
+def new_capi_key() -> str:
+    """Customer API key (SPEC §10.1): prefix 'pcdn_' + 40 hex characters."""
+    return "pcdn_" + secrets.token_hex(20)
+
+
 def require_admin(authorization: str | None = Header(default=None)) -> None:
     token = _bearer(authorization)
     if not settings.admin_api_key or not hmac.compare_digest(token, settings.admin_api_key):

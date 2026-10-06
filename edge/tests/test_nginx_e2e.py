@@ -25,7 +25,7 @@ import zlib
 
 import pytest
 
-from conftest import modules_available, nginx_conf
+from conftest import modules_available, nginx_conf, TEST_ORIGIN_ALLOW
 
 HERE = pathlib.Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("agent_e2e", HERE.parent / "pcdn-agent.py")
@@ -41,9 +41,9 @@ SQLI = "/?id=" + urllib.parse.quote("1' or '1'='1")
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    from conftest import pick_port
+
+    return pick_port()
 
 
 def make_png(w: int, h: int) -> bytes:
@@ -149,11 +149,17 @@ class Edge:
         p = pathlib.Path(self.cfg["ACCESS_LOG"])
         return [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
 
-    def last_log(self, host, marker):
-        for e in reversed(self.log()):
-            if e["h"] == host and marker in e["u"]:
-                return e
-        raise AssertionError(f"no log line for {host} {marker}")
+    def last_log(self, host, marker, timeout=8.0):
+        # the access log is buffered (F23: buffer=64k flush=1s), so a just-written line may take a
+        # moment to reach the file; poll rather than read once.
+        end = time.time() + timeout
+        while True:
+            for e in reversed(self.log()):
+                if e["h"] == host and marker in e["u"]:
+                    return e
+            if time.time() > end:
+                raise AssertionError(f"no log line for {host} {marker}")
+            time.sleep(0.2)
 
 
 def site(sid, host, origin, **sections):
@@ -202,10 +208,10 @@ def env(tmp_path_factory):
         pytest.skip("mmdb_writer/netaddr not installed")
     o = {n: Origin(n) for n in ("A", "LB1", "LB2", "LB3")}
     dead_port = free_port()
-    cfg = dict(agent.DEFAULTS)
+    cfg = dict(agent.DEFAULTS, ORIGIN_PRIVATE_ALLOW=TEST_ORIGIN_ALLOW)
     cfg.update({
         "NGINX_DIR": str(tmp / "pcdn"), "CACHE_DIR": str(tmp / "cache"), "STATE_FILE": str(tmp / "state.json"),
-        "ACCESS_LOG": str(tmp / "access.log"), "PAGES_DIR": str(HERE.parent / "pages"),
+        "ACCESS_LOG": str(tmp / "access.log"), "L4_ACCESS_LOG": str(tmp / "l4.log"), "FN_USAGE_LOG": str(tmp / "fn-usage.log"), "PAGES_DIR": str(HERE.parent / "pages"),
         "NJS_FILE": str(HERE.parent / "njs/pcdn.js"), "BASE_TEMPLATE": str(HERE.parent / "nginx/pcdn-base.conf"),
         "GEOIP_DB": str(tmp / "country.mmdb"), "RESOLVER": "127.0.0.1", "NGINX_USER": "root", "LISTEN_IPV6": "no",
         "HTTP_PORT": str(free_port()), "HTTPS_PORT": str(free_port()), "RESIZE_PORT": str(free_port()),
@@ -273,6 +279,8 @@ def env(tmp_path_factory):
              ratelimit={"rules": [{"id": "api", "enabled": True, "path": "/api/*", "methods": [], "requests": 2,
                                    "period": 60, "action": "challenge", "block_seconds": 60}]},
              errorpages={"5xx": None, "4xx": "<html><body>PCDN-CUSTOM-4XX</body></html>"}),
+        site(119, "purge.test", A, cache={"enabled": True, "level": "standard", "edge_ttl": 3600,
+                                          "browser_ttl": 0, "ignore_query": False}),
     ]
 
     agent.bootstrap(cfg)
@@ -429,8 +437,15 @@ def test_firewall_and_ratelimit_challenge_actions(env):
     codes = [env.req("fwc.test", f"/api/x?i={i}").status for i in range(4)]
     assert codes == [200, 200, 403, 403]
     assert env.last_log("fwc.test", "i=3")["v"] == "challenge:ratelimit:api"
-    # a solved challenge clears the rate-limit challenge as well
-    c = challenge_data(env.req("fwc.test", "/api/x").text)
+    # a solved challenge clears the rate-limit challenge as well. The limit_req bucket may have
+    # refilled a token between the burst above and here (CI timing), so re-request back-to-back
+    # until a rate-limit challenge is actually served instead of assuming the bucket is still full.
+    c = None
+    for _ in range(12):
+        c = challenge_data(env.req("fwc.test", "/api/x").text)
+        if c:
+            break
+    assert c, "no rate-limit challenge served after re-saturating /api/x"
     v = env.req("fwc.test", "/__pcdn/verify?" + urllib.parse.urlencode({"t": c["t"], "n": solve_pow(c), "r": c["r"]}))
     cookie = v.cookies[0].split(";")[0]
     assert env.req("fwc.test", "/api/x", headers={"Cookie": cookie}).status == 200
@@ -486,6 +501,28 @@ def test_captcha_flow(env):
     assert env.req("cap.test", "/dash", headers={"Cookie": js_cookie}).status == 403
 
 
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def test_captcha_challenges_real_browser(env):
+    # "CAPTCHA for everyone": a normal browser (not a verified crawler, no allow rule) must see the
+    # captcha before reaching the origin, and solving it must grant access for that same browser.
+    hdr = {"User-Agent": BROWSER_UA}
+    r = env.req("cap.test", "/area", headers=hdr)
+    assert r.status == 403 and "<svg" in r.text, r.text[:300]
+    assert env.last_log("cap.test", "/area")["v"] == "captcha:ddos:captcha"
+    t, ret = captcha_form(r.text)
+    nonce = t.split(".")[1]
+    hx = hmac.new(SECRET.encode(), f"capans|{nonce}".encode(), hashlib.sha256).hexdigest()
+    answer = "".join(CAPTCHA_ALPHABET[int(hx[i * 4:i * 4 + 4], 16) % len(CAPTCHA_ALPHABET)] for i in range(5))
+    form = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": BROWSER_UA}
+    good = env.req("cap.test", "/__pcdn/captcha", "POST", form, urllib.parse.urlencode({"t": t, "a": answer, "r": ret}))
+    assert good.status == 302
+    cookie = good.cookies[0].split(";")[0]
+    assert env.req("cap.test", "/area", headers={"Cookie": cookie, "User-Agent": BROWSER_UA}).status == 200
+
+
 # ----------------------------------------------------------------- rate limit
 
 def test_rate_limit_429(env):
@@ -535,6 +572,59 @@ def test_ignore_query_cache_key_and_purge(env):
     removed = agent.do_purge({"site_id": 109, "urls": ["http://iq.test/style.css?whatever"]}, env.cfg)
     assert removed == 1
     assert env.req("iq.test", "/style.css?c=3").headers["x-cache"] == "MISS"
+
+
+def _cache_files(env):
+    return [p for p in (pathlib.Path(env.cfg["CACHE_DIR"]) / "119").rglob("*") if p.is_file()]
+
+
+def test_prefix_and_everything_purge(env):
+    # populate the cache through real nginx; each cacheable response lands on disk as a cache file.
+    # (post-purge x-cache is unreliable here: nginx's per-worker open_file_cache can keep serving a
+    # deleted file's fd, so purge effects are verified against the on-disk cache files instead.)
+    def cf(path):
+        return pathlib.Path(agent.cache_file(env.cfg["CACHE_DIR"], 119, f"http://purge.test{path}"))
+
+    def prime(path):
+        assert env.req("purge.test", path).status == 200
+        assert wait_for(cf(path).exists), f"{path} not cached"
+        return cf(path)
+
+    blog_a, blog_b = prime("/blog/a.css"), prime("/blog/b.css")
+    img_c, keep = prime("/img/c.css"), prime("/keep.css")
+
+    # the nginx KEY header line format is exactly "KEY: <scheme>://<host><uri>"
+    assert b"\nKEY: http://purge.test/blog/a.css\n" in blog_a.read_bytes()
+    assert agent._read_cache_key(str(keep)) == "http://purge.test/keep.css"
+
+    # prefix purge removes only the matching paths, leaves the others
+    assert agent.do_purge({"site_id": 119, "prefixes": ["/blog/"]}, env.cfg) == 2
+    assert not blog_a.exists() and not blog_b.exists()
+    assert img_c.exists() and keep.exists()
+
+    # a host-pinned prefix naming another host matches nothing here; the right host does match
+    assert agent.do_purge({"site_id": 119, "prefixes": ["https://other.test/img/"]}, env.cfg) == 0
+    assert img_c.exists()
+    assert agent.do_purge({"site_id": 119, "prefixes": ["http://purge.test/img/"]}, env.cfg) == 1
+    assert not img_c.exists()
+
+    # exact URL purge still works on the fast hashed-key path
+    assert keep.exists()
+    assert agent.do_purge({"site_id": 119, "urls": ["http://purge.test/keep.css"]}, env.cfg) == 1
+    assert not keep.exists()
+
+    # a scan that exceeds PURGE_SCAN_MAX falls back to a full-site purge
+    for path in ("/x1.css", "/x2.css", "/x3.css"):
+        prime(path)
+    assert _cache_files(env)
+    agent.do_purge({"site_id": 119, "prefixes": ["/none/"]}, dict(env.cfg, PURGE_SCAN_MAX="1"))
+    assert _cache_files(env) == []
+
+    # everything purge wipes whatever is left
+    prime("/again.css")
+    assert _cache_files(env)
+    agent.do_purge({"site_id": 119, "everything": True}, env.cfg)
+    assert _cache_files(env) == []
 
 
 # ----------------------------------------------------------------- hotlink / headers / TLS / errors / images
@@ -590,6 +680,8 @@ def test_image_resize(env):
 
 def test_usage_payload_from_real_log(env):
     env.req("waf.test", SQLI + "&m=usage")
+    # the access log is buffered (F23): wait for the line to reach the file before reading it
+    assert wait_for(lambda: any("m=usage" in e.get("u", "") for e in env.log()))
     state = {}
     agent.read_usage(state, env.cfg["ACCESS_LOG"])
     items = agent.usage_items(state["pending"])

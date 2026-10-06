@@ -1,0 +1,122 @@
+# Disaster-recovery drill stack (tools/drill/dr-drill.sh; docs/DISASTER_RECOVERY.md).
+# A THROWAWAY copy of the control plane: PostgreSQL 16 + PowerDNS + controller, restored from a backup.
+#
+# Isolation (non-destructive by design):
+#   * every container and volume carries the label pcdn.drill=1; dr-drill.sh refuses to touch a
+#     compose project that has anything without it, and refuses the production project name;
+#   * no host port is published (no clash with production's 53/80/443, nothing exposed);
+#   * db / pdns / controller sit on an `internal` network without any route out: the restored
+#     controller cannot reach production PowerDNS, S3, edges, WHMCS, webhooks, Telegram or SMTP;
+#   * the controller runs with SCHEDULER_ENABLED=false (no backups, certificates, probes, alerts,
+#     webhook deliveries, log uploads) and every outbound integration blanked.
+# Only `tools` (fetch / restore / verify) also joins the `egress` network, to download the backup
+# from object storage when asked to.
+#
+# Variables (exported by dr-drill.sh): DRILL_IMAGE DRILL_ENV_FILE DRILL_DB_PASSWORD DRILL_PDNS_KEY
+#   DRILL_BACKUP_DIR DRILL_WORK DRILL_REPORT DRILL_TOOLS DRILL_PDNS_CONF
+
+x-drill-labels: &labels
+  pcdn.drill: "1"
+
+x-controller-env: &controller-env
+  DATABASE_URL: postgresql+psycopg://pcdn:${DRILL_DB_PASSWORD}@db:5432/pcdn
+  PDNS_API_URL: http://pdns:8081
+  PDNS_API_KEY: ${DRILL_PDNS_KEY}
+  PDNS_DNS_ADDRS: ""
+  SCHEDULER_ENABLED: "false"
+  BOT_RANGES_ENABLED: "false"
+  PROBE_ENABLED: "false"
+  GEO_CHECK: "false"
+  BACKUP_ENABLED: "false"
+  RECORD_PROBE_ENABLED: "false"
+  TUNNEL_ORIGIN_CHECK: "false"
+  BACKUP_DIR: /data/backups
+  BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+  ACME_HOME: /data/acme
+  TELEGRAM_BOT_TOKEN: ""
+  SMTP_HOST: ""
+  STORAGE_ENDPOINT: ""
+  STORAGE_ADMIN_ACCESS_KEY: ""
+  STORAGE_ADMIN_SECRET_KEY: ""
+  INSTANCE_NAME: dr-drill
+
+services:
+  db:
+    image: postgres:16-alpine
+    labels: *labels
+    environment:
+      POSTGRES_USER: pcdn
+      POSTGRES_PASSWORD: ${DRILL_DB_PASSWORD}
+      POSTGRES_DB: pcdn
+    volumes:
+      - drill-db:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "pcdn", "-d", "pcdn"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  pdns:
+    image: powerdns/pdns-auth-49:latest
+    labels: *labels
+    environment:
+      PDNS_AUTH_API_KEY: ${DRILL_PDNS_KEY}
+    volumes:
+      - drill-pdns:/var/lib/powerdns
+      - ${DRILL_PDNS_CONF}:/etc/powerdns/pdns.d/pcdn.conf:ro
+    networks: [internal]
+
+  controller:
+    image: ${DRILL_IMAGE}
+    labels: *labels
+    env_file: ${DRILL_ENV_FILE}
+    environment:
+      <<: *controller-env
+      # the restored controller never talks to the production backup bucket
+      BACKUP_S3_ENDPOINT: ""
+      BACKUP_S3_ACCESS_KEY: ""
+      BACKUP_S3_SECRET_KEY: ""
+    volumes:
+      - drill-controller:/data
+      - drill-pdns:/pdns-data:ro
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 90
+
+  # one-off: fetch / restore / verify (python -m app.manage ..., /drill/drill_check.py ...)
+  tools:
+    image: ${DRILL_IMAGE}
+    labels: *labels
+    profiles: ["tools"]
+    env_file: ${DRILL_ENV_FILE}
+    environment:
+      <<: *controller-env
+    volumes:
+      - drill-controller:/data
+      - drill-pdns:/pdns-data
+      - ${DRILL_BACKUP_DIR}:/backups:ro
+      - ${DRILL_WORK}:/work
+      - ${DRILL_REPORT}:/report
+      - ${DRILL_TOOLS}:/drill:ro
+    working_dir: /srv
+    networks: [internal, egress]
+    command: ["python", "/drill/drill_check.py", "--help"]
+
+networks:
+  internal:
+    internal: true
+    labels: *labels
+  egress:
+    labels: *labels
+
+volumes:
+  drill-db:
+    labels: *labels
+  drill-pdns:
+    labels: *labels
+  drill-controller:
+    labels: *labels

@@ -9,9 +9,10 @@ driven by `pcdn-agent` (stdlib-only Python). The controller contract is `docs/SP
 | Source (repo) | Installed to | Purpose |
 |---|---|---|
 | `edge/pcdn-agent.py` | `/usr/local/bin/pcdn-agent` | sync loop: config → nginx, purges, usage/events |
+| `edge/pcdn_agent/` | `/usr/local/lib/pcdn/pcdn_agent/` | the agent package (settings, validation, render/*, usage, logship, apply, cli); `pcdn-agent` is its launcher |
 | `edge/nginx/pcdn-base.conf` | `/usr/share/pcdn/nginx/` | **template** of the http-context config |
 | `edge/njs/pcdn.js` | `/usr/share/pcdn/njs/` | request logic (verdict, LB, challenge pages, health checks) |
-| `edge/pages/*.html` | `/usr/share/pcdn/pages/` | suspended / over-quota pages |
+| `edge/pages/*.html` | `/usr/share/pcdn/pages/` | suspended / over-quota pages, `decoy.html` (tunnel fallback) |
 | `edge/pcdn-geoip-update.sh` + `systemd/pcdn-geoip.{service,timer}` | `/usr/local/sbin/pcdn-geoip-update` | monthly DB-IP Country Lite download |
 | — | `/etc/nginx/conf.d/00-pcdn.conf` | one line: `include /etc/nginx/pcdn/http.conf;` |
 
@@ -38,13 +39,14 @@ inputs change (agent/njs/template upgrade, GeoIP database appearing, local setti
    `js_set $pcdn_verdict pcdn.verdict` evaluates, in order: `/__pcdn/*` → ok; `min_tls`
    (see below); legacy `blocked_ips`; firewall rules (first match, `allow` ends evaluation,
    `log` records and continues, `challenge`/`captcha` are satisfied by a clearance cookie);
-   `default_action`; hotlink; rate-limit rules (fixed windows in `js_shared_dict_zone`);
+   `default_action` (on tunnel paths evaluation stops here, see below); hotlink; rate-limit rules (fixed windows in `js_shared_dict_zone`);
    DDoS mode; WAF. The result is memoised in `js_var $pcdn_vmemo`, which survives internal
    redirects, so counters run exactly once per request (deny pages, error pages and the
    access log reuse it).
 3. `force_https` redirect, image-resize rewrite, legacy `limit_req`.
 4. Locations: `/__pcdn/*` (health, deny, verify, captcha, err, img — everything else 404),
-   page rules as regex locations in order, static-file location, `location /`.
+   tunnel paths (`location ^~`), page rules as regex locations in order, static-file location,
+   `location /`.
 
 Verdict: `ok` or `<action>:<source>:<rule>` (`block:waf:942100`, `challenge:ddos:auto`,
 `captcha:firewall:r2`, `block:ratelimit:login`, `log:firewall:r3`, `block:hotlink:referer`,
@@ -86,7 +88,13 @@ tick is therefore rendered as `max(pool timeout) + 1` seconds.
 
 Key `$scheme://$host$request_uri`, or `$scheme://$host$pcdn_path` (no query) when
 `ignore_query`; purges remove both variants of a URL, so purging `/a.css?v=1` also drops
-`/a.css`. `standard` honours origin headers on dynamic paths and force-caches static
+`/a.css`. A purge item may also carry `prefixes` and `everything`: `everything` (or the legacy
+empty `urls`) wipes the whole site cache dir; a `prefix` (`/blog/` for any host, or
+`https://ex.com/img/` to pin the host) is applied by scanning the site's cache files and reading
+each file's `KEY: <scheme>://<host><uri>` header line, deleting the files whose key path starts
+with the prefix. Exact URLs keep the fast hashed-key delete. The scan is capped at
+`PURGE_SCAN_MAX` files (default 500000); past the cap it falls back to a full-site purge, and it
+never raises. `standard` honours origin headers on dynamic paths and force-caches static
 extensions (as v1); `aggressive` / page-rule `everything` cache 200/206/301 for `edge_ttl`
 ignoring Cache-Control/Expires, **but never store a response carrying Set-Cookie** (it would
 leak one visitor's session). `bypass_cookies` → `proxy_cache_bypass` + `proxy_no_cache` on
@@ -117,11 +125,285 @@ wired with `geoip2 … auto_reload 60m` only when the file exists; otherwise `$p
 is empty and country conditions match neither `in` nor `not_in`. `pcdn-geoip.timer` refreshes
 it monthly (current month, falling back to the previous one).
 
+## Tunnel mode (SPEC §7)
+
+For a site whose `tunnel.enabled` is true (the controller sends `enabled: false` when the plan
+feature is off or the site is not active) every proxied host gets one location per tunnel path:
+
+```
+location ^~ "/my-secret-service" {
+    set $pcdn_tn grpc;                                   # access log "tn"
+    if ($pcdn_tcc_7 = 0) { return 403; }                 # allowed_countries (map on $pcdn_country)
+    limit_conn pcdn_tn_site 500;  limit_conn pcdn_tn_ip 8;  limit_conn_status 429;
+    client_max_body_size 0;  client_body_timeout / send_timeout = idle_timeout;
+    tcp_nodelay on;  gzip off;  brotli off;
+    grpc_set_header Host $host; X-Real-IP, X-Forwarded-*, X-Country-Code, request header rules
+    grpc_read_timeout / grpc_send_timeout = idle_timeout;  grpc_socket_keepalive on;
+    grpc_pass grpc://pcdn_tn_7_0;                        # or grpcs://, or a variable (see below)
+}
+```
+
+* **Precedence.** `^~` prefix locations are matched before any regex location, so neither page
+  rules nor the static-file location can take a tunnel path; the path is a plain prefix
+  (`/ws` also matches `/ws2` and `/ws/x`). Paths are validated again on the edge
+  (`/[A-Za-z0-9._~/-]{1,200}`, not `/__pcdn…`, unique, known protocol and pool).
+* **Protocols.** `ws` / `httpupgrade`: `proxy_pass` HTTP/1.1 with `Upgrade` / `Connection`
+  forwarded. `xhttp`: `proxy_pass` HTTP/1.1, `Connection ""`, `proxy_buffering off`,
+  `proxy_request_buffering off` (chunked both ways, verified with a real streaming upload and
+  download). `grpc` and `h2`: `grpc_pass` (`grpcs://` when the origin uses TLS, with
+  `grpc_ssl_server_name on` and `grpc_ssl_name` = `origin.sni` or the host name;
+  `grpc_ssl_verify` only with `origin.verify`). `grpc_pass` forwards any HTTP/2 stream, so it
+  also carries XHTTP stream-one/stream-up to an h2c inbound. `grpc_set_header Host $host`
+  makes nginx send a `host` header instead of `:authority` (nginx and Go h2 servers use it as the
+  authority; verified against an nginx h2c origin).
+* **Origin.** `origin` of the path, else `pool` (the same njs pool selection and health checks as
+  hosts, through `js_set $pcdn_tn_upstream` reading `$pcdn_tn_pool`), else the host's own origin
+  (record address or pool, host protocol). IP-literal origins of `xhttp` / `grpc` / `h2` paths get
+  an `upstream pcdn_tn_<site>_<n> { server …; keepalive <TUNNEL_KEEPALIVE, default 64>;
+  keepalive_timeout 300s; keepalive_requests 1000000; keepalive_time 1h; }` block (separate blocks
+  for HTTP/1.1 and HTTP/2 so a cached connection never changes protocol). A warm pool of idle
+  connections to the VPN origin removes the cross-border TCP+TLS handshake from the next
+  stream/request, and the high `keepalive_requests`/`keepalive_time` stop a long VPN session from
+  recycling a working upstream connection mid-use. Hostnames and pools stay variables so they are
+  resolved at request time (`resolver`), without keepalive. Upgraded `ws` / `httpupgrade`
+  connections are never reused, so they never use an upstream block.
+* **Security.** Firewall **block** rules, `default_action: block`, `blocked_ips` and `min_tls`
+  still apply; `allow` and `log` rules work as usual. njs (`tunnelVerdict`) skips firewall
+  challenge/captcha rules, hotlink, rate-limit rules, the DDoS challenge and the WAF for URIs
+  under a tunnel path (`tunnel_paths` in `sites.js`, same prefix test as nginx on the normalised
+  `$uri`). The legacy `rate_limit_rps` `limit_req` runs in `limit_req_dry_run` mode there. No
+  cache, no response header rules / HSTS / `X-Served-By`, no image rewrite, no gzip/brotli,
+  `proxy_intercept_errors off`. On a **connect** failure only, tunnel origins fail over to the next
+  peer — `proxy_next_upstream error timeout` / `grpc_next_upstream error timeout`, `*_tries 2`,
+  `*_timeout 15s`; never `non_idempotent` or `http_5xx`, so an in-flight stream is still never
+  replayed (F28). This is a no-op for a single-peer target (one host:port, `max_fails=0`).
+* **Limits.** `limit_conn_zone $pcdn_tn_ckey` (`pcdn_tn_site2`, `tunnel.max_connections`) and
+  `$pcdn_tn_ipkey` = `$pcdn_tn_ckey|$binary_remote_addr` (`pcdn_tn_ip2`, `max_connections_per_ip`)
+  are shared zones whose keys include the site id, so sites never share counters. They count
+  concurrent tunnel **sessions**, not every request (F13): a WebSocket/HTTPUpgrade session and each
+  gRPC/h2 stream count one; for XHTTP only the downlink GET is keyed (`$pcdn_tn_ckey =
+  $pcdn_tn_isget`), so a packet-up POST consumes no slot and reaching the limit refuses a *new*
+  session instead of tearing down an established one. Over the limit → 429. (The zone names carry a
+  `2` suffix because nginx refuses a reload that changes an existing zone's key — a mismatch
+  `nginx -t` does not catch.)
+* **per_connection_mbps is not enforced on nginx 1.24.** nginx resets `limit_rate` to 0 for
+  unbuffered responses (`proxy_buffering off` and every `grpc_pass`, see
+  `ngx_http_upstream_send_response`) and never applies it to upgraded connections; worse, a
+  `limit_rate` delay on the `101` response made nginx miss the client's close, keeping the
+  session (and its `limit_conn` slot) until the idle timeout. The value is validated but not
+  rendered; `test_unbuffered_proxying_ignores_limit_rate_on_nginx_124` fails once an nginx
+  honours it.
+* **Timeouts.** `idle_timeout` is the upstream read/send timeout (`proxy_*` / `grpc_*`), the
+  client body timeout and `send_timeout`. The HTTP/2 connection itself is idle-closed after
+  `keepalive_timeout` (75 s) only when it has no open stream.
+* **Fallback** for all other paths of the host: `origin` = the normal site; `decoy` =
+  `pages/decoy.html` (a neutral "new website coming soon" page titled after the domain's first
+  label, returned with 200 for every method, no image rewrite, no origin request); `404` =
+  `return 404`. Security verdicts still run on those paths.
+* **Listeners.** Every TLS listener is `listen 443 ssl http2` (nginx 1.24 syntax), so gRPC /
+  h2 work on any site with a certificate, while ALPN `http/1.1` clients keep WebSocket /
+  HTTPUpgrade / XHTTP. nginx cannot proxy WebSocket over HTTP/2 (RFC 8441), so ws/httpupgrade
+  clients must negotiate HTTP/1.1 (Xray does). Plain port 80 speaks HTTP/1.1 only: gRPC / h2
+  paths need a certificate.
+
+## Tunnel data-path tunables (buffers & timeouts)
+
+Buffers and timeouts on the tunnel data path are `agent.conf` keys. Defaults suit a mixed
+general/tunnel node; `install.sh --role tunnel` raises the throughput-oriented ones (it writes
+`SSL_BUFFER_SIZE=16k` and `TUNNEL_H2_BODY_BUFFER=512k`). Raise them on dedicated tunnel nodes with
+spare RAM; lower the per-stream buffer on small nodes.
+
+* `TUNNEL_H2_BODY_BUFFER` (default `256k`, F3): per-stream `client_body_buffer_size` for HTTP/2
+  tunnel uploads (gRPC/h2/XHTTP). The default HTTP/2 window is only 64k, which caps a single
+  stream's in-flight upload at 64 KiB; this raises it. The buffer is allocated per active stream
+  whose body has no `Content-Length`, so cost ≈ concurrent streams × size (≈ 2.5 GB for 10k gRPC
+  streams at 256k). Use `128k` on ≤2 GB nodes. Applied only at tunnel locations, never as a
+  server/http-level `http2_body_preread_size`.
+* `TUNNEL_RELAY_BUFFER` (default `16k`, F14): the relay buffer on the tunnel data path
+  (`proxy_buffer_size` / `grpc_buffer_size` and the location-level `http2_chunk_size`). The old 4k
+  buffers cost about 2.3× the CPU per tunneled byte. Costs about +12k per active TLS connection
+  (freed while idle), ≈ 240 MB per 10k WebSocket sessions.
+* `SSL_BUFFER_SIZE` (default `4k`, F14): the http-level `ssl_buffer_size`. Pure-tunnel hosts (whose
+  `tunnel.fallback` is `decoy` or `404`) additionally get `ssl_buffer_size 16k` in their server
+  block. `--role tunnel` sets this to `16k` node-wide; general web nodes keep `4k` for faster TLS
+  first byte.
+* `TUNNEL_CONNECT_TIMEOUT` (default `10`, clamped 3-30 s, F12): drives **both**
+  `proxy_connect_timeout` and `grpc_connect_timeout` for tunnel origins, so a dead origin fails fast
+  instead of hanging on nginx's 60 s gRPC default. Raise to ~15 on a lossy path.
+* `TUNNEL_KEEPALIVE_REQUESTS` (default `10000000`, N2/F27): client-facing HTTP/2 stream cap per
+  connection, emitted in the tunnel server block only (overriding the http-level
+  `keepalive_requests 100000`). A low value forces a mid-session GOAWAY + reconnect for stream-heavy
+  XHTTP/gRPC tunnels; non-tunnel hosts keep the bounded default.
+
+(`TUNNEL_KEEPALIVE`, default 64, is the number of idle **upstream** keepalive connections kept per
+worker to each IP-literal tunnel origin — see the **Origin** bullet above.)
+
+## Access log
+
+```
+{"t","h","b","s","c","ip","cc","m","u","ua","v",   SPEC §5
+ "tn": "grpc",      $pcdn_tn: tunnel protocol, "" for normal requests (map default, set in the location)
+ "rt": 1800.25,     $request_time: the whole session for ws/httpupgrade, the stream for grpc/h2
+ "bu": 188,         $request_length
+ "ub": "20291",     $upstream_bytes_sent (string: "" without upstream, "a, b" after retries)
+ "us": "200",       $upstream_status ("" = no upstream contacted; SPEC §14.3.1 platform_errors)
+ "pg": "",          $pcdn_page: "site" for the suspended / over-quota page
+ "sc": "https",     $scheme            (log export, SPEC §14.3.2)
+ "pr": "HTTP/2.0",  $server_protocol   (log export)
+ "rf": "...",       $http_referer      (log export; query stripped before shipping)
+ "tp": "grpc1",     $pcdn_tp: tunnel path id ("" for normal requests; SPEC §15.1)
+ "uct": "0.012"}    $upstream_connect_time ("-" when the connect failed)
+```
+
+The 6D fields are appended at the end, so the parser still accepts lines written before an upgrade
+(they simply never count as platform errors and carry no scheme/protocol/referer).
+
+Measured with real nginx 1.24 (`test_tunnel_log_fields_and_usage`): for a WebSocket session
+that echoed 20 000 bytes, `b` = 20 201 (downstream frames are counted), `bu` = 188 (request
+head only — frames after the 101 are **not** part of `$request_length`) and `ub` = 20 291
+(the upgraded frames **are** counted: nginx takes it from the upstream connection's byte
+counter, which the keepalive module resets on reuse). For a gRPC stream that uploaded 30 000
+bytes, `bu` = 30 141 (HTTP/2 DATA is counted in `$request_length`) and `ub` = 30 275. The agent
+therefore sets `bytes_up` per line **by protocol** (F37): `ws` / `httpupgrade` use
+`max(bu, sum(ub))`, because frames after the 101 are not in `$request_length` and only `ub` counts
+them; `grpc` / `h2` / `xhttp` use `bu` alone (`$request_length`), because for those `ub` also counts
+the headers the edge injects toward the origin and any retry re-sends, which would over-bill the
+customer. `bytes_down = b`. The client's own forwarded request head is still billed via
+`$request_length` (unavoidable); only the edge-added header delta is removed.
+
+The agent aggregates tunnel lines (`tn` non-empty) per host-hour into the usage item's optional
+`tunnel` object: `sessions` (lines with status 101 or 2xx), `seconds` (sum of `rt`, rounded per
+item), `bytes_up`, `bytes_down`, `by_protocol` (protocol → up + down). Tunnel lines still count
+in `bytes` / `requests` like any request; the controller adds `bytes_up` for billing. Refused
+tunnel requests (403 country, 429 limit) add bytes but no session; requests refused by a
+security verdict are rewritten to the deny location before the tunnel location runs, so they
+are logged as normal requests with their verdict.
+
+## Heartbeat metrics (SPEC §7.4)
+
+Every `HEARTBEAT_INTERVAL` seconds (60) the agent POSTs `/edge/v1/heartbeat` with the applied
+version, the last apply error and `metrics`:
+
+* `rx_mbps` / `tx_mbps` — `/proc/net/dev` byte deltas of the IPv4 default-route interface
+  (`/proc/net/route`) between two heartbeats (the first one measures over one second); without a
+  default route, the sum of all interfaces except `lo`, `docker*`, `veth*`, `br-*`, tunnels and
+  other virtual ones. Counter resets give 0.
+* `connections` — ESTABLISHED TCP sockets whose local port is `HTTP_PORT` / `HTTPS_PORT`
+  (`/proc/net/tcp` + `tcp6`), i.e. client connections (upstream sockets are not counted).
+* `load1` (`os.getloadavg`), `cpus` (`os.cpu_count`).
+
+Every part is guarded: an unreadable file gives 0, a failed heartbeat is logged and retried at
+the next tick; the agent never stops for metrics.
+
+The heartbeat also carries `bundle_version` (the running edge bundle version, SPEC §11.1; from
+`BUNDLE_VERSION_FILE` written by `bootstrap.sh`, else a hash of the agent file) and, on the
+**first** contact of a fresh node, `region`/`group` from the config, so the node self-registers
+into the right pool. The controller applies region/group only on first contact and never
+overrides a later operator edit.
+
+## One-command install & bundle (SPEC §11.1)
+
+The controller serves the secret-free edge tree so a node is brought up with one command:
+
+```
+curl -fsSL https://<controller>/edge/bootstrap.sh | sudo PCDN_EDGE_TOKEN=edge_xxx bash -s -- \
+    --controller https://<controller> [--region home|global] [--role general|tunnel] ...
+# token also via --token-file F or a no-echo prompt; --token still works; https only unless --insecure-http
+```
+
+`edge/bootstrap.sh` downloads `GET /edge/bundle.tar.gz` (a gzip tar of `edge/` built on the fly
+from `EDGE_BUNDLE_DIR`, excluding `__pycache__`/`*.pyc`/`tests/`), unpacks it and runs `install.sh`
+with the same flags. `GET /edge/version` returns the bundle hash (`bootstrap.sh` records it to
+`/etc/pcdn/bundle.version`). All three routes are unauthenticated and hold no secrets; when
+`EDGE_BUNDLE_DIR` is unset/missing they return 404 and the panel falls back to manual git/scp.
+`install.sh` gains `--region` and `--role` (persisted to `/etc/pcdn/agent.conf` as `REGION` /
+`GROUP`). See `docs/NODES.md` for the operator runbook (batch add, upgrade with `--upgrade`,
+decommission, troubleshooting) and `edge/cloud-init.yaml.example` for unattended first-boot.
+
+## Centralized logs (SPEC §11.2)
+
+On the heartbeat cadence the agent tails the nginx error log (`ERROR_LOG`) and its own WARN/ERROR
+lines and POSTs only new `warn`/`error`/`crit` lines to `POST /edge/v1/logs`
+(`{lines:[{t,level,msg}]}`). It de-duplicates against the last batch, tracks a file offset (with
+rotation/truncation handling like the access log), caps ~40 lines/report and ~500 chars/line, and
+**redacts** IPs, `client:` fields and `edge_`/`pcdn_` tokens — it never ships access logs, request
+bodies, visitor IPs, tokens or keys. Log shipping is fail-soft: it never crashes the agent or
+blocks the heartbeat. The controller keeps a capped ring (~120 lines / ~16 KiB) per edge, exposed
+at `GET /api/v1/edges/{id}/logs`.
+
+## System tuning (install.sh, idempotent)
+
+* `/etc/sysctl.d/999-pcdn.conf` (F30: numbered so it sorts after `99-sysctl.conf`; the old
+  `99-pcdn.conf` is `rm`'d on `--upgrade`): BBR + `fq`, `somaxconn` / `tcp_max_syn_backlog` 65535,
+  `netdev_max_backlog` 65536, `tcp_fastopen = 3`, `ip_local_port_range 10240 65535`,
+  `tcp_tw_reuse`, `tcp_fin_timeout 15`, `tcp_slow_start_after_idle 0`, `tcp_mtu_probing 1`,
+  64 MB `rmem_max`/`wmem_max` and `tcp_rmem`/`tcp_wmem` maxima, `tcp_notsent_lowat 128k`,
+  keepalive 300 s / 30 s × 5 (dead VPN peers are noticed; `proxy_socket_keepalive` /
+  `grpc_socket_keepalive` use it towards origins), `tcp_no_metrics_save 1` and `tcp_sack 1` so a
+  bad congestion window from the lossy cross-border path is not cached onto the next connection,
+  `fs.file-max = 9223372036854775807` with `fs.nr_open` left at the systemd default (F31: the old
+  2 M cap sat below systemd's own defaults; the per-process `LimitNOFILE` / `worker_rlimit_nofile`
+  are the real limit). After `sysctl --system`, install.sh reads each key back with `sysctl -n`
+  and prints a `warning:` on any mismatch (e.g. a value overridden by `/etc/sysctl.conf`), and
+  attaches `fq` to the default-route interface immediately when it is single-queue (a multiqueue
+  NIC prints a `warning:` to reboot so `default_qdisc=fq` attaches per hardware queue instead).
+  `tcp_bbr` is loaded now and at boot (`/etc/modules-load.d/pcdn-bbr.conf`).
+  `/etc/sysctl.d/999-pcdn-conntrack.conf` (`nf_conntrack_max` 1 M, established timeout 1 day) is
+  written unconditionally, and `nf_conntrack` is pinned at boot
+  (`/etc/modules-load.d/pcdn-conntrack.conf`) with `hashsize 262144`
+  (`/etc/modprobe.d/pcdn-conntrack.conf`, also applied live via `/sys`), so conntrack tuning
+  survives netfilter loading after install or a reboot (F19); the old `99-pcdn-conntrack.conf` is
+  removed on `--upgrade`.
+* Default-server `listen` lines (pcdn-base.conf, both HTTP and HTTPS, IPv4 + IPv6):
+  `reuseport backlog=65535 so_keepalive=120s:30s:4`. `reuseport` spreads long-lived tunnel
+  connections across all workers (F4), `backlog=65535` lets the `somaxconn` / `tcp_max_syn_backlog`
+  tuning actually take effect (F16), and `so_keepalive` detects a dead or NAT-expired client after
+  ~4 min and frees its `limit_conn` slot (F17). These options sit only on the `default_server`
+  listens; per-site `listen` lines stay bare, or nginx rejects the reload with "duplicate listen
+  options".
+* `/etc/systemd/system/nginx.service.d/pcdn-limits.conf`: `LimitNOFILE=1048576`,
+  `OOMScoreAdjust=-500` (F24) and `Restart=on-failure` + `RestartSec=2` — the distro unit has no
+  restart policy, so an OOM-killed or crashed master would otherwise leave the node serving nothing.
+  A clean `systemctl stop` is not a failure and stays stopped; systemd's default start rate limit
+  still stops a node whose nginx cannot start at all, which the panel then shows as offline.
+* `nginx.conf` (main/events context, between the `# >>> nginx.conf edits` markers):
+  `worker_rlimit_nofile 524288`, `worker_connections 65535`, `multi_accept off` (F4: forcing it
+  **on** piled long-lived tunnel connections onto one worker, capping the node at one core and one
+  65535-connection budget) and `worker_shutdown_timeout 1h` (`--shutdown-timeout`; F6: bounds how
+  many draining worker generations a reload leaves pinned by long-lived tunnels — lower to 20-30m on
+  ≤4 GB nodes, never a value in seconds, which would hard-cut every tunnel on each reload); stock
+  `gzip on`, `ssl_protocols`, `ssl_prefer_server_ciphers`, `keepalive_timeout` are commented out
+  because http.conf sets them.
+* http.conf (http context): `keepalive_timeout 75s`, `keepalive_requests 100000` (also the
+  per-connection stream cap of HTTP/2 since nginx 1.19.7; tunnel hosts override it per server with
+  `TUNNEL_KEEPALIVE_REQUESTS`), `http2_max_concurrent_streams 512`, `reset_timedout_connection on`,
+  and `proxy_connect_timeout` / `grpc_connect_timeout` = `TUNNEL_CONNECT_TIMEOUT` (10 s, F12).
+
 ## Agent settings (`/etc/pcdn/agent.conf`, or `PCDN_<KEY>` env)
 
 v1 keys plus `HTTP_PORT` (80), `HTTPS_PORT` (443), `RESIZE_PORT` (8089), `RESOLVER`
 (`1.1.1.1 8.8.8.8`), `GEOIP_DB`, `NJS_FILE`, `BASE_TEMPLATE`, `CA_BUNDLE` (origin_verify),
-`DICT_SIZE` (rate-limit/DDoS counter zone, 32m).
+`DICT_SIZE` (rate-limit/DDoS counter zone, 32m), `HEARTBEAT_INTERVAL` (60 s),
+`PURGE_SCAN_MAX` (max cache files scanned per prefix purge before falling back to a full-site
+purge, 500000), `ERROR_LOG` (nginx error log tailed for centralized logs, `/var/log/nginx/error.log`),
+`BUNDLE_VERSION_FILE` (`/etc/pcdn/bundle.version`), `REGION` / `GROUP` (reported on first heartbeat).
+
+Tunnel data-path keys are listed under **Tunnel data-path tunables** above
+(`TUNNEL_H2_BODY_BUFFER` 256k, `TUNNEL_RELAY_BUFFER` 16k, `SSL_BUFFER_SIZE` 4k,
+`TUNNEL_CONNECT_TIMEOUT` 10, `TUNNEL_KEEPALIVE_REQUESTS` 10000000, `TUNNEL_KEEPALIVE` 64). Reload
+and usage keys: `RELOAD_MIN_INTERVAL` (reload-coalescing floor, 120 s, F5), `RELOAD_DEBOUNCE` (a
+freshly-seen version settles this long before applying so sub-debounce bursts coalesce, 5 s, F5),
+`RELOAD_VERIFY` (after a reload, poll `/__pcdn/confver` and retry if the master rejected the reload,
+`yes`, F29), `USAGE_TIMEOUT` (usage POST timeout, 150 s — strictly above Caddy's 120 s header
+timeout so a batch is never replayed, F7), `USAGE_OUTBOX_MAX_DAYS` (drop an unacknowledged usage
+batch older than this, 6 days — inside the controller's 7-day `batch_id` dedup window, F7),
+`FOREIGN_DEFER` (defer a reload up to this long when only another edge group's sites changed and no
+global file changed, 900 s, F21).
+
+Log export keys (SPEC §14.3.2): `LOGSHIP_SPOOL_DIR` (default: `logship/` next to `STATE_FILE`, dir
+0700 / files 0600), `LOGSHIP_SPOOL_MAX_MB` (256 — oldest batches dropped beyond it, and anything
+older than 72 h), `LOGSHIP_INTERVAL` (30 s), `LOGSHIP_TIMEOUT` (30 s per POST). `install.sh --upgrade`
+keeps these if an operator set them.
 
 ## Usage / events
 
@@ -132,15 +414,377 @@ an event. Items (≤ 20 000) and events (≤ 2 000) are POSTed in batches; unack
 stays in the state file (events backlog capped at 10 000, newest kept). v1 state files and log
 rotation handling keep working.
 
+**Live analytics (SPEC §14.3.1).** The same log pass also buckets per host-minute: requests, bytes,
+cache hits, status classes, top-20 countries and top-20 paths (query stripped). They ride in the
+same usage POST as `live` (same outbox entry and `batch_id`), ≤ 5 000 items / ~2 MiB per POST and
+20 000 items / 8 MiB across the outbox, oldest minutes dropped first, nothing older than 24 h. If
+the controller rejects a POST carrying `live` (400/413/422) it is resent once without it under the
+same `batch_id`, so hourly usage is never held back by live data.
+
+**platform_errors (SPEC §14.3.1).** Counted per host-hour when the status is 500–599 except 501
+and 505 (any visitor can provoke those with a malformed request, which would let anyone lower a
+site's SLA), `us` is present and empty (no upstream contacted — any upstream status is an origin
+error), the response was not served from cache, the verdict is not block/challenge/captcha and
+`pg` is not `site`. Known limit: an origin *hostname* that fails to resolve is logged without an
+upstream, so it counts as a platform error even when the cause is the customer's own DNS.
+
+**Log export (SPEC §14.3.2).** For sites whose config has `logs.enabled`, a line is kept when
+`blake2b-64(raw line) / 2^64 < sample_rate` (deterministic). Tunnel traffic and `/__pcdn/`
+requests are excluded; with `anonymize_ip` the IP is reduced (IPv4 /24, IPv6 /48) before anything
+is written to the spool. Records are spooled on disk in batches (stable 32-hex `batch_id` = file
+name, reused verbatim on retries) and POSTed to `/edge/v1/logship` (≤ 5 000 records / ~2 MiB)
+on their own cadence with a time box, backoff 30 s → 15 min; a 404 (older controller) pauses
+shipping until the config version changes; a 400/413/422 drops that one batch (counted). The
+heartbeat reports `capabilities.live_analytics` / `capabilities.logship` and a `logship` block
+(sites, spool size, dropped, disabled).
+
 ## Tests
 
 ```
 cd edge && python3 -m pytest -q tests/
 ```
 
-`test_agent.py` (rendering, escaping, purge, usage, installer edits against the stock
-`nginx.conf`), `test_njs_logic.py` (pcdn.js logic under node with mocks: CIDR/IPv6, WAF
-signatures and false positives, pool selection) and `test_nginx_e2e.py` (real nginx + njs on
-high ports with python origins and a generated mmdb mapping 127.0.0.0/8 → CN). Tests skip
+`test_agent.py` (rendering, escaping, purge, usage, tunnel rendering/usage, heartbeat metrics,
+installer edits against the stock `nginx.conf`), `test_njs_logic.py` (pcdn.js logic under node
+with mocks: CIDR/IPv6, WAF signatures and false positives, pool selection, tunnel verdicts),
+`test_nginx_e2e.py` (real nginx + njs on high ports with python origins and a generated mmdb
+mapping 127.0.0.0/8 → CN) and `test_tunnel_e2e.py` (real nginx: WebSocket and HTTPUpgrade echo,
+XHTTP streaming upload/download, gRPC and raw h2 bidirectional streams, security bypass vs.
+blocks, allowed countries, per-IP/per-site `limit_conn`, decoy/404 fallback, log fields and
+usage). The tunnel origins are stdlib stand-ins in `tests/tunnel_kit.py` (WebSocket framing,
+an h2c echo server and an HTTP/2-over-TLS client that never need HPACK Huffman decoding) plus
+an nginx h2c server, so CI needs no extra packages. Tests skip
 when nginx, the modules or node are missing; the e2e nginx runs `user root` because pytest
 temp dirs are not traversable by unprivileged workers.
+
+## Tunnel quality, fair share & speed test (SPEC §15)
+
+**Per-path telemetry.** Per host-hour the usage item's `tunnel.paths` carries, per path id (≤ 50):
+sessions, seconds, bytes, `abnormal`, `connect_ms_sum`/`connect_n` and classified `errors`
+(`classify_tunnel`, first match wins): gRPC over HTTP/1.x → `protocol`; 101/2xx → session; 499 after
+an accepted upgrade → session (client close); no upstream contacted: 429/503 → `limit`, 403 →
+`country`, 400/426 → `protocol`, other 5xx → `edge`; last upstream 502 → `origin_refused`, 504 →
+`origin_timeout`; any other upstream status → `origin_error`. `abnormal` comes from the nginx error log
+(`[error]` … "while proxying upgraded connection" / "while reading upstream"), because the access log
+cannot tell an origin reset from a clean end. Live minute items add `tunnel_attempts`/`tunnel_errors`.
+
+**426 for ws/httpupgrade without `Upgrade`.** The edge answers before the origin is contacted, so a
+client configured with the wrong protocol shows up as `protocol` instead of an opaque origin error.
+
+**Fair share (admission only).** nginx 1.24 cannot rate-limit upgraded/unbuffered streams, so fair share
+refuses NEW sessions (429) of one dominant site while the node is hot (≥ 85 % of `node.capacity_mbps`,
+cleared below 80 %); see SPEC §15.8 for the exact rule. Established sessions are never touched; the hot
+flag lives in the `pcdn_fair` shared dict, is refreshed on every heartbeat and expires after 180 s.
+Capacity comes from the controller (`node.capacity_mbps`, set per node in the panel) or `CAPACITY_MBPS`
+in agent.conf; 0 = never hot.
+
+**Speed test.** `/__pcdn/speed/{ping,down,up}` on every active site (CORS `*`, no-store, rate-limited
+per IP, counted as normal traffic). Downloads are served from `SPEED_FILE` (random data written once,
+10 MiB) via the flv module (`--with-http_flv_module`); `X-Pcdn-Node` is the node's public tag (SPEC
+§23.12.2: `node.public_tag` from the controller, else a hash of the node name), never an address or name.
+
+New agent.conf keys (kept by `--upgrade`): `CAPACITY_MBPS` (0), `FAIR_SHARE_PCT` (25), `NODE_NAME`
+(hostname), `SPEED_FILE` (`speed.bin` next to the state file).
+
+
+## Wave 8 (SPEC §16)
+
+- **L4 proxy:** `l4/stream.conf` (stream block, JSON log `L4_ACCESS_LOG`) + `l4/sites/<sid>.conf`, rendered
+  from the node-wide `l4` list; needs `libnginx-mod-stream` and `include /etc/nginx/pcdn/l4/*.conf;` in the
+  main context of nginx.conf (install.sh adds both). Apps outside `L4_PORT_RANGE`, on node ports or on busy
+  ports are skipped with a warning. Usage `l4: {app: {bytes_in, bytes_out, sessions}}` (not in `bytes`).
+- **Video:** manifest/segment cache rules, `slice 1m` for mp4, media CORS `*`, bounded mirror prefetch.
+- **Images v2:** signed `w,h,fit,q,fmt` transforms (403 on bad signature), AVIF via `avifenc`/Pillow,
+  smart crop; transformer `pcdn-imaged` (systemd sandbox, loopback `IMAGE_PORT`).
+- **Net guard:** `pcdn-agent guard` renders nftables `inet pcdn_guard`; `install.sh --harden-net` applies it
+  (`GUARD_*` keys, SSH/allow-list first, optional SYN proxy).
+- **Storage origins:** `origin.storage` hosts proxied with SNI + verification, bucket Host, Referer token
+  (0600 `storage/<sid>.conf`), GET/HEAD only, no visitor credentials, loopback `STORAGE_FETCH_PORT` (8091)
+  for the image paths.
+- **Edge Functions:** `pcdn-fn` (edge/pcdn-fn.py, runtime edge/fn/runtime.js, unit edge/systemd/pcdn-fn.service)
+  runs one QuickJS process per invocation under Landlock + seccomp + no_new_privs + MDWE + rlimits; nginx
+  routes bound paths to it over a unix socket; `fetch()` goes back through `/run/pcdn-fnfetch/fetch.sock`
+  to the site's own origin only. Capability `edge_functions` only after the self-test passes. Usage
+  `functions: {invocations, cpu_ms, errors, timeouts}`.
+- New agent.conf keys: `L4_PORT_RANGE`, `L4_ACCESS_LOG`, `NGINX_CONF`, `IMAGED`, `IMAGE_PORT`,
+  `IMAGE_WORKERS`, `IMAGE_MAX_SOURCE_MB`, `GUARD*`, `AVIF`, `STORAGE_FETCH_PORT`, `FUNCTIONS`, `FN_*`
+  (all kept by `--upgrade`).
+
+
+## Wave 13: tunnel speed and stability (SPEC §22)
+
+Hard constraint (SPEC §22): nothing here evades filtering, hides / rotates node addresses, obfuscates or
+fragments traffic, or picks nodes by "what is not blocked". The probe tests only the node's own health over
+loopback (or an operator-run echo origin); node selection stays health / load / capacity driven.
+
+**Drain (§22.1).** `node.drain = {state, refuse_after, until}` from the controller is agent-side only (never
+rendered, never a reload). While draining, after the DNS grace (`refuse_after`; fallback start + 330 s) the
+agent sets the njs flag `drain` in `pcdn_fair` (`/__pcdn/fair?drain=1`, refreshed every tick, expires after
+180 s → fail open). Every tunnel location renders, right after the fair-share line,
+`if ($pcdn_tn_drain) { error_page 503 = /__pcdn_drain; return 503; }`; `pcdn.tunnelDrain` is `"1"` only for
+the first request of a client connection (`$connection_requests = 1`) that is not an xhttp POST, so upgraded
+sessions, new h2 streams on an existing connection and xhttp packet POSTs are never refused, nor is web
+traffic. `/__pcdn_drain` (internal) answers `503`, `Retry-After: 30`, `Connection: close`
+(`keepalive_timeout 0`) and is logged with `"pg":"drain"` → counted as `errors.edge`. The agent checks every
+10 s: ≤ `DRAIN_IDLE_CONNS` (10) ESTABLISHED public connections twice in a row, or `until` reached → `drained`
+(heartbeat sent at once). Heartbeat `drain: {state, conns, since}`; capability `drain: true`.
+CLI: `pcdn-agent drain --minutes N [--reason R] [--wait] [--timeout S]` (POST `/edge/v1/drain`; exit 0 ok,
+3 `last_edge` (EN + FA message), 2 other errors incl. an older controller's 404) and `pcdn-agent undrain`.
+A drain the controller has shown ends as soon as a config no longer shows it (the last `node.drain`
+is kept and re-evaluated every tick, so a 304 poll never delays it); only a CLI-started drain the
+controller has not shown yet survives a stale config for 120 s after its start.
+The CLI writes `state["drain"]` under `STATE_FILE.lock`; the running agent adopts it on its next tick and never
+overwrites it (merge by `at`). `install.sh/bootstrap.sh --upgrade --drain[=1..120]` (default 15; refused
+without `--upgrade` or out of range) drain BEFORE nginx / the agent are touched: an agent too old for
+`drain` (its `drain --help`, run with `PCDN_CONFIG=/nonexistent`, does not exit 0) or a failed drain → warning,
+upgrade without drain; exit 3 → upgrade aborted. A failed upgrade after the drain runs `undrain` (EXIT trap).
+After the restart the new agent ends an UPGRADE drain (`reason upgrade`) itself once its first config apply
+succeeded and the first tunnel probe passed (or the probe is unsupported); an admin drain is never ended by
+the agent. `--drain` never changes `worker_shutdown_timeout`.
+
+**Fewer reloads (§22.2).** `RELOAD_MAX_WAIT` (900 s, 60..3600): the oldest unapplied version is applied on the
+next poll whatever back-pressure / `RELOAD_MIN_INTERVAL` / F21 say (back-pressure is capped at it).
+`node.drain`, `node.probe`, `node.dns_weight` never reach the rendered tree (F20 skip, no reload); shared
+ticket keys are a global file (one reload per rotation). The F21 global digest now masks the tree digest
+embedded in `/__pcdn/confver` (it changed with every site, so F21 never deferred anything before).
+Heartbeat `reloads: {count_1h, count_24h, last_at, coalesced_1h, pending_s, deferred, wst_s,
+forced_shutdowns_24h}` (`state["reload_times"]`: 48 h, ≤ 500; `wst_s` parsed from `NGINX_CONF`).
+**Memory guard:** `mem_pct ≥ MEM_GUARD_PCT` (92; 0 = off) on 2 heartbeats while old worker generations
+drain → `SIGTERM` to the oldest "worker process is shutting down" (start time from `/proc/<pid>/stat`), at
+most one per 60 s, logged, recorded in `state["forced_shutdowns"]`; never the master or a current worker.
+A worker already signalled is skipped, so the next round takes the next-oldest generation.
+**Critical tier:** from `MEM_GUARD_HARD_PCT` (97; 0 = no critical tier) the guard acts on the FIRST
+heartbeat, without the 60 s cooldown, on up to `MEM_GUARD_MAX_KILLS` (3) of the oldest generations at
+once, and `SIGKILL`s a worker still shutting down `MEM_GUARD_KILL_GRACE_S` (60) after its `SIGTERM`
+(`state["forced_shutdowns"][*]["sig"]`: `term` → `kill`). While a generation drains at that memory level
+`_reload_min_interval()` also goes straight to the 600 s ceiling — a reload forks a whole new generation,
+and the OOM killer's victim may be the master, which takes every tunnel on the node with it (and leaves a
+pid file nothing rewrites). `RELOAD_MAX_WAIT` still forces the pending version through.
+**worker_shutdown_timeout:** `install.sh --shutdown-timeout auto` (default): RAM < 4 GiB `30m`, 4–8 GiB `2h`,
+≥ 8 GiB `4h`. An explicit value (never seconds below 60) is stored as `SHUTDOWN_TIMEOUT` and kept by
+`--upgrade`; an `--upgrade` of an edge without that line keeps nginx.conf's existing value.
+
+**Synthetic tunnel probe (§22.3).** `http.conf` gains a server on the public HTTPS listener
+(`server_name probe.pcdn.invalid`, self-signed EC P-256 cert in `PROBE_DIR` — install.sh: `/etc/pcdn/probe`,
+key 0600 — `allow 127.0.0.0/8; allow ::1; deny all;`, `access_log off`) whose `/__pcdn_probe/ws` and
+`/__pcdn_probe/grpc` locations are built by the same `tunnel_pass_lines` as customer ws / grpc paths
+(`proxy_bind` / `grpc_bind` INTERNAL_SRC), plus a loopback h2c server on `PROBE_H2C_PORT` (8093) that answers
+any method with 200 `application/grpc`, `PROBE_BYTES` bytes (`PROBE_DIR/body.bin`) and `grpc-status 0`. The
+agent runs the WS echo origin on `127.0.0.1:PROBE_ECHO_PORT` (8092; both ports are in `internal_ports()`)
+and, every `PROBE_INTERVAL` (60 s, or `node.probe.interval`) in a background thread with a 10 s budget:
+WS (TLS to 127.0.0.1:HTTPS_PORT, SNI probe.pcdn.invalid, upgrade, 3 × 1 KiB echoes, `down:`/`up:` of
+`PROBE_BYTES`) and gRPC (`curl --http2`, only when `curl -V` lists HTTP2). A probe fails on an error, an echo
+mismatch or `setup_ms > 3000`; errors never contain addresses. Heartbeat `tunnel_probe: {at, ok, ws, grpc,
+consecutive_fail}` (omitted when no probe is supported: probe off, no openssl, not rendered yet); capability
+`tunnel_probe: true`. `node.probe.origin` (controller `TUNNEL_PROBE_ORIGIN`) is reached through a relay in
+the local echo port, so it never changes the rendered tree; operators run that origin with
+`pcdn-agent echo-origin --listen 0.0.0.0:<port>` (same protocol: binary echo, `down:<n>`, `up:<n>`, ≤ 4 MiB,
+16 connections, idle 30 s).
+
+**Multi-origin tunnel paths (§22.4).** A path with `origins` becomes the internal pool `tn.<path id>`
+(`failover` / `round_robin` → weighted with the backup flags as sent, `sticky_ip` → ip_hash; members with a
+different tls / verify / sni are skipped; members the origin policy refuses are dropped, a path left
+without members is dropped) and renders exactly like a pool path (`$pcdn_tn_pool "tn.<id>"`,
+`tunnelUpstream`, F1 affinity, F11 keepalive upstreams), TLS name = the shared `sni` or `$host`. Old
+controllers / single `origin` paths render as before; capability `tunnel_multi_origin: true`. Pools with
+`health.type = tcp` (internal and customer pools) are checked by the agent's TCP health thread
+(`ORIGIN_TCP_HEALTH`, ≤ 64 concurrent connects, every `interval`, origin guard applied to the resolved
+addresses) and pushed to nginx with `POST /__pcdn/hc` (localhost-only, `pcdn.hcSet`,
+`{"<site>|<pool>|<host:port>": <consecutive failures>}`, ≤ 4096 keys); njs `health()` skips tcp pools.
+Entries age out of `pcdn_hc` (3600 s) and a missing entry counts as up (fail open). Established sessions
+are never moved.
+
+**Timeouts (§22.5).** Path `idle_timeout` (60..86400, null = the site's) drives every per-location
+timeout; `send_timeout` at server level stays `min(site idle, 300)`. Edge timer contract
+(`render/site.py EDGE_TUNNEL_TIMERS`): `client_idle_s` 600, `max_connection_age_s` 21600, `h2_max_streams`
+512, `tcp_keepalive` 120/30/4, `connect_timeout_s` 10.
+
+**Kernel tuning profile (§22.6).** `pcdn-agent tune --write` writes the RAM-scaled
+`/etc/sysctl.d/999-pcdn.mem.conf` (rmem/wmem/tcp_rmem/tcp_wmem max 8 / 32 / 64 MiB and `nf_conntrack_max`
+262144 / 524288 / 1048576 for < 2 / 2–8 / ≥ 8 GiB, `tcp_notsent_lowat` 131072) and loads it (`sysctl -p`);
+idempotent; `TUNE_PROFILE=off` removes it. (The SPEC's name `999-pcdn-mem.conf` would sort BEFORE
+`999-pcdn.conf` — "-" < "." — and be overridden at boot, so the file is `999-pcdn.mem.conf`.)
+`pcdn-agent tune --check` prints the profile and the check as JSON. At start and hourly the agent compares
+every key of `999-pcdn.conf`, `999-pcdn-conntrack.conf` and the mem file with `PROC_SYS` (keys without a
+/proc/sys entry cannot be verified and are skipped), checks bbr availability when `TCP_CC=bbr`, the qdisc of
+the default interface (`tc`) and the nginx master's `Max open files` → heartbeat `tuning: {profile, ram_mb,
+ok, cc, qdisc, nofile, mismatches ≤ 20}`.
+
+**Upstream keepalive for host names (§22.7).** On nginx ≥ 1.27.3 (capability `upstream_resolve`) host-name
+origins of xhttp/grpc/h2 paths (single origin, `origins` members, pool members) get
+`upstream pcdn_tn_<sid>_h<n> { zone …; server <host>:<port> resolve max_fails=0; keepalive … }` instead of
+request-time resolution. WS / HTTPUpgrade connections are never reused. Usage `tunnel.paths[id].reused_n`
+counts tunnel requests whose `uct` is exactly `0.000` (an approximation of a reused connection).
+
+**TLS (§22.8).** `node.tls_tickets = {id, keys: [current, next, previous]}` (base64 of 80 bytes each) →
+`tickets/0..2.key` (raw, 0600, dir 0700, global files) and `ssl_session_tickets on;` +
+`ssl_session_ticket_key` lines (first key encrypts); null / malformed → `ssl_session_tickets off;` and no
+files. Key material never appears in logs (a malformed block is logged without content), the heartbeat or
+the node logs. Per site `ssl.cert_rsa` / `ssl.key_rsa` → `certs/<sid>.rsa.crt|.rsa.key` and a second
+certificate pair; `ssl.ocsp = true` renders `ssl_stapling on; ssl_stapling_verify on;
+ssl_trusted_certificate <CA_BUNDLE>;` only when the leaf certificate really names an OCSP responder.
+
+**HTTP/3 switch (§22.9).** QUIC is rendered only when the nginx build can (`caps.http3`) and `node.http3` is
+not `false` (default server and every site).
+
+**"Why did my connection drop?" (§22.12).** Each `tunnel.paths[id]` gains `ends: {normal, idle_timeout,
+origin, node_reload, node_drain, other}` over the accepted sessions. At access-log time (start = `t − rt`):
+`node_drain` = started before a drain start and ended within [until − 3 s, until + 120 s], or within 120 s
+of the agent restart of an upgrade drain (`state["drain_log"]`, ≤ 50, 48 h); `node_reload` = started before a
+reload R and ended within ±5 s of R + `worker_shutdown_timeout`, or within ±5 s of a forced worker shutdown;
+else `normal`. Error-log lines of the same host+path ("… while proxying upgraded connection / reading
+upstream"; `timed out` → `idle_timeout`, reset / premature close / broken pipe → `origin`, any other
+`[error]` → `other`; `[info] client timed out` counts when the log keeps info) are added to their reason and
+subtracted from `normal` when the item is sent (never below 0) — a documented approximation. `abnormal`
+keeps its §15.8 meaning.
+
+**New agent.conf keys** (all kept by `--upgrade`, `SHUTDOWN_TIMEOUT` only when explicit):
+
+| key | default | meaning |
+|---|---|---|
+| `RELOAD_MAX_WAIT` | 900 | s; hard upper bound for a pending config version (60..3600) |
+| `MEM_GUARD_PCT` | 92 | memory guard threshold (50..99, 0 = off) |
+| `MEM_GUARD_HARD_PCT` | 97 | critical tier: act at once, several generations, SIGKILL escalation (0 = off) |
+| `MEM_GUARD_MAX_KILLS` | 3 | generations stopped per round in the critical tier (1..32) |
+| `MEM_GUARD_KILL_GRACE_S` | 60 | SIGTERM → SIGKILL grace in the critical tier (5..3600) |
+| `SHUTDOWN_TIMEOUT` | — | explicit `worker_shutdown_timeout` written by install.sh |
+| `DRAIN_IDLE_CONNS` | 10 | drained at or below this many public connections (2 checks) |
+| `PROBE_ENABLED` | yes | synthetic tunnel probe |
+| `PROBE_INTERVAL` | 60 | s (30..600; `node.probe.interval` wins) |
+| `PROBE_BYTES` | 262144 | download / upload size (16384..4194304) |
+| `PROBE_ECHO_PORT` | 8092 | loopback WS echo origin (agent) |
+| `PROBE_H2C_PORT` | 8093 | loopback h2c body server (nginx) |
+| `PROBE_DIR` | `probe/` next to `STATE_FILE` | probe certificate + body (install.sh: `/etc/pcdn/probe`) |
+| `ORIGIN_TCP_HEALTH` | yes | TCP health thread |
+| `TUNE_PROFILE` | auto | `auto` / `off` (999-pcdn.mem.conf) |
+| `PROC_SYS` | /proc/sys | read by the tuning check (tests) |
+| `SYSCTL_DIR` | /etc/sysctl.d | where the tuning files live (tests) |
+| `NGINX_PID_FILE` | /run/nginx.pid | nginx master (open-files check) |
+
+Tests: `edge/tests/test_wave13.py` (unit: njs drain predicate / hcSet / pick, CLI exit codes with a fake
+controller, upgrade auto-undrain, install.sh / bootstrap.sh argument blocks, RELOAD_MAX_WAIT, non-rendered
+keys, WST parser + auto table, memory guard on a fake /proc, echo protocol, probe render, multi-origin pools,
+TCP checker, tuning with a fake /proc/sys, upstream resolve, tickets, dual cert / OCSP, HTTP/3 gate, session
+ends) and `edge/tests/test_tunnel_speed_e2e.py` (real nginx: WS + gRPC probe, 403 for non-loopback clients,
+drain refusal semantics, multi-origin failover with TCP health, ticket resumption).
+
+## Wave 14: release safety, operations and customer experience (SPEC §23)
+
+Hard constraint (SPEC §23): nothing here hides or rotates node addresses, evades filtering or picks nodes by
+reachability. RUM data is a performance report for the site owner only (no node dimension, never read by
+node selection); only internal node *names* / host names stop leaking to visitors.
+
+**Release (§23.1).** A bundle built from a tag carries `edge/RELEASE` (`vX.Y.Z`). `install.sh` copies it to
+`/etc/pcdn/release` (no file in the bundle → removed: release unknown) and keeps the verified tarball it was
+installed from (`PCDN_RELEASE_TARBALL`, set by `bootstrap.sh` and by the self-upgrade) as
+`RELEASES_DIR/<vX.Y.Z>.tar.gz` (dir 0700, files 0600, the 3 newest; the installed one is always the newest)
+for a rollback. `install.sh --release vX.Y.Z` refuses a bundle whose `edge/RELEASE` differs (or is missing).
+Every heartbeat carries `"release": "vX.Y.Z" | null` next to `bundle_version`.
+
+**Pinned bootstrap.** `bootstrap.sh --version vX.Y.Z` (or `--version=…`, validated with
+`^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$` before anything runs) downloads
+`/edge/bundle.tar.gz?version=vX.Y.Z` and `/edge/releases/vX.Y.Z.sha256`, verifies with `sha256sum -c` (mismatch →
+exit 1, nothing installed) and runs `install.sh --release vX.Y.Z`. Without `--version`, a pin advertised by
+`GET /edge/releases` for the node's group (`groups.<group>`, else `pinned`; group = `tunnel` for
+`--role tunnel`, else `general`; an `--upgrade` without `--role` uses `GROUP` from agent.conf) is installed the
+same way and printed. A controller without `/edge/releases` (404) → the live bundle as before; with
+`--version` → «این کنترلر نسخهٔ پین‌شده ارائه نمی‌کند» and exit 1. `--upgrade`, `--drain` and reading
+`CONTROLLER_URL` from `/etc/pcdn/agent.conf` work as before.
+
+**Join tokens (§23.9).** Instead of an edge token, a one-time join token (`jt_` + 40 hex) in `PCDN_JOIN_TOKEN`
+or `--join-token-file F` (bootstrap.sh and install.sh; never argv). Right before agent.conf is written,
+install.sh POSTs `{"join_token", "hostname"}` (body on stdin) to `/edge/v1/join` (https only unless
+`--insecure-http`) and stores the returned `token` in agent.conf (0600). 401 → «توکن پیوستن نامعتبر یا منقضی
+است» / "join token invalid or expired", exit 1; 404 (older controller) → exit 1 with a clear message. Cloud-init:
+`curl -fsSL --proto '=https' <controller>/edge/bootstrap.sh | PCDN_JOIN_TOKEN=<token> bash -s -- --controller
+<url> --role <role> --region <region> [--version <release>]`.
+
+**Self-upgrade (§23.2, `pcdn_agent/upgrade.py`).** `node.upgrade = {"id", "release", "sha256", "drain_minutes",
+"rollback", "timeout_s"}` is agent-side only (never rendered: no reload; kept across 304 polls in
+`state["ctl_upgrade"]`). For an `id` (+ release: a rollback may reuse the attempt id) not handled yet and a
+release other than the running one the agent:
+reuses `RELEASES_DIR/<release>.tar.gz` when its sha256 matches, else downloads
+`CONTROLLER_URL/edge/bundle.tar.gz?version=<release>` (≤ 50 MB, sha256 verified: mismatch → `failed`,
+`sha256_mismatch`); unpacks it (unsafe members refused) into a new 0700 directory under `UPGRADE_DIR`; records
+`state["upgrade"]` = `installing` under the state lock; then runs
+`systemd-run --unit=pcdn-upgrade-<id>[-rb] --collect --no-block -p Type=oneshot -p TimeoutStartSec=<timeout_s>
+… install.sh --upgrade --release <release> [--drain=<m>]` (a small bash wrapper writes the installer's exit
+code to `UPGRADE_DIR/<unit>.status`; an installer that predates `--release`, e.g. a rollback target, gets none;
+`drain_minutes` 0 = no drain). The installer survives the agent restart it causes; the existing drain flow
+drains first and the new agent undrains itself. The new agent (or the old one, once `/etc/pcdn/release`
+changed) reports `done`; a non-zero exit (status file, else `systemctl show` while the unit is loaded) →
+`failed` (`install_failed: exit N`; exit 3 = the drain's last-edge refusal → `last_edge`, install.sh exits 3
+instead of 1 only under the self-upgrade), `timeout_s` without the release change → `timeout`. Never two
+upgrades at once; a `node.upgrade` for the running release is `done` at once; a rollback is the same path.
+Heartbeat `"upgrade": {"id", "release", "state": "downloading"|"installing"|"done"|"failed", "error" (≤ 200,
+no secrets), "at", "rollback"}` (omitted when never upgraded; a transition triggers a heartbeat at once).
+`capabilities.self_upgrade` = `SELF_UPGRADE` (yes) and `systemd-run` present; `SELF_UPGRADE=no` → false and
+nothing is done (rollouts list the node as `manual`).
+
+**Public node tag (§23.12.2).** `node.public_tag` (8 hex, rendered) is the value of `$pcdn_node`: every
+proxied response's `X-Served-By` (previously `$hostname`, the OS host name) and the speed-test
+`X-Pcdn-Node`. Without it (old controller) the old name hash is used. Old agents keep `X-Served-By $hostname`
+until upgraded.
+
+**Live `oe` / `pe` (§23.5).** Every live (minute) item carries `"oe"`: 502 / 503 / 504 with a non-empty
+upstream status (the origin answered it or nginx recorded the failed connect / timeout), not from the cache,
+not the site's suspended page, not a security answer; and `"pe"`: the §14.3.1 platform errors of the minute.
+
+**RUM (§23.7).** Per-site config `rum: {"enabled", "sample", "inject": "auto"|"manual", "exclude", "spa"}` (old
+controllers send none; rendered only on active sites of nodes with njs).
+* `GET /__pcdn/rum.js` → `edge/pages/rum.js` (installed to `/usr/share/pcdn/pages/`; < 4 KB, no cookies /
+  storage / identifiers / user agent, no eval; `Cache-Control: public, max-age=3600`,
+  `application/javascript; charset=utf-8`, `nosniff`). It reads `data-s` (sample rate) and `data-spa="1"`
+  from its own tag, collects ttfb / fcp / lcp / cls (session windows) / inp (largest `event` duration with an
+  interactionId, threshold 40 ms) / dns / tcp / tls / dom / load, `nt`, `dev` (m ≤ 767 px, t ≤ 1024 px, d),
+  `cs` (Server-Timing `cdn-cache`) and the path, and sends one beacon per view on hidden / pagehide
+  (`sendBeacon`, fallback `fetch` keepalive, credentials omitted); with spa, one `nt: "soft"` beacon (inp /
+  cls) per further view.
+* `inject: "auto"`: the HTML-serving proxy locations (not static assets, `/__pcdn/`, tunnels, storage
+  origins, decoy/404 tunnel hosts) render `sub_filter '</head>' '$pcdn_rum_<sid></head>'; sub_filter_once on;`
+  with a per-site `map $uri $pcdn_rum_<sid>` (excluded prefixes → `""`), `proxy_set_header Accept-Encoding "";`
+  (sub_filter needs an uncompressed origin body; the edge still compresses towards clients — more origin
+  bandwidth, cached objects stored uncompressed) and `add_header Server-Timing $pcdn_rum_st;` (HTML only:
+  `cdn-cache;desc=$upstream_cache_status`). `inject: "manual"` renders only the two endpoints.
+* `POST /__pcdn/rum`: `limit_req zone=pcdn_rum` (2 r/s per address, burst 20, in memory; rejections logged
+  at info level), body ≤ 2 KB, `pcdn.rumIngest`: only POST with `text/plain` / `application/json` and an
+  `Origin` (else `Referer`) host equal to `$host`; `v == 1`; ms metrics clamped to 0..60000, cls 0..10, path
+  `^/[^\s?#]{0,199}$` else `/`; unknown `nt` / `dev` dropped, `cs` else `""`. The sanitized line
+  `{"t" (minute), "h", "cc", "asn", "rg", "p", "nt", "dev", "cs", …metrics}` goes to `RUM_LOG` via
+  `log_format pcdn_rum escape=none '$pcdn_rum_line'` — no address field exists; always answers 204. The
+  location has no access log (never billed, not in analytics / fair share / tunnel telemetry).
+* ASN / region: `$pcdn_asn` from `RUM_ASN_DB` (DB-IP "IP to ASN Lite", `pcdn-geoip-update --asn`, refreshed by
+  pcdn-geoip.service; absent → 0) and `$pcdn_region` from `RUM_REGION_DB` (city / subdivision mmdb, default
+  off → ""), both only with the geoip2 module; the client address is read only for these lookups.
+* The agent tails `RUM_LOG` (own offset, rotation like the L4 log) and aggregates per host-hour into the usage
+  item's `rum`: `{"n", "all": H, "by": {"cc" ≤ 30, "asn" ≤ 20, "rg" ≤ 31, "dev", "path" ≤ 50, "cs"}}`, `H =
+  {"n", "<metric>": [counts]}` with the fixed buckets (contract with the controller): ms metrics
+  `[50, 100, 200, 300, 500, 800, 1000, 1500, 1800, 2000, 2500, 3000, 4000, 5000, 8000, 12000, ∞]` (17 counts),
+  cls ×1000 `[10, 50, 100, 150, 250, 500, 1000, ∞]` (8 counts); an upper bound is inclusive. Top-N by `n`, the
+  rest summed into `"other"`; ≤ 32 KB per item (`path` dropped first, then `rg`). Unknown dimensions (no
+  country, ASN 0, empty region, no cache status) are left out of that breakdown. Capability `rum: true` (njs).
+  Old controllers drop the key.
+
+New agent.conf keys (kept by `--upgrade`):
+
+| key | default | meaning |
+|---|---|---|
+| `RUM_ASN_DB` | `/usr/share/pcdn/geo/asn.mmdb` | ASN database (used only if present) |
+| `RUM_REGION_DB` | `""` | city / subdivision database (off) |
+| `RUM_LOG` | `/var/log/nginx/pcdn-rum.log` | the RUM beacon log (logrotate as the access log) |
+| `UPGRADE_DIR` | `/var/lib/pcdn/upgrade` | unpacked bundle of a running self-upgrade (0700) + exit status |
+| `RELEASES_DIR` | `/var/lib/pcdn/releases` | kept release tarballs for rollback (3 newest) |
+| `SELF_UPGRADE` | yes | `no` → capability false, `node.upgrade` ignored |
+| `RELEASE_FILE` | `/etc/pcdn/release` | the installed release (written by install.sh) |
+
+Tests: `edge/tests/test_wave14.py` (public tag + fallback, X-Served-By never `$hostname`, non-rendered
+`node.upgrade`, the self-upgrade state machine with a fake controller and `systemd-run` / `systemctl` PATH shims:
+download + sha, cached tarball, idempotent release, failed unit / last edge / timeout / restart detection, the
+wrapper's exit status; heartbeat `release` / `upgrade` / capabilities; `oe` / `pe` rules; RUM buckets golden,
+aggregation / top-N / size cap / rotation; RUM rendering + `nginx -t`; `pcdn.rumIngest` and `rum.js` under node;
+install.sh release check / release files / join flow (fake curl) / last-edge exit; bootstrap.sh `--version` and
+release download with a fake curl) and `edge/tests/test_wave14_e2e.py` (real nginx: injection once on HTML,
+none on JSON / excluded paths, gzip to the client, the script endpoint, ingestion → RUM log without address →
+usage item, X-Served-By / X-Pcdn-Node = the tag). Staging: `tests/integration/test_wave14.py` (skips against
+pre-wave-14 controllers / agents).
+

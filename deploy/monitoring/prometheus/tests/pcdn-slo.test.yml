@@ -1,0 +1,80 @@
+# promtool test rules prometheus/tests/pcdn-slo.test.yml   (run from deploy/monitoring/prometheus)
+rule_files:
+  - ../rules/pcdn-slo.yml
+
+evaluation_interval: 1m
+
+tests:
+  # fast burn: needs BOTH 1h and 5m >= 14.4; resolves when the short window recovers
+  - interval: 1m
+    input_series:
+      - series: 'pcdn_slo_burn_rate{job="pcdn-controller", instance="api.example", group="general", sli="availability", window="1h"}'
+        values: '0 20 20 20 20 20 20 20 20 20'
+      - series: 'pcdn_slo_burn_rate{job="pcdn-controller", instance="api.example", group="general", sli="availability", window="5m"}'
+        values: '0 1 30 30 30 30 30 2 2 2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: PcdnSloBurnFast
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: PcdnSloBurnFast
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: PcdnSloBurnFast
+        exp_alerts:
+          - exp_labels: {severity: critical, source: prometheus, job: pcdn-controller, instance: api.example, group: general, sli: availability}
+            exp_annotations:
+              summary: "بودجهٔ خطای availability گروه general سریع مصرف می‌شود"
+              description: "نرخ مصرف بودجه در ۱ ساعت و ۵ دقیقهٔ اخیر ≥ ۱۴٫۴ برابر است (اکنون 20.0). با این روند کل بودجهٔ ماه در کمتر از ۲ روز تمام می‌شود."
+              runbook: docs/MONITORING.md
+      - eval_time: 8m
+        alertname: PcdnSloBurnFast
+        exp_alerts: []
+
+  # a long window alone (old incident) does not page; slow burn needs 6h AND 30m >= 6 for 15m
+  - interval: 5m
+    input_series:
+      - series: 'pcdn_slo_burn_rate{job="pcdn-controller", instance="api.example", group="tunnel", sli="errors", window="1h"}'
+        values: '20x10'
+      - series: 'pcdn_slo_burn_rate{job="pcdn-controller", instance="api.example", group="tunnel", sli="errors", window="5m"}'
+        values: '0x10'
+      - series: 'pcdn_slo_burn_rate{job="pcdn-controller", instance="api.example", group="tunnel", sli="errors", window="6h"}'
+        values: '7x10'
+      - series: 'pcdn_slo_burn_rate{job="pcdn-controller", instance="api.example", group="tunnel", sli="errors", window="30m"}'
+        values: '8 8 8 8 8 8 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PcdnSloBurnFast
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: PcdnSloBurnSlow
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PcdnSloBurnSlow
+        exp_alerts:
+          - exp_labels: {severity: warning, source: prometheus, job: pcdn-controller, instance: api.example, group: tunnel, sli: errors}
+            exp_annotations:
+              summary: "بودجهٔ خطای errors گروه tunnel پیوسته مصرف می‌شود"
+              description: "نرخ مصرف بودجه در ۶ ساعت و ۳۰ دقیقهٔ اخیر ≥ ۶ برابر است (اکنون 7.0)."
+              runbook: docs/MONITORING.md
+      - eval_time: 35m
+        alertname: PcdnSloBurnSlow
+        exp_alerts: []
+
+  # budget exhausted
+  - interval: 5m
+    input_series:
+      - series: 'pcdn_slo_error_budget_remaining{job="pcdn-controller", instance="api.example", group="general", sli="latency"}'
+        values: '5 1 0 -3 -3 -3 -3'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PcdnSloBudgetExhausted
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: PcdnSloBudgetExhausted
+        exp_alerts:
+          - exp_labels: {severity: warning, source: prometheus, job: pcdn-controller, instance: api.example, group: general, sli: latency}
+            exp_annotations:
+              summary: "بودجهٔ خطای ماه برای latency گروه general تمام شده است"
+              description: "تا پایان ماه هر خطای بیشتر هدف SLO را می‌شکند؛ تغییرات پرخطر (انتشار نسخه) را به تعویق بیندازید."
+              runbook: docs/RELEASE.md

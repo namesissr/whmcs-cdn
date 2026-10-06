@@ -1,0 +1,82 @@
+# Pasargad CDN — object storage on SeaweedFS (SPEC §16.8, docs/STORAGE.md)
+#   cp .env.example .env && edit && docker compose up -d && ./bootstrap.sh
+#
+# One container runs master + volume + filer + S3 gateway (`weed server`), which is the supported
+# single-node layout; a second data server is added later by pointing a `weed volume` at this
+# master. MinIO's kit (now unusable: its community images were removed from Docker Hub in September
+# 2026 and the project was archived) is kept under minio/ for servers that still run it.
+#
+# One copy of every object: put RAID1/RAID10 under SEAWEED_DATA_DIR, and take backups (docs §7).
+
+services:
+  seaweedfs:
+    image: ${SEAWEED_IMAGE:-chrislusf/seaweedfs:4.48}
+    restart: unless-stopped
+    # -s3.iam.readOnly=false: the controller creates each customer's access key over the IAM API
+    #   (it defaults to true, which answers every IAM write with 403).
+    # -volume.max=0: the number of volumes is free disk / VOLUME_SIZE_MB instead of the default 8.
+    #   Every bucket is its own collection with its own volumes, so the default would cap the whole
+    #   server at a handful of buckets ("No writable volumes and no free volumes left").
+    # -master.volumeSizeLimitMB: smaller volumes mean more buckets fit in the same free space; 1 GiB
+    #   suits customer buckets (raise it for few, huge buckets).
+    command: >
+      server
+      -dir=/data
+      -ip=seaweedfs
+      -master.port=9333
+      -master.volumeSizeLimitMB=${VOLUME_SIZE_MB:-1024}
+      -volume.port=8080
+      -volume.max=0
+      -filer
+      -filer.port=8888
+      -s3
+      -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
+      -s3.iam.readOnly=false
+      -s3.allowDeleteBucketNotEmpty=false
+      -s3.port.iceberg=0
+      -s3.port.lance=0
+      -metricsPort=9327
+    # No -s3.domainName: buckets are addressed path-style (https://<domain>/<bucket>/<key>), which
+    # one certificate covers. Virtual-host style would need a wildcard certificate for *.<domain>.
+    volumes:
+      - ${SEAWEED_DATA_DIR:-/srv/seaweedfs/data}:/data
+      # Written by bootstrap.sh: the operator admin identity and the controller's scoped identity.
+      # Run ./bootstrap.sh for the first start (it writes this file and brings the stack up itself):
+      # a `docker compose up -d` before it exists makes Docker create a DIRECTORY here and the
+      # gateway dies on "fail to load config file ... is a directory".
+      # Customer identities are NOT here — the controller creates them over the IAM API and the
+      # server keeps them in the filer, so they survive a restart and are never in a file on disk.
+      # owned by uid 1000 (the image drops privileges to the `seaweed` user), 0600
+      - ./s3.json:/etc/seaweedfs/s3.json:ro
+    expose:
+      - "8333"   # S3 (through Caddy only)
+      - "8080"   # volume server /status: the disk's size (through Caddy, controller addresses only)
+      - "9327"   # Prometheus metrics (through Caddy, controller addresses only)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9333/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      STORAGE_DOMAIN: ${STORAGE_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      ADMIN_ALLOW_IPS: ${ADMIN_ALLOW_IPS:-127.0.0.1/32}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - seaweedfs
+
+volumes:
+  caddy-data:
+  caddy-config:

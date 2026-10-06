@@ -9,6 +9,12 @@ ExecStart=/usr/bin/python3 /usr/local/bin/pcdn-agent
 Restart=always
 RestartSec=5
 Environment=PCDN_CONFIG=/etc/pcdn/agent.conf
+# F24: the agent tails a possibly-huge access log on one thread; keep it off nginx's back — low CPU
+# and idle I/O priority, and biased toward the OOM killer (nginx is biased away) so a memory spike
+# drops the accounting agent, not the workers carrying live tunnels.
+Nice=10
+IOSchedulingClass=idle
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# Status mirror: curl + jq on Alpine, runs mirror.sh as an unprivileged user.
+FROM alpine:3.20
+RUN apk add --no-cache curl jq ca-certificates tzdata \
+    && adduser -D -H -u 10001 mirror \
+    && mkdir -p /srv/www /srv/data && chown mirror:mirror /srv/www /srv/data
+COPY mirror.sh /usr/local/bin/mirror.sh
+COPY mirror.js /src/mirror.js
+RUN chmod 0755 /usr/local/bin/mirror.sh
+USER mirror
+ENTRYPOINT ["/usr/local/bin/mirror.sh"]

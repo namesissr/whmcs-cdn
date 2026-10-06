@@ -1,0 +1,143 @@
+# Pasargad CDN — monitoring stack (Prometheus + Alertmanager + Grafana + blackbox probes)
+#
+# Run it on a host OTHER than the control plane, so it can still alert when that host is down.
+#   cd deploy/monitoring
+#   cp .env.example .env && $EDITOR .env      # never commit .env
+#   docker compose up -d
+#   docker compose --profile api-bridge up -d   # optional: per-edge load/capacity/uptime/traffic
+#
+# Grafana listens on 127.0.0.1:3000 only (SSH tunnel or a reverse proxy with TLS in front of it).
+# Full guide (Persian): docs/MONITORING.md
+#
+# Secrets (METRICS_TOKEN, TELEGRAM_BOT_TOKEN, SMTP_PASSWORD, PCDN_ADMIN_API_KEY) reach the
+# containers only as /run/secrets/* files (Compose `secrets:` from the environment, needs
+# Docker Compose >= 2.23); they are never written into a config file in this directory.
+
+name: pcdn-monitoring
+
+# the official Prometheus/Alertmanager images ship busybox sh+awk, enough for render-config.sh
+x-render: &render ./render-config.sh:/render/render-config.sh:ro
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/render/render-config.sh", "prometheus"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --web.enable-lifecycle
+      - --web.external-url=${PROMETHEUS_EXTERNAL_URL:-http://127.0.0.1:9090/}
+    environment:
+      CONTROLLER_URL: ${CONTROLLER_URL:?set CONTROLLER_URL in .env (e.g. https://cdn-api.example.com)}
+      STATUS_PAGE_URL: ${STATUS_PAGE_URL:-}
+      PCDN_API_BRIDGE: ${PCDN_API_BRIDGE:-0}
+      PROBE_EXTRA_URLS: ${PROBE_EXTRA_URLS:-}
+    volumes:
+      - *render
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - metrics_token
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - alertmanager
+      - blackbox
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/render/render-config.sh", "alertmanager"]
+    command:
+      - --config.file=/alertmanager/rendered/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=${ALERTMANAGER_EXTERNAL_URL:-http://127.0.0.1:9093/}
+    environment:
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_API_URL: ${TELEGRAM_API_URL:-https://api.telegram.org}
+      ALERT_HTTPS_PROXY: ${ALERT_HTTPS_PROXY:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_SMARTHOST: ${SMTP_SMARTHOST:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-true}
+      GRAFANA_URL: ${GRAFANA_URL:-http://127.0.0.1:3000}
+    volumes:
+      - *render
+      - ./alertmanager/templates:/etc/alertmanager/templates:ro
+      - alertmanager-data:/alertmanager
+    secrets:
+      - telegram_bot_token
+      - smtp_password
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  grafana:
+    image: grafana/grafana-oss:11.6.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://127.0.0.1:3000}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: ${GRAFANA_COOKIE_SECURE:-false}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      # no outbound phone-home (also avoids timeouts on networks with restricted egress)
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pcdn-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    secrets:
+      - grafana_admin_password
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.27.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+
+  # Optional (profile api-bridge): turns the admin API's /api/v1/overview and /api/v1/analytics into
+  # pcdn_api_* metrics (per-edge load/capacity/uptime, traffic, cache hit ratio, security events).
+  # It needs the controller's ADMIN_API_KEY — a full-control credential. Read the warning in
+  # docs/MONITORING.md before enabling it. Only the fields mapped in json-exporter/config.yml become
+  # metrics: no customer domain ever reaches Prometheus.
+  json-exporter:
+    image: quay.io/prometheuscommunity/json-exporter:v0.7.0
+    restart: unless-stopped
+    profiles: ["api-bridge"]
+    command: ["--config.file=/etc/json-exporter/config.yml"]
+    volumes:
+      - ./json-exporter/config.yml:/etc/json-exporter/config.yml:ro
+    secrets:
+      - admin_api_key
+
+secrets:
+  metrics_token:
+    environment: METRICS_TOKEN
+  telegram_bot_token:
+    environment: TELEGRAM_BOT_TOKEN
+  smtp_password:
+    environment: SMTP_PASSWORD
+  grafana_admin_password:
+    environment: GRAFANA_ADMIN_PASSWORD
+  admin_api_key:
+    environment: PCDN_ADMIN_API_KEY
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

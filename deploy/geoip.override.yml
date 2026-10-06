@@ -1,0 +1,10 @@
+# GeoDNS: Iranian visitors get "home" edges, everyone else "global" edges.
+# Enable by adding to .env:
+#   COMPOSE_FILE=docker-compose.yml:deploy/geoip.override.yml
+#   GEOIP_ENABLED=true
+# and download the country database first: sudo deploy/geoip-update.sh
+services:
+  pdns:
+    volumes:
+      - ./dns/geoip.conf:/etc/powerdns/pdns.d/geoip.conf:ro
+      - ./dns/geo:/etc/powerdns/geo:ro

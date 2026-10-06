@@ -1,0 +1,64 @@
+# Caddy in front of one or more controller containers
+#   docker compose up -d --scale controller=2
+# Docker's DNS returns one A record per running "controller" container; Caddy re-reads
+# them every few seconds and spreads requests across them. A request whose connection
+# fails is retried on another instance (lb_try_duration), and an instance that fails is
+# skipped for fail_duration. Controllers are stateless; only the leader runs the scheduler.
+{$CONTROLLER_DOMAIN} {
+	encode gzip
+
+	# F7: the edge usage report (POST /edge/v1/usage) is NOT safe to re-dispatch. If Caddy retried
+	# it on another controller after the body was already delivered, an agent that predates the
+	# batch_id idempotency key would be double-counted (and could be pushed into over_quota). Serve
+	# it through its own reverse_proxy with load-balancer retries disabled (lb_try_duration 0), so
+	# the proxy delivers it at most once; a genuine failure is retried by the AGENT, which resends
+	# the same batch_id and is deduped on the controller. response_header_timeout stays at 120s,
+	# strictly below the agent's ~150s usage timeout, so a slow-but-succeeding POST is answered
+	# before the agent gives up rather than being cut off and re-sent.
+	@usage path /edge/v1/usage
+	handle @usage {
+		reverse_proxy {
+			to controller:8000
+			dynamic a {
+				name controller
+				port 8000
+				refresh 5s
+				resolvers 127.0.0.11
+				dial_timeout 2s
+			}
+			lb_policy round_robin
+			lb_try_duration 0
+			fail_duration 30s
+			max_fails 1
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 120s
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy {
+			# static fallback: used whenever the dynamic lookup below fails or is slow
+			# (e.g. right after `docker compose up`, before Docker's DNS knows the containers)
+			to controller:8000
+			dynamic a {
+				name controller
+				port 8000
+				refresh 5s
+				resolvers 127.0.0.11
+				dial_timeout 2s
+			}
+			lb_policy round_robin
+			lb_try_duration 10s
+			lb_try_interval 250ms
+			fail_duration 30s
+			max_fails 1
+			# a hung instance is detected by the response timeout rather than by a health probe
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 120s
+			}
+		}
+	}
+}

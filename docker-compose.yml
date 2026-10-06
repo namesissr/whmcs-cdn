@@ -1,18 +1,58 @@
 # Pasargad CDN — control plane (controller API + PowerDNS ns1 + Postgres + Caddy TLS)
 # Usage: cp .env.example .env && edit && docker compose up -d --build
+#
+# More than one controller (same server):  docker compose up -d --scale controller=2
+#   only one of them runs the background jobs (leader election in PostgreSQL),
+#   Caddy balances the API across all of them. Two-server HA: docs/OPERATIONS.md.
+# Restore / maintenance commands:   docker compose --profile tools run --rm --no-deps tools python -m app.manage --help
+
+x-controller: &controller
+  build: ./controller
+  image: pcdn-controller:local
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn}
+    # L3: X-Forwarded-For / -Proto are trusted only from Caddy (and other proxies) on private
+    # networks, never from a client reaching port 8000 directly (uvicorn reads FORWARDED_ALLOW_IPS)
+    FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+    BACKUP_DIR: /data/backups
+    BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+    EDGE_BUNDLE_DIR: /srv/edge         # secret-free edge bundle served for one-command node install (SPEC §11.1)
+  depends_on:
+    - db
+    - pdns
 
 services:
   controller:
-    build: ./controller
-    restart: unless-stopped
-    env_file: .env
+    <<: *controller
+    volumes:
+      - controller-data:/data            # acme.sh home, backups (shared by every replica)
+      - pdns-data:/pdns-data:ro          # PowerDNS sqlite DB (zones + DNSSEC keys), read for backups
+      - ./edge:/srv/edge:ro              # secret-free edge bundle served at /edge/bundle.tar.gz (SPEC §11.1)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # one-off maintenance container: same image, PowerDNS volume writable (restore).
+  #   docker compose --profile tools run --rm --no-deps tools python -m app.manage restore ... --yes
+  tools:
+    <<: *controller
+    profiles: ["tools"]
+    restart: "no"
     environment:
-      DATABASE_URL: postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://pcdn:${POSTGRES_PASSWORD}@db:5432/pcdn}
+      BACKUP_DIR: /data/backups
+      BACKUP_PDNS_DB: /pdns-data/pdns.sqlite3
+      SCHEDULER_ENABLED: "false"
     volumes:
       - controller-data:/data
-    depends_on:
-      - db
-      - pdns
+      - pdns-data:/pdns-data
+    # an archive from elsewhere:  ... run --rm -v /root/pcdn-backup-X.tar.gz.enc:/restore/b.enc:ro tools ...
+    command: ["python", "-m", "app.manage", "--help"]
 
   db:
     image: postgres:16-alpine
@@ -29,6 +69,9 @@ services:
     restart: unless-stopped
     environment:
       PDNS_AUTH_API_KEY: ${PDNS_API_KEY}
+    # M5: who may use the HTTP API (8081, never published here). Command-line settings override the
+    # config files; default = loopback + the private ranges Docker networks use (docs/SECURITY.md)
+    command: ["--webserver-allow-from=${PDNS_API_ALLOW_FROM:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"]
     ports:
       - "53:53/udp"
       - "53:53/tcp"
@@ -39,11 +82,13 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
-    command: caddy reverse-proxy --from ${CONTROLLER_DOMAIN} --to controller:8000
+    environment:
+      CONTROLLER_DOMAIN: ${CONTROLLER_DOMAIN}
     ports:
       - "80:80"
       - "443:443"
     volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
     depends_on:
       - controller

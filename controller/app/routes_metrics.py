@@ -1,0 +1,311 @@
+"""GET /metrics — Prometheus text exposition (SPEC §13.1).
+
+Platform aggregates ONLY. The endpoint NEVER exposes a domain, IP, token, key or any other
+per-customer identifier — just counts and ages (the wave-13 per-edge gauges are labelled with the
+operator's edge NAME only, SPEC §22.2). It is cheap (a handful of aggregate queries)
+and wrapped so a scrape never 500s: whatever cannot be computed is simply left out.
+
+Mounted WITHOUT the admin-auth dependency. If METRICS_TOKEN is set it must be presented as
+`Authorization: Bearer <token>`; otherwise the endpoint is open (an internal scrape network).
+"""
+
+import hmac
+import logging
+from datetime import timedelta
+
+from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import PlainTextResponse
+from sqlalchemy import func, select
+
+from . import alerts, dnsbuild, edge_state
+from .config import settings
+from .db import SessionLocal
+from .models import AuditLog, Edge, LogSpool, Site, State, WebhookDelivery, utcnow
+from .services import edge_metrics
+
+log = logging.getLogger("pcdn.metrics")
+
+router = APIRouter()
+
+CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+# scheduler per-job last-run timestamps live in the State table under this prefix (see scheduler)
+JOBRUN_PREFIX = "jobrun:"
+
+
+def _check_token(authorization: str | None) -> None:
+    token = settings.metrics_token
+    if not token:
+        return  # open endpoint (internal scrape network)
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "missing bearer token")
+    if not hmac.compare_digest(authorization[7:].strip(), token):
+        raise HTTPException(401, "invalid metrics token")
+
+
+class _Out:
+    """Accumulates Prometheus metric families; HELP/TYPE emitted once per metric name."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+        self._seen: set[str] = set()
+
+    def metric(self, name: str, value, help_: str, type_: str = "gauge", labels: dict | None = None):
+        if value is None:
+            return
+        if name not in self._seen:
+            self.lines.append(f"# HELP {name} {help_}")
+            self.lines.append(f"# TYPE {name} {type_}")
+            self._seen.add(name)
+        if labels:
+            label_str = ",".join(f'{k}="{_escape(str(v))}"' for k, v in labels.items())
+            self.lines.append(f"{name}{{{label_str}}} {_num(value)}")
+        else:
+            self.lines.append(f"{name} {_num(value)}")
+
+    def text(self) -> str:
+        return "\n".join(self.lines) + "\n"
+
+
+def _escape(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def _num(v) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return repr(v)
+    return str(v)
+
+
+def _age_seconds(iso: str | None, now) -> int | None:
+    if not iso:
+        return None
+    from datetime import datetime
+    try:
+        return max(0, int((now - datetime.fromisoformat(iso)).total_seconds()))
+    except ValueError:
+        return None
+
+
+def _collect(out: _Out) -> None:
+    """Fill `out` with every aggregate we can compute. Each block is wrapped so one failing
+    query never costs the whole scrape."""
+    now = utcnow()
+    db = SessionLocal()
+    try:
+        # edges ---------------------------------------------------------------
+        try:
+            cutoff = now - timedelta(seconds=settings.edge_offline_seconds)
+            edges = list(db.scalars(select(Edge).where(Edge.enabled.is_(True))))
+            online = sum(1 for e in edges if e.last_seen_at is not None and e.last_seen_at >= cutoff)
+            shed = sum(1 for e in edges if e.shed)
+            probe_failing = sum(1 for e in edges if (e.probe_fail or 0) >= settings.probe_fail_checks)
+            total = db.scalar(select(func.count(Edge.id)))
+            out.metric("pcdn_edges_total", total, "Number of edge nodes registered.")
+            out.metric("pcdn_edges_online", online, "Enabled edge nodes seen within EDGE_OFFLINE_SECONDS.")
+            out.metric("pcdn_edges_shed", shed, "Enabled edge nodes currently shed from DNS (load shedding).")
+            out.metric("pcdn_edges_probe_failing", probe_failing,
+                       "Enabled edges that heartbeat but fail the synthetic health probe.")
+            # SPEC §22: per-edge node health by edge NAME only (never an address)
+            out.metric("pcdn_edges_draining", sum(1 for e in edges if dnsbuild.is_draining(e)),
+                       "Enabled edges drained for maintenance (left out of DNS).")
+            out.metric("pcdn_edges_tunnel_degraded", sum(1 for e in edges if e.tunnel_degraded),
+                       "Enabled edges whose own tunnel path fails the loopback probe.")
+            live = [e for e in sorted(edges, key=lambda x: x.name)
+                    if e.last_seen_at is not None and e.last_seen_at >= cutoff]
+            for e in live:  # one metric family at a time (exposition format)
+                rl = edge_state.loads(e.reload_stats)
+                if "count_1h" in rl:
+                    out.metric("pcdn_edge_reloads_1h", int(rl.get("count_1h") or 0),
+                               "nginx reloads of the edge in the last hour (heartbeat).", labels={"edge": e.name})
+            for e in live:
+                m = edge_metrics(e) or {}
+                if m.get("draining_workers") is not None:
+                    out.metric("pcdn_edge_draining_workers", int(m["draining_workers"]),
+                               "nginx worker generations still shutting down on the edge.", labels={"edge": e.name})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: edges block failed")
+            db.rollback()
+
+        # sites ---------------------------------------------------------------
+        try:
+            rows = db.execute(select(Site.status, Site.suspended, Site.over_quota)).all()
+            by_status: dict[str, int] = {}
+            for status, suspended, over_quota in rows:
+                eff = "suspended" if suspended else "over_quota" if over_quota else status
+                by_status[eff] = by_status.get(eff, 0) + 1
+            out.metric("pcdn_sites_total", len(rows), "Number of sites.")
+            for eff, n in sorted(by_status.items()):
+                out.metric("pcdn_sites", n, "Sites by effective status.", labels={"status": eff})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: sites block failed")
+            db.rollback()
+
+        # ssl -----------------------------------------------------------------
+        try:
+            ssl_rows = db.execute(
+                select(Site.ssl_status, func.count(Site.id)).group_by(Site.ssl_status)).all()
+            for status, n in ssl_rows:
+                out.metric("pcdn_ssl_certificates", n, "Sites by SSL status.",
+                           labels={"status": status or "none"})
+            limit = now + timedelta(days=settings.alert_cert_days)
+            expiring = db.scalar(select(func.count(Site.id)).where(
+                Site.ssl_status.in_(("active", "pending")),
+                Site.ssl_expires_at.is_not(None), Site.ssl_expires_at < limit,
+                Site.ssl_allowed.is_(True)))
+            out.metric("pcdn_ssl_certs_expiring", expiring,
+                       f"Certificates expiring within ALERT_CERT_DAYS ({settings.alert_cert_days}d).")
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: ssl block failed")
+            db.rollback()
+
+        # scheduler / dns / usage / backup (all from the State table) ---------
+        try:
+            state = {r.key: r.value for r in db.scalars(select(State))}
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: state read failed")
+            db.rollback()
+            state = {}
+
+        sched_age = _age_seconds(state.get("scheduler:last_run"), now)
+        out.metric("pcdn_scheduler_last_run_age_seconds", sched_age,
+                   "Seconds since any scheduler job last ran (leader).")
+        for key, value in sorted(state.items()):
+            if key.startswith(JOBRUN_PREFIX):
+                age = _age_seconds(value, now)
+                out.metric("pcdn_scheduler_job_last_run_age_seconds", age,
+                           "Seconds since each scheduler job last completed.",
+                           labels={"job": key[len(JOBRUN_PREFIX):]})
+
+        dns_age = _age_seconds(state.get("dns:last_sync_at"), now)
+        out.metric("pcdn_dns_last_sync_age_seconds", dns_age, "Seconds since DNS last synced cleanly.")
+
+        usage_ingested = state.get("metrics:usage_batches")
+        if usage_ingested is not None:
+            try:
+                out.metric("pcdn_usage_batches_ingested_total", int(usage_ingested),
+                           "Usage batches accepted from edges.", type_="counter")
+            except ValueError:
+                pass
+
+        backup_age = _age_seconds(state.get("backup:last_success_at"), now)
+        out.metric("pcdn_backup_last_success_age_seconds", backup_age,
+                   "Seconds since the last successful backup.")
+
+        # dns sync errors + active alerts -------------------------------------
+        try:
+            open_alerts = alerts.open_alerts(db)
+            dns_errors = sum(1 for c in open_alerts
+                             if str(c.get("key", "")).startswith(("dns_sync:", "pdns_down:")))
+            out.metric("pcdn_dns_sync_errors", dns_errors, "Open DNS-sync / PowerDNS error conditions.")
+            out.metric("pcdn_active_alerts", len(open_alerts), "Currently open alert conditions.")
+            by_sev: dict[str, int] = {}
+            for c in open_alerts:
+                sev = str(c.get("severity") or "warning")
+                by_sev[sev] = by_sev.get(sev, 0) + 1
+            for sev, n in sorted(by_sev.items()):
+                out.metric("pcdn_active_alerts_by_severity", n, "Open alerts by severity.",
+                           labels={"severity": sev})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: alerts block failed")
+            db.rollback()
+
+        # audit log size (cheap sanity signal; no identifiers) ----------------
+        try:
+            out.metric("pcdn_audit_log_entries", db.scalar(select(func.count(AuditLog.id))),
+                       "Rows currently held in the audit log.")
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: audit block failed")
+            db.rollback()
+
+        # webhooks + log export (SPEC §14.3): platform totals only, never a domain or URL ------
+        try:
+            counts = dict(db.execute(select(WebhookDelivery.status, func.count(WebhookDelivery.id))
+                                     .where(WebhookDelivery.status.in_(("pending", "failed")))
+                                     .group_by(WebhookDelivery.status)).all())
+            for status in ("pending", "failed"):
+                out.metric("pcdn_webhook_deliveries", int(counts.get(status, 0)),
+                           "Webhook deliveries held (last 7 days) by status.", labels={"status": status})
+            out.metric("pcdn_log_export_pending_records",
+                       int(db.scalar(select(func.coalesce(func.sum(LogSpool.records), 0))) or 0),
+                       "Access-log records spooled for upload to customer buckets.")
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: webhooks/log export block failed")
+            db.rollback()
+        # client app errors (SPEC §18.4): bounded page label set (errortrack.PAGES + "other") -------
+        try:
+            from . import errortrack
+
+            for page, n in sorted(errortrack.client_error_counts(db).items()):
+                out.metric("pcdn_client_errors_total", n, "JavaScript errors reported by the WHMCS client app, "
+                           "by page.", "counter", labels={"page": page})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: client errors block failed")
+            db.rollback()
+    finally:
+        db.close()
+
+
+def _wave14(out: _Out) -> None:
+    """SPEC §23: build info, rollout state and the SLO gauges (operator-only, no customer identifier)."""
+    out.metric("pcdn_build_info", 1, "Controller platform version (label).", labels={"version": settings.app_version})
+    db = SessionLocal()
+    try:
+        try:
+            from . import rollout
+
+            r, counts = rollout.metrics(db)
+            if r is not None:
+                out.metric("pcdn_rollout_state", 1, "State of the latest node rollout.",
+                           labels={"rollout": r.id, "state": r.state})
+                for state in sorted(counts):
+                    out.metric("pcdn_rollout_edges", counts[state], "Edges of the latest rollout by state.",
+                               labels={"state": state})
+        except Exception:  # noqa: BLE001
+            log.exception("metrics: rollout block failed")
+            db.rollback()
+        if settings.slo_enabled:
+            try:
+                from . import slo
+
+                state = slo.evaluate(db)
+                for g in state["groups"]:
+                    for sli, v in g["slis"].items():
+                        labels = {"group": g["group"], "sli": sli}
+                        out.metric("pcdn_slo_objective", v["objective"] / 100.0, "SLO objective (ratio).",
+                                   labels=labels)
+                        if v["actual"] is not None:
+                            out.metric("pcdn_slo_ratio", v["actual"] / 100.0, "SLI good/total ratio.",
+                                       labels={**labels, "window": "month"})
+                        thirty = slo._sum(db, g["group"], "1h", utcnow() - timedelta(days=30), utcnow())
+                        bad, total = slo.bad_total(thirty, sli)
+                        if total:
+                            out.metric("pcdn_slo_ratio", round((total - bad) / total, 6), "SLI good/total ratio.",
+                                       labels={**labels, "window": "30d"})
+                        if v["budget_remaining_pct"] is not None:
+                            out.metric("pcdn_slo_error_budget_remaining", v["budget_remaining_pct"] / 100.0,
+                                       "Error budget left this month (ratio, may be negative).", labels=labels)
+                        for w, rate in v["burn"].items():
+                            out.metric("pcdn_slo_burn_rate", rate, "Error budget burn rate.",
+                                       labels={**labels, "window": w})
+            except Exception:  # noqa: BLE001
+                log.exception("metrics: slo block failed")
+                db.rollback()
+    finally:
+        db.close()
+
+
+@router.get("/metrics")
+def metrics(authorization: str | None = Header(default=None)):
+    _check_token(authorization)
+    out = _Out()
+    try:
+        _collect(out)
+    except Exception:  # noqa: BLE001 - a scrape must never 500
+        log.exception("metrics collection failed")
+    try:
+        _wave14(out)
+    except Exception:  # noqa: BLE001
+        log.exception("metrics collection (wave 14) failed")
+    return PlainTextResponse(out.text(), media_type=CONTENT_TYPE)

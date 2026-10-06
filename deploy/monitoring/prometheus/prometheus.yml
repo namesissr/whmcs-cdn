@@ -1,0 +1,95 @@
+# Pasargad CDN — Prometheus configuration.
+# Environment-dependent targets are rendered at start into /prometheus/rendered/*.json by
+# render-config.sh (from CONTROLLER_URL, STATUS_PAGE_URL, PROBE_EXTRA_URLS, PCDN_API_BRIDGE).
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    platform: pcdn
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Controller GET /metrics (SPEC §13.1). Platform aggregates only; Bearer METRICS_TOKEN if set.
+  - job_name: pcdn-controller
+    scrape_interval: 30s
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/metrics_token
+    file_sd_configs:
+      - files: [/prometheus/rendered/controller.json]
+
+  # Black-box probes from this (separate) host: is the controller reachable over HTTPS at all,
+  # is /healthz/deep green, does the public /status.json answer, is the status page up.
+  - job_name: pcdn-probe
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    file_sd_configs:
+      - files:
+          - /prometheus/rendered/probe-healthz.json
+          - /prometheus/rendered/probe-status-json.json
+          - /prometheus/rendered/probe-status-page.json
+          - /prometheus/rendered/probe-extra.json
+    relabel_configs: &blackbox_relabel
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # /healthz/deep answers 503 when degraded; probed with its own module so the body is checked too
+  - job_name: pcdn-probe-deep
+    metrics_path: /probe
+    scrape_interval: 60s
+    params:
+      module: [http_deep_health]
+    file_sd_configs:
+      - files: [/prometheus/rendered/probe-deep.json]
+    relabel_configs: *blackbox_relabel
+
+  # Optional admin-API bridge (compose profile api-bridge). Empty target lists when disabled.
+  - job_name: pcdn-api-overview
+    metrics_path: /probe
+    scrape_interval: 2m
+    scrape_timeout: 60s
+    params:
+      module: [overview]
+    file_sd_configs:
+      - files: [/prometheus/rendered/bridge-overview.json]
+    relabel_configs: &bridge_relabel
+      - source_labels: [__address__]
+        target_label: __param_target
+      - target_label: instance
+        replacement: controller-api
+      - target_label: __address__
+        replacement: json-exporter:7979
+
+  - job_name: pcdn-api-analytics
+    metrics_path: /probe
+    scrape_interval: 5m
+    scrape_timeout: 90s
+    params:
+      module: [analytics]
+    file_sd_configs:
+      - files: [/prometheus/rendered/bridge-analytics.json]
+    relabel_configs: *bridge_relabel
+
+  # the monitoring stack itself
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+  - job_name: blackbox
+    static_configs:
+      - targets: ["blackbox:9115"]

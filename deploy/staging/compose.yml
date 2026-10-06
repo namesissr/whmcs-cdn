@@ -1,0 +1,252 @@
+# Pasargad CDN — full staging environment (docs/STAGING.md)
+#
+#   deploy/staging/staging.sh up      # build + start + wait until every service is healthy
+#   deploy/staging/staging.sh test    # end-to-end tests (tests/integration) inside the runner
+#   deploy/staging/staging.sh down    # stop and delete everything (volumes included)
+#
+# Services: db (PostgreSQL) + controller + pdns (PowerDNS ns1) + origin (HTTP echo, WebSocket/gRPC
+# echo, TCP echo) + runner (provisions the edges through the admin API, then runs pytest) +
+# edge-1 / edge-2 (Ubuntu 24.04, installed by the controller's own one-command installer) and,
+# with --profile storage, a SeaweedFS object-storage server.
+#
+# STAGING ONLY: every key below is a public, fixed test value. Never reuse it anywhere.
+#
+# The network uses a globally-routable-LOOKING range on purpose: the controller rejects private
+# addresses for edges and origins (validation.validate_ip), so 10/8, 172.16/12 and 192.168/16 cannot
+# be used. 11.200.0.0/24 is not reachable from the internet through this bridge; change it with
+# STAGING_NET=<a.b.c> if it collides with something on your host.
+
+name: pcdn-staging
+
+x-edge: &edge
+  build: ./edge
+  image: pcdn-staging-edge:local
+  restart: "no"
+  ulimits:
+    nofile: { soft: 1048576, hard: 1048576 }
+  volumes:
+    - staging-tokens:/staging/tokens:ro
+  depends_on:
+    runner:
+      condition: service_healthy
+    origin:
+      condition: service_healthy
+  healthcheck:
+    # nginx answers the health host AND the agent has completed at least one sync with the controller
+    test: ["CMD-SHELL", "curl -fsS -H 'Host: health.pcdn' http://127.0.0.1/__pcdn/health >/dev/null && test -s /var/lib/pcdn/state.json"]
+    interval: 5s
+    timeout: 5s
+    retries: 3
+    start_period: 600s
+
+x-edge-env: &edge-env
+  CONTROLLER_URL: http://controller:8000
+  # the one-liner from the controller says https://<CONTROLLER_DOMAIN>; staging serves plain HTTP
+  CONTROLLER_PUBLIC_URL: https://controller:8000
+  TOKENS_DIR: /staging/tokens
+  # extra bootstrap.sh / install.sh flags: --insecure-http (bootstrap.sh refuses the plain-http
+  # controller URL above without it), no country DB download, no IPv6 in docker
+  EDGE_INSTALL_FLAGS: "--insecure-http --no-geoip --no-ipv6 --no-avif"
+  # origin guard (agent + nftables pcdn_origin_guard): the staging network is where the origin, MinIO
+  # and the Docker DNS-named services live, so it is listed as an allowed "private" origin network
+  # (read by load_config() as ORIGIN_PRIVATE_ALLOW, also while install.sh renders the guard ruleset)
+  PCDN_ORIGIN_PRIVATE_ALLOW: ${STAGING_NET:-11.200.0}.0/24
+  # agent cadence for tests (production defaults: 20 / 60 / 60 / 120 / 5 s); read by load_config()
+  PCDN_POLL_INTERVAL: "2"
+  PCDN_HEARTBEAT_INTERVAL: "10"
+  PCDN_USAGE_INTERVAL: "5"
+  PCDN_RELOAD_MIN_INTERVAL: "2"
+  PCDN_RELOAD_DEBOUNCE: "1"
+  # Docker's embedded DNS (origins / the storage endpoint may be container names)
+  PCDN_RESOLVER: 127.0.0.11
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pcdn
+      POSTGRES_PASSWORD: staging-db-password
+      POSTGRES_DB: pcdn
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pcdn -d pcdn"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [cdn]
+
+  pdns:
+    image: powerdns/pdns-auth-49:latest
+    environment:
+      PDNS_AUTH_API_KEY: staging-pdns-key
+    # dns/pdns.conf only lets private networks reach the API; the staging network looks public
+    command: ["--webserver-allow-from=${STAGING_NET:-11.200.0}.0/24,127.0.0.1,::1"]
+    volumes:
+      - ../../dns/pdns.conf:/etc/powerdns/pdns.d/pcdn.conf:ro
+    healthcheck:
+      test: ["CMD", "pdns_control", "rping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.53
+
+  controller:
+    build: ../../controller
+    image: pcdn-controller:staging
+    environment:
+      DATABASE_URL: postgresql+psycopg://pcdn:staging-db-password@db:5432/pcdn
+      ADMIN_API_KEY: ${STAGING_ADMIN_API_KEY:-staging-admin-key}
+      CONTROLLER_DOMAIN: controller:8000
+      EDGE_BUNDLE_DIR: /srv/edge
+      PDNS_API_URL: http://pdns:8081
+      PDNS_API_KEY: staging-pdns-key
+      NAMESERVERS: ns1.staging.test,ns2.staging.test
+      SOA_EMAIL: hostmaster.staging.test
+      # delegation check asks our own PowerDNS (the .test zones exist nowhere else)
+      NS_RESOLVERS: ${STAGING_NET:-11.200.0}.53
+      NS_CHECK_INTERVAL: "10"
+      # .test is not delegated anywhere: skip the registered-parent walk (security review C1)
+      NS_CHECK_PARENT: "false"
+      LUA_SELECTOR: all
+      SCHEDULER_INTERVAL: "5"
+      EDGE_OFFLINE_SECONDS: "60"
+      EDGE_ALERT_SECONDS: "30"
+      PROBE_TIMEOUT: "3"
+      GEOIP_ENABLED: "false"
+      GEO_CHECK: "false"
+      BACKUP_ENABLED: "false"
+      BOT_RANGES_ENABLED: "false"
+      INSTANCE_NAME: staging
+      # Fernet key = urlsafe_b64("pcdn-staging-only-not-a-secret!!"): PUBLIC, staging only
+      DATA_ENCRYPTION_KEY: cGNkbi1zdGFnaW5nLW9ubHktbm90LWEtc2VjcmV0ISE=
+      # object storage: empty (off) unless staging.sh runs with STAGING_STORAGE=1 (--profile storage)
+      STORAGE_ENDPOINT: ${STAGING_STORAGE_ENDPOINT:-}
+      STORAGE_ADMIN_ACCESS_KEY: ${STAGING_STORAGE_ACCESS_KEY:-}
+      STORAGE_ADMIN_SECRET_KEY: ${STAGING_STORAGE_SECRET_KEY:-}
+      STORAGE_BACKEND: ${STAGING_STORAGE_BACKEND:-seaweedfs}
+      STORAGE_METRICS_PATH: ${STAGING_STORAGE_METRICS:-http://seaweedfs:9327/metrics}
+      STORAGE_INSECURE_HTTP: "true"
+      # SPEC §23.1: /healthz reports the version (staging.sh exports it from VERSION) and /healthz/deep the
+      # environment; tools/release/staging-verify.sh refuses any controller reporting "production"
+      PCDN_VERSION: ${PCDN_VERSION:-}
+      PCDN_ENVIRONMENT: staging
+    volumes:
+      - ../../edge:/srv/edge:ro          # secret-free edge bundle served at /edge/bundle.tar.gz
+    depends_on:
+      db:
+        condition: service_healthy
+      pdns:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 30s
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.10
+
+  # sample origin: HTTP echo :80, tools/loadtest origin (WebSocket/HTTPUpgrade/XHTTP/gRPC echo) :8080,
+  # TCP echo :9000 (L4 proxy)
+  origin:
+    image: python:3.12-slim
+    command: ["python", "/srv/staging/staging_origin.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      LOADTEST_DIR: /srv/loadtest
+    volumes:
+      - ./origin:/srv/staging:ro
+      - ../../tools/loadtest:/srv/loadtest:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1/healthz',timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.80
+
+  # creates the edges through the admin API (POST /api/v1/edges), hands each its one-time token and
+  # install one-liner through the staging-tokens volume, then idles; tests run here (staging.sh test)
+  runner:
+    build: ./runner
+    image: pcdn-staging-runner:local
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CONTROLLER_URL: http://controller:8000
+      ADMIN_API_KEY: ${STAGING_ADMIN_API_KEY:-staging-admin-key}
+      TOKENS_DIR: /staging/tokens
+      STAGING_EDGES: edge-1=${STAGING_NET:-11.200.0}.21,edge-2=${STAGING_NET:-11.200.0}.22
+      STAGING_DNS: ${STAGING_NET:-11.200.0}.53
+      STAGING_ORIGIN_IP: ${STAGING_NET:-11.200.0}.80
+      STAGING_STORAGE: ${STAGING_STORAGE:-0}
+      STAGING_STORAGE_ENDPOINT: ${STAGING_STORAGE_ENDPOINT:-}
+    volumes:
+      - staging-tokens:/staging/tokens
+      - ../../tests/integration:/tests/integration:ro
+    command: ["python", "/opt/staging/provision.py", "--then-sleep"]
+    depends_on:
+      controller:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/staging/tokens/.done"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.100
+
+  edge-1:
+    <<: *edge
+    hostname: edge-1
+    environment:
+      <<: *edge-env
+      EDGE_NAME: edge-1
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.21
+
+  edge-2:
+    <<: *edge
+    hostname: edge-2
+    environment:
+      <<: *edge-env
+      EDGE_NAME: edge-2
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.22
+
+  # ---- optional: object storage origin (SPEC §16.8) ------------------------------------------
+  # SeaweedFS, the same server and the same scoped controller identity the production kit installs
+  # (deploy/storage/). STAGING ONLY: the keys below are public, fixed test values.
+  seaweedfs:
+    image: ${SEAWEED_IMAGE:-chrislusf/seaweedfs:4.48}
+    profiles: ["storage"]
+    command: >
+      server -dir=/data -ip=seaweedfs
+      -master.volumeSizeLimitMB=64 -volume.max=20
+      -filer -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -s3.iam.readOnly=false
+      -s3.port.iceberg=0 -s3.port.lance=0 -metricsPort=9327
+    volumes:
+      - ./seaweed-s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9333/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks:
+      cdn:
+        ipv4_address: ${STAGING_NET:-11.200.0}.90
+
+networks:
+  cdn:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${STAGING_NET:-11.200.0}.0/24
+
+volumes:
+  staging-tokens:

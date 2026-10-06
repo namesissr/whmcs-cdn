@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# STAGING ONLY — a systemctl stand-in for edge containers (no systemd inside docker).
+#
+# edge/install.sh and the agent's NGINX_RELOAD_CMD ("systemctl reload nginx") call systemctl; this shim
+# maps those calls onto plain processes:
+#   nginx         start / stop / reload / restart the nginx daemon (master pid in /run/nginx.pid)
+#   pcdn-imaged   started in the background (unsandboxed: the systemd hardening is not available)
+#   pcdn-agent    no-op: the container entrypoint execs the agent in the foreground afterwards
+#   everything else (timers, pcdn-guard, pcdn-fn, daemon-reload, ...) is a logged no-op
+set -u
+
+log() { echo "systemctl(staging): $*" >&2; }
+
+QUIET=no
+NOW=no
+ACTION=""
+UNITS=()
+for a in "$@"; do
+  case "$a" in
+    -q|--quiet) QUIET=yes ;;
+    --now) NOW=yes ;;
+    --no-block|--no-pager|--system|-f|--force) ;;
+    -*) ;;
+    *) if [ -z "$ACTION" ]; then ACTION="$a"; else UNITS+=("${a%.service}"); fi ;;
+  esac
+done
+
+nginx_running() { [ -s /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; }
+
+imaged_running() { [ -s /run/pcdn-imaged.pid ] && kill -0 "$(cat /run/pcdn-imaged.pid)" 2>/dev/null; }
+
+unit_do() {  # unit action
+  local unit="$1" act="$2"
+  case "$unit" in
+    nginx)
+      case "$act" in
+        start) nginx_running || nginx ;;
+        stop) if nginx_running; then nginx -s quit; fi ;;
+        reload|reload-or-restart|try-reload-or-restart)
+          if nginx_running; then nginx -s reload; else nginx; fi ;;
+        restart|try-restart)
+          if nginx_running; then nginx -s stop; sleep 1; fi; nginx ;;
+      esac ;;
+    pcdn-imaged)
+      case "$act" in
+        start|restart|reload|try-restart)
+          if imaged_running; then kill "$(cat /run/pcdn-imaged.pid)" 2>/dev/null; sleep 0.5; fi
+          PCDN_CONFIG=/etc/pcdn/imaged.conf nohup /usr/bin/python3 /usr/local/bin/pcdn-agent imaged \
+            >>/var/log/pcdn-imaged.log 2>&1 </dev/null &
+          echo $! > /run/pcdn-imaged.pid ;;
+        stop) if imaged_running; then kill "$(cat /run/pcdn-imaged.pid)"; fi; rm -f /run/pcdn-imaged.pid ;;
+      esac ;;
+    pcdn-agent)
+      [ "$QUIET" = yes ] || log "pcdn-agent $act: the agent runs in the container foreground (entrypoint)" ;;
+    *)
+      [ "$QUIET" = yes ] || log "$unit $act: not available in a container (ignored)" ;;
+  esac
+}
+
+case "$ACTION" in
+  daemon-reload|daemon-reexec|reset-failed|mask|unmask|preset) exit 0 ;;
+  is-active)
+    for u in "${UNITS[@]}"; do
+      case "$u" in
+        nginx) nginx_running || exit 3 ;;
+        pcdn-imaged) imaged_running || exit 3 ;;
+        *) exit 3 ;;   # e.g. systemd-resolved: inactive
+      esac
+    done
+    exit 0 ;;
+  is-enabled) exit 0 ;;
+  enable)  [ "$NOW" = yes ] && for u in "${UNITS[@]}"; do unit_do "$u" start; done; exit 0 ;;
+  disable) [ "$NOW" = yes ] && for u in "${UNITS[@]}"; do unit_do "$u" stop; done; exit 0 ;;
+  start|stop|reload|restart|try-restart|reload-or-restart|try-reload-or-restart)
+    rc=0
+    for u in "${UNITS[@]}"; do unit_do "$u" "$ACTION" || rc=$?; done
+    exit "$rc" ;;
+  status)
+    for u in "${UNITS[@]}"; do
+      if [ "$u" = nginx ] && nginx_running; then echo "nginx: active (pid $(cat /run/nginx.pid))"; else echo "$u: n/a"; fi
+    done
+    exit 0 ;;
+  *) [ "$QUIET" = yes ] || log "'$ACTION' ignored"; exit 0 ;;
+esac

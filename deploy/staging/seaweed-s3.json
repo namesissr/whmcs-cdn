@@ -1,0 +1,25 @@
+{
+  "_comment": "Staging only (SPEC §16.8). The same two identities deploy/storage/bootstrap.sh writes on a real storage server, with PUBLIC fixed keys: a break-glass admin, the controller's scoped identity (s3:* on cdn-* plus the IAM calls that create a customer key), and an anonymous identity with no permissions so a bucket policy can allow the edges' Referer-conditioned GET. Never reuse these values anywhere.",
+  "identities": [
+    {
+      "name": "pcdn-admin",
+      "credentials": [{"accessKey": "STAGINGADMINKEY00000", "secretKey": "staging-admin-secret"}],
+      "actions": ["Admin"]
+    },
+    {
+      "name": "pcdn-controller",
+      "credentials": [{"accessKey": "STAGINGCONTROLLERKEY", "secretKey": "staging-storage-secret"}],
+      "policyNames": ["pcdn-controller"]
+    },
+    {
+      "name": "anonymous",
+      "actions": []
+    }
+  ],
+  "policies": [
+    {
+      "name": "pcdn-controller",
+      "content": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PcdnCustomerBucketsOnly\",\"Effect\":\"Allow\",\"Action\":[\"s3:*\"],\"Resource\":[\"arn:aws:s3:::cdn-*\",\"arn:aws:s3:::cdn-*/*\"]},{\"Sid\":\"PcdnCustomerKeys\",\"Effect\":\"Allow\",\"Action\":[\"iam:CreateUser\",\"iam:DeleteUser\",\"iam:GetUser\",\"iam:PutUserPolicy\",\"iam:DeleteUserPolicy\",\"iam:GetUserPolicy\",\"iam:CreateAccessKey\",\"iam:DeleteAccessKey\",\"iam:ListAccessKeys\"],\"Resource\":[\"*\"]}]}"
+    }
+  ]
+}
