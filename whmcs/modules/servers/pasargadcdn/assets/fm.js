@@ -209,8 +209,11 @@
       st.loading = true;
       st.error = null;
       draw();
-      var q = 'prefix=' + encodeURIComponent(prefix || '') + '&limit=' + PAGE + (token ? '&token=' + encodeURIComponent(token) : '');
-      return P.api('GET', base(name) + '?' + q).then(function (res) {
+      // The query goes through api()'s own parameter: P.api() sends the path as ONE encoded value,
+      // so a '?' glued onto it would reach the server inside the path and never match a route.
+      var q = { prefix: prefix || '', limit: PAGE };
+      if (token) q.token = token;
+      return P.api('GET', base(name), null, q).then(function (res) {
         st.loading = false;
         if (!res.ok || !res.data) { st.error = res; draw(); return; }
         var data = res.data;

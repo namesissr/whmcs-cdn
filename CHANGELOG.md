@@ -136,6 +136,21 @@ start at all.
 - Docs: STORAGE.md rewritten (setup, policy, backup, upgrade, troubleshooting, and §11 on the MinIO
   path and how to migrate off it), SPEC §16.8, UPGRADE, `.env.example`.
 
+### Fixed — the file manager's listing came back 404
+
+- The drawer asked for `storage/buckets/<b>/objects?prefix=…`, but `api()` sends the sub-path as one
+  encoded value, so the `?` arrived inside the path and matched no route in the client proxy's
+  whitelist: every listing failed with «فهرست فایل‌ها خوانده نشد». The query now goes through
+  `api()`'s own parameter, and `ClientApi::QUERY_RE` whitelists `prefix` / `token` / `limit` for that
+  route — without which paging and folders would have been dropped silently.
+- A shared domain's roles (SPEC §20) can now use the manager the button offers them: listing and a
+  download link are reads for every role, while upload, folder, rename and delete need `editor`. A
+  bucket's access key still stays with the owner.
+- New `whmcs/tests/routes.php` exercises `ClientApi::allowed()`, `::query()` and `::shareAllows()`
+  directly (57 checks, run by the `whmcs` CI job), and `fm.test.js` now fails if any `api()` call
+  glues a query string onto its path.
+- Docs: STORAGE.md had the multipart `urls` shape wrong (it is a list of `{part, url}`).
+
 ### Added — a file manager in the customer's storage section
 
 A customer who buys storage no longer needs `aws`/`rclone` to put a file there and hand out its link.

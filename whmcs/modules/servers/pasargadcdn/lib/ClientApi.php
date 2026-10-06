@@ -195,6 +195,14 @@ class ClientApi
     const QUERY_RE = [
         // SPEC §23.4: diff against `current` or another version, optionally one section
         self::W17_DIFF => ['against' => '/^(current|[0-9]{1,9})$/D', 'section' => '/^(' . self::SECTIONS . ')$/D'],
+        // SPEC §16.8 file manager listing: the folder being viewed, the server's own continuation
+        // token, and the page size. A key is customer content, so anything but a control character
+        // and a `..` segment is allowed through; the controller validates the key itself.
+        'storage/buckets/' . self::BUCKET . '/objects' => [
+            'prefix' => '/^(?!.*\.\.)[^\x00-\x1f\x7f]{0,1024}$/uD',
+            'token' => '/^[^\x00-\x1f\x7f]{1,2048}$/uD',
+            'limit' => '/^([1-9][0-9]{0,2}|1000)$/D',
+        ],
     ];
 
     /**
@@ -280,6 +288,13 @@ class ClientApi
     const SHARE_ROLES = ['viewer', 'dns', 'editor'];
     /** Every whitelisted GET except the customer API keys (owner only). */
     const SHARE_READ_DENY = ['apikeys'];
+    /**
+     * SPEC §16.8: a POST that only reads. The file manager's listing is a GET, so every role can see
+     * the file names; a download link is a POST because the key travels in the body, and withholding
+     * it would leave a member staring at names they cannot open. Uploading, renaming and deleting
+     * stay writes (SHARE_EDITOR).
+     */
+    const SHARE_READ_POST = ['storage/buckets/' . self::BUCKET . '/objects/download'];
     /** dns: records (incl. import / export), the NS re-check and the secondary-DNS section; DNSSEC is view-only. */
     const SHARE_DNS = [
         'POST' => ['records', 'records/import', 'ns-check'],
@@ -294,6 +309,11 @@ class ClientApi
     const SHARE_EDITOR = [
         'POST' => ['records', 'records/import', 'dnssec', 'purge', 'ns-check', 'ssl', 'tunnel/check', 'redirects/import', 'logs/test',
             'webhooks/' . self::WEBHOOK_ID . '/(?:rotate|test)', 'image/transform-secret', 'storage/buckets', 'waf/learning/apply', self::W10_ACCESS_ROTATE,
+            // SPEC §16.8: the file manager's writes — upload (single and multipart), folders, rename
+            // and delete. The listing and a download link are reads (SHARE_READ_DENY / _READ_POST).
+            'storage/buckets/' . self::BUCKET . '/objects/(?:upload|folder|rename|delete)',
+            'storage/buckets/' . self::BUCKET . '/objects/multipart',
+            'storage/buckets/' . self::BUCKET . '/objects/multipart/(?:parts|complete|abort)',
             // SPEC §23.4: restoring a version needs the edit role (viewers and DNS managers see history and diffs only);
             // §23.6: a provider import writes DNS records AND sections, so it is an editor action too
             self::W17_RESTORE, self::W17_IMPORT_PREVIEW, self::W17_IMPORT_APPLY],
@@ -310,6 +330,13 @@ class ClientApi
         }
         if ($method === 'GET') {
             return !in_array($path, self::SHARE_READ_DENY, true);
+        }
+        if ($method === 'POST') {
+            foreach (self::SHARE_READ_POST as $re) {
+                if (preg_match('#^' . $re . '$#D', $path)) {
+                    return true;
+                }
+            }
         }
         $list = $role === 'editor' ? self::SHARE_EDITOR : ($role === 'dns' ? self::SHARE_DNS : []);
         foreach ($list[$method] ?? [] as $re) {

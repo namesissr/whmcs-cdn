@@ -171,7 +171,7 @@ config لبه حذف می‌شوند.
 | `GET /objects?prefix=&token=&limit=200` | `{"prefix","folders":[{key,name}],"objects":[{key,name,size,modified,etag,public_url}],"next_token","public_base","max_upload_bytes"}` |
 | `POST /objects/download` `{"key","expires_in"?,"attachment"?}` | `{"url","method":"GET","expires_in","public_url"}` — لینک امضاشدهٔ موقت (پیش‌فرض ۱ ساعت، سقف ۷ روز) و لینک همیشگی CDN اگر باکت مبدأ رکوردی باشد |
 | `POST /objects/upload` `{"key","size","content_type"?,"expires_in"?}` | `{"url","method":"PUT","key","expires_in"}` — یک PUT امضاشده برای فایل کوچک |
-| `POST /objects/multipart` `{"key","size","content_type"?,"parts"?}` | `{"key","upload_id","urls":{"<شماره>":"<url>"},"expires_in","part_max":1000}` |
+| `POST /objects/multipart` `{"key","size","content_type"?,"parts"?}` | `{"key","upload_id","urls":[{"part","url"}],"expires_in","part_max":1000}` |
 | `POST /objects/multipart/parts` `{"key","upload_id","first","count"}` | `{"urls","expires_in","part_max"}` — دستهٔ بعدی لینک‌های بخش‌ها (حداکثر ۱۰۰ در هر فراخوانی) |
 | `POST /objects/multipart/complete` `{"key","upload_id","parts":[{"part","etag"}]}` | `{"key","parts"}` |
 | `POST /objects/multipart/abort` `{"key","upload_id"}` | `{"ok": true}` |

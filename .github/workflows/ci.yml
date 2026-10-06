@@ -63,6 +63,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: find whmcs -name '*.php' -print0 | xargs -0 -n1 php -l
+      # the client proxy's route and query whitelist (ClientApi::allowed / ::query), exercised directly
+      - run: php whmcs/tests/routes.php
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

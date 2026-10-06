@@ -59,6 +59,34 @@ test('the upload shape follows the file size', () => {
   assert.ok(Math.ceil(7 * 1024 * 1048576 / PART) < 1000);
 });
 
+test('no api() call glues a query string onto the path', () => {
+  // api() sends the sub-path as ONE encoded value, so `path?prefix=…` reaches the server inside the
+  // path and matches no route (HTTP 404). The query belongs in api()'s fourth argument.
+  const src = fs.readFileSync(path.join(ASSETS, 'fm.js'), 'utf8')
+    .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  const paths = apiPathArgs(src);
+  assert.ok(paths.length >= 10, 'expected the api() calls to be found, got ' + paths.length);
+  for (const a of paths) assert.ok(!a.includes('?'), 'query glued onto an api() path: ' + a);
+});
+
+// The second argument of every `P.api(` call, read with balanced parentheses so `base(name) + x`
+// is one argument rather than cut at its own ')'.
+function apiPathArgs(src) {
+  const out = [];
+  for (let i = src.indexOf('P.api('); i >= 0; i = src.indexOf('P.api(', i + 1)) {
+    let depth = 0, arg = 1, buf = '';
+    for (let j = i + 5; j < src.length; j++) {
+      const c = src[j];
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') { depth--; if (depth === 0) break; }
+      else if (c === ',' && depth === 1) { arg++; continue; }
+      if (arg === 2 && depth >= 1) buf += c;
+    }
+    out.push(buf.trim());
+  }
+  return out;
+}
+
 test('every file icon exists in ui.js', () => {
   const P = load();
   const ui = fs.readFileSync(path.join(ASSETS, 'ui.js'), 'utf8');
