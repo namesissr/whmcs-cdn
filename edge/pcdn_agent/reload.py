@@ -2,11 +2,14 @@
 node-global files) and the post-reload /__pcdn/confver verification."""
 
 import hashlib
+import os
 import re
+import signal
 import time
 import urllib.request
 
 from .common import _int
+from .settings import log
 
 
 CONFVER_MARKER = "__PCDN_CONFVER__"
@@ -82,6 +85,84 @@ def verify_reload(cfg: dict, digest: str) -> bool:
             pass
         time.sleep(0.3)
     return False
+
+
+# ----------------------------------------------------------------- reloading the master
+
+_MASTER_TITLE = re.compile(r"nginx:\s+master process")
+
+
+def _read_pid(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_master(proc: str, pid: int) -> bool:
+    try:
+        with open(os.path.join(proc, str(pid), "cmdline"), "rb") as f:
+            title = f.read(256).replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    return bool(_MASTER_TITLE.match(title))
+
+
+def find_master_pid(cfg: dict) -> int | None:
+    """Pid of the running nginx master, read from its process title under PROC_DIR (the lowest such
+    pid: a master spawned by a reload-less restart is always older than its workers)."""
+    proc = cfg.get("PROC_DIR") or "/proc"
+    try:
+        pids = sorted(int(n) for n in os.listdir(proc) if n.isdigit())
+    except OSError:
+        return None
+    for pid in pids:
+        if _is_master(proc, pid):
+            return pid
+    return None
+
+
+def reload_nginx(cfg: dict, run) -> tuple[int, str]:
+    """NGINX_RELOAD_CMD, with a repair path for the one failure that otherwise strands a node on
+    stale config forever: an empty / stale /run/nginx.pid. `nginx -s reload` (and systemd's
+    ExecReload, which is the same command) reads the master's pid from that file, so once it is
+    truncated every reload fails with `invalid PID number ""` while nginx keeps serving happily --
+    no `nginx -t` error, no `emerg`, nothing in the error log but that one line. The node then runs
+    whatever config it had when the file broke, and every later change (a new site, a rotated
+    certificate, the tunnel self-probe's own server blocks) is silently never loaded.
+
+    Only touched when the pid file does not already point at a live master, so a reload that fails
+    for any other reason is reported as before."""
+    code, output = run(cfg["NGINX_RELOAD_CMD"])
+    if code == 0:
+        return code, output
+    path = cfg.get("NGINX_PID_FILE") or "/run/nginx.pid"
+    stale = _read_pid(path)
+    if stale is not None and _is_master(cfg.get("PROC_DIR") or "/proc", stale):
+        return code, output   # the pid file is fine; this failure is something else
+    master = find_master_pid(cfg)
+    if master is None:
+        return code, output   # no master running: a restart is the operator's call, not ours
+    try:
+        with open(path, "w") as f:
+            f.write(f"{master}\n")
+    except OSError as e:
+        log.warning("nginx reload failed and %s could not be rewritten (%s)", path, e)
+    else:
+        code2, out2 = run(cfg["NGINX_RELOAD_CMD"])
+        if code2 == 0:
+            log.warning("nginx reload failed (%s); rewrote %s with master pid %d and reloaded",
+                        " ".join(output.split())[-200:], path, master)
+            return 0, out2
+        output += "\n" + out2
+    try:
+        os.kill(master, signal.SIGHUP)
+    except OSError as e:
+        return code, output + f"\n(pid file {path} repaired to {master}, SIGHUP failed: {e})"
+    log.warning("nginx reload command failed (%s); sent SIGHUP to the master (pid %d) instead",
+                " ".join(output.split())[-200:], master)
+    return 0, output + f"\n(reload command failed; SIGHUP sent to nginx master {master})"
 
 
 # ----------------------------------------------------------------- worker_shutdown_timeout (SPEC §22.2)

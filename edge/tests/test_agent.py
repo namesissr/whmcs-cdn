@@ -5,6 +5,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 
 import pytest
@@ -1938,3 +1939,60 @@ def test_bot_and_pack_verdicts_become_security_events():
     assert [(e["action"], e["source"], e["rule"]) for e in events] == [
         ("block", "bots", "spoofed"), ("challenge", "bots", "library"), ("log", "bots", "empty_ua"),
         ("block", "waf", "991100")]
+
+
+# ----------------------------------------------------------------- reload with a broken pid file
+
+def _fake_master(proc: pathlib.Path, pid: int, title: str = "nginx: master process /usr/sbin/nginx"):
+    (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+    (proc / str(pid) / "cmdline").write_bytes(title.encode() + b"\0")
+
+
+def test_reload_repairs_an_empty_pid_file(tmp_path):
+    """An empty /run/nginx.pid makes `nginx -s reload` (and systemd's ExecReload) fail forever while
+    nginx keeps serving the config it had: the node would never load a new site, certificate or the
+    tunnel probe again. The agent rewrites the pid file from the running master and retries."""
+    proc, pidf = tmp_path / "proc", tmp_path / "nginx.pid"
+    _fake_master(proc, 4242)
+    pidf.write_text("")
+    cfg = make_cfg(tmp_path, PROC_DIR=str(proc), NGINX_PID_FILE=str(pidf))
+    calls = []
+
+    def run(cmd):
+        calls.append(cmd)
+        return (0, "") if pidf.read_text().strip() else (1, 'nginx: [error] invalid PID number "" in "/run/nginx.pid"')
+
+    assert agent.reload_nginx(cfg, run) == (0, "")
+    assert len(calls) == 2 and pidf.read_text().strip() == "4242"
+
+
+def test_reload_sighup_fallback_when_the_retry_still_fails(tmp_path, monkeypatch):
+    proc, pidf = tmp_path / "proc", tmp_path / "nginx.pid"
+    _fake_master(proc, 4242)
+    cfg = make_cfg(tmp_path, PROC_DIR=str(proc), NGINX_PID_FILE=str(pidf))   # pid file missing entirely
+    sent = []
+    monkeypatch.setattr(agent.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    code, out = agent.reload_nginx(cfg, lambda cmd: (1, "boom"))
+    assert code == 0 and "SIGHUP sent to nginx master 4242" in out
+    assert sent == [(4242, signal.SIGHUP)]
+
+
+def test_reload_failure_is_reported_when_the_pid_file_is_healthy(tmp_path):
+    """A reload that fails for any other reason must keep failing loudly — no pid file is rewritten
+    and no signal is sent."""
+    proc, pidf = tmp_path / "proc", tmp_path / "nginx.pid"
+    _fake_master(proc, 4242)
+    pidf.write_text("4242\n")
+    cfg = make_cfg(tmp_path, PROC_DIR=str(proc), NGINX_PID_FILE=str(pidf))
+    calls = []
+    assert agent.reload_nginx(cfg, lambda cmd: (calls.append(cmd), (1, "nope"))[1]) == (1, "nope")
+    assert len(calls) == 1 and pidf.read_text().strip() == "4242"
+
+
+def test_reload_failure_with_no_master_running_is_not_touched(tmp_path):
+    proc = tmp_path / "proc"
+    (proc / "9").mkdir(parents=True)
+    (proc / "9" / "cmdline").write_bytes(b"sshd: root\0")
+    cfg = make_cfg(tmp_path, PROC_DIR=str(proc), NGINX_PID_FILE=str(tmp_path / "nginx.pid"))
+    assert agent.reload_nginx(cfg, lambda cmd: (1, "down")) == (1, "down")
+    assert not (tmp_path / "nginx.pid").exists()

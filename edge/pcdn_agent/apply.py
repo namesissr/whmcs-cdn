@@ -9,7 +9,7 @@ import subprocess
 import time
 
 from .capabilities import nginx_capabilities
-from .reload import verify_reload
+from .reload import reload_nginx, verify_reload
 from .render.guards import ORIGIN_GUARD_TABLE
 from .render.site import ensure_speed_file
 from .render.tree import render_tree
@@ -83,7 +83,7 @@ def apply_config(config: dict, cfg: dict, files: dict | None = None, digest: str
         if had_old:
             os.rename(old, root)
         return "nginx -t failed: " + output[-1500:]
-    code, output = run(cfg["NGINX_RELOAD_CMD"])
+    code, output = reload_nginx(cfg, run)
     shutil.rmtree(old, ignore_errors=True)
     if code != 0:
         return "nginx reload failed: " + output[-1500:]
