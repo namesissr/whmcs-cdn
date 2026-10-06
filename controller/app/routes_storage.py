@@ -259,6 +259,13 @@ def site_storage_usage(domain: str, month: str | None = None, db: Session = Depe
         _fail(e)
 
 
+@router.get("/storage/capacity")
+def storage_capacity(db: Session = Depends(get_db)):
+    """Operator view: what the storage server has (disk), what it is holding (the customers' objects)
+    and what has been sold (the sum of plan storage_gb). For the admin dashboard."""
+    return storage.capacity(db)
+
+
 @router.get("/storage/usage")
 def all_storage_usage(month: str | None = None, db: Session = Depends(get_db)):
     """The same report for every site that stored anything that month (WHMCS cron)."""

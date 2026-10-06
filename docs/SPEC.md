@@ -1209,6 +1209,10 @@ storage server directly — a single PUT up to 32 MiB, multipart above it (32 Mi
 part URLs handed out 100 at a time), which is why the first upload to a bucket also sets its CORS
 rules (`STORAGE_CORS_ORIGINS`). Per-file cap `STORAGE_MAX_UPLOAD_GB` (default 7) on top of the plan's
 own headroom check; a customer's file name becomes exactly one key segment inside the folder shown.
+Operator side: `GET /api/v1/storage/capacity` and a dashboard card report the server's own disk
+(total / used / free, from the volume server's `/status` over `STORAGE_STATUS_PATH`, or
+`STORAGE_CAPACITY_GB` when the server cannot be asked), the customers' data, and the sum of every
+plan's `storage_gb` — three numbers that differ on purpose, with a dashboard warning from 85 % full.
 
 ### 16.9 Edge Functions (isolated)
 Customer JavaScript at the edge is untrusted multi-tenant code; it must NOT run inside nginx/njs.

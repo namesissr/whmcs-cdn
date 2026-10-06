@@ -183,6 +183,14 @@ class FakeMinio:
             assert doc["quotatype"] == "hard" and doc["size"] == doc["quota"]
             b["quota"] = doc["size"]
             return httpx.Response(200)
+        if op == "storageinfo":
+            return httpx.Response(200, json={"disks": [
+                {"endpoint": "/export1", "totalspace": 200 * 1024 ** 3, "usedspace": 40 * 1024 ** 3,
+                 "availspace": 160 * 1024 ** 3},
+                {"endpoint": "/export2", "totalspace": 100 * 1024 ** 3, "usedspace": 10 * 1024 ** 3,
+                 "availspace": 90 * 1024 ** 3},
+                {"endpoint": "/offline", "totalspace": 0, "usedspace": 0, "availspace": 0},
+            ]})
         if op == "datausageinfo":
             usage = {n: {"size": sum(len(v) for v in b["objects"].values()), "objectsCount": len(b["objects"])}
                      for n, b in self.buckets.items()}
@@ -653,6 +661,18 @@ def real_minio(monkeypatch):
         proc.terminate()
         proc.wait(10)
         shutil.rmtree(data, ignore_errors=True)
+
+
+def test_minio_disk_status(client, minio):
+    """SPEC §16.8 capacity panel on the MinIO backend: drive totals from admin/v3/storageinfo, with
+    an offline drive (all zeroes) skipped rather than counted as a full one."""
+    out = storage.client().disk_status()
+    assert (out["total"], out["used"], out["free"]) == (300 * GIB, 50 * GIB, 250 * GIB)
+    assert [d["dir"] for d in out["dirs"]] == ["/export1", "/export2"]
+    storage._capacity_cache.clear()
+    d = client.get("/api/v1/storage/capacity").json()
+    assert d["backend"] == "minio" and d["disk"]["total"] == 300 * GIB
+    storage._capacity_cache.clear()
 
 
 def test_real_minio(client, real_minio):

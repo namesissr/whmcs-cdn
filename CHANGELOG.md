@@ -136,6 +136,25 @@ start at all.
 - Docs: STORAGE.md rewritten (setup, policy, backup, upgrade, troubleshooting, and §11 on the MinIO
   path and how to migrate off it), SPEC §16.8, UPGRADE, `.env.example`.
 
+### Added — the storage server's capacity in the admin dashboard
+
+A card «فضای ذخیره‌سازی (سرور S3)» showing three numbers that differ on purpose: the server's own
+disk (total / used / free, with a bar), the customers' data (buckets and files), and the space sold
+(the sum of every plan's `storage_gb`, flagged when it exceeds the disk). From 85 % full the
+dashboard's warning list says so, red from 95 %.
+
+- Controller: `GET /api/v1/storage/capacity`, cached 30 s, refreshing the bucket usage live so the
+  operator's figure and the customer's page never disagree within a minute. The disk comes from the
+  data server's `/status` (`STORAGE_STATUS_PATH`, default `/__pcdn/storage-status`) because no metric
+  carries the size of a disk; `SeaweedClient.disk_status()` sums the data directories and
+  `MinioClient.disk_status()` reads admin/v3/storageinfo, skipping offline drives. When neither is
+  reachable, `STORAGE_CAPACITY_GB` stands in for the total and the answer says `"source"`.
+- `deploy/storage`: the Caddyfile proxies that path to the volume server for `ADMIN_ALLOW_IPS` only,
+  exactly like the metrics path, and the compose file exposes the port to it.
+- Tests: the disk report against a real `weed` binary (`test_real_seaweed_disk_status`), the panel's
+  three numbers and the configured-capacity fallback against a fake server, and the MinIO drive
+  parsing including an offline drive.
+
 ### Fixed — the file manager's listing came back 404
 
 - The drawer asked for `storage/buckets/<b>/objects?prefix=…`, but `api()` sends the sub-path as one

@@ -332,13 +332,16 @@ final class Pages
         $ctlVersion = '';
         if ($ping['ok']) {
             // SPEC §23.1: /healthz carries the controller's platform version (`version`, wave 14)
-            $r = self::fetch(['/api/v1/overview', '/api/v1/edges', '/api/v1/events?limit=8', '/api/v1/sites', '/api/v1/alerts/status', '/healthz']);
+            $r = self::fetch(['/api/v1/overview', '/api/v1/edges', '/api/v1/events?limit=8', '/api/v1/sites', '/api/v1/alerts/status', '/healthz',
+                '/api/v1/storage/capacity']);
             $ctlVersion = self::ok($r['/healthz']) && is_string($r['/healthz']['data']['version'] ?? null) ? (string) $r['/healthz']['data']['version'] : '';
             $ov = self::ok($r['/api/v1/overview']) ? $r['/api/v1/overview']['data'] : null;
             $edges = self::ok($r['/api/v1/edges']) ? $r['/api/v1/edges']['data'] : null;
             $events = self::ok($r['/api/v1/events?limit=8']) ? $r['/api/v1/events?limit=8']['data'] : null;
             $sites = self::ok($r['/api/v1/sites']) ? $r['/api/v1/sites']['data'] : null;
             $alerts = self::ok($r['/api/v1/alerts/status']) ? $r['/api/v1/alerts/status']['data'] : null;
+            // SPEC §16.8: the storage server's own disk against the data it holds and the space sold
+            $cap = self::ok($r['/api/v1/storage/capacity']) ? $r['/api/v1/storage/capacity']['data'] : null;
         }
         $counts = Data::statusCounts();
         $h = '';
@@ -395,6 +398,11 @@ final class Pages
         if ((int) ($ov['abuse_open'] ?? 0) > 0) {
             $warn[] = ['warn', View::n((int) $ov['abuse_open']) . ' گزارش تخلف باز منتظر رسیدگی است. <a href="' . View::url(['page' => 'abuse']) . '" data-abuse-open="' . (int) $ov['abuse_open'] . '">گزارش‌های تخلف</a>'];
         }
+        $capPct = is_array($cap ?? null) && is_array($cap['disk'] ?? null) ? $cap['disk']['percent_used'] ?? null : null;
+        if (is_numeric($capPct) && (float) $capPct >= 85) {
+            $warn[] = [(float) $capPct >= 95 ? 'bad' : 'warn', 'دیسک سرور فضای ذخیره‌سازی ' . View::n((float) $capPct, 1)
+                . '٪ پر است (' . View::bytes($cap['disk']['free'] ?? 0) . ' آزاد). فضا اضافه کنید یا فروش فضای جدید را متوقف کنید.'];
+        }
         foreach (self::saturated((array) $edges) as $e) {
             $warn[] = [!empty($e['shed']) ? 'bad' : 'warn', 'نود ' . View::ltr($e['name'] ?? '') . (!empty($e['shed']) ? ' اشباع شده و موقتاً از DNS خارج است.' : ' بیش از ۸۰٪ ظرفیت بار دارد.')
                 . ' <a href="' . View::url(['page' => 'edges']) . '">نودها</a>'];
@@ -434,6 +442,11 @@ final class Pages
         $h .= View::card('سلامت نودها', $healthBody,
             '<a class="pcdna-btn pcdna-btn-sm pcdna-btn-ghost" href="' . View::url(['page' => 'edges', 'view' => 'availability']) . '">' . View::icon('activity') . '<span>گزارش در دسترس‌بودن</span></a>'
             . '<a class="pcdna-btn pcdna-btn-sm" href="' . View::url(['page' => 'edges']) . '">مدیریت نودها</a>', '', 'server');
+
+        // SPEC §16.8: object-storage capacity — what the server has, holds and has been sold
+        if (is_array($cap) && !empty($cap['available'])) {
+            $h .= View::card('فضای ذخیره‌سازی (سرور S3)', self::storageCapacity($cap), '', '', 'package');
+        }
 
         // top sites + latest events
         $byDomain = Data::servicesByDomain();
@@ -524,6 +537,58 @@ final class Pages
     {
         $v = (float) $v;
         return $v >= 1000 ? View::n($v / 1000, 1) . ' Gbps' : View::n($v, $v < 10 ? 1 : 0) . ' Mbps';
+    }
+
+    /**
+     * SPEC §16.8: the object-storage server's capacity (/api/v1/storage/capacity). Three different
+     * numbers on purpose — the disk is the whole filesystem (so `used` includes anything else on it
+     * and is what decides when to add space), the data is the customers' objects, and the sold figure
+     * is the sum of every plan's storage_gb, which may exceed the disk on purpose.
+     */
+    public static function storageCapacity(array $cap): string
+    {
+        $disk = is_array($cap['disk'] ?? null) ? $cap['disk'] : null;
+        $data = (int) ($cap['data_bytes'] ?? 0);
+        $sold = (int) ($cap['sold_bytes'] ?? 0);
+        $h = '';
+        if ($disk !== null) {
+            $total = (int) ($disk['total'] ?? 0);
+            $used = (int) ($disk['used'] ?? 0);
+            $pct = $total > 0 ? $used / $total : 0.0;
+            $h .= '<div class="pcdna-cap"><div class="pcdna-cap-head"><strong>' . View::bytes($used) . '</strong>'
+                . ' <span class="pcdna-muted">از ' . View::bytes($total) . ' دیسک سرور'
+                . (($disk['source'] ?? '') === 'configured' ? ' (مقدار اعلامی اپراتور)' : '') . '</span>'
+                . '<span class="pcdna-cap-pct">' . View::n($pct * 100, 1) . '٪</span></div>'
+                . View::meter($pct) . '</div>';
+        }
+        $rows = [];
+        if ($disk !== null) {
+            $rows['فضای آزاد دیسک'] = View::bytes($disk['free'] ?? 0);
+        }
+        $rows['دادهٔ مشتری‌ها'] = View::bytes($data)
+            . ' <span class="pcdna-muted">(' . View::n($cap['buckets'] ?? 0) . ' باکت · '
+            . View::n($cap['objects'] ?? 0) . ' فایل)</span>'
+            . (!empty($cap['data_stale']) ? ' ' . View::badge('قدیمی', 'warn') : '');
+        $rows['فروخته‌شده (جمع پلن‌ها)'] = View::bytes($sold)
+            . ' <span class="pcdna-muted">روی ' . View::n($cap['sites_with_storage'] ?? 0) . ' سرویس</span>'
+            . ($disk !== null && $sold > (int) ($disk['total'] ?? 0)
+                ? ' ' . View::badge('بیش از ظرفیت دیسک', 'warn') : '');
+        if (!empty($cap['endpoint'])) {
+            $rows['نشانی سرور'] = View::ltr((string) $cap['endpoint'], 'pcdna-code');
+        }
+        $h .= '<dl class="pcdna-dl">';
+        foreach ($rows as $k => $v) {
+            $h .= '<div><dt>' . $k . '</dt><dd>' . $v . '</dd></div>';
+        }
+        $h .= '</dl>';
+        if ($disk === null) {
+            $h .= View::alert('warn', 'سرور ذخیره‌سازی اندازهٔ دیسکش را گزارش نکرد'
+                . (!empty($cap['disk_error']) ? ' (' . View::e(View::clip((string) $cap['disk_error'], 120)) . ')' : '')
+                . '. برای دیدن ظرفیت، مسیر وضعیت را روی سرور ذخیره‌سازی باز کنید '
+                . '(<span class="pcdna-code" dir="ltr">STORAGE_STATUS_PATH</span>، بخش ۴ راهنمای فضای ذخیره‌سازی)'
+                . ' یا ظرفیت را دستی در <span class="pcdna-code" dir="ltr">STORAGE_CAPACITY_GB</span> بنویسید.');
+        }
+        return $h;
     }
 
     private static function loadCell(array $e): string

@@ -101,7 +101,8 @@ def client() -> MinioClient:
     if backend() == "minio":
         _client = MinioClient(*args)
     else:
-        _client = SeaweedClient(*args, metrics_path=settings.storage_metrics_path)
+        _client = SeaweedClient(*args, metrics_path=settings.storage_metrics_path,
+                                 status_path=settings.storage_status_path)
     return _client
 
 
@@ -254,6 +255,73 @@ def sync_site_quotas(db: Session, site: Site, rows: list[StorageBucket] | None =
 
 def used_bytes(rows: list[StorageBucket]) -> int:
     return sum(int(r.size_bytes or 0) for r in rows)
+
+
+# ------------------------------------------------------------------ the server's own capacity (operator)
+
+_CAPACITY_TTL_S = 30.0
+_capacity_cache: dict[str, object] = {}
+
+
+def capacity(db: Session, now: float | None = None) -> dict:
+    """What the storage server HAS against what it is holding and what has been sold, for the admin
+    panel. Three different numbers, which is the point:
+
+    * disk — the server's own filesystem (total / used / free). `used` is everything on that disk,
+      not only customer objects, so it is the figure that decides when to add space. Absent when the
+      server does not report it (no status path, or the MinIO backend without one reachable), in
+      which case STORAGE_CAPACITY_GB stands in for the total if the operator set it.
+    * data — the customers' objects, summed from the per-bucket usage the hourly job stores.
+    * sold — the sum of every site's plan `storage_gb`. Larger than the disk means overcommitted,
+      which is normal for a reseller but worth seeing.
+
+    Cached for 30 s: the dashboard asks on every page load and the server recomputes its bucket
+    gauges once a minute anyway."""
+    now = now if now is not None else time.monotonic()
+    hit = _capacity_cache.get("at")
+    if isinstance(hit, float) and now - hit < _CAPACITY_TTL_S and isinstance(_capacity_cache.get("v"), dict):
+        return dict(_capacity_cache["v"])          # type: ignore[arg-type]
+
+    rows = list(db.scalars(select(StorageBucket)))
+    # the same live read the customer's own page does, so the two never disagree on the same minute
+    fresh = refresh_usage(db, rows) if (rows and available()) else not rows
+    if rows and fresh:
+        db.commit()
+    data_bytes = used_bytes(rows)
+    sites = db.scalars(select(Site)).all()
+    sold = sum(limit_bytes(s) for s in sites)
+    with_storage = sum(1 for s in sites if limit_bytes(s) > 0)
+    out: dict = {
+        "available": available(),
+        "backend": backend(),
+        "endpoint": public_endpoint() or None,
+        "buckets": len(rows),
+        "objects": sum(int(r.objects or 0) for r in rows),
+        "data_bytes": data_bytes,
+        "sold_bytes": sold,
+        "sites_with_storage": with_storage,
+        "data_stale": not fresh,
+        "disk": None,
+        "disk_error": None,
+        "at": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    configured_total = int(settings.storage_capacity_gb * GIB)
+    if available():
+        try:
+            disk = _require().disk_status()
+            out["disk"] = {**disk, "source": "server"}
+        except (MinioError, NotImplementedError) as e:
+            out["disk_error"] = str(e) or type(e).__name__
+            if configured_total > 0:
+                out["disk"] = {"total": configured_total, "used": data_bytes,
+                               "free": max(0, configured_total - data_bytes), "dirs": [],
+                               "source": "configured"}
+    if out["disk"]:
+        total = int(out["disk"]["total"] or 0)
+        out["disk"]["percent_used"] = round(out["disk"]["used"] * 100 / total, 1) if total > 0 else None
+    _capacity_cache["at"] = now
+    _capacity_cache["v"] = dict(out)
+    return out
 
 
 # ------------------------------------------------------------------ bucket lifecycle

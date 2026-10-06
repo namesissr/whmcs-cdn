@@ -43,6 +43,9 @@ class FakeSeaweed:
         self.buckets: dict[str, dict] = {}   # name -> {"policy": dict|None, "objects": int}
         self.quota: dict[str, dict] = {}
         self.usage = {BUCKET: (128, 1)}
+        # what the volume server's /status reports; None = the path is not exposed at all
+        self.disks: list[dict] | None = [{"dir": "/data", "all": 300 * GIB, "used": 20 * GIB,
+                                          "free": 280 * GIB}]
         self.calls: list[tuple[str, str]] = []   # (action or method, path)
         self.fail: dict[str, tuple[int, str]] = {}   # action -> (status, code)
 
@@ -66,6 +69,10 @@ class FakeSeaweed:
             lines.append("SeaweedFS_s3_requests_total 7")                     # no bucket label: ignored
             lines.append('SeaweedFS_s3_bucket_size_bytes{bucket="bad"} oops')  # unparsable: ignored
             return httpx.Response(200, text="\n".join(lines) + "\n")
+        if path == "/__pcdn/storage-status":
+            if self.disks is None:
+                return httpx.Response(404, text="not found")
+            return httpx.Response(200, json={"DiskStatuses": self.disks, "Version": "4.48"})
         if request.method == "POST" and path == "/":
             return self.iam(request)
         if "seaweedfs-quota" in query and request.method in ("PUT", "GET"):
@@ -206,6 +213,70 @@ def test_metrics_url_forms(fake):
     with pytest.raises(MinioError) as e:
         bad.data_usage()
     assert e.value.status == 502
+
+
+def test_disk_status(cli, fake):
+    assert cli.disk_status() == {
+        "total": 300 * GIB, "used": 20 * GIB, "free": 280 * GIB,
+        "dirs": [{"dir": "/data", "total": 300 * GIB, "used": 20 * GIB, "free": 280 * GIB}]}
+    # several data directories add up
+    fake.disks = [{"dir": "/d1", "all": 100, "used": 10, "free": 90},
+                  {"dir": "/d2", "all": 200, "used": 20, "free": 180}]
+    out = cli.disk_status()
+    assert (out["total"], out["used"], out["free"], len(out["dirs"])) == (300, 30, 270, 2)
+    # a server that does not expose the path, and one that answers something else
+    fake.disks = None
+    with pytest.raises(MinioError):
+        cli.disk_status()
+    fake.disks = []
+    with pytest.raises(MinioError) as e:
+        cli.disk_status()
+    assert "no disk" in str(e.value)
+    off = SeaweedClient(ENDPOINT, AK, SK, transport=httpx.MockTransport(fake.handler), status_path="")
+    assert off.status_url == ""
+    with pytest.raises(MinioError):
+        off.disk_status()
+
+
+def test_capacity_report(client, seaweed, monkeypatch):
+    """SPEC §16.8: the admin dashboard's capacity panel — the server's disk, the customers' data and
+    the space sold, which are three different numbers."""
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setattr(settings, "data_encryption_key", Fernet.generate_key().decode())
+    make_site(client, storage_gb=50)
+    bucket = client.post(f"{S}/storage/buckets", json={"name": "assets"}).json()
+    seaweed.usage = {bucket["bucket"]: (3 * GIB, 12)}
+    storage._capacity_cache.clear()
+
+    out = client.get("/api/v1/storage/capacity")
+    assert out.status_code == 200, out.text
+    d = out.json()
+    assert d["available"] is True and d["backend"] == "seaweedfs"
+    assert d["disk"] == {"total": 300 * GIB, "used": 20 * GIB, "free": 280 * GIB,
+                        "dirs": [{"dir": "/data", "total": 300 * GIB, "used": 20 * GIB, "free": 280 * GIB}],
+                        "source": "server", "percent_used": 6.7}
+    assert d["data_bytes"] == 3 * GIB and d["objects"] == 12 and d["buckets"] == 1
+    assert d["sold_bytes"] == 50 * GIB and d["sites_with_storage"] == 1
+    assert d["data_stale"] is False and d["disk_error"] is None
+
+    # the answer is cached briefly, so the dashboard's page loads do not hammer the server
+    seaweed.disks = [{"dir": "/data", "all": GIB, "used": GIB, "free": 0}]
+    assert client.get("/api/v1/storage/capacity").json()["disk"]["total"] == 300 * GIB
+    storage._capacity_cache.clear()
+    assert client.get("/api/v1/storage/capacity").json()["disk"]["percent_used"] == 100.0
+
+    # a server that does not report its disk: no disk figures unless the operator states the capacity
+    seaweed.disks = None
+    storage._capacity_cache.clear()
+    d = client.get("/api/v1/storage/capacity").json()
+    assert d["disk"] is None and d["disk_error"]
+    monkeypatch.setattr(settings, "storage_capacity_gb", 300.0)
+    storage._capacity_cache.clear()
+    d = client.get("/api/v1/storage/capacity").json()
+    assert d["disk"]["source"] == "configured"
+    assert (d["disk"]["total"], d["disk"]["used"], d["disk"]["free"]) == (300 * GIB, 3 * GIB, 297 * GIB)
+    storage._capacity_cache.clear()
 
 
 def test_quota_requests(cli, fake):
@@ -351,7 +422,7 @@ def real_seaweed(monkeypatch):
     if not binary:
         pytest.skip("no weed binary (set PCDN_TEST_WEED_BIN)")
     data = tempfile.mkdtemp()
-    s3_port, metrics_port = _free_port(), _free_port()
+    s3_port, metrics_port, volume_port = _free_port(), _free_port(), _free_port()
     config = {
         "identities": [
             {"name": "pcdn-controller", "credentials": [{"accessKey": AK, "secretKey": SK}],
@@ -367,7 +438,7 @@ def real_seaweed(monkeypatch):
     log = open(os.path.join(data, "weed.log"), "w+")
     proc = subprocess.Popen(
         [binary, "server", f"-dir={data}", "-ip=127.0.0.1",
-         f"-master.port={_free_port()}", f"-volume.port={_free_port()}", "-volume.max=20",
+         f"-master.port={_free_port()}", f"-volume.port={volume_port}", "-volume.max=20",
          "-master.volumeSizeLimitMB=64", "-filer", f"-filer.port={_free_port()}",
          "-s3", f"-s3.port={s3_port}", f"-s3.config={config_path}", "-s3.iam.readOnly=false",
          "-s3.port.iceberg=0", "-s3.port.lance=0", f"-metricsPort={metrics_port}"],
@@ -392,8 +463,11 @@ def real_seaweed(monkeypatch):
         monkeypatch.setattr(settings, "storage_admin_access_key", AK)
         monkeypatch.setattr(settings, "storage_admin_secret_key", SK)
         monkeypatch.setattr(settings, "storage_insecure_http", True)
+        # the live server reaches both of its own ports directly; in production the storage server's
+        # reverse proxy exposes them as paths for the controller's address only
         storage.set_client(SeaweedClient(url, AK, SK, timeout=60,
-                                         metrics_path=f"http://127.0.0.1:{metrics_port}/metrics"))
+                                         metrics_path=f"http://127.0.0.1:{metrics_port}/metrics",
+                                         status_path=f"http://127.0.0.1:{volume_port}/status"))
         yield url
     finally:
         storage.set_client(None)
@@ -510,6 +584,20 @@ def test_upload_is_refused_without_room(client, seaweed, monkeypatch):
     assert r.status_code == 409 and "پر است" in r.json()["detail"]
     # and a key the panel must never send
     assert client.post(f"{base}/upload", json={"key": "../escape", "size": 1}).status_code == 422
+
+
+def test_real_seaweed_disk_status(client, real_seaweed):
+    """The capacity panel's disk figures against a real server: the numbers come from the volume
+    server's /status, which is the only place SeaweedFS states the size of its disk."""
+    out = storage.client().disk_status()
+    assert out["dirs"] and out["total"] > 0
+    assert out["used"] + out["free"] <= out["total"] + 4096        # rounding of reserved blocks
+    assert 0 < out["free"] <= out["total"]
+    storage._capacity_cache.clear()
+    d = client.get("/api/v1/storage/capacity").json()
+    assert d["disk"]["source"] == "server" and d["disk"]["total"] == out["total"]
+    assert 0 <= d["disk"]["percent_used"] <= 100
+    storage._capacity_cache.clear()
 
 
 def test_real_seaweed_file_manager(client, real_seaweed):

@@ -51,6 +51,7 @@ services:
       - ./s3.json:/etc/seaweedfs/s3.json:ro
     expose:
       - "8333"   # S3 (through Caddy only)
+      - "8080"   # volume server /status: the disk's size (through Caddy, controller addresses only)
       - "9327"   # Prometheus metrics (through Caddy, controller addresses only)
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9333/healthz"]

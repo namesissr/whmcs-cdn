@@ -391,6 +391,27 @@ class MinioClient:
             out.setdefault(name, {"size": int(size or 0), "objects": 0})
         return {"last_update": doc.get("lastUpdate"), "buckets": out}
 
+    def disk_status(self) -> dict:
+        """{"total", "used", "free", "dirs": [{dir, total, used, free}]} of the server's drives, from
+        admin/v3/storageinfo. Whole-filesystem figures, so `used` includes whatever else lives on the
+        drive. Offline drives report zeroes and are skipped."""
+        doc = self._call("GET", ADMIN_PREFIX + "/storageinfo").json()
+        dirs, total, used, free = [], 0, 0, 0
+        for d in (doc.get("disks") or []):
+            if not isinstance(d, dict) or int(d.get("totalspace") or 0) <= 0:
+                continue
+            one = {"dir": str(d.get("endpoint") or d.get("drive_path") or ""),
+                   "total": int(d.get("totalspace") or 0),
+                   "used": int(d.get("usedspace") or 0),
+                   "free": int(d.get("availspace") or d.get("availablespace") or 0)}
+            dirs.append(one)
+            total += one["total"]
+            used += one["used"]
+            free += one["free"]
+        if not dirs:
+            raise MinioError("storage info: no drive reported")
+        return {"total": total, "used": used, "free": free, "dirs": dirs}
+
     # -- root-only helpers: used by the integration test and documented for the bootstrap only. The
     # controller's own credentials never have the permissions these need.
 

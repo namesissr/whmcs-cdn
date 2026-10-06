@@ -19,6 +19,20 @@
 		reverse_proxy seaweedfs:9327
 	}
 
+	# The volume server's /status is the only place the server says how big its disk is (no metric
+	# carries it), which the admin dashboard's capacity panel reads. Unauthenticated like the
+	# metrics, so the controller's address(es) only (STORAGE_STATUS_PATH on the controller).
+	@status path /__pcdn/storage-status /__pcdn/storage-status/*
+	@status_denied {
+		path /__pcdn/storage-status /__pcdn/storage-status/*
+		not remote_ip {$ADMIN_ALLOW_IPS}
+	}
+	respond @status_denied 403
+	handle @status {
+		rewrite * /status
+		reverse_proxy seaweedfs:8080
+	}
+
 	# The IAM API (customer access keys) is a POST to / — it is SigV4-signed and only the
 	# controller's identity may call it, but it is operator surface, so it is also address-limited.
 	@iam_denied {

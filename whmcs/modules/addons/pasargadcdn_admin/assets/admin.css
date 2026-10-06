@@ -689,4 +689,10 @@
 .pcdna .pcdna-city-cell, .pcdna .pcdna-release-cell { min-width: 110px; }
 .pcdna .pcdna-tag-search { margin-bottom: 10px; }
 .pcdna h4 { margin: 12px 0 6px; font-size: 14px; }
+/* SPEC §16.8: the storage server's capacity bar on the dashboard */
+.pcdna .pcdna-cap { margin: 2px 0 12px; }
+.pcdna .pcdna-cap-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.pcdna .pcdna-cap-head strong { font-size: 20px; }
+.pcdna .pcdna-cap-pct { margin-inline-start: auto; font-variant-numeric: tabular-nums; color: #64748b; }
+.pcdna .pcdna-cap .pcdna-meter { height: 9px; }
 @media (max-width: 600px) { .pcdna .pcdna-subnav-item span { font-size: 12px; } .pcdna .pcdna-slo-grid { grid-template-columns: 1fr; } }

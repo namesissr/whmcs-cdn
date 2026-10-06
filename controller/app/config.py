@@ -291,6 +291,15 @@ class Settings:
     # private network. seaweedfs backend only.
     storage_metrics_path: str = field(
         default_factory=lambda: (os.getenv("STORAGE_METRICS_PATH") or "/__pcdn/storage-metrics").strip())
+    # the storage server's own disk report (how much space the server HAS, which no metric carries):
+    # a path proxied to the volume server's /status for the controller's address only, or a full URL.
+    # seaweedfs backend only; empty turns the capacity panel's disk figures off.
+    storage_status_path: str = field(
+        default_factory=lambda: (os.getenv("STORAGE_STATUS_PATH") or "/__pcdn/storage-status").strip())
+    # what the operator knows the server holds, in GB, when the server cannot report it (the MinIO
+    # backend, or a status path that is not reachable). 0 = use what the server reports.
+    storage_capacity_gb: float = field(
+        default_factory=lambda: max(0.0, min(1_000_000.0, _float("STORAGE_CAPACITY_GB", 0.0))))
     storage_endpoint: str = field(default_factory=lambda: os.getenv("STORAGE_ENDPOINT", "").strip().rstrip("/"))
     storage_public_endpoint: str = field(
         default_factory=lambda: (os.getenv("STORAGE_PUBLIC_ENDPOINT") or os.getenv("STORAGE_ENDPOINT", "")

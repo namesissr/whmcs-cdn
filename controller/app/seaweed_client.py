@@ -36,6 +36,7 @@ IAM_VERSION = "2010-05-08"
 QUOTA_PARAM = "seaweedfs-quota"
 # path on the storage endpoint that the storage server maps to the S3 gateway's metrics port
 DEFAULT_METRICS_PATH = "/__pcdn/storage-metrics"
+DEFAULT_STATUS_PATH = "/__pcdn/storage-status"
 _SIZE_METRIC = "s3_bucket_size_bytes"
 _COUNT_METRIC = "s3_bucket_object_count"
 _NOT_FOUND = ("NoSuchEntity", "NoSuchEntityException", "NoSuchBucketPolicy")
@@ -95,13 +96,19 @@ class SeaweedClient(MinioClient):
 
     def __init__(self, endpoint: str, access_key: str, secret_key: str, region: str = "us-east-1",
                  transport: httpx.BaseTransport | None = None, timeout: float = 20,
-                 metrics_path: str = DEFAULT_METRICS_PATH):
+                 metrics_path: str = DEFAULT_METRICS_PATH,
+                 status_path: str = DEFAULT_STATUS_PATH):
         super().__init__(endpoint, access_key, secret_key, region, transport, timeout)
-        path = metrics_path or DEFAULT_METRICS_PATH
         # a full URL (the gateway's metrics port straight from a private network) or a path on the
         # storage endpoint, which the storage server proxies to that port for the controller's
         # address only (deploy/storage/Caddyfile)
-        self.metrics_url = path if path.startswith(("http://", "https://")) else \
+        self.metrics_url = self._own_url(metrics_path or DEFAULT_METRICS_PATH)
+        # the volume server's /status, which is the only place the server says how big its disk is.
+        # Empty means the operator did not expose it: the capacity report then has no disk figures.
+        self.status_url = self._own_url(status_path) if status_path else ""
+
+    def _own_url(self, path: str) -> str:
+        return path if path.startswith(("http://", "https://")) else \
             str(self.base) + "/" + path.lstrip("/")
 
     # -- IAM (customer access keys)
@@ -185,6 +192,40 @@ class SeaweedClient(MinioClient):
                    for name, size in sizes.items()}
         return {"last_update": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "buckets": buckets}
+
+    def disk_status(self) -> dict:
+        """{"total": int, "used": int, "free": int, "dirs": [{dir, total, used, free}]} of the data
+        server's own disks, summed over its data directories. These are whole-filesystem figures, so
+        `used` includes anything else living on that disk — which is what an operator deciding
+        whether to add space wants to see, and never smaller than the customers' data.
+
+        Taken from the volume server's /status (no metric carries the disk's size), proxied to the
+        controller's address only like the metrics path, and unsigned for the same reason."""
+        if not self.status_url:
+            raise MinioError("storage status path not configured")
+        try:
+            r = self.http.get(self.status_url)
+        except httpx.HTTPError as e:
+            raise MinioError(f"storage status unreachable: {type(e).__name__}") from None
+        if r.status_code != 200:
+            raise MinioError(f"storage status: HTTP {r.status_code}", r.status_code)
+        try:
+            rows = (r.json() or {}).get("DiskStatuses") or []
+        except ValueError:
+            raise MinioError("storage status: answer was not JSON") from None
+        dirs, total, used, free = [], 0, 0, 0
+        for d in rows:
+            if not isinstance(d, dict):
+                continue
+            one = {"dir": str(d.get("dir") or ""), "total": int(d.get("all") or 0),
+                   "used": int(d.get("used") or 0), "free": int(d.get("free") or 0)}
+            dirs.append(one)
+            total += one["total"]
+            used += one["used"]
+            free += one["free"]
+        if not dirs:
+            raise MinioError("storage status: no disk reported")
+        return {"total": total, "used": used, "free": free, "dirs": dirs}
 
     # -- not part of this backend: the MinIO-only bootstrap helpers. SeaweedFS's operator identities
     # come from the server's own config file (deploy/storage/bootstrap.sh), never over the wire.
