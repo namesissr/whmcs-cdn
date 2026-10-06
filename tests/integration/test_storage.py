@@ -60,3 +60,40 @@ def test_storage_bucket_served_through_the_edges(api, edges, storage_site):
     import urllib.request
     with pytest.raises(urllib.error.HTTPError):
         urllib.request.urlopen(f"{endpoint}/{b['bucket']}/hello.txt", timeout=10)
+
+
+def test_signed_links_only_record(api, edges, storage_site):
+    """SPEC §16.8: with `storage_signed` the bucket is served on the customer's own host to a link the
+    controller hands out, and to nothing else — the whole path, through real nginx and njs."""
+    import urllib.request
+
+    base = f"/api/v1/sites/{DOMAIN}/storage/buckets/assets/objects"
+    body = ("signed " + uuid.uuid4().hex).encode()
+    # upload the way the customer's file manager does: a presigned PUT straight to the storage server
+    up = api.post(f"{base}/upload", {"key": "private.bin", "size": len(body)})
+    urllib.request.urlopen(urllib.request.Request(up["url"], data=body, method="PUT"), timeout=30).read()
+
+    # the record that already serves this bucket, switched to signed links only
+    rec = next(r for r in api.get(f"/api/v1/sites/{DOMAIN}/records") if r.get("storage") == "assets")
+    body_rec = {"name": rec["name"], "type": rec["type"], "content": "", "proxied": True,
+                "storage": "assets"}
+    api.put(f"/api/v1/sites/{DOMAIN}/records/{rec['id']}", dict(body_rec, storage_signed=True))
+    host = f"files.{DOMAIN}"
+    try:
+        # every edge refuses an unsigned request once it has the new config
+        for name, ip in edges.items():
+            wait_until(lambda ip=ip: (lambda r: r if r.status == 403 else None)(
+                edge_request(ip, host, "/private.bin")), f"403 without a link on {name}")
+        dl = api.post(f"{base}/download", {"key": "private.bin", "expires_in": 600})
+        assert dl["kind"] == "cdn" and dl["url"].startswith(f"https://{host}/"), dl["url"]
+        assert dl["public_url"] is None
+        path = dl["url"].split(host, 1)[1]
+        for name, ip in edges.items():
+            r = wait_until(lambda ip=ip: (lambda r: r if r.status == 200 else None)(
+                edge_request(ip, host, path)), f"the signed link on {name}")
+            assert r.body == body
+            # tampering with either half of the link is a 403
+            assert edge_request(ip, host, path + "0").status == 403
+            assert edge_request(ip, host, path.split("?")[0]).status == 403
+    finally:   # back to public, so the module's other tests see the state they set up
+        api.put(f"/api/v1/sites/{DOMAIN}/records/{rec['id']}", dict(body_rec, storage_signed=False))

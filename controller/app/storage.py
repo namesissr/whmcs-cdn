@@ -26,11 +26,15 @@ Customer input never chooses a host: the endpoint is operator config (STORAGE_EN
 STORAGE_PUBLIC_ENDPOINT), a bucket name is validated to [a-z0-9-] and always prefixed.
 """
 
+import hashlib
+import hmac
 import logging
 import re
 import secrets
 import time
 from datetime import datetime, timedelta
+
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import delete, func, select
@@ -676,17 +680,29 @@ def month_report(db: Session, site: Site, month: str | None = None, now: datetim
 
 # ------------------------------------------------------------------ edge config
 
-def edge_origin(b: StorageBucket) -> dict:
+def link_key(b: StorageBucket) -> str:
+    """The key the edges verify this bucket's signed links with (SPEC §16.8). Derived from the
+    bucket's read token rather than being it, so a link's signature never reveals what the edges send
+    as Referer, and separate from the customer's own access key, so «کلید جدید» does not break links
+    the customer has already shared. A link therefore stands until its own expiry (7 days at most);
+    what ends every link at once is a new read token (crypto.drop_unreadable_secrets)."""
+    return hmac.new(b.origin_token.encode(), b"pcdn-file-link-v1", hashlib.sha256).hexdigest()
+
+
+def edge_origin(b: StorageBucket, signed: bool = False) -> dict:
     """The `origin.storage` block of an edge host (SPEC §16.8): fetch over TLS from `host:port`
     (SNI + certificate verification for `host`), `Host: host_header`, URI = path_prefix + the
-    request path (path-style S3, no query string), `Referer: referer`. GET/HEAD only."""
+    request path (path-style S3, no query string), `Referer: referer`. GET/HEAD only.
+
+    `signed`: the host serves this bucket only to a signed, unexpired link (`link_key`)."""
     u = httpx.URL(public_endpoint())
     tls = u.scheme == "https"
     host = u.host
     port = u.port or (443 if tls else 80)
     host_header = (f"[{host}]" if ":" in host else host) + (f":{u.port}" if u.port else "")
     return {"host": host, "port": port, "tls": tls, "host_header": host_header, "bucket": b.bucket,
-            "path_prefix": f"{u.path.rstrip('/')}/{b.bucket}", "referer": b.origin_token}
+            "path_prefix": f"{u.path.rstrip('/')}/{b.bucket}", "referer": b.origin_token,
+            **({"signed": True, "link_key": link_key(b)} if signed else {})}
 
 
 def edge_buckets(db: Session) -> dict[tuple[int, str], StorageBucket]:
@@ -770,9 +786,9 @@ def ensure_cors(cli, bucket: str, now: float | None = None) -> None:
         log.warning("storage: CORS on %s not applied: %s", bucket, e)
 
 
-def public_base(db: Session, site: Site, bucket_name: str) -> str | None:
-    """`https://host` of a proxied record served from this bucket, so the file manager can show a
-    permanent CDN link instead of an expiring one. None when no record uses the bucket."""
+def cdn_host(db: Session, site: Site, bucket_name: str) -> tuple[str, bool] | None:
+    """(host, signed only?) of the proxied record served from this bucket, so a file link can be on
+    the customer's own domain. None when no record uses the bucket."""
     from .models import Record
 
     rec = db.scalar(select(Record).where(Record.site_id == site.id, Record.proxied.is_(True),
@@ -780,7 +796,31 @@ def public_base(db: Session, site: Site, bucket_name: str) -> str | None:
     if rec is None:
         return None
     host = site.domain if rec.name in ("@", "", None) else f"{rec.name}.{site.domain}"
-    return "https://" + host
+    return host, bool(rec.storage_signed)
+
+
+def public_base(db: Session, site: Site, bucket_name: str) -> str | None:
+    """`https://host` at which this bucket's files are publicly readable, for the permanent link the
+    file manager shows. None when no record uses the bucket, and None when that record hands the
+    bucket out by signed link only — there is no permanent address then, which is the point."""
+    hit = cdn_host(db, site, bucket_name)
+    return None if hit is None or hit[1] else "https://" + hit[0]
+
+
+def cdn_link(db: Session, site: Site, b: StorageBucket, key: str, seconds: int) -> str | None:
+    """A signed link to one file on the customer's own CDN host, or None when this bucket's record
+    does not hand files out that way. `e` is the expiry and `s` the signature the edges check
+    (edge/njs/pcdn.js fileLink): HMAC-SHA256 over host, the decoded path and the expiry, truncated to
+    128 bits. Nothing of the storage server's own address appears in it."""
+    hit = cdn_host(db, site, b.name)
+    if hit is None or not hit[1]:
+        return None
+    host, _ = hit
+    exp = int(time.time()) + seconds
+    path = "/" + key.lstrip("/")
+    mac = hmac.new(link_key(b).encode(), f"f|{host}|{path}|{exp}".encode(), hashlib.sha256)
+    sig = mac.hexdigest()[:32]
+    return f"https://{host}{quote(path)}?e={exp}&s={sig}"
 
 
 def list_objects(db: Session, site: Site, name: str, prefix: str = "", token: str = "",
@@ -792,7 +832,8 @@ def list_objects(db: Session, site: Site, name: str, prefix: str = "", token: st
         page = cli.list_objects(b.bucket, p, token, max(1, min(LIST_MAX, int(limit or LIST_DEFAULT))))
     except MinioError as e:
         raise StorageError(f"خواندن فهرست فایل‌ها ناموفق بود: {e}", 502) from None
-    base = public_base(db, site, b.name)
+    hit = cdn_host(db, site, b.name)
+    base = None if hit is None or hit[1] else "https://" + hit[0]
     objects = []
     for o in page["objects"]:
         if o["key"] == p:          # the folder marker itself
@@ -801,6 +842,9 @@ def list_objects(db: Session, site: Site, name: str, prefix: str = "", token: st
                         "public_url": (base + "/" + o["key"]) if base else None})
     return {"prefix": p, "folders": [{"key": f, "name": f[len(p):].rstrip("/")} for f in page["folders"]],
             "objects": objects, "next_token": page["next_token"], "public_base": base,
+            # the customer's own host that serves this bucket, and whether it does so by signed link
+            # only — what the panel needs to say where a download link will point
+            "link_host": hit[0] if hit else None, "signed_only": bool(hit and hit[1]),
             "max_upload_bytes": max_upload_bytes()}
 
 
@@ -810,15 +854,25 @@ def _expires(seconds: int | None) -> int:
 
 def presign_download(db: Session, site: Site, name: str, key: str, seconds: int | None = None,
                      attachment: bool = True) -> dict:
+    """A time-limited link to one file.
+
+    When the bucket's CDN record hands files out by signed link, the link is on the customer's own
+    host and the storage server's address never appears (`kind: "cdn"`). Otherwise it is a presigned
+    URL of the storage endpoint (`kind: "storage"`), which is the only address a bucket without a CDN
+    record has. `public_url` is the permanent address, which exists only while the bucket is public."""
     b = find_bucket(db, site, name)
     cli = _require()
     k = validate_key(key)
     exp = _expires(seconds)
+    cdn = cdn_link(db, site, b, k, exp)
+    if cdn:
+        return {"url": cdn, "method": "GET", "expires_in": exp, "kind": "cdn", "public_url": None}
     query = {}
     if attachment:
         filename = k.rsplit("/", 1)[-1].replace('"', "")
         query["response-content-disposition"] = f'attachment; filename="{filename}"'
     return {"url": cli.presign("GET", b.bucket, k, exp, query), "method": "GET", "expires_in": exp,
+            "kind": "storage",
             "public_url": (lambda base: base + "/" + k if base else None)(public_base(db, site, b.name))}
 
 

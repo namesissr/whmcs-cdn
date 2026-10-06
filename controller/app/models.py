@@ -188,6 +188,10 @@ class Record(Base):
     # (StorageBucket.name, the customer's short name). The edge gets the storage endpoint, the
     # bucket path and the bucket's read token instead of an address (storage.edge_origin).
     storage_bucket: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    # SPEC §16.8: with a storage origin, serve the bucket only to a signed, unexpired link the
+    # controller handed out (the edges answer 403 to anything else). False = the bucket is public
+    # at this host, which is what a website origin needs.
+    storage_signed: Mapped[bool] = mapped_column(Boolean, default=False)
 
     site: Mapped[Site] = relationship(back_populates="records")
 

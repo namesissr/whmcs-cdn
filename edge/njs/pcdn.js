@@ -20,6 +20,7 @@
 //   tfHeaders js_header_filter     — conditional transform-rule response headers (SPEC §14.2)
 //   deny / verify / captcha        — js_content handlers for /__pcdn/*
 //   accessEmail js_set $pcdn_acc_email — signed-in email of an access app (SPEC §18.2)
+//   fileLink js_set $pcdn_flink    — "1" for a valid signed file link of a storage host (SPEC §16.8)
 //   accessLogin/Send/Verify/Logout — js_content of /__pcdn/access/* (SPEC §18.2)
 //   health                         — js_periodic origin health checker
 //
@@ -1981,6 +1982,32 @@ function accessGate(ctx, site) {
     return 'acc:deny:' + app.id;
 }
 
+// ------------------------------------------------------------------ signed file links (SPEC §16.8)
+//
+// A storage host in "signed links only" mode serves a file to a link the controller handed out and
+// to nothing else: ?e=<unix expiry>&s=<32 hex>, where
+//     s = HMAC-SHA256(<the bucket's link key>, "f|" + <host> + "|" + <decoded path> + "|" + e)
+// truncated to 32 hex characters (128 bits). The key is per bucket and never leaves the 0600
+// storage conf: the server block hands it over in $pcdn_flink_key. A link is therefore good for one
+// file on one host until it expires, and rotating the bucket's key ends every link at once.
+//
+// js_set $pcdn_flink -> "1" (serve it) or "0" (nginx answers 403). Nothing here reads request
+// headers or any other input, so the answer cannot vary with what a visitor sends.
+function fileLink(r) {
+    try {
+        const key = String(r.variables.pcdn_flink_key || '');
+        if (!key) return '0';                         // not a signed host: the guard is not rendered
+        const a = rawArgs(r.variables.args);
+        const exp = String(a.e || ''), sig = String(a.s || '').toLowerCase();
+        if (!/^[0-9]{1,12}$/.test(exp) || !/^[0-9a-f]{32}$/.test(sig)) return '0';
+        if (parseInt(exp, 10) <= now()) return '0';
+        const host = String(r.variables.host || '').toLowerCase();
+        const want = hmac(key, 'f|' + host + '|' + r.uri + '|' + exp).substring(0, 32);
+        return safeEq(sig, want) ? '1' : '0';
+    } catch (e) { r.error('pcdn fileLink: ' + e); }
+    return '0';
+}
+
 // js_set $pcdn_acc_email -> X-PCDN-Access-Email: the signed-in email on a path of an access app
 // ("" = the header is not sent; a visitor's own copy never reaches the origin)
 function accessEmail(r) {
@@ -2253,4 +2280,4 @@ function rumIngest(r) {
 
 export default { verdict, upstream, tunnelUpstream, imgW, imgH, imgQ, deny, verify, captcha, health,
     bodyNeed, bodyInspect, tfHeaders, tunnelFair, tunnelDrain, fairSet, hcSet, speedDown, speedUp, videoNext,
-    accessEmail, accessLogin, accessSend, accessVerify, accessLogout, rumIngest };
+    accessEmail, accessLogin, accessSend, accessVerify, accessLogout, rumIngest, fileLink };

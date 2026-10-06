@@ -11,6 +11,8 @@ storage server, the functions pass-through and fetch() socket, and the token nev
 response, the access log, the error log or the agent's log.
 """
 
+import hashlib
+import hmac
 import io
 import logging
 import os
@@ -20,7 +22,9 @@ import ssl
 import struct
 import subprocess
 import threading
+import time
 import http.server
+from urllib.parse import quote
 
 import pytest
 
@@ -186,9 +190,23 @@ def jpeg():
     return buf.getvalue()
 
 
-def storage(host, port):
-    return {"storage": {"host": host, "port": port, "tls": True, "host_header": f"{host}:{port}", "bucket": BUCKET,
-                        "path_prefix": f"/{BUCKET}", "referer": TOKEN}}
+LINK_KEY = "a1" * 24          # 48 hex characters, as storage.link_key() derives
+
+
+def storage(host, port, signed=False):
+    st = {"host": host, "port": port, "tls": True, "host_header": f"{host}:{port}", "bucket": BUCKET,
+          "path_prefix": f"/{BUCKET}", "referer": TOKEN}
+    if signed:   # SPEC §16.8: files handed out by signed link only
+        st.update(signed=True, link_key=LINK_KEY)
+    return {"storage": st}
+
+
+def link(path, host="files.st.test", expires_in=300, key=LINK_KEY, now=None):
+    """The link the controller hands out (controller/app/storage.py cdn_link): ?e=<expiry>&s=<32 hex
+    of HMAC-SHA256(key, "f|host|path|e")>."""
+    exp = int((now if now is not None else time.time())) + expires_in
+    sig = hmac.new(key.encode(), f"f|{host}|{path}|{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{quote(path)}?e={exp}&s={sig}"
 
 
 @pytest.fixture(scope="module")
@@ -218,7 +236,9 @@ def env(tmp_path_factory):
         "hosts": [{"name": "st.test", "origin": {"address": "127.0.0.1", "port": plain.port}},
                   {"name": "cdn.st.test", "origin": storage("s3.test", bucket.port)},
                   # the endpoint's certificate does not name wrong.test: verification must fail
-                  {"name": "bad.st.test", "origin": storage("wrong.test", bucket.port)}],
+                  {"name": "bad.st.test", "origin": storage("wrong.test", bucket.port)},
+                  # SPEC §16.8: the same bucket by signed link only
+                  {"name": "files.st.test", "origin": storage("s3.test", bucket.port, signed=True)}],
         "cache": {"enabled": True, "level": "standard", "edge_ttl": 3600, "browser_ttl": 0, "ignore_query": False,
                   "bypass_cookies": [], "always_online": True},
         "image": {"enabled": True, "quality": 80, "max_width": 2000},
@@ -400,3 +420,62 @@ def test_token_never_logged_and_kept_root_only(env):
     for rel in ("sites/501.conf", "http.conf", "js/sites.js"):
         with open(os.path.join(root, rel)) as f:
             assert TOKEN not in f.read(), rel
+
+
+def test_signed_links_only_host(env):
+    """SPEC §16.8: a bucket handed out by signed link — the host serves a valid, unexpired link for
+    that exact path and nothing else, and the storage server is never even asked otherwise."""
+    before = len(env.bucket.reqs)
+    # no signature at all: 403, and nothing was fetched
+    assert env.req("files.st.test", "/hello.txt").status == 403
+    # a well-formed link the controller would hand out
+    r = env.req("files.st.test", link("/hello.txt"))
+    assert r.status == 200 and r.body == b"hello object", r.status
+    req = last(env, f"/{BUCKET}/hello.txt")
+    # the query never reaches the bucket and the fetch still carries the Referer token
+    assert req["path"] == f"/{BUCKET}/hello.txt" and req["headers"]["Referer"] == TOKEN
+
+    # every way a link can be wrong is a 403
+    bad = {
+        "expired": link("/hello.txt", expires_in=-10),
+        "another host's signature": link("/hello.txt", host="cdn.st.test"),
+        "another key's signature": link("/hello.txt", key="b2" * 24),
+        "signature of another path": link("/other.txt").replace("/other.txt", "/hello.txt"),
+        "no expiry": link("/hello.txt").split("&")[1].replace("s=", "/hello.txt?s="),
+        "truncated signature": link("/hello.txt")[:-1],
+        "non-hex signature": link("/hello.txt")[:-2] + "zz",
+    }
+    for why, path in bad.items():
+        assert env.req("files.st.test", path).status == 403, why
+    # none of those reached the storage server: one fetch for the one good link
+    assert len(env.bucket.reqs) == before + 1, [r["path"] for r in env.bucket.reqs[before:]]
+
+    # a link to a key that is not there is still a link: the bucket answers 404
+    assert env.req("files.st.test", link("/nope.txt")).status == 404
+    # writes stay refused on this host as on any storage host
+    assert env.req("files.st.test", link("/hello.txt"), method="POST").status == 405
+
+
+def test_signed_links_share_one_cache_entry(env):
+    """Two links to the same file differ in their signature; the cache must not store the object once
+    per link handed out."""
+    env.req("files.st.test", link("/hello.txt"))     # warm (or already warm from the test above)
+    before = len(env.bucket.reqs)
+    for _ in range(3):
+        r = env.req("files.st.test", link("/hello.txt", expires_in=600))
+        assert r.status == 200 and r.body == b"hello object"
+        assert r.headers.get("x-cache") == "HIT", r.headers.get("x-cache")
+    assert len(env.bucket.reqs) == before, [x["path"] for x in env.bucket.reqs[before:]]
+
+
+def test_signed_host_keeps_the_link_key_out_of_the_readable_files(env):
+    root = env.cfg["NGINX_DIR"]
+    conf = open(os.path.join(root, "storage/501.conf")).read()
+    assert LINK_KEY in conf                      # the 0600 file is where it lives
+    assert oct(os.stat(os.path.join(root, "storage/501.conf")).st_mode & 0o777) == "0o600"
+    for rel in ("sites/501.conf", "http.conf", "js/sites.js"):
+        with open(os.path.join(root, rel)) as f:
+            assert LINK_KEY not in f.read(), rel
+    assert all(LINK_KEY not in m for m in env.agent_logs)
+    assert LINK_KEY not in (env.tmp / "access.log").read_text()
+    assert LINK_KEY not in (env.tmp / "error.log").read_text()

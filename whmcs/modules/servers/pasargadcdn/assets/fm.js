@@ -187,7 +187,7 @@
   function fileManager(bucket, overview) {
     var name = String((bucket && bucket.name) || bucket || '');
     var st = { prefix: '', page: null, token: null, loading: false, error: null, sel: {},
-      jobs: [], publicBase: null, maxUpload: 0 };
+      jobs: [], publicBase: null, linkHost: null, signedOnly: false, maxUpload: 0 };
     var listHolder = h('div', { className: 'pcdn-fm-list' });
     var upHolder = h('div', { className: 'pcdn-fm-uploads' });
     var crumbs = h('nav', { className: 'pcdn-fm-crumbs', 'aria-label': t('مسیر') });
@@ -228,6 +228,8 @@
         st.prefix = data.prefix || '';
         st.token = data.next_token || null;
         st.publicBase = data.public_base || null;
+        st.linkHost = data.link_host || null;
+        st.signedOnly = !!data.signed_only;
         st.maxUpload = Number(data.max_upload_bytes) || 0;
         draw();
       });
@@ -329,11 +331,16 @@
           append(holder, [
             P.alertBox('success', t('این باکت مبدأ CDN است، پس لینک زیر دائمی است و از لبه‌ها (با کش) تحویل داده می‌شود.')),
             P.copyable(st.publicBase + '/' + obj.key, { label: t('کپی لینک دائمی') })]);
+        } else if (st.signedOnly && st.linkHost) {
+          // the record hands this bucket out by signed link only: the link is on the customer's own
+          // host and carries nothing of the storage server's address
+          append(holder, [P.alertBox('info', [t('لینک موقت روی دامنهٔ خودتان ساخته می‌شود: '),
+            h('code', { text: st.linkHost }), t(' — این باکت بدون لینک معتبر باز نمی‌شود، پس لینک دائمی ندارد.')])]);
         } else {
           append(holder, [
-            P.alertBox('info', [t('برای لینک دائمی، این باکت را مبدأ یک زیردامنه کنید (مثلاً '),
+            P.alertBox('info', [t('لینک‌ها روی دامنهٔ خودتان ساخته می‌شوند اگر این باکت مبدأ یک زیردامنه باشد (مثلاً '),
               h('code', { text: 'files.' + ((S().site && S().site.domain) || 'example.com') }),
-              t('). تا آن زمان می‌توانید لینک موقت بسازید.')]),
+              t('). تا آن زمان لینک موقت از نشانی فضای ذخیره‌سازی ساخته می‌شود.')]),
             P.btn(t('ساخت زیردامنه برای این باکت'), { icon: 'cloud', write: true, cls: 'pcdn-fm-mkorigin',
               onclick: function () {
                 dd.close(true);
@@ -350,7 +357,9 @@
             { key: obj.key, expires_in: Number(pick.ttl), attachment: false })).then(function (res) {
             if (!res.ok || !res.data) { out.appendChild(P.errorBox(res, t('لینک ساخته نشد'))); return; }
             append(out, [P.copyable(res.data.url, { label: t('کپی لینک موقت') }),
-              h('p', { className: 'pcdn-help', text: t('این لینک پس از ') + P.dur(Number(res.data.expires_in) || 0) + t(' از کار می‌افتد و فقط همین یک فایل را می‌دهد.') })]);
+              h('p', { className: 'pcdn-help', text: t('این لینک پس از ') + P.dur(Number(res.data.expires_in) || 0)
+                + t(' از کار می‌افتد و فقط همین یک فایل را می‌دهد.')
+                + (res.data.kind === 'cdn' ? t(' از لبه‌های CDN و روی دامنهٔ خودتان تحویل داده می‌شود.') : '') })]);
           });
         } });
         append(row, [P.select(pick, 'ttl', t('اعتبار لینک موقت'),

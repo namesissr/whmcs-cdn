@@ -1209,6 +1209,13 @@ storage server directly — a single PUT up to 32 MiB, multipart above it (32 Mi
 part URLs handed out 100 at a time), which is why the first upload to a bucket also sets its CORS
 rules (`STORAGE_CORS_ORIGINS`). Per-file cap `STORAGE_MAX_UPLOAD_GB` (default 7) on top of the plan's
 own headroom check; a customer's file name becomes exactly one key segment inside the folder shown.
+A record with a storage origin may carry `storage_signed`: the edges then serve that bucket only to a
+link the controller signed (`?e=<expiry>&s=<128-bit HMAC over host, decoded path and expiry>`, njs
+`fileLink`, 403 otherwise), so a customer's download link is on their own domain and the storage
+endpoint's address never appears in it. The key is derived from the bucket's read token and lives only
+in the edge's 0600 storage conf; such a host is dropped on a node without njs rather than served
+publicly, and its cache key ignores the signature. A bucket with no CDN record keeps the presigned
+storage URL.
 Operator side: `GET /api/v1/storage/capacity` and a dashboard card report the server's own disk
 (total / used / free, from the volume server's `/status` over `STORAGE_STATUS_PATH`, or
 `STORAGE_CAPACITY_GB` when the server cannot be asked), the customers' data, and the sum of every

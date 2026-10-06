@@ -15,6 +15,7 @@ TOKEN = "Tk_" + "a1B2-c3D4" * 5            # 48 chars of [A-Za-z0-9_-]
 STO = {"host": "s3.example.net", "port": 443, "tls": True, "host_header": "s3.example.net",
        "bucket": "cdn-k3m9q2xa-assets", "path_prefix": "/cdn-k3m9q2xa-assets", "referer": TOKEN}
 SHIELD_SECRET = "5f" * 32
+LINK_KEY = "9c" * 24                       # 48 hex characters, as the controller derives it
 
 
 def sto(**kw):
@@ -47,7 +48,7 @@ def test_norm_storage_origin_valid_shapes():
     st = agent.norm_storage_origin(sto())
     assert st == {"proto": "https", "tls": True, "hp": "s3.example.net:443", "host": "s3.example.net",
                   "ssl_name": "s3.example.net", "host_header": "s3.example.net", "bucket": STO["bucket"],
-                  "prefix": STO["path_prefix"], "referer": TOKEN}
+                  "prefix": STO["path_prefix"], "referer": TOKEN, "signed": False, "link_key": ""}
     st = agent.norm_storage_origin(sto(host="S3.Example.NET", port=9443, host_header="s3.example.net:9443",
                                        path_prefix="/s3/v1/" + STO["bucket"]))
     assert st["hp"] == "s3.example.net:9443" and st["host_header"] == "s3.example.net:9443"
@@ -106,6 +107,65 @@ def test_invalid_storage_host_is_skipped_and_the_token_never_logged(tmp_path, ca
 
 
 # ----------------------------------------------------------------- rendering
+
+def test_norm_storage_origin_signed_links():
+    """SPEC §16.8: signed links only. Both the flag and a usable key, or the host is dropped — a
+    malformed key must never fall back to serving the bucket publicly."""
+    st = agent.norm_storage_origin(sto(signed=True, link_key=LINK_KEY))
+    assert st["signed"] is True and st["link_key"] == LINK_KEY
+    # the flag without a key, a key of the wrong shape, or a key without the flag
+    for bad in (sto(signed=True), sto(signed=True, link_key=""), sto(signed=True, link_key="zz" * 16),
+                sto(signed=True, link_key=LINK_KEY.upper()), sto(signed=True, link_key="ab" * 4),
+                sto(signed=True, link_key=["a" * 32]), sto(signed="yes", link_key=LINK_KEY),
+                sto(signed=1, link_key=LINK_KEY), sto(link_key=LINK_KEY)):
+        assert agent.norm_storage_origin(bad) is None, bad
+    # a public host reports no key at all, so nothing can leak one into a rendered file by accident
+    assert agent.norm_storage_origin(sto())["link_key"] == ""
+    # the key is masked in a log line, like the read token
+    rep = agent.storage_log_repr(sto(signed=True, link_key=LINK_KEY))
+    assert LINK_KEY not in rep and TOKEN not in rep and rep.count("<redacted>") == 2
+
+
+def test_render_signed_storage_host(tmp_path):
+    """The guard, the key's own 0600 map and the cache key that ignores the signature."""
+    cfg = make_cfg(tmp_path)
+    s = ssite(hosts=[{"name": "example.com", "origin": {"address": "127.0.0.1", "port": 18080}},
+                     {"name": "files.example.com", "origin": sto(signed=True, link_key=LINK_KEY)}])
+    files = agent.render_all({"sites": [s]}, cfg)
+    text = files["sites/7.conf"]
+    # the key lives beside the read token in the 0600 file and nowhere else
+    assert f"map $uri $pcdn_slink_7_0 {{\n    default \"{LINK_KEY}\";\n}}" in files["storage/7.conf"]
+    for rel in ("sites/7.conf", "http.conf", "js/sites.js"):
+        assert LINK_KEY not in files[rel], rel
+    blk = server_of(text, "files.example.com")
+    assert "set $pcdn_flink_key $pcdn_slink_7_0;" in blk
+    loc = blk[blk.index("    location / {"):]
+    assert 'if ($pcdn_flink != "1") { return 403; }' in loc
+    # one cache entry per file, not per link handed out
+    assert "proxy_cache_key $scheme://$host$pcdn_path;" in loc
+    assert "$request_uri" not in loc.split("proxy_pass")[0]
+    # the public host of the same bucket still keys on the whole request URI
+    pub = agent.render_all({"sites": [ssite()]}, cfg)["sites/7.conf"]
+    assert "proxy_cache_key $scheme://$host$request_uri;" in server_of(pub, "cdn.example.com")
+    # the variables njs answers through are declared once, at http level
+    assert "js_var $pcdn_flink_key;" in files["http.conf"] and "js_set $pcdn_flink pcdn.fileLink;" in files["http.conf"]
+    # a site without signed links keeps a byte-identical http.conf
+    plain = agent.render_all({"sites": [ssite()]}, cfg)["http.conf"]
+    assert "pcdn_flink" not in plain
+
+
+def test_signed_storage_host_needs_njs(tmp_path, caplog):
+    """Without njs the guard cannot run, so the host is dropped rather than served to everyone."""
+    cfg = make_cfg(tmp_path)
+    s = ssite(hosts=[{"name": "files.example.com", "origin": sto(signed=True, link_key=LINK_KEY)}])
+    with caplog.at_level(logging.WARNING):
+        files = agent.render_all({"sites": [s]}, make_cfg(
+            tmp_path, NGINX_CAPS=dict(agent.LEGACY_CAPS, modules=[x for x in agent.LEGACY_CAPS["modules"] if x != "njs"])))
+    text = files["sites/7.conf"]
+    assert "files.example.com" not in text and "pcdn_flink" not in text
+    assert LINK_KEY not in text and all(LINK_KEY not in m for m in caplog.messages)
+    assert any("needs njs for signed links" in m for m in caplog.messages), caplog.messages
+
 
 def test_render_storage_host(tmp_path):
     cfg = make_cfg(tmp_path)

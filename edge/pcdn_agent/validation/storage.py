@@ -14,6 +14,8 @@ SAFE_STO_BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 # / ".." segment) and never contains "%", so nothing in it is decoded or normalised away
 SAFE_STO_PREFIX = re.compile(r"^(?:/[A-Za-z0-9_~-][A-Za-z0-9._~-]{0,127}){1,16}$")
 SAFE_STO_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+# SPEC §16.8 signed file links: the key njs verifies a link's signature with (hex, controller-derived)
+SAFE_STO_LINK_KEY = re.compile(r"^[0-9a-f]{32,128}$")
 STO_KEYS = ("host", "port", "tls", "host_header", "bucket", "path_prefix", "referer")
 
 
@@ -64,7 +66,17 @@ def norm_storage_origin(origin) -> dict | None:
             or not SAFE_STO_PREFIX.match(prefix) or not prefix.endswith("/" + bucket)
             or not SAFE_STO_TOKEN.match(ref)):
         return None
+    # SPEC §16.8: signed links only. Both must be right or the host is dropped: serving the bucket
+    # publicly because a key was malformed would be exactly the mistake the mode exists to prevent.
+    signed = st.get("signed", False)
+    link_key = st.get("link_key", "")
+    if signed is not False:
+        if signed is not True or not isinstance(link_key, str) or not SAFE_STO_LINK_KEY.match(link_key):
+            return None
+    elif link_key != "":
+        return None
     return {"proto": "https" if tls else "http", "tls": tls, "hp": f"{nhost}:{port}", "host": nhost,
+            "signed": bool(signed), "link_key": link_key if signed else "",
             # SNI / certificate name: the hostname (nginx sends no SNI for an IP literal, and an IP
             # endpoint only verifies when its certificate names it)
             "ssl_name": nhost.strip("[]"), "host_header": m.group(1).lower() + (f":{m.group(2)}" if m.group(2) else ""),
@@ -74,6 +86,6 @@ def norm_storage_origin(origin) -> dict | None:
 def storage_log_repr(origin) -> str:
     """repr() of a host's origin for log lines, the storage read token (referer) masked."""
     if isinstance(origin, dict) and isinstance(origin.get("storage"), dict):
-        origin = dict(origin, storage={k: ("<redacted>" if k == "referer" else v)
+        origin = dict(origin, storage={k: ("<redacted>" if k in ("referer", "link_key") else v)
                                        for k, v in origin["storage"].items()})
     return repr(origin)

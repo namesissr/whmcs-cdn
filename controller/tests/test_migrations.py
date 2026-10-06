@@ -90,8 +90,9 @@ def test_baseline_is_the_pre_migration_schema(any_engine):
             "rollout_edges", "edge_join_tokens", "provision_proposals"} <= tables, diff
     # 0017: weighted / controller-checked DNS records (SPEC §16.7); 0018: records.storage_bucket
     record_added = sorted(d[3].name for d in flat if d[0] == "add_column" and d[2] == "records")
+    # 0024: records.storage_signed (SPEC §16.8 signed file links)
     assert record_added == ["health_at", "health_error", "health_fail", "health_ms", "health_ok", "health_path",
-                            "health_protocol", "storage_bucket", "weight"], diff
+                            "health_protocol", "storage_bucket", "storage_signed", "weight"], diff
     # 0002: sites.secret String(64) -> Text
     assert any(d[0] == "modify_type" and d[2:4] == ("sites", "secret") for d in flat), diff
     # nothing else changed between 0001 and head

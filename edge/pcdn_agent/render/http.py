@@ -226,6 +226,14 @@ def render_gates(cfg: dict, wr: bool, access: bool) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_file_links() -> str:
+    """http-level part of SPEC §16.8 signed file links, appended only while some site hands out a
+    bucket by signed link (other nodes keep a byte-identical http.conf). js_var: a storage host's
+    server block sets the key from its 0600 conf, so the key never reaches sites.js."""
+    return ("\n# signed file links (SPEC §16.8) - pcdn.js fileLink\n"
+            "js_var $pcdn_flink_key;\njs_set $pcdn_flink pcdn.fileLink;\n")
+
+
 def render_resizer(cfg: dict) -> str:
     """The loopback image server block of http.conf (SPEC §2 resize, §16.6 images v2).
 

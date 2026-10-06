@@ -136,6 +136,38 @@ start at all.
 - Docs: STORAGE.md rewritten (setup, policy, backup, upgrade, troubleshooting, and §11 on the MinIO
   path and how to migrate off it), SPEC §16.8, UPGRADE, `.env.example`.
 
+### Added — download links on the customer's own domain
+
+A download link used to carry the storage endpoint's address, which is the platform's hostname rather
+than the customer's. A record whose origin is a bucket can now be switched to «فقط با لینک امضاشده»
+(`storage_signed`, migration `0024`, default off so nothing changes for a bucket that serves a site):
+the edges then serve that bucket only to a link the controller signed, so the link is
+`https://files.example.com/<key>?e=<expiry>&s=<signature>` and nothing of the storage server shows in
+it. Anything without a valid, unexpired signature gets a 403 before the storage server is asked at
+all, which also makes a bucket shareable without being public.
+
+- Edge: njs `fileLink` verifies `s` against the host, the decoded path and `e`
+  (HMAC-SHA256 truncated to 128 bits, constant-time compare), and the storage location answers 403
+  when it does not match. The key lives beside the bucket's read token in the 0600 `storage/<sid>.conf`
+  — never in `sites.js` (0644), a response or a log line — and is derived from that token rather than
+  being it. Such a host is dropped (with a warning) on a node without njs instead of serving the
+  bucket to everyone, and its cache key ignores the query, so ten links to one file are one cache
+  entry.
+- Controller: `POST .../objects/download` answers with that link and `"kind": "cdn"` when the bucket's
+  record is in that mode, and the presigned storage URL (`"kind": "storage"`) otherwise — which is all
+  a bucket without a CDN record has. A signed-only bucket reports no `public_url`/`public_base`, since
+  it no longer has a permanent address; the listing adds `link_host` and `signed_only` so the panel can
+  say where a link will point. The customer's own «کلید جدید» deliberately does not break links they
+  have already shared.
+- WHMCS: a switch on the record form (DNS section) and the link dialog saying which domain the link is
+  on, with the «ساخت زیردامنه» shortcut when the bucket has no record yet. English strings included.
+- Tests: the whole gate against real nginx + njs (unsigned, expired, another host's or key's
+  signature, a signature moved to another path, truncated and non-hex — each a 403 with no fetch; one
+  cache entry across signatures; the key absent from every readable file), the edge's validation of
+  the pair and the njs-less drop, and the controller's link shape, signature, edge config and mode
+  changes.
+- Docs: STORAGE.md §4 (the link, the key, cache and revocation), SPEC §16.8.
+
 ### Added — the storage server's capacity in the admin dashboard
 
 A card «فضای ذخیره‌سازی (سرور S3)» showing three numbers that differ on purpose: the server's own

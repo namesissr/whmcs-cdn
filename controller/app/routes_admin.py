@@ -233,6 +233,9 @@ class RecordIn(BaseModel):
     health_path: str | None = Field(default=None, max_length=512, pattern=r"^/[^\s\"'<>\\]*$")
     # SPEC §16.8 origin shortcut: serve this proxied record from the site's storage bucket <name>
     storage: str | None = Field(default=None, max_length=63, pattern=r"^[a-z0-9-]{1,63}$")
+    # SPEC §16.8: with `storage`, hand the bucket's files out only to a signed link (the edges answer
+    # 403 to anything else). Leave it off for a bucket that serves a website.
+    storage_signed: bool = False
 
 
 class PurgeIn(BaseModel):
@@ -836,6 +839,8 @@ def _url_host(url: str) -> str:
 def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> dict:
     name = normalize_name(body.name, site.domain)
     rtype_in, content_in = body.type, body.content
+    if body.storage_signed and not body.storage:
+        raise ValidationError("«فقط با لینک امضاشده» تنها برای رکوردی با مبدأ فضای ذخیره‌سازی معنا دارد")
     if body.storage:
         rtype_in, content_in = _storage_origin(site, body)
     rtype, content, prio, proxied = validate_record(rtype_in, content_in, body.priority, body.proxied)
@@ -872,6 +877,7 @@ def _record_from(site: Site, body: RecordIn, exclude_id: int | None = None) -> d
         "name": name, "type": rtype, "content": content, "priority": prio, "proxied": proxied, "ttl": body.ttl,
         "pool": pool,
         "storage_bucket": body.storage if proxied else None,
+        "storage_signed": bool(body.storage_signed) and bool(body.storage) and proxied,
         "origin_port": body.origin_port if proxied and not pool and not body.storage else None,
         "health_check": health,
         "health_port": body.health_port if health else None,

@@ -4208,5 +4208,13 @@ window.PCDN_I18N_EN = {
   'ساعات سکوت معتبر نیست (شروع و پایان باید متفاوت باشند).': 'The quiet hours are not valid (start and end must differ).',
   'ارسال پیامک ممکن نشد؛ کمی بعد دوباره تلاش کنید.': 'The text message could not be sent; try again a little later.',
   'کد منقضی شده است؛ کد تازه بگیرید.': 'The code has expired; request a new one.',
-  'کلید یا دامنه معتبر نیست؛ دوباره بررسی کنید.': 'The key or domain is not valid; check them again.'
+  'کلید یا دامنه معتبر نیست؛ دوباره بررسی کنید.': 'The key or domain is not valid; check them again.',
+  // SPEC §16.8 signed file links on the customer's own host (storage.js, fm.js)
+  'فقط با لینک امضاشده': 'Signed links only',
+  'فایل‌ها فقط با لینکی که در «مدیریت فایل‌ها» می‌سازید باز می‌شوند و لینک تاریخ انقضا دارد؛ بدون لینک معتبر پاسخ ۴۰۳ است. برای باکتی که فایل‌های سایت (تصویر، CSS، ویدیوی عمومی) را سرو می‌کند روشن نکنید.': 'Files open only through a link you create in the file manager, and that link expires; anything else gets a 403. Leave it off for a bucket that serves your site\'s own files (images, CSS, public video).',
+  'لینک موقت روی دامنهٔ خودتان ساخته می‌شود: ': 'Temporary links are built on your own domain: ',
+  ' — این باکت بدون لینک معتبر باز نمی‌شود، پس لینک دائمی ندارد.': ' — this bucket opens only with a valid link, so it has no permanent address.',
+  'لینک‌ها روی دامنهٔ خودتان ساخته می‌شوند اگر این باکت مبدأ یک زیردامنه باشد (مثلاً ': 'Links are built on your own domain once this bucket is the origin of a subdomain (for example ',
+  '). تا آن زمان لینک موقت از نشانی فضای ذخیره‌سازی ساخته می‌شود.': '). Until then a temporary link uses the storage endpoint\'s address.',
+  ' از لبه‌های CDN و روی دامنهٔ خودتان تحویل داده می‌شود.': ' It is served from the CDN edges on your own domain.'
 };

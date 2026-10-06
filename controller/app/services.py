@@ -398,8 +398,10 @@ def record_to_dict(r) -> dict:
         "id": r.id, "name": r.name, "type": r.type, "content": r.content,
         "ttl": r.ttl, "priority": r.priority, "proxied": r.proxied,
         "pool": r.pool, "origin_port": r.origin_port,
-        # SPEC §16.8: origin shortcut to one of the site's storage buckets (its short name)
+        # SPEC §16.8: origin shortcut to one of the site's storage buckets (its short name), and
+        # whether that bucket is served by signed link only
         "storage": r.storage_bucket,
+        "storage_signed": bool(r.storage_signed) if r.storage_bucket else False,
         "health_check": r.health_check, "health_port": r.health_port,
         # SPEC §16.7: weighted / failover sets and the controller's probe of non-proxied records
         "weight": r.weight, "health_protocol": r.health_protocol, "health_path": r.health_path,
@@ -520,7 +522,7 @@ def build_edge_config(db: Session, edge: Edge | None = None) -> dict:
                 if b is None:
                     continue
                 try:
-                    origin = {"storage": storage.edge_origin(b)}
+                    origin = {"storage": storage.edge_origin(b, bool(r.storage_signed))}
                 except crypto.CryptoError:  # unreadable token (key lost): this host only
                     continue
             elif r.pool:

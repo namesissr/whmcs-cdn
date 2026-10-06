@@ -8,7 +8,8 @@ from ..reload import CONFVER_MARKER, tree_digest
 from ..settings import asset
 from ..validation.rules import norm_bot_ranges, norm_origin_pull
 from ..capabilities import has_module
-from .http import TICKET_FILES, norm_node, norm_tickets, render_bots, render_gates, render_http, render_mtls_resizer
+from .http import (TICKET_FILES, norm_node, norm_tickets, render_bots, render_file_links, render_gates,
+                   render_http, render_mtls_resizer)
 from .probe import render_probe
 from .shield import norm_shield, render_shield
 from .site import _render_site, render_edge_auth
@@ -27,11 +28,13 @@ def render_all(config: dict, cfg: dict) -> dict:
     platform = norm_origin_pull(config)   # node-wide platform client certificate (SPEC §14.2)
     platform_pair = (platform["cert"], platform["key"]) if platform else None
     resizer_pairs, platform_used, fn_any, sto_fetch = {}, False, False, False
+    flink_any = False   # SPEC §16.8: some site serves a bucket by signed link only
     node = norm_node(config, cfg)
     for site in config.get("sites", []):
         text, extra, js, meta = _render_site(site, cfg, shield, platform_pair, node)
         fn_any = fn_any or bool(meta.get("functions"))
         sto_fetch = sto_fetch or bool(meta.get("storage_fetch"))
+        flink_any = flink_any or bool(meta.get("file_links"))
         files[f"sites/{int(site['id'])}.conf"] = text
         files.update(extra)
         platform_used = platform_used or meta.get("mtls_platform")
@@ -72,6 +75,8 @@ def render_all(config: dict, cfg: dict) -> dict:
         files["http.conf"] += ("\n# object-storage origins for the image resizer (SPEC §16.8): unknown hosts\nserver {\n"
                                f"    listen 127.0.0.1:{_int(cfg.get('STORAGE_FETCH_PORT'), 8091, 1, 65535)} "
                                "default_server;\n    server_name _;\n    access_log off;\n    return 404;\n}\n")
+    if flink_any:   # SPEC §16.8: the variables pcdn.fileLink answers through
+        files["http.conf"] += render_file_links()
     # SPEC §18.1 / §18.2 visitor gates: http-level dict / variables, the controller token for the OTP
     # hop (0600, nginx master only); only while some site uses them and the node has njs
     wr_any = any("waiting_room" in j for j in js_sites.values())

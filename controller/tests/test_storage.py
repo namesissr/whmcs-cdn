@@ -705,3 +705,88 @@ def test_real_minio(client, real_minio):
     MinioClient(url, rot["access_key"], rot["secret_key"])._call("DELETE", f"/{c['bucket']}/hello.txt")
     assert client.delete(f"{S}/storage/buckets/assets").status_code == 200
     assert not storage.client().bucket_exists(c["bucket"])
+
+
+def test_signed_file_links_on_the_customers_own_host(client, minio):
+    """SPEC §16.8: a record may hand its bucket out by signed link only, so a download link is on the
+    customer's own domain and the storage endpoint never appears in it."""
+    import hashlib
+    import hmac as _hmac
+    from urllib.parse import parse_qs, urlparse
+
+    make_site(client, storage_gb=1)
+    activate()
+    token = online_edge(client)
+    b = client.post(f"{S}/storage/buckets", json={"name": "files"}).json()
+    base = f"{S}/storage/buckets/files/objects"
+
+    # the flag means nothing without a storage origin
+    r = client.post(f"{S}/records", json={"name": "x", "type": "A", "content": "93.184.216.34",
+                                          "proxied": True, "storage_signed": True})
+    assert r.status_code == 422 and "لینک امضاشده" in r.json()["detail"]
+
+    # without a record the only address the bucket has is the storage endpoint's
+    dl = client.post(f"{base}/download", json={"key": "docs/a.pdf"}).json()
+    assert dl["kind"] == "storage" and dl["url"].startswith(ENDPOINT) and dl["public_url"] is None
+
+    # a public storage record: a permanent link on the customer's host, and the temporary one stays
+    # a presigned storage URL (there is nothing to expire — the file is public at that address)
+    rec = client.post(f"{S}/records", json={"name": "pub", "type": "CNAME", "proxied": True,
+                                            "storage": "files"})
+    assert rec.status_code == 201 and rec.json()["storage_signed"] is False
+    dl = client.post(f"{base}/download", json={"key": "docs/a.pdf"}).json()
+    assert dl["kind"] == "storage" and dl["public_url"] == "https://pub.example.com/docs/a.pdf"
+
+    # turn the record to signed links only
+    rid = rec.json()["id"]
+    up = client.put(f"{S}/records/{rid}", json={"name": "pub", "type": "CNAME", "proxied": True,
+                                               "storage": "files", "storage_signed": True})
+    assert up.status_code == 200 and up.json()["storage_signed"] is True
+
+    dl = client.post(f"{base}/download", json={"key": "docs/a b.pdf", "expires_in": 600}).json()
+    assert dl["kind"] == "cdn" and dl["expires_in"] == 600
+    u = urlparse(dl["url"])
+    assert (u.scheme, u.netloc, u.path) == ("https", "pub.example.com", "/docs/a%20b.pdf")
+    assert ENDPOINT not in dl["url"] and "s3" not in u.netloc
+    # there is no permanent address any more, and the listing stops offering one
+    assert dl["public_url"] is None
+    assert client.get(base).json()["public_base"] is None
+
+    # the signature is exactly what the edges verify (edge/njs/pcdn.js fileLink)
+    q = parse_qs(u.query)
+    with SessionLocal() as db:
+        row = db.scalar(select(StorageBucket))
+        key = storage.link_key(row)
+        origin_token = row.origin_token
+    want = _hmac.new(key.encode(), f"f|pub.example.com|/docs/a b.pdf|{q['e'][0]}".encode(),
+                     hashlib.sha256).hexdigest()[:32]
+    assert q["s"][0] == want and len(q["s"][0]) == 32
+    # and it is derived from the bucket's read token rather than being it
+    assert key != origin_token and origin_token not in dl["url"]
+
+    # the edges learn the mode and the key with the origin, and the key is not the token
+    cfg = edge_get(client, token, "/edge/v1/config").json()
+    o = {h["name"]: h["origin"] for h in cfg["sites"][0]["hosts"]}["pub.example.com"]["storage"]
+    assert o["signed"] is True and o["link_key"] == key and o["referer"] == origin_token
+
+    # the customer's own key rotation does NOT break links they have already shared: the link key
+    # follows the bucket's read token, not the access key
+    client.post(f"{S}/storage/buckets/files/rotate-key")
+    with SessionLocal() as db:
+        row = db.scalar(select(StorageBucket))
+        assert storage.link_key(row) == key and row.access_key != b["access_key"]
+    # a new read token is what ends every link at once
+    with SessionLocal() as db:
+        row = db.scalar(select(StorageBucket))
+        row.origin_token = "0" * 48
+        db.commit()
+        assert storage.link_key(row) != key
+
+    # back to public: the permanent link returns
+    client.put(f"{S}/records/{rid}", json={"name": "pub", "type": "CNAME", "proxied": True,
+                                           "storage": "files", "storage_signed": False})
+    dl = client.post(f"{base}/download", json={"key": "docs/a.pdf"}).json()
+    assert dl["kind"] == "storage" and dl["public_url"] == "https://pub.example.com/docs/a.pdf"
+    o = {h["name"]: h["origin"] for h in edge_get(client, token, "/edge/v1/config").json()["sites"][0]["hosts"]
+         }["pub.example.com"]["storage"]
+    assert "signed" not in o and "link_key" not in o

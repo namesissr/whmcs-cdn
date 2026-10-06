@@ -366,12 +366,20 @@
       redraw();
     }, help: r.storage ? t('فایل‌ها از باکت تحویل داده می‌شوند. «مقدار» را می‌توانید خالی بگذارید (یک CNAME به نشانی فضای ذخیره‌سازی ثبت می‌شود)؛ برای ریشهٔ دامنه (@) نوع A با یک آی‌پی عمومی بدهید.')
       : t('برای تحویل فایل‌های یک باکت از CDN، باکت را انتخاب کنید.') }));
+    // SPEC §16.8: the same bucket, but handed out only through a link this panel builds — so a
+    // download address is on the customer's own domain without the bucket being public.
+    if (r.storage) {
+      box.appendChild(P.toggle(r, 'storage_signed', t('فقط با لینک امضاشده'), {
+        help: t('فایل‌ها فقط با لینکی که در «مدیریت فایل‌ها» می‌سازید باز می‌شوند و لینک تاریخ انقضا دارد؛ بدون لینک معتبر پاسخ ۴۰۳ است. برای باکتی که فایل‌های سایت (تصویر، CSS، ویدیوی عمومی) را سرو می‌کند روشن نکنید.')
+      }));
+    }
     return box;
   }
   /** Adds `storage` to a record body only when set (a proxied record with a bucket origin). */
   function recordBodyExtra(r, b) {
     if (b.proxied && r.storage) {
       b.storage = String(r.storage);
+      b.storage_signed = !!r.storage_signed;
       b.pool = null;
       b.origin_port = null;
     }
