@@ -516,7 +516,6 @@ def test_real_seaweed_file_manager(client, real_seaweed):
     """The whole file-manager flow against a real server: list, presigned upload and download,
     folders, rename, multipart and delete — the browser's half done with plain HTTP, as a browser
     would, so a signature or CORS mistake fails here rather than in a customer's panel."""
-    url = real_seaweed
     make_site(client, storage_gb=1)
     bucket = client.post(f"{S}/storage/buckets", json={"name": "assets"})
     assert bucket.status_code == 201, bucket.text
