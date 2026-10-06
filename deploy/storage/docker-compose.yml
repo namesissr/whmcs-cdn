@@ -1,30 +1,59 @@
-# Pasargad CDN — object storage, single node (SPEC §16.8, docs/STORAGE.md)
+# Pasargad CDN — object storage on SeaweedFS (SPEC §16.8, docs/STORAGE.md)
 #   cp .env.example .env && edit && docker compose up -d && ./bootstrap.sh
-# Four disks with erasure coding instead:  docker compose -f docker-compose.erasure.yml up -d
-# One node keeps ONE copy of every object: use RAID below it or the erasure variant, and backups.
+#
+# One container runs master + volume + filer + S3 gateway (`weed server`), which is the supported
+# single-node layout; a second data server is added later by pointing a `weed volume` at this
+# master. MinIO's kit (now unusable: its community images were removed from Docker Hub in September
+# 2026 and the project was archived) is kept under minio/ for servers that still run it.
+#
+# One copy of every object: put RAID1/RAID10 under SEAWEED_DATA_DIR, and take backups (docs §7).
 
 services:
-  minio:
-    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+  seaweedfs:
+    image: ${SEAWEED_IMAGE:-chrislusf/seaweedfs:4.48}
     restart: unless-stopped
-    command: ["server", "/data"]
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
-      MINIO_SERVER_URL: https://${STORAGE_DOMAIN:?set STORAGE_DOMAIN in .env}
-      MINIO_SITE_REGION: ${MINIO_REGION:-us-east-1}
-      MINIO_BROWSER: "off"
+    # -s3.iam.readOnly=false: the controller creates each customer's access key over the IAM API
+    #   (it defaults to true, which answers every IAM write with 403).
+    # -volume.max=0: the number of volumes is free disk / VOLUME_SIZE_MB instead of the default 8.
+    #   Every bucket is its own collection with its own volumes, so the default would cap the whole
+    #   server at a handful of buckets ("No writable volumes and no free volumes left").
+    # -master.volumeSizeLimitMB: smaller volumes mean more buckets fit in the same free space; 1 GiB
+    #   suits customer buckets (raise it for few, huge buckets).
+    command: >
+      server
+      -dir=/data
+      -ip=seaweedfs
+      -master.port=9333
+      -master.volumeSizeLimitMB=${VOLUME_SIZE_MB:-1024}
+      -volume.port=8080
+      -volume.max=0
+      -filer
+      -filer.port=8888
+      -s3
+      -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
+      -s3.iam.readOnly=false
+      -s3.allowDeleteBucketNotEmpty=false
+      -s3.port.iceberg=0
+      -s3.port.lance=0
+      -metricsPort=9327
+    # No -s3.domainName: buckets are addressed path-style (https://<domain>/<bucket>/<key>), which
+    # one certificate covers. Virtual-host style would need a wildcard certificate for *.<domain>.
     volumes:
-      - ${MINIO_DATA_DIR:-./data}:/data
-    # not published: only Caddy (same network) talks to MinIO
+      - ${SEAWEED_DATA_DIR:-/srv/seaweedfs/data}:/data
+      # written by bootstrap.sh: the operator admin identity and the controller's scoped identity.
+      # Customer identities are NOT here — the controller creates them over the IAM API and the
+      # server keeps them in the filer, so they survive a restart and are never in a file on disk.
+      - ./s3.json:/etc/seaweedfs/s3.json:ro
     expose:
-      - "9000"
+      - "8333"   # S3 (through Caddy only)
+      - "9327"   # Prometheus metrics (through Caddy, controller addresses only)
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9333/healthz"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 30s
 
   caddy:
     image: caddy:2-alpine
@@ -41,27 +70,7 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     depends_on:
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-  # one-off admin shell with the root credentials (bootstrap, quota checks, `mc admin` maintenance):
-  #   docker compose --profile tools run --rm mc
-  mc:
-    image: ${MC_IMAGE:-minio/mc:latest}
-    profiles: ["tools"]
-    restart: "no"
-    environment:
-      MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
-    volumes:
-      - ./pcdn-controller-policy.json:/policy/pcdn-controller-policy.json:ro
-    entrypoint: ["/bin/sh"]
-    depends_on:
-      - minio
+      - seaweedfs
 
 volumes:
   caddy-data:

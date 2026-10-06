@@ -276,10 +276,21 @@ class Settings:
     record_probe_timeout: float = field(default_factory=lambda: float(os.getenv("RECORD_PROBE_TIMEOUT") or 5))
 
     # SPEC §16.8 object storage (docs/STORAGE.md). STORAGE_ENDPOINT: the https URL the controller
-    # reaches MinIO on (operator config, trusted); STORAGE_PUBLIC_ENDPOINT: what customers' S3 tools
-    # and the edges use (default: the same). The admin pair is a MinIO user with the policy in
-    # deploy/storage/pcdn-controller-policy.json — never the MinIO root credentials. Empty endpoint or
-    # keys = the storage product is off (the storage routes answer 503).
+    # reaches the storage server on (operator config, trusted); STORAGE_PUBLIC_ENDPOINT: what
+    # customers' S3 tools and the edges use (default: the same). The admin pair is the storage
+    # server's scoped controller identity (deploy/storage/bootstrap.sh) — never its root/admin
+    # credentials. Empty endpoint or keys = the storage product is off (storage routes answer 503).
+    # STORAGE_BACKEND picks the server: seaweedfs (deploy/storage, the default for a new install) or
+    # minio for an existing MinIO/AIStor server. It only changes the operator-side calls (quota,
+    # customer keys, usage); the S3 data plane is the same.
+    storage_backend: str = field(
+        default_factory=lambda: (os.getenv("STORAGE_BACKEND") or "minio").strip().lower())
+    # where the SeaweedFS S3 gateway's Prometheus metrics (the per-bucket usage gauges) are read
+    # from: a path on STORAGE_ENDPOINT that the storage server proxies to the metrics port for the
+    # controller's address only (deploy/storage/Caddyfile), or a full http(s) URL of that port on a
+    # private network. seaweedfs backend only.
+    storage_metrics_path: str = field(
+        default_factory=lambda: (os.getenv("STORAGE_METRICS_PATH") or "/__pcdn/storage-metrics").strip())
     storage_endpoint: str = field(default_factory=lambda: os.getenv("STORAGE_ENDPOINT", "").strip().rstrip("/"))
     storage_public_endpoint: str = field(
         default_factory=lambda: (os.getenv("STORAGE_PUBLIC_ENDPOINT") or os.getenv("STORAGE_ENDPOINT", "")
@@ -289,12 +300,12 @@ class Settings:
         default_factory=lambda: (os.getenv("STORAGE_ADMIN_SECRET_KEY") or os.getenv("STORAGE_ADMIN_SECRET", "")).strip())
     storage_region: str = field(default_factory=lambda: (os.getenv("STORAGE_REGION") or "us-east-1").strip())
     # global bucket name = prefix + per-site tag + "-" + name; MUST match the Resource of the
-    # controller's MinIO policy (arn:aws:s3:::cdn-*)
+    # controller identity's policy on the storage server (arn:aws:s3:::cdn-*)
     storage_bucket_prefix: str = field(
         default_factory=lambda: (os.getenv("STORAGE_BUCKET_PREFIX") or "cdn-").strip().lower())
     storage_max_buckets: int = field(
         default_factory=lambda: min(100, max(1, int(os.getenv("STORAGE_MAX_BUCKETS") or 10))))
-    # only for a MinIO on a private network without TLS (never over the internet): allow http://
+    # only for a storage server on a private network without TLS (never over the internet): allow http://
     storage_insecure_http: bool = field(default_factory=lambda: _bool("STORAGE_INSECURE_HTTP", False))
 
     # SPEC §16.9 edge functions: total UTF-8 code of one site's `functions` section (every item,

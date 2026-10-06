@@ -1,0 +1,68 @@
+# Pasargad CDN — object storage, single node (SPEC §16.8, docs/STORAGE.md)
+#   cp .env.example .env && edit && docker compose up -d && ./bootstrap.sh
+# Four disks with erasure coding instead:  docker compose -f docker-compose.erasure.yml up -d
+# One node keeps ONE copy of every object: use RAID below it or the erasure variant, and backups.
+
+services:
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    restart: unless-stopped
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_SERVER_URL: https://${STORAGE_DOMAIN:?set STORAGE_DOMAIN in .env}
+      MINIO_SITE_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_BROWSER: "off"
+    volumes:
+      - ${MINIO_DATA_DIR:-./data}:/data
+    # not published: only Caddy (same network) talks to MinIO
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      STORAGE_DOMAIN: ${STORAGE_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      ADMIN_ALLOW_IPS: ${ADMIN_ALLOW_IPS:-127.0.0.1/32}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # one-off admin shell with the root credentials (bootstrap, quota checks, `mc admin` maintenance):
+  #   docker compose --profile tools run --rm mc
+  mc:
+    image: ${MC_IMAGE:-minio/mc:latest}
+    profiles: ["tools"]
+    restart: "no"
+    environment:
+      MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
+    volumes:
+      - ./pcdn-controller-policy.json:/policy/pcdn-controller-policy.json:ro
+    entrypoint: ["/bin/sh"]
+    depends_on:
+      - minio
+
+volumes:
+  caddy-data:
+  caddy-config:

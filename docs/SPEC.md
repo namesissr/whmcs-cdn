@@ -1185,10 +1185,20 @@ Unsupported features degrade gracefully (serve original).
   and `allow_axfr: [ip]` to let the customer's own secondary transfer from us (with TSIG).
 
 ### 16.8 Object storage
-`deploy/storage/`: docker-compose for MinIO (single node or 4-disk erasure), Caddy TLS, behind the
-CDN as an origin type. Controller: plan feature `storage_gb` (0 = none); `POST /api/v1/sites/{d}/
-storage/buckets {name}` creates a bucket + scoped access key via the MinIO admin API (secret shown
-once, stored encrypted), `GET` lists buckets with usage, `DELETE` (only empty). Usage collected
+`deploy/storage/`: docker-compose for the storage server, Caddy TLS, behind the CDN as an origin
+type. The server is **SeaweedFS** (`STORAGE_BACKEND=seaweedfs`, `app/seaweed_client.py`): MinIO's
+community images were removed from Docker Hub in September 2026 and its repository was archived in
+February 2026, so the MinIO kit (kept under `deploy/storage/minio/`, `STORAGE_BACKEND=minio`,
+`app/minio_client.py`) only serves servers that already run it. Both backends share the S3 data
+plane and the same client interface; they differ in three operator calls — bucket quota
+(`PUT /{bucket}?seaweedfs-quota` vs `admin/v3/set-bucket-quota`), a customer's access key (IAM
+CreateUser + PutUserPolicy + CreateAccessKey, the server keeping it in the filer, vs a madmin
+service account) and usage (the gateway's per-bucket Prometheus gauges, read over
+`STORAGE_METRICS_PATH`, vs `admin/v3/datausageinfo`). SeaweedFS names two multipart actions
+differently (`ListMultipartUploads` / `ListParts`), which the client translates. Controller: plan
+feature `storage_gb` (0 = none); `POST /api/v1/sites/{d}/storage/buckets {name}` creates a bucket +
+scoped access key (secret shown once, stored encrypted), `GET` lists buckets with usage, `DELETE`
+(only empty). Usage collected
 hourly and billed via WHMCS (GB-month). A record/origin shortcut `origin: {storage: "<bucket>"}`
 makes a bucket a CDN origin. Customer app page «فضای ذخیره‌سازی».
 

@@ -637,7 +637,7 @@ def real_minio(monkeypatch):
                 pass
             time.sleep(0.1)
         root = MinioClient(url, "rootadmin", "rootpassword-123")
-        policy_file = os.path.join(os.path.dirname(__file__), "..", "..", "deploy", "storage",
+        policy_file = os.path.join(os.path.dirname(__file__), "..", "..", "deploy", "storage", "minio",
                                    "pcdn-controller-policy.json")
         root.add_canned_policy("pcdn-controller", json.load(open(policy_file)))
         root.add_user(ADMIN_AK, ADMIN_SK)

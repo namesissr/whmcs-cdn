@@ -107,6 +107,35 @@ DNS, rollouts or provisioning — enforced by an import test).
 - Docs: API, OPERATIONS (§۱۰), MONITORING, SECURITY (§۱۲), UPGRADE («۱۲) موج ۱۴ — انتشار ایمن، عملیات و
   تجربهٔ مشتری»), DISASTER_RECOVERY (weekly restore test), NODES (§۱۴); `.env.example` wave 14 block.
 
+### Changed — object storage moved from MinIO to SeaweedFS
+
+MinIO's community edition was archived (2026-02-13) and its images were removed from Docker Hub
+(2026-09-11), with anonymous pulls from quay.io closed days later, so `deploy/storage` could no longer
+start at all.
+
+- Controller: new `app/seaweed_client.py` behind the same client interface — bucket quota via the
+  `PUT /{bucket}?seaweedfs-quota` extension, a customer's access key via the IAM API on the S3 port
+  (CreateUser + PutUserPolicy + CreateAccessKey with the key pair we generate; the server keeps it in
+  the filer, so it survives restarts), usage from the gateway's per-bucket Prometheus gauges. The two
+  multipart action names SeaweedFS spells differently are translated. `STORAGE_BACKEND`
+  (`seaweedfs`|`minio`, default `minio` so an existing install is not switched by an upgrade) and
+  `STORAGE_METRICS_PATH` are new; `app/minio_client.py` is unchanged apart from a `service` argument
+  on its signer and error parsing that now also reads the IAM API's nested `<Error><Code>`.
+- `deploy/storage/`: SeaweedFS compose (one container: master + volume + filer + S3 gateway), Caddy
+  with the metrics path and the IAM POST limited to the controller's addresses, and a `bootstrap.sh`
+  that writes the operator admin identity plus the scoped `pcdn-controller` identity and prints the
+  controller's credentials once. `-volume.max=0` with a 1 GiB volume size, because every bucket is
+  its own collection and the default of 8 volumes caps the server at a handful of buckets. The MinIO
+  kit moved to `deploy/storage/minio/` for servers that still run it.
+- Staging: the `storage` profile runs SeaweedFS with the same identities (`deploy/staging/seaweed-s3.json`).
+- Tests: `controller/tests/test_storage_seaweed.py` — the quota / IAM / usage calls and the backend
+  switch against a fake server, plus `test_real_seaweed`, which starts a real `weed` binary with the
+  identities `bootstrap.sh` writes (skipped without one: `PCDN_TEST_WEED_BIN` or `weed` on PATH) and
+  runs the whole bucket flow, including that the customer key reaches nothing but its own bucket and
+  that the edges' Referer-conditioned anonymous GET works while listing stays denied.
+- Docs: STORAGE.md rewritten (setup, policy, backup, upgrade, troubleshooting, and §11 on the MinIO
+  path and how to migrate off it), SPEC §16.8, UPGRADE, `.env.example`.
+
 ### Fixed — node stability under memory pressure and a broken nginx pid file
 
 - Edge: a reload that fails while `NGINX_PID_FILE` does not point at a live master (an empty or stale

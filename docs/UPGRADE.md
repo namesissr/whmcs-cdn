@@ -224,8 +224,10 @@ cd /opt/pcdn/edge && sudo ./install.sh --upgrade
 - پروکسی TCP/UDP: `L4_PORT_RANGE=20000-29999` (پیش‌فرض)، `L4_RESERVED_PORTS` (اختیاری).
 - رکوردهای وزن‌دار: `RECORD_PROBE_ENABLED=true`، `RECORD_PROBE_TIMEOUT=5`.
 - Edge Functions: `FUNCTIONS_MAX_SITE_KB=8192` (پیش‌فرض).
-- فضای ذخیره‌سازی: `STORAGE_ENDPOINT`, `STORAGE_ADMIN_ACCESS_KEY`, `STORAGE_ADMIN_SECRET_KEY` و بقیه طبق
-  `docs/STORAGE.md` — اول سرور ذخیره‌سازی را با `deploy/storage` راه بیندازید.
+- فضای ذخیره‌سازی: `STORAGE_BACKEND=seaweedfs`, `STORAGE_ENDPOINT`, `STORAGE_ADMIN_ACCESS_KEY`,
+  `STORAGE_ADMIN_SECRET_KEY` و بقیه طبق `docs/STORAGE.md` — اول سرور ذخیره‌سازی را با `deploy/storage`
+  راه بیندازید. (نصب‌هایی که از قبل MinIO دارند `STORAGE_BACKEND=minio` بگذارند؛ ایمیج‌های جامعهٔ مینیو از
+  Docker Hub حذف شده‌اند، مسیر مهاجرت در `docs/STORAGE.md` بخش ۱۱.)
 - DNS ثانویه: در `dns/pdns.conf` گزینه‌ی `secondary=yes` اضافه شده؛ بعد از `git pull` کانتینر PowerDNS را
   دوباره بالا بیاورید: `docker compose up -d --force-recreate pdns` (نام سرویس را با compose خودتان تطبیق دهید).
 

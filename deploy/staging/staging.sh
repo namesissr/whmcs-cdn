@@ -24,8 +24,9 @@ fi
 
 if [ "${STAGING_STORAGE:-0}" = 1 ]; then
   export STAGING_STORAGE=1
-  export STAGING_STORAGE_ENDPOINT="${STAGING_STORAGE_ENDPOINT:-http://minio:9000}"
-  export STAGING_STORAGE_ACCESS_KEY="${STAGING_STORAGE_ACCESS_KEY:-pcdn-controller}"
+  export STAGING_STORAGE_ENDPOINT="${STAGING_STORAGE_ENDPOINT:-http://seaweedfs:9000}"
+  # must match deploy/staging/seaweed-s3.json (public, staging-only values)
+  export STAGING_STORAGE_ACCESS_KEY="${STAGING_STORAGE_ACCESS_KEY:-STAGINGCONTROLLERKEY}"
   export STAGING_STORAGE_SECRET_KEY="${STAGING_STORAGE_SECRET_KEY:-staging-storage-secret}"
   COMPOSE+=(--profile storage)
 fi

@@ -7,7 +7,7 @@
 # Services: db (PostgreSQL) + controller + pdns (PowerDNS ns1) + origin (HTTP echo, WebSocket/gRPC
 # echo, TCP echo) + runner (provisions the edges through the admin API, then runs pytest) +
 # edge-1 / edge-2 (Ubuntu 24.04, installed by the controller's own one-command installer) and,
-# with --profile storage, MinIO + a one-off MinIO user/policy setup.
+# with --profile storage, a SeaweedFS object-storage server.
 #
 # STAGING ONLY: every key below is a public, fixed test value. Never reuse it anywhere.
 #
@@ -124,6 +124,8 @@ services:
       STORAGE_ENDPOINT: ${STAGING_STORAGE_ENDPOINT:-}
       STORAGE_ADMIN_ACCESS_KEY: ${STAGING_STORAGE_ACCESS_KEY:-}
       STORAGE_ADMIN_SECRET_KEY: ${STAGING_STORAGE_SECRET_KEY:-}
+      STORAGE_BACKEND: ${STAGING_STORAGE_BACKEND:-seaweedfs}
+      STORAGE_METRICS_PATH: ${STAGING_STORAGE_METRICS:-http://seaweedfs:9327/metrics}
       STORAGE_INSECURE_HTTP: "true"
       # SPEC §23.1: /healthz reports the version (staging.sh exports it from VERSION) and /healthz/deep the
       # environment; tools/release/staging-verify.sh refuses any controller reporting "production"
@@ -218,52 +220,26 @@ services:
         ipv4_address: ${STAGING_NET:-11.200.0}.22
 
   # ---- optional: object storage origin (SPEC §16.8) ------------------------------------------
-  minio:
-    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+  # SeaweedFS, the same server and the same scoped controller identity the production kit installs
+  # (deploy/storage/). STAGING ONLY: the keys below are public, fixed test values.
+  seaweedfs:
+    image: ${SEAWEED_IMAGE:-chrislusf/seaweedfs:4.48}
     profiles: ["storage"]
-    command: ["server", "/data"]
-    environment:
-      MINIO_ROOT_USER: staging-minio-root
-      MINIO_ROOT_PASSWORD: staging-minio-root-password
-      MINIO_SITE_REGION: us-east-1
-      MINIO_BROWSER: "off"
+    command: >
+      server -dir=/data -ip=seaweedfs
+      -master.volumeSizeLimitMB=64 -volume.max=20
+      -filer -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -s3.iam.readOnly=false
+      -s3.port.iceberg=0 -s3.port.lance=0 -metricsPort=9327
+    volumes:
+      - ./seaweed-s3.json:/etc/seaweedfs/s3.json:ro
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9333/healthz"]
       interval: 3s
       timeout: 3s
-      retries: 30
+      retries: 40
     networks:
       cdn:
         ipv4_address: ${STAGING_NET:-11.200.0}.90
-
-  # the controller's MinIO user with deploy/storage/pcdn-controller-policy.json (what
-  # deploy/storage/bootstrap.sh does on a real storage server), then idles so `up --wait` sees it healthy
-  minio-init:
-    image: ${MC_IMAGE:-minio/mc:latest}
-    profiles: ["storage"]
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        set -e;
-        mc alias set local http://minio:9000 staging-minio-root staging-minio-root-password;
-        mc admin policy create local pcdn-controller /policy/pcdn-controller-policy.json;
-        mc admin user add local "$$CTRL_USER" "$$CTRL_SECRET";
-        mc admin policy attach local pcdn-controller --user "$$CTRL_USER" || true;
-        touch /tmp/ready; echo storage ready; exec sleep infinity
-    environment:
-      CTRL_USER: ${STAGING_STORAGE_ACCESS_KEY:-pcdn-controller}
-      CTRL_SECRET: ${STAGING_STORAGE_SECRET_KEY:-staging-storage-secret}
-    volumes:
-      - ../storage/pcdn-controller-policy.json:/policy/pcdn-controller-policy.json:ro
-    depends_on:
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "test", "-f", "/tmp/ready"]
-      interval: 2s
-      timeout: 3s
-      retries: 60
-    networks: [cdn]
 
 networks:
   cdn:

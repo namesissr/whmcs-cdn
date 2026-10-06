@@ -126,8 +126,10 @@ def _hmac(key: bytes, msg: str) -> bytes:
 
 
 def sign_v4(method: str, base: httpx.URL, path: str, query: dict[str, str], payload: bytes,
-            access_key: str, secret_key: str, region: str, now: datetime | None = None) -> tuple[str, dict]:
-    """-> (url, headers) of a SigV4-signed request (service s3). `path` is already URI-encoded."""
+            access_key: str, secret_key: str, region: str, now: datetime | None = None,
+            service: str = "s3") -> tuple[str, dict]:
+    """-> (url, headers) of a SigV4-signed request. `path` is already URI-encoded. `service` is the
+    credential scope's service: s3 for the data plane, iam for a SeaweedFS IAM call (§16.8)."""
     now = now or datetime.now(timezone.utc)
     amz_date, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
     host = base.host if ":" not in base.host else f"[{base.host}]"
@@ -139,9 +141,9 @@ def sign_v4(method: str, base: httpx.URL, path: str, query: dict[str, str], payl
     cq = "&".join(f"{_q(k)}={_q(v)}" for k, v in sorted(query.items()))
     canonical = "\n".join([method, path, cq, "".join(f"{k}:{headers[k]}\n" for k in sorted(headers)),
                            signed, payload_hash])
-    scope = f"{day}/{region}/s3/aws4_request"
+    scope = f"{day}/{region}/{service}/aws4_request"
     to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
-    k = _hmac(_hmac(_hmac(_hmac(("AWS4" + secret_key).encode(), day), region), "s3"), "aws4_request")
+    k = _hmac(_hmac(_hmac(_hmac(("AWS4" + secret_key).encode(), day), region), service), "aws4_request")
     sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
     out = {"x-amz-content-sha256": payload_hash, "x-amz-date": amz_date,
            "Authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
@@ -182,10 +184,11 @@ class MinioClient:
     # -- transport
 
     def _call(self, method: str, path: str, query: dict | None = None, body: bytes = b"",
-              ok: tuple[int, ...] = (200, 204), headers: dict | None = None) -> httpx.Response:
+              ok: tuple[int, ...] = (200, 204), headers: dict | None = None,
+              service: str = "s3") -> httpx.Response:
         full = self.prefix + path
         url, h = sign_v4(method, self.base, full, query or {}, body, self.access_key, self.secret_key,
-                         self.region)
+                         self.region, service=service)
         if headers:
             h.update(headers)
         try:
@@ -302,6 +305,13 @@ def _error_of(r: httpx.Response) -> tuple[str | None, str | None]:
         pass
     try:
         root = ElementTree.fromstring(text)
-        return root.findtext("Code"), (root.findtext("Message") or "")[:300]
     except ElementTree.ParseError:
         return None, text[:200]
+    # S3 puts Code/Message at the top level, the IAM API nests them in <Error> under a default
+    # xmlns, so match on the local name anywhere in the document
+    found = {}
+    for el in root.iter():
+        local = el.tag.split("}")[-1]
+        if local in ("Code", "Message") and local not in found and (el.text or "").strip():
+            found[local] = el.text.strip()
+    return found.get("Code"), (found.get("Message") or "")[:300]

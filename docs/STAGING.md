@@ -205,7 +205,7 @@ STAGING_STORAGE=1 deploy/staging/staging.sh down
 ```
 
 با `STAGING_STORAGE=1` اسکریپت پروفایل `storage` را فعال می‌کند (MinIO + `minio-init` که کاربر کنترلر را با
-`deploy/storage/pcdn-controller-policy.json` می‌سازد — همان کاری که `deploy/storage/bootstrap.sh` روی سرور
+`deploy/storage/minio/pcdn-controller-policy.json` می‌سازد — همان کاری که `deploy/storage/minio/bootstrap.sh` روی سرور
 واقعی انجام می‌دهد) و `STORAGE_ENDPOINT=http://minio:9000` را با `STORAGE_INSECURE_HTTP=true` به کنترلر
 می‌دهد. L4 پروفایل جدایی ندارد چون nginx نود ماژول stream را دارد.
 

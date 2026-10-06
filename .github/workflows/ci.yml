@@ -191,6 +191,12 @@ jobs:
       - run: sh -n deploy/monitoring/render-config.sh && sh -n deploy/status/mirror.sh
       - run: docker compose -f deploy/monitoring/docker-compose.yml --env-file deploy/monitoring/.env.example config -q
       - run: docker compose -f deploy/status/docker-compose.yml --env-file deploy/status/.env.example config -q
+      # SPEC §16.8: the object-storage kit and the staging stack that mirrors it
+      - run: docker compose -f deploy/storage/docker-compose.yml --env-file deploy/storage/.env.example config -q
+      - run: docker compose -f deploy/storage/minio/docker-compose.yml --env-file deploy/storage/minio/.env.example config -q
+      - run: docker compose -f deploy/staging/compose.yml config -q
+      - run: sh -n deploy/storage/bootstrap.sh && shellcheck -s sh deploy/storage/bootstrap.sh
+      - run: python3 -c "import json; json.load(open('deploy/staging/seaweed-s3.json'))"
       - run: pip install -r docs-site/requirements.txt && mkdocs build --strict
 
   # release metadata (SPEC §23.1): VERSION is SemVer, CHANGELOG has [Unreleased], the edge release bundle

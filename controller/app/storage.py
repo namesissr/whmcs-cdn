@@ -1,16 +1,17 @@
 """Object storage product (SPEC §16.8, docs/STORAGE.md).
 
-The platform runs one MinIO deployment (deploy/storage/). The controller manages it with a MinIO
-user whose policy only allows bucket quota + data usage (admin) and s3:* on `cdn-*` buckets
-(deploy/storage/pcdn-controller-policy.json) — never the root credentials. Per customer bucket:
+The platform runs one storage deployment (deploy/storage/): SeaweedFS by default, or MinIO / AIStor
+on a server that already runs it (STORAGE_BACKEND; seaweed_client.py / minio_client.py, same
+interface). Either way the controller holds a scoped identity whose policy allows only s3:* on
+`cdn-*` buckets plus the calls that manage a customer's key and quota — never the admin or root
+credentials. Per customer bucket:
 
 * the bucket itself, named STORAGE_BUCKET_PREFIX + a random per-site tag + "-" + the customer's name
-  (globally unique on MinIO; the tag also keeps a reused site id away from a leftover bucket);
-* a MinIO *service account* (access key) owned by the controller's user, with an inline policy
-  limited to that one bucket. MinIO evaluates it as (parent policy ∩ inline policy), and a user may
-  create / delete its own service accounts without any admin permission — so the controller needs no
-  admin:CreateUser / CreatePolicy / AttachPolicy / UpdateServiceAccount (which would let it mint
-  credentials for other users, root included). Key rotation = new service account + delete old;
+  (globally unique on the server; the tag also keeps a reused site id away from a leftover bucket);
+* an access key limited to that one bucket by an inline policy: on SeaweedFS an IAM user named after
+  the key (the server keeps it in the filer), on MinIO a service account owned by the controller's
+  user, which MinIO evaluates as (parent policy ∩ inline policy). Neither needs a permission that
+  could mint credentials for another identity. Key rotation = new key + delete old;
 * a hard bucket quota: the bucket's own size + the site's remaining headroom (plan `storage_gb`
   minus the site's total), recomputed hourly and on every bucket / plan change, plus a refusal of
   new buckets and an operator alert while a site is over its storage;
@@ -37,6 +38,7 @@ from sqlalchemy.orm import Session
 from . import alerts, minio_client, sections
 from .config import settings
 from .minio_client import MinioClient, MinioError
+from .seaweed_client import SeaweedClient
 from .models import Record, Site, State, StorageBucket, StorageUsageHourly, utcnow
 
 log = logging.getLogger("pcdn.storage")
@@ -82,14 +84,23 @@ def configured() -> bool:
     return True
 
 
+def backend() -> str:
+    """"seaweedfs" (the default for a new install) or "minio" (an existing MinIO / AIStor server)."""
+    return "minio" if (settings.storage_backend or "").lower() == "minio" else "seaweedfs"
+
+
 def client() -> MinioClient:
     global _client
     if _client is not None:
         return _client
     if not configured():
         raise StorageError("فضای ذخیره‌سازی روی این کنترلر پیکربندی نشده است (STORAGE_ENDPOINT)", 503)
-    _client = MinioClient(settings.storage_endpoint, settings.storage_admin_access_key,
-                          settings.storage_admin_secret_key, settings.storage_region)
+    args = (settings.storage_endpoint, settings.storage_admin_access_key,
+            settings.storage_admin_secret_key, settings.storage_region)
+    if backend() == "minio":
+        _client = MinioClient(*args)
+    else:
+        _client = SeaweedClient(*args, metrics_path=settings.storage_metrics_path)
     return _client
 
 
