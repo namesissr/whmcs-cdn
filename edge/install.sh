@@ -514,11 +514,21 @@ fi
 install -d -m 755 /etc/systemd/system/nginx.service.d
 # F24: bias the OOM killer away from nginx (the agent is biased toward it) so a memory spike drops
 # the accounting agent, not the workers carrying live tunnels.
+# Restart=on-failure: the distribution's nginx unit has no restart policy at all, so a master that is
+# OOM-killed or crashes leaves the node answering nothing until a human notices. Only a FAILURE
+# restarts it, so `systemctl stop nginx` by an operator stays stopped, and a reload is not a restart.
+# systemd's default rate limit (5 starts / 10 s) still applies: a node whose nginx cannot start at all
+# stays down and visible in the panel instead of looping forever.
 cat > /etc/systemd/system/nginx.service.d/pcdn-limits.conf <<'EOF'
 [Service]
 LimitNOFILE=1048576
 OOMScoreAdjust=-500
+Restart=on-failure
+RestartSec=2
 EOF
+# the drop-in only takes effect after a daemon-reload, and the blocks that would do one further down
+# (guard / origin guard / fn / imaged) are all conditional
+systemctl daemon-reload
 
 # >>> pcdn join (SPEC §23.9; edge/tests/test_wave14.py runs this block with a fake curl)
 # a one-time join token is exchanged for the node's edge token right before agent.conf is written (the

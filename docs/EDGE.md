@@ -361,7 +361,11 @@ at `GET /api/v1/edges/{id}/logs`.
   ~4 min and frees its `limit_conn` slot (F17). These options sit only on the `default_server`
   listens; per-site `listen` lines stay bare, or nginx rejects the reload with "duplicate listen
   options".
-* `/etc/systemd/system/nginx.service.d/pcdn-limits.conf`: `LimitNOFILE=1048576`.
+* `/etc/systemd/system/nginx.service.d/pcdn-limits.conf`: `LimitNOFILE=1048576`,
+  `OOMScoreAdjust=-500` (F24) and `Restart=on-failure` + `RestartSec=2` — the distro unit has no
+  restart policy, so an OOM-killed or crashed master would otherwise leave the node serving nothing.
+  A clean `systemctl stop` is not a failure and stays stopped; systemd's default start rate limit
+  still stops a node whose nginx cannot start at all, which the panel then shows as offline.
 * `nginx.conf` (main/events context, between the `# >>> nginx.conf edits` markers):
   `worker_rlimit_nofile 524288`, `worker_connections 65535`, `multi_accept off` (F4: forcing it
   **on** piled long-lived tunnel connections onto one worker, capping the node at one core and one

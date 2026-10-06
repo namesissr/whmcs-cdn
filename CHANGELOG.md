@@ -152,6 +152,10 @@ start at all.
 - Controller: the memory part of `edge_health:<id>` gained hysteresis (`EDGE_MEM_ALERT` for 3 heartbeats,
   resolving 10 points lower) and a `critical` tier from 97 % on the first report, naming the node's draining
   generations and the remedies.
+- Edge: the nginx drop-in gained `Restart=on-failure` + `RestartSec=2` (and the drop-in is now
+  followed by a `systemctl daemon-reload`, which only happened in conditional blocks further down).
+  The distribution's unit has no restart policy, so an OOM-killed or crashed master left the node
+  answering nothing until someone noticed; a clean `systemctl stop` still stays stopped.
 - Docs: NODES (§۱۳-۱-۱ node memory and worker generations, troubleshooting row for the empty pid file),
   EDGE, MONITORING, SPEC (§6, §22.2).
 

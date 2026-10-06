@@ -1505,6 +1505,20 @@ def _install_block(start, end):
     return install.split(start, 1)[1].split(end, 1)[0]
 
 
+def test_install_writes_the_nginx_drop_in(tmp_path):
+    """The nginx drop-in must keep nginx alive: the distro unit has no restart policy, so an
+    OOM-killed master would leave the node serving nothing. A clean stop must stay stopped."""
+    block = _install_block("cat > /etc/systemd/system/nginx.service.d/pcdn-limits.conf <<'EOF'", "\nEOF")
+    assert "Restart=on-failure" in block and "RestartSec=" in block
+    assert "Restart=always" not in block          # an operator's `systemctl stop nginx` stays stopped
+    assert "LimitNOFILE=1048576" in block and "OOMScoreAdjust=-500" in block
+    # a drop-in without a daemon-reload would only take effect on the next boot, and every other
+    # reload in install.sh sits inside a conditional block
+    install = (HERE.parent / "install.sh").read_text()
+    after = install.split("nginx.service.d/pcdn-limits.conf", 1)[1]
+    assert "systemctl daemon-reload" in after.split("# >>> pcdn join", 1)[0]
+
+
 def test_install_upgrade_roundtrip_new_keys(tmp_path):
     """install.sh writes TCP_CC / HTTP3 to agent.conf and --upgrade reads them back (flags win)."""
     conf = tmp_path / "agent.conf"
