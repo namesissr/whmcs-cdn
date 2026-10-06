@@ -242,6 +242,13 @@ DEFAULTS = {
     # §22.2 memory guard: mem_pct >= this for 2 heartbeats while old worker generations drain -> SIGTERM
     # the oldest shutting-down worker (at most one per 60 s). 0 = off, else 50..99
     "MEM_GUARD_PCT": "92",
+    # §22.2 critical memory: from here up the guard acts on the first heartbeat, without the 60 s
+    # cooldown, on up to MEM_GUARD_MAX_KILLS generations at once, SIGKILLs a worker that ignored its
+    # SIGTERM for MEM_GUARD_KILL_GRACE_S, and a reload (a whole new worker generation) waits until
+    # RELOAD_MAX_WAIT forces it. 0 = no critical tier, else 50..99
+    "MEM_GUARD_HARD_PCT": "97",
+    "MEM_GUARD_MAX_KILLS": "3",
+    "MEM_GUARD_KILL_GRACE_S": "60",
     # §22.2: worker_shutdown_timeout chosen by install.sh (empty = auto by RAM / kept from nginx.conf)
     "SHUTDOWN_TIMEOUT": "",
     # §22.1 drain: "drained" once ESTABLISHED client connections <= this for 2 checks (10 s apart)

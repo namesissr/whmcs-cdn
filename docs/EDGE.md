@@ -548,6 +548,14 @@ forced_shutdowns_24h}` (`state["reload_times"]`: 48 h, ≤ 500; `wst_s` parsed f
 **Memory guard:** `mem_pct ≥ MEM_GUARD_PCT` (92; 0 = off) on 2 heartbeats while old worker generations
 drain → `SIGTERM` to the oldest "worker process is shutting down" (start time from `/proc/<pid>/stat`), at
 most one per 60 s, logged, recorded in `state["forced_shutdowns"]`; never the master or a current worker.
+A worker already signalled is skipped, so the next round takes the next-oldest generation.
+**Critical tier:** from `MEM_GUARD_HARD_PCT` (97; 0 = no critical tier) the guard acts on the FIRST
+heartbeat, without the 60 s cooldown, on up to `MEM_GUARD_MAX_KILLS` (3) of the oldest generations at
+once, and `SIGKILL`s a worker still shutting down `MEM_GUARD_KILL_GRACE_S` (60) after its `SIGTERM`
+(`state["forced_shutdowns"][*]["sig"]`: `term` → `kill`). While a generation drains at that memory level
+`_reload_min_interval()` also goes straight to the 600 s ceiling — a reload forks a whole new generation,
+and the OOM killer's victim may be the master, which takes every tunnel on the node with it (and leaves a
+pid file nothing rewrites). `RELOAD_MAX_WAIT` still forces the pending version through.
 **worker_shutdown_timeout:** `install.sh --shutdown-timeout auto` (default): RAM < 4 GiB `30m`, 4–8 GiB `2h`,
 ≥ 8 GiB `4h`. An explicit value (never seconds below 60) is stored as `SHUTDOWN_TIMEOUT` and kept by
 `--upgrade`; an `--upgrade` of an edge without that line keeps nginx.conf's existing value.
@@ -632,6 +640,9 @@ keeps its §15.8 meaning.
 |---|---|---|
 | `RELOAD_MAX_WAIT` | 900 | s; hard upper bound for a pending config version (60..3600) |
 | `MEM_GUARD_PCT` | 92 | memory guard threshold (50..99, 0 = off) |
+| `MEM_GUARD_HARD_PCT` | 97 | critical tier: act at once, several generations, SIGKILL escalation (0 = off) |
+| `MEM_GUARD_MAX_KILLS` | 3 | generations stopped per round in the critical tier (1..32) |
+| `MEM_GUARD_KILL_GRACE_S` | 60 | SIGTERM → SIGKILL grace in the critical tier (5..3600) |
 | `SHUTDOWN_TIMEOUT` | — | explicit `worker_shutdown_timeout` written by install.sh |
 | `DRAIN_IDLE_CONNS` | 10 | drained at or below this many public connections (2 checks) |
 | `PROBE_ENABLED` | yes | synthetic tunnel probe |

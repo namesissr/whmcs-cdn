@@ -1744,7 +1744,20 @@ Keep F5/F20/F21 as they are and add:
   consecutive heartbeats AND shutting-down workers exist, send `SIGTERM` to the **oldest** shutting-down
   worker (lowest start time from `/proc/<pid>/stat`), at most one per 60 s; log WARN; record
   `{"t", "pid"}` into `state["forced_shutdowns"]` (≤ 200, 48 h) for §22.12 classification
-  (`node_reload`). Never touches the master or current-generation workers.
+  (`node_reload`). Never touches the master or current-generation workers. A worker already signalled is
+  skipped (the next round takes the next-oldest generation).
+- **Critical memory tier** (agent): from `MEM_GUARD_HARD_PCT` (agent.conf, default 97, 0 = off) up the guard
+  acts on the FIRST high heartbeat, ignores the 60 s cooldown, stops up to `MEM_GUARD_MAX_KILLS` (3) of the
+  oldest generations per round, and sends `SIGKILL` to a worker still listed as shutting down
+  `MEM_GUARD_KILL_GRACE_S` (60) after its `SIGTERM` (`forced_shutdowns` entries carry `"sig": "term"|"kill"`).
+  While any generation is draining at that memory level the reload back-pressure jumps to its 600 s ceiling:
+  a reload forks a whole new worker generation, and if the kernel's OOM killer picks the nginx master
+  instead, every tunnel on the node dies with it (and `/run/nginx.pid` is left empty, so later reloads fail
+  too — see the reload repair below). `RELOAD_MAX_WAIT` still forces the pending version through.
+- **Reload repair** (agent): a reload that fails while `NGINX_PID_FILE` does not point at a live master
+  (empty / stale pid file → `invalid PID number ""`, which nginx reports without any `nginx -t` or `emerg`
+  error while it keeps serving the old config) rewrites that file from the running master's pid, retries
+  once, then falls back to `SIGHUP`; WARN either way.
 - **Metrics** in the heartbeat (new object, B emits, A stores):
   `"reloads": {"count_1h": int, "count_24h": int, "last_at": iso|null, "coalesced_1h": int,
   "pending_s": int, "deferred": bool, "wst_s": int|null, "forced_shutdowns_24h": int}` where

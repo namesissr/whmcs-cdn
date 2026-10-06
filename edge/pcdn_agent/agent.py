@@ -26,8 +26,8 @@ from .drain import (
 UPGRADE_UNDRAIN_GRACE_S = 300
 from .functions import functions_enabled, read_fn_usage, sync_functions
 from .heartbeat import (
-    RELOAD_KEEP_S, RELOAD_TIMES_MAX, collect_metrics, count_draining_workers, heartbeat_capabilities, memory_guard,
-    net_sample, prune_times, reload_stats,
+    RELOAD_KEEP_S, RELOAD_TIMES_MAX, collect_metrics, count_draining_workers, heartbeat_capabilities, mem_pct,
+    memory_guard, net_sample, prune_times, reload_stats,
 )
 from .logship import LogShip
 from .nodelogs import collect_logs, tunnel_map
@@ -195,10 +195,24 @@ class Agent:
 
     def _reload_min_interval(self) -> float:
         """F5 reload back-pressure: base RELOAD_MIN_INTERVAL, doubled (up to 600 s) while more than
-        2×nproc worker generations are still draining, so reloads never outpace worker shutdown."""
+        2×nproc worker generations are still draining, so reloads never outpace worker shutdown.
+
+        §22.2: at critical memory (MEM_GUARD_HARD_PCT) it goes straight to the 600 s ceiling while old
+        generations are still draining. A reload there forks a whole new generation on a node that is
+        already minutes from the OOM killer — and the kernel's victim may well be the nginx master,
+        which takes every tunnel on the node with it. RELOAD_MAX_WAIT still forces the change through,
+        so nothing is stuck behind this."""
         base = _int(self.cfg.get("RELOAD_MIN_INTERVAL"), 120, 0, 3600)
         try:
-            if count_draining_workers(self.cfg.get("PROC_DIR", "/proc")) > 2 * (os.cpu_count() or 1):
+            draining = count_draining_workers(self.cfg.get("PROC_DIR", "/proc"))
+            if draining:
+                hard = _int(self.cfg.get("MEM_GUARD_HARD_PCT"), 97, 0, 99)
+                mem = mem_pct(self.cfg.get("PROC_MEMINFO", "/proc/meminfo"))
+                if hard and mem is not None and mem >= hard:
+                    log.warning("reload held back: memory at %.1f %% with %d worker generation(s) still "
+                                "draining", mem, draining)
+                    return 600
+            if draining > 2 * (os.cpu_count() or 1):
                 return min(600, base * 2)
         except Exception:  # noqa: BLE001
             pass

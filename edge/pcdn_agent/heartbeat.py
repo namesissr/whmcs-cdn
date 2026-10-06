@@ -254,10 +254,25 @@ def shutting_down_workers(proc: str = "/proc") -> list[tuple[int, int]]:
     return sorted(out)
 
 
+def _still_shutting_down(proc: str, pid: int) -> bool:
+    """True while `pid` is still an nginx worker of an old generation (so a recycled pid is never hit)."""
+    try:
+        with open(os.path.join(proc, str(pid), "cmdline"), "rb") as f:
+            return b"worker process is shutting down" in f.read()
+    except OSError:
+        return False
+
+
 def memory_guard(state: dict, cfg: dict, mem: float | None, now: float | None = None, kill=os.kill) -> int | None:
     """Called once per heartbeat. When mem_pct >= MEM_GUARD_PCT for 2 consecutive heartbeats and old
     worker generations are still draining, SIGTERM the oldest shutting-down worker (at most one per 60 s)
-    and record it in state["forced_shutdowns"] (session-end classification). -> the pid or None."""
+    and record it in state["forced_shutdowns"] (session-end classification). -> the pid or None.
+
+    From MEM_GUARD_HARD_PCT up the node is minutes away from the OOM killer, which does not pick the
+    worker the guard would: it can take the master instead, and with it every tunnel on the node (plus
+    a pid file nothing rewrites, so no later reload works either). So above that line the guard acts on
+    the FIRST heartbeat, without the 60 s cooldown, on up to MEM_GUARD_MAX_KILLS of the oldest
+    generations at once, and SIGKILLs a worker that ignored its SIGTERM for MEM_GUARD_KILL_GRACE_S."""
     now = time.time() if now is None else now
     pct = _int(cfg.get("MEM_GUARD_PCT"), 92, 0, 99)
     if pct and pct < 50:
@@ -265,22 +280,49 @@ def memory_guard(state: dict, cfg: dict, mem: float | None, now: float | None = 
     if not pct or mem is None or mem < pct:
         state["mem_high"] = 0
         return None
+    hard = _int(cfg.get("MEM_GUARD_HARD_PCT"), 97, 0, 99)
+    critical = bool(hard) and mem >= max(pct, hard)
     state["mem_high"] = int(state.get("mem_high") or 0) + 1
-    if state["mem_high"] < 2 or now - float(state.get("mem_guard_at") or 0) < 60:
+    if not critical and (state["mem_high"] < 2 or now - float(state.get("mem_guard_at") or 0) < 60):
         return None
-    victims = shutting_down_workers(cfg.get("PROC_DIR", "/proc"))
-    if not victims:
-        return None
-    pid = victims[0][1]
-    try:
-        kill(pid, signal.SIGTERM)
-    except OSError as e:
-        log.warning("memory guard: cannot stop old nginx worker %d: %s", pid, e)
-        return None
-    log.warning("memory guard: memory at %.1f %% (>= %d %%): stopped the oldest shutting-down nginx worker %d",
-                mem, pct, pid)
-    state["mem_guard_at"] = now
+    proc = cfg.get("PROC_DIR", "/proc")
+    victims = shutting_down_workers(proc)
     fs = [f for f in state.get("forced_shutdowns") or [] if isinstance(f, dict) and now - f.get("t", 0) <= RELOAD_KEEP_S]
-    fs.append({"t": now, "pid": pid})
+    killed = None
+    if critical:   # a worker that ignored its SIGTERM holds its memory until worker_shutdown_timeout
+        grace = _int(cfg.get("MEM_GUARD_KILL_GRACE_S"), 60, 5, 3600)
+        for f in fs:
+            pid = f.get("pid")
+            if f.get("sig") == "kill" or not isinstance(pid, int) or now - f.get("t", 0) < grace:
+                continue
+            if not _still_shutting_down(proc, pid):
+                continue
+            try:
+                kill(pid, signal.SIGKILL)
+            except OSError as e:
+                log.warning("memory guard: cannot SIGKILL old nginx worker %d: %s", pid, e)
+                continue
+            f["sig"] = "kill"
+            killed = killed or pid
+            log.warning("memory guard: memory at %.1f %% (critical): SIGKILLed old nginx worker %d, which had "
+                        "not stopped %.0f s after SIGTERM", mem, pid, now - f.get("t", 0))
+    done = {f.get("pid") for f in fs if isinstance(f.get("pid"), int)}
+    want = _int(cfg.get("MEM_GUARD_MAX_KILLS"), 3, 1, 32) if critical else 1
+    for _start, pid in victims:
+        if want <= 0:
+            break
+        if pid in done:   # already SIGTERMed (and SIGKILLed above once the grace passed)
+            continue
+        try:
+            kill(pid, signal.SIGTERM)
+        except OSError as e:
+            log.warning("memory guard: cannot stop old nginx worker %d: %s", pid, e)
+            continue
+        log.warning("memory guard: memory at %.1f %% (>= %d %%): stopped the oldest shutting-down nginx worker %d",
+                    mem, pct, pid)
+        state["mem_guard_at"] = now
+        fs.append({"t": now, "pid": pid, "sig": "term"})
+        killed = killed or pid
+        want -= 1
     state["forced_shutdowns"] = fs[-FORCED_MAX:]
-    return pid
+    return killed

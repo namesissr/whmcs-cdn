@@ -7,6 +7,7 @@ test_tunnel_speed_e2e.py."""
 import base64
 import io
 import json
+import signal
 import os
 import pathlib
 import shutil
@@ -604,15 +605,85 @@ def test_memory_guard_victim_selection(tmp_path):
     assert agent.memory_guard(st, cfg, 95.0, now=1000, kill=kill) is None   # the first high heartbeat
     assert agent.memory_guard(st, cfg, 95.0, now=1060, kill=kill) == 202    # second: the oldest old worker
     assert agent.memory_guard(st, cfg, 96.0, now=1100, kill=kill) is None   # rate limit: one per 60 s
-    assert agent.memory_guard(st, cfg, 96.0, now=1121, kill=kill) == 202    # (the fake /proc still lists it)
-    assert killed == [202, 202] and 100 not in killed and 301 not in killed and 302 not in killed
-    assert [f["pid"] for f in st["forced_shutdowns"]] == [202, 202]
+    # a worker already SIGTERMed is not signalled again: the next-oldest generation frees real memory
+    assert agent.memory_guard(st, cfg, 96.0, now=1121, kill=kill) == 201
+    assert killed == [202, 201] and 100 not in killed and 301 not in killed and 302 not in killed
+    assert [f["pid"] for f in st["forced_shutdowns"]] == [202, 201]
     assert agent.memory_guard(st, cfg, 50.0, now=1200, kill=kill) is None and st["mem_high"] == 0
     assert agent.memory_guard({"mem_high": 5}, dict(cfg, MEM_GUARD_PCT="0"), 99.0, now=1, kill=kill) is None
     assert agent.reload_stats(st, None, now=1300)["forced_shutdowns_24h"] == 2
     empty = fake_proc(tmp_path / "e", {301: ("nginx: worker process", 50)})
     st2 = {"mem_high": 1}
     assert agent.memory_guard(st2, dict(cfg, PROC_DIR=str(empty)), 99.0, now=1, kill=kill) is None
+
+
+def test_memory_guard_critical_tier(tmp_path):
+    """At MEM_GUARD_HARD_PCT the OOM killer is the alternative, and its victim may be the master (and
+    with it every tunnel on the node): act on the first heartbeat, on several generations at once, and
+    SIGKILL a worker that ignored its SIGTERM."""
+    proc = fake_proc(tmp_path, {
+        100: ("nginx: master process /usr/sbin/nginx", 10),
+        201: ("nginx: worker process is shutting down", 700),
+        202: ("nginx: worker process is shutting down", 300),
+        203: ("nginx: worker process is shutting down", 500),
+        204: ("nginx: worker process is shutting down", 900),
+        301: ("nginx: worker process", 50)})
+    cfg = make_cfg(tmp_path, PROC_DIR=str(proc), MEM_GUARD_PCT="92", MEM_GUARD_HARD_PCT="97")
+    killed, st = [], {}
+
+    def kill(pid, sig):
+        killed.append((pid, sig))
+    # first high heartbeat, no cooldown wait: the three oldest old generations, never the master
+    assert agent.memory_guard(st, cfg, 99.1, now=1000, kill=kill) == 202
+    assert killed == [(202, signal.SIGTERM), (203, signal.SIGTERM), (201, signal.SIGTERM)]
+    assert [f["sig"] for f in st["forced_shutdowns"]] == ["term"] * 3
+    # still critical 20 s later: too early to escalate, but the untouched generation goes
+    killed.clear()
+    assert agent.memory_guard(st, cfg, 99.0, now=1020, kill=kill) == 204
+    assert killed == [(204, signal.SIGTERM)]
+    # past the grace and they are all still shutting down -> SIGKILL, once each
+    killed.clear()
+    assert agent.memory_guard(st, cfg, 98.0, now=1100, kill=kill) == 202
+    assert killed == [(202, signal.SIGKILL), (203, signal.SIGKILL), (201, signal.SIGKILL),
+                      (204, signal.SIGKILL)]
+    assert all(f["sig"] == "kill" for f in st["forced_shutdowns"])
+    killed.clear()   # nothing left to escalate and nothing new to stop
+    assert agent.memory_guard(st, cfg, 98.0, now=1200, kill=kill) is None and killed == []
+    # a worker that did stop (or a recycled pid) is never signalled again
+    killed.clear()
+    gone = fake_proc(tmp_path / "g", {100: ("nginx: master process /usr/sbin/nginx", 10),
+                                      202: ("some-other-program", 300)})
+    st2 = {"forced_shutdowns": [{"t": 1000, "pid": 202, "sig": "term"}]}
+    assert agent.memory_guard(st2, dict(cfg, PROC_DIR=str(gone)), 99.0, now=1200, kill=kill) is None
+    assert killed == []
+    # below the critical line the old two-heartbeat + cooldown discipline is unchanged
+    st3 = {}
+    assert agent.memory_guard(st3, cfg, 96.9, now=2000, kill=kill) is None   # first high heartbeat only
+    # MEM_GUARD_HARD_PCT=0 disables the critical tier: even 99.9 % waits for the second heartbeat and
+    # then stops one generation, as before
+    assert agent.memory_guard(st3, dict(cfg, MEM_GUARD_HARD_PCT="0"), 99.9, now=2001, kill=kill) == 202
+    assert killed == [(202, signal.SIGTERM)]
+
+
+def test_reload_held_back_at_critical_memory(tmp_path, monkeypatch):
+    """A reload forks a whole new worker generation; at critical memory that is how a node loses its
+    master. The back-pressure goes to the ceiling, and RELOAD_MAX_WAIT still forces the change."""
+    proc = fake_proc(tmp_path, {201: ("nginx: worker process is shutting down", 300),
+                                301: ("nginx: worker process", 50)})
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       1000000 kB\nMemAvailable:      5000 kB\n")
+    cfg = make_cfg(tmp_path, PROC_DIR=str(proc), PROC_MEMINFO=str(meminfo), RELOAD_MIN_INTERVAL="120",
+                   MEM_GUARD_HARD_PCT="97")
+    a = agent.Agent.__new__(agent.Agent)
+    a.cfg, a.state = cfg, {}
+    assert a._reload_min_interval() == 600
+    meminfo.write_text("MemTotal:       1000000 kB\nMemAvailable:     500000 kB\n")
+    assert a._reload_min_interval() == 120
+    # no draining generation: memory alone never holds a reload back (nothing to wait for)
+    only_new = fake_proc(tmp_path / "n", {301: ("nginx: worker process", 50)})
+    meminfo.write_text("MemTotal:       1000000 kB\nMemAvailable:      5000 kB\n")
+    a.cfg = dict(cfg, PROC_DIR=str(only_new))
+    assert a._reload_min_interval() == 120
 
 
 # ================================================================= §22.3 probe
